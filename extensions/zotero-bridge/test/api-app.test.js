@@ -24,7 +24,7 @@ function build(overrides) {
   const tracker = { inBatch: false, touched: [], created: [] };
   const deps = {
     zotero,
-    version: '0.1.3',
+    version: '0.1.4',
     host: HOST,
     token: TOKEN,
     validate: v,
@@ -87,7 +87,7 @@ test('GET /v1/status answers with the versions, for an admitted caller', async (
   const { app } = build();
   const out = await call(app, 'GET', '/v1/status');
   assert.equal(out.status, 200);
-  assert.deepEqual(out.body, { plugin_version: '0.1.3', api_version: 1, zotero_version: '10.0.6', library_id: 1 });
+  assert.deepEqual(out.body, { plugin_version: '0.1.4', api_version: 1, zotero_version: '10.0.6', library_id: 1 });
 });
 
 test('no token is a 401 that says how to send one', async () => {

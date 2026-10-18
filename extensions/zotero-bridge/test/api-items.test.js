@@ -19,6 +19,7 @@ function setup(overrides = {}) {
     newId: () => 'ID1',
     tempDir: () => '/tmp/zotero-test',
     tracker,
+    localApiServesFiles: overrides.localApiServesFiles || (() => false),
     // A delay that never fires, so the file check finishes first unless a test says otherwise.
     delay: overrides.delay || (() => new Promise(() => {})),
   });
@@ -448,4 +449,52 @@ test('the write factory refuses to start without the shared tracker or the delay
     () => createItemWrites({ ...base, tracker: { inBatch: false, touched: [], created: [] } }),
     /needs deps\.delay/
   );
+});
+
+test('a linked file is refused while Zotero local API is on, before any file is checked or linked', async () => {
+  const { zotero, io, items } = setup({ localApiServesFiles: () => true });
+  const parent = zotero._addItem('book', { title: 'Book' });
+  io.files.set('/tmp/zotero-test/present.pdf', Uint8Array.from([37, 80, 68, 70]));
+  await assert.rejects(
+    items.createAttachment(parent.key, { mode: 'linked_file', path: '/tmp/zotero-test/present.pdf' }),
+    apiErrorMatch(422, 'linking_unavailable')
+  );
+  assert.equal(zotero._calls.links.length, 0);
+});
+
+test('a linked file is refused by default when no local API check is wired in (fails closed)', async () => {
+  const zotero = createFakeZotero();
+  const io = createFakeIO();
+  const tracker = { inBatch: false, touched: [], created: [] };
+  const items = createItemWrites({
+    zotero, validate: v, io, newId: () => 'ID1', tempDir: () => '/tmp/zotero-test', tracker,
+    delay: () => new Promise(() => {}),
+  });
+  const parent = zotero._addItem('book', { title: 'Book' });
+  io.files.set('/tmp/zotero-test/present.pdf', Uint8Array.from([37]));
+  await assert.rejects(
+    items.createAttachment(parent.key, { mode: 'linked_file', path: '/tmp/zotero-test/present.pdf' }),
+    apiErrorMatch(422, 'linking_unavailable')
+  );
+  assert.equal(zotero._calls.links.length, 0);
+});
+
+test('a linked file must be a document, image or media file, whatever folder it is in', async () => {
+  const { zotero, io, items } = setup();
+  const parent = zotero._addItem('book', { title: 'Book' });
+  for (const path of ['/tmp/zotero-test/id_rsa', '/tmp/zotero-test/.env', '/tmp/zotero-test/tool.exe', '/tmp/zotero-test/data.sqlite']) {
+    io.files.set(path, Uint8Array.from([1]));
+    await assert.rejects(items.createAttachment(parent.key, { mode: 'linked_file', path }), apiErrorMatch(422, 'linking_refused'), path);
+  }
+  assert.equal(zotero._calls.links.length, 0);
+});
+
+test('a linked file under a credentials, profile or app-data folder is refused even when its type is allowed', async () => {
+  const { zotero, io, items } = setup();
+  const parent = zotero._addItem('book', { title: 'Book' });
+  for (const path of ['/tmp/zotero-test/.ssh/notes.pdf', '/tmp/zotero-test/.meridian/api.txt', '/tmp/zotero-test/AppData/Roaming/x.pdf', '/tmp/zotero-test/project/.git/readme.md']) {
+    io.files.set(path, Uint8Array.from([1]));
+    await assert.rejects(items.createAttachment(parent.key, { mode: 'linked_file', path }), apiErrorMatch(422, 'linking_refused'), path);
+  }
+  assert.equal(zotero._calls.links.length, 0);
 });

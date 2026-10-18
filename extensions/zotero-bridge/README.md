@@ -10,8 +10,9 @@ Menu actions and a local write API for Zotero:
   notes, attachments, relations, collections and tags, and it imports BibTeX. Reads stay on Zotero's own local API.
   See "Local write API" below.
 
-Plugin ID: `meridian-zotero@usemeridian.us`. Version `0.1.3` (source; not yet signed or released).
-Earlier builds: `0.1.2` (Mozilla-signed, menus only, no write API), `0.1.1` (on Mozilla, uploaded by the owner, with
+Plugin ID: `meridian-zotero@usemeridian.us`. Version `0.1.4` (source; not yet signed or released).
+Earlier builds: `0.1.3` (released; it had the write API, but accepted any readable file as a linked attachment, which
+0.1.4 closes), `0.1.2` (Mozilla-signed, menus only, no write API), `0.1.1` (on Mozilla, uploaded by the owner, with
 the old placeholder `update_url`, so it does not auto-update from GitHub), `0.1.0` (Mozilla-approved, no
 `strict_max_version`).
 
@@ -27,7 +28,7 @@ the old placeholder `update_url`, so it does not auto-update from GitHub), `0.1.
 - **Not verified in Zotero:** the two menu commands, the preferences pane, and the file pickers. These run only
   through the Zotero window, which the checks above did not drive. The BibTeX import they share with the API was
   verified through the API.
-- **Not yet done:** a Mozilla-signed `0.1.3` build, and its release to the update channel. Until that happens,
+- **Not yet done:** a Mozilla-signed `0.1.4` build, and its release to the update channel. Until that happens,
   Meridian's install step prints the signing command.
 
 Two bugs were found and fixed while verifying. The BibTeX duplicate check called `Zotero.Items.getAll` with its first
@@ -87,6 +88,7 @@ curl -s -X POST http://127.0.0.1:23125/v1/items \
 
 Reads: use Zotero's own local API (`http://127.0.0.1:23119/api/users/0/...`), which Zotero serves when
 "Allow other applications on this computer to communicate with Zotero" is on. The write API does not serve reads.
+That same switch controls linked attachments: while it is on, the write API refuses to create them (see Limits).
 
 ### Endpoints
 
@@ -102,7 +104,7 @@ Collection responses have the same fields except `date_modified`, because Zotero
 | `POST /v1/items/{key}/restore` | precondition fields, optional | Takes the item out of the trash. |
 | `POST /v1/items/{key}/notes` | `html` | Creates a child note of a regular item. Answers 201. |
 | `PATCH /v1/notes/{key}` | `html`, precondition fields | Replaces the note's HTML. |
-| `POST /v1/items/{key}/attachments` | `mode`, and either `filename` plus `data_base64` (`imported_file`) or `path` (`linked_file`), plus optional `title` and `content_type` | Answers 201. A linked file must exist, or the reply is 422 `file_not_found`. Not allowed inside a batch. |
+| `POST /v1/items/{key}/attachments` | `mode`, and either `filename` plus `data_base64` (`imported_file`) or `path` (`linked_file`), plus optional `title` and `content_type` | Answers 201. A linked file is refused with 422 `linking_unavailable` while Zotero's local API is on, and with 422 `linking_refused` for a file type or folder that is not allowed (see Limits). Not allowed inside a batch. |
 | `POST /v1/items/{key}/relations` | `related_key`, or `predicate` plus `object` | Adds a relation. |
 | `DELETE /v1/items/{key}/relations` | the same as the POST | Removes the relation. |
 | `POST /v1/collections` | `name`, optional `parent_key` | Answers 201. |
@@ -149,10 +151,23 @@ needs the `predicate:name` form (for example `dc:replaces`) and an `object` with
 - A creator role that the item type does not allow is refused with 422. The message names the role and the item type.
 - A BibTeX duplicate check counts trashed items as existing, so a re-import does not bring back something the user
   trashed.
-- An imported attachment is copied into Zotero storage. A linked attachment stores the path. A token holder can link
-  any absolute regular file that the Zotero process can read. The reply is 201 for a file that exists and 422
-  `file_not_found` otherwise, so a reply shows whether a path exists. UNC and device paths are refused. A check that
-  stalls for more than five seconds returns 422 `file_check_timed_out`. The API does not return file contents.
+- An imported attachment is copied into Zotero storage. A linked attachment stores the path. Linking is restricted,
+  because Zotero's own local API serves a linked file to any local program that asks, with no token:
+  - While that API is on (the switch in Zotero's Advanced settings, `extensions.zotero.httpServer.localAPI.enabled`),
+    a linked attachment is refused with 422 `linking_unavailable`. Turn the switch off to link files, or import the file.
+  - The file name must end in a document, image or media extension: `pdf`, `epub`, `djvu`, `doc`, `docx`, `odt`, `rtf`,
+    `txt`, `md`, `html`, `htm`, `csv`, `tsv`, `xls`, `xlsx`, `ods`, `ppt`, `pptx`, `odp`, `png`, `jpg`, `jpeg`, `gif`,
+    `tif`, `tiff`, `webp`, `bmp`, `svg`, `mp3`, `m4a`, `wav`, `mp4` or `mov`. Any other name, including a dot-file, is
+    refused with 422 `linking_refused`.
+  - No folder on the path may be named `AppData`, `.meridian`, `.ssh`, `.gnupg`, `.aws`, `.azure`, `.kube`, `.docker`,
+    `.git` or `.password-store` (any letter case). Such a path is refused with 422 `linking_refused`.
+  - The file must then exist. A missing file returns 422 `file_not_found`, so a reply shows whether a path exists. A
+    check that stalls for more than five seconds returns 422 `file_check_timed_out`. UNC and device paths are refused.
+    The API does not return file contents.
+  - These rules read the text of the path. They do not follow a symbolic link or junction, so a link created outside
+    the API can point at a file the rules would refuse. Create the links yourself only in folders you control.
+  - The check runs when a file is linked. If you turn the local API on later, every linked file becomes readable by
+    local programs, including ones linked earlier. Keep the switch off while such files matter to you.
 - Errors go to Zotero's error console. Request bodies and the token are never logged.
 
 ### Not in this version

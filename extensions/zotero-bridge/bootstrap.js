@@ -528,6 +528,10 @@ async function meridianStartApi() {
 function meridianWriteDeps(validate, tracker) {
   return {
     zotero: Zotero,
+    localApiServesFiles: function () {
+      // Read at call time, so a change to the preference takes effect without restarting the add-on.
+      return Services.prefs.getBoolPref('extensions.zotero.httpServer.localAPI.enabled', true);
+    },
     validate: validate,
     tracker: tracker,
     delay: meridianDelay,

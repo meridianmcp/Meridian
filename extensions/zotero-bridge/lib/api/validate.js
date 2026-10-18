@@ -186,6 +186,35 @@ function isAbsolutePath(path) {
   return ABSOLUTE_RE.test(path);
 }
 
+// Extensions a linked file may have. Zotero attachments are documents, figures and media. Keys, configs, scripts,
+// databases and archives are not on the list, so a linked file can never be one of them.
+var LINKABLE_EXTENSIONS = [
+  'pdf', 'epub', 'djvu', 'doc', 'docx', 'odt', 'rtf', 'txt', 'md', 'html', 'htm', 'csv', 'tsv',
+  'xls', 'xlsx', 'ods', 'ppt', 'pptx', 'odp', 'png', 'jpg', 'jpeg', 'gif', 'tif', 'tiff', 'webp',
+  'bmp', 'svg', 'mp3', 'm4a', 'wav', 'mp4', 'mov',
+];
+
+// Folders that hold credentials, profiles or app state. A path through any of them is refused.
+var SENSITIVE_SEGMENTS = [
+  'appdata', '.meridian', '.ssh', '.gnupg', '.aws', '.azure', '.kube', '.docker', '.git', '.password-store',
+];
+
+// Null when the path may be linked, otherwise the reason it may not. It judges the text of the path only.
+function linkableFileProblem(path) {
+  var segments = String(path).split(/[\\\/]+/).map(function (s) { return s.toLowerCase(); }).filter(function (s) { return s !== ''; });
+  for (var i = 0; i < segments.length; i++) {
+    if (SENSITIVE_SEGMENTS.indexOf(segments[i]) !== -1) {
+      return 'That folder holds credentials, profiles or app data, so it cannot be linked.';
+    }
+  }
+  var name = segments.length ? segments[segments.length - 1] : '';
+  var dot = name.lastIndexOf('.');
+  var ext = dot > 0 ? name.slice(dot + 1) : '';
+  if (LINKABLE_EXTENSIONS.indexOf(ext) === -1) {
+    return 'Only documents, images and media can be linked. Import the file instead.';
+  }
+  return null;
+}
 function predicateValue(value, name) {
   if (typeof value !== 'string' || !PREDICATE_RE.test(value)) {
     throw invalid(name, 'must look like dc:relation');
@@ -217,6 +246,7 @@ module.exports = {
   decodeBase64: decodeBase64,
   safeFilename: safeFilename,
   isAbsolutePath: isAbsolutePath,
+  linkableFileProblem: linkableFileProblem,
   predicateValue: predicateValue,
   relationObjectValue: relationObjectValue,
 };

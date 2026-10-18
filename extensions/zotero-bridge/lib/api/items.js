@@ -22,6 +22,7 @@ function createItemWrites(deps) {
   var delay = deps.delay;
   var apiError = v.apiError;
   var invalid = v.invalid;
+  var localApiServesFiles = deps.localApiServesFiles || function () { return true; };
 
   if (!tracker) throw new Error('createItemWrites needs deps.tracker');
   if (typeof delay !== 'function') throw new Error('createItemWrites needs deps.delay');
@@ -406,6 +407,17 @@ function createItemWrites(deps) {
   async function linkAttachmentFile(parent, body, title, contentType) {
     var path = v.requireString(body.path, 'path', v.LIMITS.path);
     if (!v.isAbsolutePath(path)) throw invalid('path', 'must be an absolute path');
+    // Zotero's local API serves a linked file to any local program that asks, with no token, so while that API is on
+    // a linked file would be readable by every account on the machine. Fails closed when no check is wired in.
+    if (localApiServesFiles()) {
+      throw apiError(
+        422,
+        'linking_unavailable',
+        'Zotero\u2019s local API is on, and it serves linked files to any local program. Import the file instead, or turn the local API off.'
+      );
+    }
+    var problem = v.linkableFileProblem(path);
+    if (problem) throw apiError(422, 'linking_refused', problem);
     var info = await statWithin(path);
     if (info === TIMED_OUT) {
       throw apiError(

@@ -93,7 +93,7 @@ What signing does, and what it does not:
 - **One forced kill, for the signing child only.** If Mozilla does not finish within the wait, `sign-plugin` ends the signing child's own process tree, with `taskkill /PID <child> /T /F` on Windows, so that a hung web-ext cannot block the command. This is the only forced kill in the signing path. It touches only the signing child's process tree, and never Zotero or any other process. Zotero's own close step is a plain close request and never forces anything.
 - **Fallback: install the unsigned file yourself.** The install prints the path of the unsigned file. In Zotero, open **Tools > Plugins**, click the gear icon, choose **Install Plugin From File**, and select that file. Zotero may refuse an unsigned add-on in a normal build. The menu names used in this guide and that refusal are unverified on Zotero 10.0.6.
 
-**Not yet verified:** Mozilla's unlisted signing of version 0.1.3 has not been run against Mozilla. Zotero accepting a signed `.xpi` copied into a profile's `extensions` folder is not yet verified on a real Zotero install.
+**Status of 0.1.4:** not yet signed, released or installed. The signing step has to run against Mozilla before the release step publishes the signed file, and only then can the install copy it into a profile.
 
 ## 5. Verify
 
@@ -101,7 +101,7 @@ What signing does, and what it does not:
 2. Right-click a collection in the left pane. The menu has **Import BibTeX here...**.
 3. Select a regular item and right-click it. The menu has **Attach PDFs from folder...**.
 4. Zotero's settings include a pane named **Meridian Zotero Bridge**.
-5. The write API answers. Read the token into a shell variable without printing it, then ask for the status. The answer names the plugin version (0.1.3 or later) and Zotero's version:
+5. The write API answers. Read the token into a shell variable without printing it, then ask for the status. The answer names the plugin version (0.1.4 or later) and Zotero's version:
 
    ```bash
    TOKEN=$(cat "$HOME/.meridian/local_runner/zotero_bridge/api_token")
@@ -130,4 +130,5 @@ What signing does, and what it does not:
 - **Zotero did not register the plugin.** The install waits up to two minutes for Zotero to register the add-on. If it does not, the plugin is not enabled yet. Start Zotero once, then run the install again.
 - **Nothing happens on macOS or Linux.** The tray prompt, the immediate install, the tray menu items and the close step are Windows only in this build. Use the manual install in section 4.
 - **The write API does not answer on port 23125.** It starts only when the profile's `user.js` names a token file that holds a usable token. If the token file is missing, the menus still work and the API stays off. Zotero logs the reason to its error console. Run the install again to create the token file and the lines. If another program already uses port 23125, the API also stays off, and Zotero logs that too.
+- **A linked attachment is refused with `linking_unavailable`.** Zotero's local API is on, and it serves linked files to any local program. Turn it off in Zotero's Advanced settings (`extensions.zotero.httpServer.localAPI.enabled`), or import the file instead. Reads through Zotero's local API need that switch on, so you cannot have both at once.
 - **Not listed after restart.** The automatic route has not been verified on a real Zotero install. If Meridian Zotero Bridge is not in **Tools > Plugins** after a restart, use the manual install in section 4, and tell us what **Tools > Plugins** showed.

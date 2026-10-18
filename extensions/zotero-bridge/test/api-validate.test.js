@@ -94,3 +94,15 @@ test('optional integers reject negatives and fractions, and booleans reject stri
   assert.throws(() => v.optionalBoolean('true', 'b'));
   assert.equal(v.optionalBoolean(undefined, 'b'), false);
 });
+
+test('linkableFileProblem allows documents, images and media in ordinary folders, in any letter case', () => {
+  for (const p of ['/var/papers/paper.pdf', 'D:' + '/papers/Paper.PDF', 'D:' + '\\papers\\notes.txt', '/x/figure.SVG', '/x/clip.mp4']) {
+    assert.equal(v.linkableFileProblem(p), null, p);
+  }
+});
+
+test('linkableFileProblem refuses other file types, dot-files, and credentials, profile or app-data folders', () => {
+  for (const p of ['/x/id_rsa', '/x/.env', '/x/tool.exe', '/x/archive.zip', '/x/db.sqlite', '/x/.ssh/config.txt', '/x/AppData/y.pdf', '/x/.git/notes.md', '/x/appdata/a.pdf']) {
+    assert.notEqual(v.linkableFileProblem(p), null, p);
+  }
+});
