@@ -152,6 +152,36 @@ class TestExactTier:
         assert result["bindings"][0]["resolved_sha256"] == recorded_hash
 
     @duckdb_required
+    def test_unique_size_file_gains_hash_once_a_same_size_partner_appears(
+        self, tmp_path: Path,
+    ) -> None:
+        """A file indexed while its size was unique carries no hash. Once a
+        same-size file appears, the next rebuild backfills that hash, so a
+        hash confirmation against the original file can resolve instead of
+        staying unresolved forever."""
+        f = tmp_path / "loss_curve.png"
+        f.write_bytes(b"fake-bytes-AAAA")
+
+        first = PV.resolve_figure_output(str(tmp_path), str(f))
+        assert first is not None
+        assert first["sha256"] is None  # unique size: hash skipped
+
+        (tmp_path / "later_sibling.png").write_bytes(b"fake-bytes-BBBB")
+        second = PV.resolve_figure_output(str(tmp_path), str(f))
+        assert second is not None
+        assert second["sha256"], "the unhashed row was not backfilled"
+
+        result = PV.bind_artifact_provenance(
+            str(tmp_path),
+            [{
+                "artifact_id": "fig-1", "kind": "figure",
+                "canonical_path": str(f), "expected_sha256": second["sha256"],
+            }],
+        )
+        assert result["all_clear"] is True
+        assert result["bindings"][0]["status"] == PV.RESOLVED
+
+    @duckdb_required
     def test_exact_match_mismatched_expected_hash_is_hash_mismatch(
         self, tmp_path: Path,
     ) -> None:

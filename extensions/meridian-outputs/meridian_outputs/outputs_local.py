@@ -1926,13 +1926,81 @@ class ArchivalClassification:
     reason: str = ""
 
 
+def _stat_size_or_none(path: str) -> int | None:
+    """``os.stat(path).st_size``, or ``None`` when the stat fails."""
+    try:
+        return os.stat(path).st_size
+    except (OSError, ValueError):
+        return None
+
+
+def _compare_content(
+    path_a: str,
+    path_b: str,
+    *,
+    hash_of: Callable[[str], str | None],
+    size_of: Callable[[str], int | None],
+) -> bool | None:
+    """Size-first byte-identity check for one pair of files.
+
+    Returns ``False`` without hashing when both sizes are known and differ,
+    since files of different sizes cannot be byte-identical. Otherwise,
+    including when either size is unknown, it compares the two hashes:
+    ``True`` when they are equal, ``False`` when they differ, and ``None``
+    when either hash is unavailable, which means the pair could not be
+    confirmed either way.
+    """
+    size_a = size_of(path_a)
+    size_b = size_of(path_b)
+    if size_a is not None and size_b is not None and size_a != size_b:
+        return False
+    hash_a = hash_of(path_a)
+    if hash_a is None:
+        return None
+    hash_b = hash_of(path_b)
+    if hash_b is None:
+        return None
+    return hash_a == hash_b
+
+
+def files_content_identical(
+    path_a: str,
+    path_b: str,
+    *,
+    hasher: Callable[[str], str | None] = _xxh3_file,
+) -> bool | None:
+    """Public byte-identity check for two files, size first.
+
+    ``False`` when the sizes differ (no hash is computed) or the hashes
+    differ, ``True`` when the hashes are equal, and ``None`` when a hash
+    could not be computed. A failed stat falls back to hashing. This is the
+    same pairwise rule :func:`classify_canonical_archival` applies to an
+    archival candidate and its twin, exposed for callers whose naming
+    heuristics that function's stage-1 filter does not recognise (see
+    :mod:`meridian_outputs.classify`).
+    """
+    return _compare_content(
+        path_a, path_b, hash_of=hasher, size_of=_stat_size_or_none,
+    )
+
+
 def classify_canonical_archival(
     paths: list[str], *, hasher: Callable[[str], str | None] = _xxh3_file,
+    sizer: Callable[[str], int | None] | None = None,
 ) -> dict[str, ArchivalClassification]:
     """Two-stage canonical-vs-archival classification.  Deterministic output
-    order: keys follow the input ``paths`` list order (caller sorts them)."""
+    order: keys follow the input ``paths`` list order (caller sorts them).
+
+    Stage 2 compares sizes before hashes. When the candidate and its twin
+    have different sizes, the candidate is classified "content DIFFERS"
+    without hashing either file. ``sizer`` supplies those sizes: by default
+    each file is stat-ed, and a failed stat (``None``) falls back to the
+    hash comparison. :meth:`OutputsFtsIndex.rebuild` passes the sizes it
+    already holds so that classification adds no file I/O.
+    """
     path_set = set(paths)
     _hash_cache: dict[str, str | None] = {}
+    size_of = sizer if sizer is not None else _stat_size_or_none
 
     def _h(p: str) -> str | None:
         if p not in _hash_cache:
@@ -1952,6 +2020,17 @@ def classify_canonical_archival(
             out[path] = ArchivalClassification(
                 path=path, is_archival=False,
                 reason="archival name pattern but no canonical twin present",
+            )
+            continue
+        cand_size = size_of(path)
+        twin_size = size_of(twin)
+        if cand_size is not None and twin_size is not None and cand_size != twin_size:
+            out[path] = ArchivalClassification(
+                path=path, is_archival=False, canonical_path=twin,
+                reason=(
+                    "archival name pattern but content DIFFERS from twin "
+                    f"(sizes differ: {cand_size} vs {twin_size} bytes)"
+                ),
             )
             continue
         cand_hash = _h(path)
@@ -3483,6 +3562,17 @@ class OutputsFtsIndex:
         # from scratch, AND doubles as the signal the walk throttle (above)
         # uses to pause further discovery until Phase 1/2 catch up.
         self._pending_stale: dict[str, tuple[float | None, int | None]] = {}
+        # Same-size detection follow-up (see _promote_unhashed_same_size_rows).
+        # _same_size_promoted records the stat signature each promoted path
+        # had when it was queued, so a path whose hash still comes back None
+        # (an unreadable file) is not re-queued on every call while its
+        # signature is unchanged. Entries are dropped once the path gets a
+        # real hash. _same_size_scan_needed forces the promotion scan on a
+        # call with an empty backlog: on the first calls of a new instance
+        # (rehydration from disk happens in Phase 2, after the scan) and
+        # after a scan that could not queue every candidate.
+        self._same_size_promoted: dict[str, tuple[float | None, int | None]] = {}
+        self._same_size_scan_needed: bool = True
         # Planner diagnostics: phase timings and discovery coverage from the
         # most recent rebuild.  These are intentionally lightweight and make
         # large-root bottlenecks measurable instead of inferred from a single
@@ -5217,6 +5307,90 @@ class OutputsFtsIndex:
             )
             return None
 
+    def _known_size_counts(
+        self, all_paths: list[str], path_set: set[str],
+    ) -> dict[int, int]:
+        """Return a size -> count map over every path this call knows about.
+
+        A path in ``self._pending_stale`` counts with its freshly stat-ed
+        size, including a path deferred past this call's bounded intake
+        slice. Any other path counts with the size cached in ``_row_cache``.
+        Pending paths outside ``all_paths`` (a backlog restored from disk
+        before the walk revisits them) are counted as well. A path with no
+        known size is not counted. No file is stat-ed here.
+        """
+        counts: dict[int, int] = {}
+        pending = self._pending_stale
+        cache = self._row_cache
+        for p in all_paths:
+            sig = pending.get(p)
+            if sig is not None:
+                sz = sig[1]
+            else:
+                row = cache.get(p)
+                sz = row.size if row is not None else None
+            if sz is not None:
+                counts[sz] = counts.get(sz, 0) + 1
+        for p, sig in pending.items():
+            if p not in path_set and sig[1] is not None:
+                counts[sig[1]] = counts.get(sig[1], 0) + 1
+        return counts
+
+    def _promote_unhashed_same_size_rows(
+        self,
+        all_paths: list[str],
+        size_counts: dict[int, int],
+        analysis_limit: int,
+    ) -> int:
+        """Queue cached rows that were indexed without a hash but now share
+        their size with another known file. Returns the number queued.
+
+        The size prefilter (e1fd4182) skips hashing a file whose size is
+        unique when it is analysed, so its row keeps ``sha256=None``. If a
+        file of the same size appears later, that row is never revisited:
+        its stat signature is unchanged, and archival classification reads
+        the cached ``None`` and reports a byte-identical pair as different.
+        This pass adds each such row back to ``self._pending_stale`` with
+        its manifest signature (the same pattern as strict staleness mode),
+        so ``_needs_hash`` hashes it once and Phase 2 persists the hash.
+
+        Bounded and deterministic: candidates are taken in sorted path
+        order, and at most ``analysis_limit`` minus the current backlog are
+        queued, so promotion never pushes the backlog past one call's
+        intake. When candidates remain, or rehydration from disk has not run
+        yet (``self._con is None``), ``_same_size_scan_needed`` stays set so
+        a later call scans again even with an empty backlog. A path whose
+        hash came back ``None`` is not re-queued while its signature is
+        unchanged (see ``_same_size_promoted``).
+        """
+        pending = self._pending_stale
+        cache = self._row_cache
+        candidates: list[str] = []
+        for p in all_paths:
+            if p in pending:
+                continue
+            row = cache.get(p)
+            if row is None or row.sha256 is not None or row.size is None:
+                continue
+            if size_counts.get(row.size, 0) < 2:
+                continue
+            sig = self._manifest.get(p, (row.mtime, row.size))
+            if self._same_size_promoted.get(p) == sig:
+                continue
+            candidates.append(p)
+        candidates.sort()
+        slots = max(0, analysis_limit - len(pending))
+        queued = candidates[:slots]
+        for p in queued:
+            row = cache[p]
+            sig = self._manifest.get(p, (row.mtime, row.size))
+            pending[p] = sig
+            self._same_size_promoted[p] = sig
+        deferred = len(candidates) - len(queued)
+        self._same_size_scan_needed = deferred > 0 or self._con is None
+        self.last_rebuild_metrics["same_size_promotion_deferred"] = deferred
+        return len(queued)
+
     def rebuild(
         self, *, max_seconds: float | None = DEFAULT_REBUILD_BUDGET_SECONDS,
         staleness_mode: str = "fast", staleness_sample_rate: float = 0.1,
@@ -5579,6 +5753,7 @@ class OutputsFtsIndex:
             # drop it from the backlog so it isn't retried forever.
             for p in removed_paths:
                 self._pending_stale.pop(p, None)
+                self._same_size_promoted.pop(p, None)
             # 6af1518d -- a full pass just completed: this is the new
             # authoritative "expected" total (progress-signal denominator for
             # ConvergenceState), and the scan boundary resets -- the NEXT
@@ -5718,6 +5893,27 @@ class OutputsFtsIndex:
                     # leaving the on-disk row's content untouched.
                     self._pending_stale[p] = self._manifest.get(p, (None, None))
 
+        # Same-size detection: the size -> count map behind _needs_hash below
+        # counts every known path, using the fresh stat signature for any
+        # path in the pending backlog, including paths deferred past this
+        # call's intake slice. Rows indexed while their size was unique carry
+        # sha256=None; once another file of that size appears they are
+        # promoted back into the backlog so they are hashed once and the hash
+        # persists. Both steps cost O(known paths), so they run only when
+        # something is pending (a size count can only rise when a file is new
+        # or changed) or when a scan is still owed (see
+        # _same_size_scan_needed). A call with an empty backlog therefore
+        # adds no work.
+        size_counts: dict[int, int] | None = None
+        same_size_promoted = 0
+        self.last_rebuild_metrics["same_size_promotion_deferred"] = 0
+        if self._pending_stale or self._same_size_scan_needed:
+            size_counts = self._known_size_counts(all_paths, path_set)
+            same_size_promoted = self._promote_unhashed_same_size_rows(
+                all_paths, size_counts, analysis_limit,
+            )
+        self.last_rebuild_metrics["same_size_promoted"] = same_size_promoted
+
         # b85394bd -- BOUNDED ANALYSIS INTAKE: `self._pending_stale` may hold
         # far more than one call should take on at once (discovery capacity
         # is now effectively unbounded per call -- see `walk_batch` above --
@@ -5763,21 +5959,16 @@ class OutputsFtsIndex:
         files_hash_needed = 0
         files_hash_skipped = 0
         if stale:
-            # e1fd4182 (size-prefilter follow-up) -- build a size -> count
-            # map across ALL known paths (stale files use their freshly-
-            # stat'd size from stale_sigs; already-cached files use the size
-            # already sitting in _row_cache from a prior rebuild -- no extra
-            # stat calls either way) so a stale file can be compared against
-            # duplicates that AREN'T themselves stale this call, not just
-            # other members of this batch.
-            size_counts: dict[int, int] = {}
-            for p in all_paths:
-                sz = (
-                    stale_sigs[p][1] if p in stale_sigs
-                    else (self._row_cache[p].size if p in self._row_cache else None)
-                )
-                if sz is not None:
-                    size_counts[sz] = size_counts.get(sz, 0) + 1
+            # e1fd4182 (size-prefilter follow-up) -- a size -> count map
+            # across ALL known paths (pending files use their freshly-stat'd
+            # size, already-cached files the size in _row_cache from a prior
+            # rebuild -- no extra stat calls either way) so a stale file can
+            # be compared against duplicates that AREN'T themselves stale this
+            # call, not just other members of this batch. Built above, before
+            # the intake slice, so deferred paths count too (see
+            # _known_size_counts); a non-empty `stale` implies it was built.
+            if size_counts is None:
+                size_counts = self._known_size_counts(all_paths, path_set)
 
             def _needs_hash(p: str) -> bool:
                 # 49b97a6a -- a pending hash-algo-version upgrade means every
@@ -5860,6 +6051,12 @@ class OutputsFtsIndex:
                 else:
                     pool.shutdown(wait=True)
 
+        if self._same_size_promoted:
+            # A promoted path that now has a real hash needs no retry guard.
+            for p, a in precomputed.items():
+                if a.sha256 is not None:
+                    self._same_size_promoted.pop(p, None)
+
         self.last_rebuild_metrics["analysis_seconds"] = round(
             time.monotonic() - analysis_started, 6,
         )
@@ -5935,8 +6132,21 @@ class OutputsFtsIndex:
                 # its turn in a future Phase 1 comes up.
                 return None
 
+            def _known_size(path: str) -> int | None:
+                # Same-size detection: the sizes this call already holds, so
+                # the size-first check in classify_canonical_archival adds no
+                # stat calls here. None falls back to _cached_hasher.
+                analysis = precomputed.get(path)
+                if analysis is not None:
+                    return analysis.size
+                sig = self._pending_stale.get(path)
+                if sig is not None:
+                    return sig[1]
+                cached_row = self._row_cache.get(path)
+                return cached_row.size if cached_row is not None else None
+
             classifications = classify_canonical_archival(
-                all_paths, hasher=_cached_hasher,
+                all_paths, hasher=_cached_hasher, sizer=_known_size,
             )
         self.last_rebuild_metrics["classification_seconds"] = round(
             time.monotonic() - classify_started, 6,
