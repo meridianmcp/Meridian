@@ -1067,17 +1067,15 @@ def test_ws_auth_header_only_succeeds(monkeypatch, handler_name, extra):
 
 
 @pytest.mark.parametrize("handler_name,extra", _WS_AUTH_SITES)
-def test_ws_auth_query_only_succeeds_as_legacy_fallback(monkeypatch, handler_name, extra):
-    """The query-string fallback is intentionally still load-bearing for WS
-    (see the module note in routes/tunnel.py) — it must keep authenticating,
-    not silently break existing local tunnel binaries."""
+def test_ws_auth_query_only_is_refused(monkeypatch, handler_name, extra):
+    """The query-string fallback is gone. A token that arrives only in the URL is treated as no token at all,
+    so the connection is refused the same way as one with no token."""
     tenant_id = _tid()
-    seen = _patch_ws_auth(monkeypatch, tenant_id)
+    _patch_ws_auth(monkeypatch, tenant_id)
     ws = _FakeAuthWS(query_params={"token": "query-token"})
     handler = getattr(tn, handler_name)
     asyncio.run(handler(ws, tenant_id, **extra))
-    assert seen["token"] == "query-token"
-    assert ws.closed_with is None
+    assert ws.closed_with == (4401, "invalid or mismatched token")
 
 
 @pytest.mark.parametrize("handler_name,extra", _WS_AUTH_SITES)
@@ -1109,10 +1107,10 @@ def test_extract_ws_auth_token_helper_directly_header_only():
     assert (token, used_query) == ("Bearer h", False)
 
 
-def test_extract_ws_auth_token_helper_directly_query_only():
+def test_extract_ws_auth_token_helper_directly_query_only_is_refused():
     ws = _FakeAuthWS(query_params={"token": "q"})
     token, used_query = tn._extract_ws_auth_token(ws)
-    assert (token, used_query) == ("q", True)
+    assert (token, used_query) == ("", False)
 
 
 def test_extract_ws_auth_token_helper_directly_both_prefers_header():

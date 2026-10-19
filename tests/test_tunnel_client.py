@@ -277,7 +277,7 @@ def test_find_npx_returns_nonempty_string():
 def test_build_proxy_command_structure():
     cmd = tc._build_proxy_command("npx", "/repo", port=9000)
     assert cmd[0] == "npx"
-    assert "mcp-proxy" in cmd
+    assert tc.MCP_PROXY_PACKAGE in cmd
     assert "--port" in cmd
     assert "9000" in cmd
     # Streamable HTTP + stateless mode required for the tunnel relay.
@@ -290,7 +290,7 @@ def test_build_proxy_command_structure():
     assert cmd[-1] == "/repo"
     # mcp-proxy comes before the separator; filesystem server after it.
     sep = cmd.index("--")
-    assert "mcp-proxy" in cmd[:sep]
+    assert tc.MCP_PROXY_PACKAGE in cmd[:sep]
     assert tc.FS_SERVER_PACKAGE in cmd[sep:]
     # Inner command is bare npx (resolved by mcp-proxy / the shell), not a path.
     assert cmd[sep + 1] == "npx"
@@ -370,7 +370,7 @@ def test_build_code_proxy_command_structure(monkeypatch):
     monkeypatch.setattr(tc.sys, "platform", "linux")  # test POSIX path — no --shell
     cmd = tc._build_code_proxy_command("npx", "/usr/local/bin/codebase-memory-mcp", port=9009)
     assert cmd[0] == "npx"
-    assert "mcp-proxy" in cmd
+    assert tc.MCP_PROXY_PACKAGE in cmd
     assert "--port" in cmd
     assert "9009" in cmd
     assert "--server" in cmd
@@ -388,7 +388,7 @@ def test_build_extractor_proxy_command_structure(monkeypatch):
     inner = ["uvx", "mcp-server-code-extractor"]
     cmd = tc._build_extractor_proxy_command("npx", inner, port=9010)
     assert cmd[0] == "npx"
-    assert "mcp-proxy" in cmd
+    assert tc.MCP_PROXY_PACKAGE in cmd
     assert "--port" in cmd
     assert "9010" in cmd
     assert "--server" in cmd
@@ -1996,7 +1996,7 @@ def test_write_cached_token_preserves_other_keys(monkeypatch, tmp_path):
 
 def test_build_proxy_for_inner_structure():
     cmd = tc._build_proxy_for_inner("npx", ["codegraph", "--stdio"], 8809)
-    assert cmd[:7] == ["npx", "-y", "mcp-proxy", "--port", "8809",
+    assert cmd[:7] == ["npx", "-y", tc.MCP_PROXY_PACKAGE, "--port", "8809",
                        "--server", "stream"]
     assert "--stateless" in cmd
     # Inner command appears after the -- separator.
@@ -2136,7 +2136,7 @@ def test_build_proxy_for_inner_persistent_omits_stateless():
     cmd = tc._build_proxy_for_inner("npx", ["dc", "--serve"], 8813, stateless=False)
     assert "--stateless" not in cmd
     # Streamable HTTP transport is still present.
-    assert cmd[:6] == ["npx", "-y", "mcp-proxy", "--port", "8813", "--server"]
+    assert cmd[:6] == ["npx", "-y", tc.MCP_PROXY_PACKAGE, "--port", "8813", "--server"]
     assert cmd[cmd.index("--") + 1:] == ["dc", "--serve"]
 
 
@@ -5100,7 +5100,9 @@ def test_reconnect_loop_lazy_transient_startup_timeout_never_quarantines(monkeyp
     statuses = [m for m in sent if m.get("type") == "plugin_status"]
     assert not any(m.get("state") == "quarantined" for m in statuses), statuses
     assert proxy.diagnostics.state is not tc.SlotState.QUARANTINED
-    assert proxy.diagnostics.state in tc._TRANSIENT_STATES
+    # Requests are served concurrently, so the stream can end while the last spawn is still in progress. STARTING is
+    # a live, non-quarantined state, which is what this test is about.
+    assert proxy.diagnostics.state in tc._TRANSIENT_STATES | {tc.SlotState.STARTING}
 
 
 # --- _spawn_with_cache_retry TAR_ENTRY_ERROR path --------------------------

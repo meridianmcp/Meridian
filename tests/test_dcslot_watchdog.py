@@ -209,7 +209,7 @@ def test_run_connection_lazy_timeout_kills_then_next_request_respawns(monkeypatc
     # First relay times out (marker set, like _relay_request does); second succeeds.
     calls = {"n": 0}
 
-    async def fake_relay(client, base, msg, tool_prefix=None):
+    async def fake_relay(client, base, msg, tool_prefix=None, **_kw):
         calls["n"] += 1
         if calls["n"] == 1:
             return {"type": "response", "id": msg["id"], "status": 502,
@@ -296,7 +296,7 @@ def test_run_connection_lazy_slow_success_does_not_kill(monkeypatch):
         async def __aexit__(self, *a):
             pass
 
-    async def fake_relay(client, base, msg, tool_prefix=None):
+    async def fake_relay(client, base, msg, tool_prefix=None, **_kw):
         # Slow but SUCCESSFUL — no _timed_out marker.
         return {"type": "response", "id": msg["id"], "status": 200}
 

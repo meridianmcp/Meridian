@@ -15,6 +15,7 @@ from __future__ import annotations
 import asyncio
 import base64
 import json
+import sys
 
 import pytest
 
@@ -53,28 +54,28 @@ def _write_policy(data) -> None:
 def test_missing_policy_is_locked_down(local_home):
     policy = tc._load_local_policy()
     assert policy == {
-        "allow_fs_writes": False, "enable_shell_slot": False,
+        "allow_tunnel_writes": False, "enable_shell_slot": False,
         "custom_plugins": {}, "builtin_commands": {},
     }
 
 
 def test_only_a_literal_true_turns_a_switch_on(local_home):
-    _write_policy({"allow_fs_writes": "yes", "enable_shell_slot": 1})
+    _write_policy({"allow_tunnel_writes": "yes", "enable_shell_slot": 1})
     policy = tc._load_local_policy()
-    assert policy["allow_fs_writes"] is False
+    assert policy["allow_tunnel_writes"] is False
     assert policy["enable_shell_slot"] is False
 
 
 def test_literal_true_turns_the_switches_on(local_home):
-    _write_policy({"allow_fs_writes": True, "enable_shell_slot": True})
+    _write_policy({"allow_tunnel_writes": True, "enable_shell_slot": True})
     policy = tc._load_local_policy()
-    assert policy["allow_fs_writes"] is True
+    assert policy["allow_tunnel_writes"] is True
     assert policy["enable_shell_slot"] is True
 
 
 def test_malformed_policy_falls_back_to_defaults(local_home):
     _write_policy("not json{")
-    assert tc._load_local_policy()["allow_fs_writes"] is False
+    assert tc._load_local_policy()["allow_tunnel_writes"] is False
 
 
 # ---------------------------------------------------------------------------
@@ -180,12 +181,17 @@ def _denial_body(denial: dict) -> dict:
     return json.loads(base64.b64decode(denial["body"]))
 
 
+def _refused(msg, label="fs"):
+    refusal = tc._guard_request(msg, label, tc._LOCKED_POLICY)
+    return refusal[0] if refusal else None
+
+
 @pytest.mark.parametrize("name", [
     "write_file", "edit_file", "create_directory", "move_file",
     "filesystem__write_file", "Filesystem: write_file", "Filesystem: move_file",
 ])
 def test_write_tool_call_is_refused(name):
-    denial = tc._fs_write_denial(_request_msg(_call(name)))
+    denial = _refused(_request_msg(_call(name)))
     assert denial is not None
     assert denial["status"] == 403
     assert denial["id"] == "r1"
@@ -196,30 +202,30 @@ def test_write_tool_call_is_refused(name):
 
 @pytest.mark.parametrize("name", ["read_text_file", "list_directory", "search_files", "Filesystem: read_text_file"])
 def test_read_tool_call_passes(name):
-    assert tc._fs_write_denial(_request_msg(_call(name))) is None
+    assert _refused(_request_msg(_call(name))) is None
 
 
 def test_batch_with_one_write_is_refused():
     batch = [_call("read_text_file", 1), _call("write_file", 2)]
-    denial = tc._fs_write_denial(_request_msg(batch))
+    denial = _refused(_request_msg(batch))
     assert denial is not None
     assert _denial_body(denial)["error"]["code"] == -32001
 
 
 def test_unparseable_body_naming_a_write_tool_is_refused():
     body = base64.b64encode(b'{"method": "tools/call", "params": {"name": "write_file"').decode()
-    denial = tc._fs_write_denial({"id": "r2", "body": body})
+    denial = _refused({"id": "r2", "body": body})
     assert denial is not None
     assert denial["status"] == 403
 
 
 def test_unparseable_body_naming_nothing_passes():
     body = base64.b64encode(b"not json at all").decode()
-    assert tc._fs_write_denial({"id": "r3", "body": body}) is None
+    assert _refused({"id": "r3", "body": body}) is None
 
 
 def test_request_without_body_passes():
-    assert tc._fs_write_denial({"id": "r4", "method": "GET", "path": "/mcp"}) is None
+    assert _refused({"id": "r4", "method": "GET", "path": "/mcp"}) is None
 
 
 def test_write_tool_set_is_the_documented_one():
@@ -367,3 +373,117 @@ def test_github_cli_and_gcloud_appdata_folders_are_denied(local_home, monkeypatc
 
 def test_unrelated_config_folder_is_allowed(local_home):
     assert not tc._is_denied_root(str(local_home / ".config" / "nvim"))
+
+
+# ---------------------------------------------------------------------------
+# programs and writes that run through the other slots
+# ---------------------------------------------------------------------------
+
+def test_exec_slots_are_the_programs_that_run_on_this_machine():
+    assert tc.EXEC_SLOT_NAMES == frozenset({"desktop-commander", "mcp-debugger", "meridian-latex"})
+
+
+@pytest.mark.parametrize("slot", sorted(tc.EXEC_SLOT_NAMES))
+def test_exec_slot_stays_off_without_the_local_switch(local_home, slot):
+    plugins = resolve_plugins(None, detected_slots=[])
+    for p in plugins:
+        if p["name"] == slot:
+            p["enabled"] = True
+    enforced = tc._enforce_local_slot_policy(plugins, tc._load_local_policy())
+    entry = next(p for p in enforced if p["name"] == slot)
+    assert entry["enabled"] is False
+
+
+def test_exec_slot_starts_only_when_the_local_policy_enables_it(local_home):
+    _write_policy({"enable_shell_slot": True})
+    plugins = resolve_plugins(None, detected_slots=[])
+    for p in plugins:
+        if p["name"] == "mcp-debugger":
+            p["enabled"] = True
+    enforced = tc._enforce_local_slot_policy(plugins, tc._load_local_policy())
+    entry = next(p for p in enforced if p["name"] == "mcp-debugger")
+    assert entry["enabled"] is True
+
+
+@pytest.mark.parametrize("label,name", [
+    ("extract", "execute_shell_command"),
+    ("extract", "replace_symbol_body"),
+    ("docs", "write_section"),
+    ("outputs", "register_artifact"),
+    ("word", "save_document"),
+    ("code", "index_repository"),
+])
+def test_tunnel_write_or_exec_tool_is_refused_by_default(label, name):
+    assert _refused(_request_msg(_call(name)), label=label) is not None
+
+
+def test_serena_shell_passes_only_with_the_local_shell_switch():
+    msg = _request_msg(_call("execute_shell_command"))
+    assert tc._guard_request(msg, "extract", {**tc._LOCKED_POLICY, "enable_shell_slot": True}) is None
+    assert tc._guard_request(msg, "extract", tc._LOCKED_POLICY) is not None
+
+
+def test_docs_write_passes_only_with_the_local_tunnel_write_switch():
+    msg = _request_msg(_call("write_section"))
+    assert tc._guard_request(msg, "docs", {**tc._LOCKED_POLICY, "allow_tunnel_writes": True}) is None
+    assert tc._guard_request(msg, "docs", tc._LOCKED_POLICY) is not None
+
+
+def _read_request(path: str) -> dict:
+    return _request_msg({"jsonrpc": "2.0", "id": 8, "method": "tools/call",
+                         "params": {"name": "read_text_file", "arguments": {"path": path}}})
+
+
+@pytest.mark.parametrize("path", [".env", "config/.env.local", "certs/server.pem", "id_rsa", ".git/config"])
+def test_read_of_a_key_or_credential_file_is_refused(path):
+    assert _refused(_read_request(path)) is not None
+
+
+@pytest.mark.parametrize("path", [".env.example", "docs/readme.md"])
+def test_read_of_an_ordinary_or_template_file_passes(path):
+    assert _refused(_read_request(path)) is None
+
+
+def test_resource_read_of_a_key_file_is_refused():
+    msg = _request_msg({"jsonrpc": "2.0", "id": 5, "method": "resources/read",
+                        "params": {"uri": "file:///C:/repo/certs/server.key"}})
+    assert _refused(msg) is not None
+
+
+def test_relayed_body_has_a_meridian_token_redacted():
+    text = '{"result": {"text": "token sk_meridian_abcdefghijklmnop0123 here"}}'
+    resp = {"type": "response", "id": "r", "status": 200, "body": base64.b64encode(text.encode()).decode()}
+    out = base64.b64decode(tc._redact_response(resp)["body"]).decode()
+    assert "sk_meridian_abcdefghijklmnop0123" not in out
+    assert "redacted by the Meridian tunnel" in out
+
+
+def test_relayed_body_without_secrets_passes_unchanged():
+    body = base64.b64encode(b'{"result": {"text": "hello"}}').decode()
+    resp = {"type": "response", "id": "r", "status": 200, "body": body}
+    assert tc._redact_response(resp) is resp
+
+
+@pytest.mark.parametrize("root", [
+    "C:\\Users\\me\\Docs & calc",
+    "C:\\Users\\me\\Projects C:\\Users\\me\\.ssh",
+    "C:\\Users\\me\\a|b",
+    "C:\\Users\\me\\100%",
+    "C:\\Users\\me\\Notes\nx",
+])
+def test_windows_root_with_a_space_or_cmd_character_is_refused(root):
+    assert tc._unsafe_windows_root(root, platform="win32") is True
+
+
+def test_windows_plain_root_is_served():
+    assert tc._unsafe_windows_root("C:\\Users\\me\\Documents\\Notes", platform="win32") is False
+
+
+def test_posix_root_with_a_space_is_not_refused_for_that():
+    assert tc._unsafe_windows_root("/home/me/My Notes", platform="linux") is False
+
+
+@pytest.mark.skipif(sys.platform != "win32", reason="the root check reads the real platform")
+def test_served_roots_drop_a_windows_root_that_would_smuggle_a_folder(local_home):
+    smuggled = str(local_home / "Projects") + " " + str(local_home / ".ssh")
+    assert tc._allowed_served_roots([smuggled, str(local_home / "Notes")]) == [str(local_home / "Notes")]

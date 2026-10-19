@@ -67,15 +67,67 @@ _MAX_BACKOFF = 30.0
 # slow-but-alive relay never trips it, while still bounding genuine dead-peer
 # detection to a reasonable ping_interval + ping_timeout = ~65s worst case.
 _WS_PING_TIMEOUT = 45.0
+# How long in-flight requests get to finish when a tunnel socket closes.
+_CLOSE_GRACE_SECONDS = 5.0
 
 # Pinned: `npx -y` with no version pulls whatever is latest on every tunnel start. 2.0.0 is the version that
 # `latest` resolved to when this pin was added, so pinning changes nothing today and stops silent upgrades.
 FS_SERVER_PACKAGE = "@modelcontextprotocol/server-filesystem@2.0.0"
+# Pinned for the same reason. 6.7.20 is the version npx latest resolved to, and it provides the --shell, --server, and
+# --stateless flags the tunnel passes.
+MCP_PROXY_PACKAGE = "mcp-proxy@6.7.20"
 
-# Tools on the filesystem server that change files. The server exposes no read-only switch, so the tunnel client
-# refuses these calls unless this machine's local policy allows writes.
-FS_WRITE_TOOLS = frozenset({"write_file", "edit_file", "create_directory", "move_file"})
+# Built-in plugins that run programs on this machine. Like the shell slot, each starts only when the local policy
+# enables it, whatever the hosted config says.
 SHELL_SLOT_NAME = "desktop-commander"
+EXEC_SLOT_NAMES = frozenset({"desktop-commander", "mcp-debugger", "meridian-latex"})
+
+# Tools that change files or stored state, per slot label. Each set mirrors the server that declares the tools, and
+# tests keep the sets in step with those declarations. A write is refused over the tunnel unless the local policy
+# sets allow_tunnel_writes to true.
+FS_WRITE_TOOLS = frozenset({"write_file", "edit_file", "create_directory", "move_file"})
+SERENA_WRITE_TOOLS = frozenset({
+    "create_text_file", "replace_content", "replace_symbol_body", "insert_after_symbol", "insert_before_symbol",
+    "rename_symbol", "safe_delete_symbol", "write_memory", "edit_memory", "delete_memory", "rename_memory",
+})
+CODEBASE_WRITE_TOOLS = frozenset({"delete_project", "index_repository", "ingest_traces", "manage_adr"})
+WORD_WRITE_TOOLS = frozenset({
+    "add_break", "add_bullet_list", "add_heading", "add_image", "add_list", "add_numbered_list",
+    "add_page_break", "add_paragraph", "add_picture", "add_table", "apply_style", "convert_document",
+    "copy_document", "create_document", "delete_paragraph", "edit_paragraph", "insert_paragraph", "merge_cells",
+    "replace_paragraph", "replace_text", "save_document", "search_and_replace", "set_cell_text",
+    "set_document_properties", "set_footer", "set_header", "set_heading", "set_paragraph_text", "set_properties",
+    "set_style", "update_cell", "update_paragraph",
+})
+DOCS_WRITE_TOOLS = frozenset({
+    "append_text_run_after_math", "apply_and_merge_batch_transform", "apply_batch_transform",
+    "apply_prose_edit_packets", "apply_reviewable_edit_transaction", "copy_section", "delete_user_journal_style_preset",
+    "edit_caption", "edit_citation", "edit_equation", "extract_paragraph_images", "flag_for_review",
+    "highlight_document", "index_document", "index_document_structure", "index_equations", "ingest_local_document",
+    "ingest_local_document_structure", "insert_bibliography_entry", "insert_caption", "insert_citation",
+    "insert_column", "insert_cross_reference", "insert_equation", "insert_figure_block", "insert_highlighted_note",
+    "insert_image", "insert_media_part", "insert_table", "merge_docx_draft", "move_section", "relocate_figure",
+    "relocate_table", "remove_bibliography_entry", "remove_caption", "remove_citation", "remove_cross_reference",
+    "remove_equation", "remove_package_part", "remove_table", "render_with_receipt", "renumber_sequences",
+    "repair_equation_batch", "retrofit_plaintext_captions", "save_user_journal_style_preset", "split_cell",
+    "sync_bibliography", "transpose_table", "update_bibliography_entry", "write_section",
+})
+OUTPUTS_WRITE_TOOLS = frozenset({
+    "annotate_outputs", "bind_artifact_provenance", "bind_artifact_source_edge", "classify_outputs",
+    "evict_derived_cache", "finalize_run_manifest", "invalidate_derived_variant",
+    "invalidate_stale_derived_variants", "put_cached_derived_variant", "reconcile_legacy_artifact_outputs",
+    "record_provenance", "register_artifact", "register_output_paths", "start_run_manifest", "tag_output",
+})
+TUNNEL_WRITE_TOOLS: dict[str, frozenset] = {
+    "fs": FS_WRITE_TOOLS,
+    "extract": SERENA_WRITE_TOOLS,
+    "code": CODEBASE_WRITE_TOOLS,
+    "word": WORD_WRITE_TOOLS,
+    "docs": DOCS_WRITE_TOOLS,
+    "outputs": OUTPUTS_WRITE_TOOLS,
+}
+# Serena can also run a shell. That tool counts as exec, gated by the shell switch like the exec slots.
+TUNNEL_EXEC_TOOLS: dict[str, frozenset] = {"extract": frozenset({"execute_shell_command"})}
 # 0b3ea61a — every websockets.connect() below sets ping_interval/ping_timeout
 # explicitly (676e53a3, above) but never set open_timeout — the CONNECT itself
 # (TCP+TLS+HTTP Upgrade handshake) silently inherited the websockets library's
@@ -2219,6 +2271,113 @@ async def _run_connection_lazy(
 
     background: set[asyncio.Task] = set()
     policy = _load_local_policy()
+    # Each request is served as its own task, so one slow tool call cannot hold up the other requests on this socket.
+    # spawn_lock keeps two requests from racing to start, restart, or re-root the same proxy.
+    spawn_lock = asyncio.Lock()
+
+    async def _serve_request(msg: dict) -> None:
+        """Serve one server ``request``: lazy-spawn the proxy, relay through the guard, send the reply."""
+        nonlocal _spawn_failures, _preflight_done
+        try:
+            async with spawn_lock:
+                # Lazy spawn: bring the proxy up if it died or was idle-killed.
+                _was_running = proxy.is_running
+                if not proxy.is_running:
+                    await proxy.ensure_running()
+                if not proxy.is_running:
+                    # Spawn failed — count it; escalate to unhealthy once
+                    # the slot exhausts its retry budget (a3410a9c).
+                    _spawn_failures += 1
+                    if _spawn_failures > _WATCHDOG_MAX_RETRIES:
+                        await _mark_unhealthy()
+                    # Return 503 so the server doesn't time out.
+                    err = json.dumps({"error": "local proxy not available"}).encode()
+                    await ws.send(json.dumps({
+                        "type": "response",
+                        "id": msg.get("id"),
+                        "status": 503,
+                        "headers": {"content-type": "application/json"},
+                        "body": base64.b64encode(err).decode(),
+                    }))
+                    return
+                _spawn_failures = 0
+                # Pre-flight the proxy once, the first time we bring it up.
+                if not _preflight_done and not _was_running:
+                    _preflight_done = True
+                    # ddd46cc8 — proxy=proxy so a failing preflight also
+                    # lands on the shared SlotDiagnostics contract.
+                    if not await _preflight_slot(ws, proxy.port, label, proxy=proxy):
+                        # _preflight_slot already reported unhealthy; just
+                        # start the background re-probe.
+                        await _mark_unhealthy(already_reported=True)
+            proxy.touch()
+            resp = await _relay_request(
+                http_client, local_base, msg, tool_prefix=tool_prefix,
+                label=label, policy=policy,
+            )
+            # Auto-add: if access was denied and the path falls under
+            # a known repo_path, silently expand and retry once (b9d1b606).
+            denied_path = _extract_denied_path(resp)
+            if denied_path and _known:
+                try:
+                    dp = Path(denied_path).resolve()
+                except Exception:
+                    dp = None
+                if dp is not None:
+                    anchor = next(
+                        (
+                            r for r in _known
+                            if _is_subpath(dp, Path(r))
+                        ),
+                        None,
+                    )
+                    if anchor:
+                        updated_cmd, changed = _add_fs_roots_to_cmd(
+                            proxy.cmd, [anchor]
+                        )
+                        if changed:
+                            async with spawn_lock:
+                                proxy.cmd = updated_cmd
+                                proxy.kill()
+                                await proxy.ensure_running()
+                            if proxy.is_running:
+                                print(
+                                    f"tunnel:{label}: auto-added {anchor!r} "
+                                    f"(denied: {denied_path!r})",
+                                    flush=True,
+                                )
+                                resp = await _relay_request(
+                                    http_client, local_base, msg,
+                                    tool_prefix=tool_prefix,
+                                    label=label, policy=policy,
+                                )
+            # 3bde892a — request-timeout watchdog. If the relay to a
+            # freshly-lazy-spawned slot TIMED OUT (mcp-proxy hung on
+            # the MCP initialize handshake — no internal timeout in
+            # createServer()), the proxy may be a zombie still holding
+            # the port, which keeps is_running True and makes
+            # ensure_running() a no-op forever. Force-kill it now so
+            # the NEXT request respawns it — the same kill+respawn
+            # recovery a failed health probe gets via _reprobe_once.
+            # Only fires on an actual timeout, never a slow-but-OK req.
+            if _relay_timed_out(resp):
+                resp.pop("_timed_out", None)  # never send on the wire
+                await _kill_on_request_timeout(proxy)
+            await ws.send(json.dumps(resp))
+        except Exception as exc:  # noqa: BLE001 — answer with an error so the server does not wait out its timeout
+            print(f"tunnel:{label}: request {msg.get('id')!r} failed: {exc}", flush=True)
+            try:
+                err = json.dumps({"error": "local request failed"}).encode()
+                await ws.send(json.dumps({
+                    "type": "response",
+                    "id": msg.get("id"),
+                    "status": 502,
+                    "headers": {"content-type": "application/json"},
+                    "body": base64.b64encode(err).decode(),
+                }))
+            except Exception:  # noqa: BLE001 — the socket is already gone
+                pass
+
     try:
         async with websockets.connect(
             ws_url, max_size=None, ping_interval=20, ping_timeout=_WS_PING_TIMEOUT,
@@ -2292,96 +2451,17 @@ async def _run_connection_lazy(
                         await ws.send(json.dumps(run_result))
                         continue
                     if msg.get("type") == "request":
-                        # Lazy spawn: bring the proxy up if it died or was idle-killed.
-                        _was_running = proxy.is_running
-                        if not proxy.is_running:
-                            await proxy.ensure_running()
-                        if not proxy.is_running:
-                            # Spawn failed — count it; escalate to unhealthy once
-                            # the slot exhausts its retry budget (a3410a9c).
-                            _spawn_failures += 1
-                            if _spawn_failures > _WATCHDOG_MAX_RETRIES:
-                                await _mark_unhealthy()
-                            # Return 503 so the server doesn't time out.
-                            req_id = msg.get("id")
-                            err = json.dumps({"error": "local proxy not available"}).encode()
-                            await ws.send(json.dumps({
-                                "type": "response",
-                                "id": req_id,
-                                "status": 503,
-                                "headers": {"content-type": "application/json"},
-                                "body": base64.b64encode(err).decode(),
-                            }))
-                            continue
-                        _spawn_failures = 0
-                        # Pre-flight the proxy once, the first time we bring it up.
-                        if not _preflight_done and not _was_running:
-                            _preflight_done = True
-                            # ddd46cc8 — proxy=proxy so a failing preflight also
-                            # lands on the shared SlotDiagnostics contract.
-                            if not await _preflight_slot(ws, proxy.port, label, proxy=proxy):
-                                # _preflight_slot already reported unhealthy; just
-                                # start the background re-probe.
-                                await _mark_unhealthy(already_reported=True)
-                        if label == "fs" and not policy["allow_fs_writes"]:
-                            denial = _fs_write_denial(msg)
-                            if denial is not None:
-                                print(f"tunnel:{label}: refused a hosted-side write", flush=True)
-                                await ws.send(json.dumps(denial))
-                                continue
-                        proxy.touch()
-                        resp = await _relay_request(
-                            http_client, local_base, msg, tool_prefix=tool_prefix
-                        )
-                        # Auto-add: if access was denied and the path falls under
-                        # a known repo_path, silently expand and retry once (b9d1b606).
-                        denied_path = _extract_denied_path(resp)
-                        if denied_path and _known:
-                            try:
-                                dp = Path(denied_path).resolve()
-                            except Exception:
-                                dp = None
-                            if dp is not None:
-                                anchor = next(
-                                    (
-                                        r for r in _known
-                                        if _is_subpath(dp, Path(r))
-                                    ),
-                                    None,
-                                )
-                                if anchor:
-                                    updated_cmd, changed = _add_fs_roots_to_cmd(
-                                        proxy.cmd, [anchor]
-                                    )
-                                    if changed:
-                                        proxy.cmd = updated_cmd
-                                        proxy.kill()
-                                        await proxy.ensure_running()
-                                        if proxy.is_running:
-                                            print(
-                                                f"tunnel:{label}: auto-added {anchor!r} "
-                                                f"(denied: {denied_path!r})",
-                                                flush=True,
-                                            )
-                                            resp = await _relay_request(
-                                                http_client, local_base, msg,
-                                                tool_prefix=tool_prefix,
-                                            )
-                        # 3bde892a — request-timeout watchdog. If the relay to a
-                        # freshly-lazy-spawned slot TIMED OUT (mcp-proxy hung on
-                        # the MCP initialize handshake — no internal timeout in
-                        # createServer()), the proxy may be a zombie still holding
-                        # the port, which keeps is_running True and makes
-                        # ensure_running() a no-op forever. Force-kill it now so
-                        # the NEXT request respawns it — the same kill+respawn
-                        # recovery a failed health probe gets via _reprobe_once.
-                        # Only fires on an actual timeout, never a slow-but-OK req.
-                        if _relay_timed_out(resp):
-                            resp.pop("_timed_out", None)  # never send on the wire
-                            await _kill_on_request_timeout(proxy)
-                        await ws.send(json.dumps(resp))
+                        # Each request is served by its own task (see _serve_request). Awaiting the relay here
+                        # would stop this loop from reading pings, control messages, and other requests.
+                        answer = asyncio.ensure_future(_serve_request(msg))
+                        background.add(answer)
+                        answer.add_done_callback(background.discard)
+                        continue
     finally:
-        # A verification still running when the socket closes has no one left to answer.
+        # In-flight requests and verifications get a short grace to finish; anything still running after that
+        # has no socket left to answer on, so it is cancelled.
+        if background:
+            await asyncio.wait(list(background), timeout=_CLOSE_GRACE_SECONDS)
         for _bg in background:
             _bg.cancel()
         # Stop the background re-probe when the connection closes so it doesn't
@@ -2534,6 +2614,7 @@ async def _run_extract_pool_connection(
         if _reprobe_task is None:
             _reprobe_task = asyncio.ensure_future(_reprobe(ws))
 
+    policy = _load_local_policy()
     try:
         async with websockets.connect(
             ws_url, max_size=None, ping_interval=20, ping_timeout=_WS_PING_TIMEOUT,
@@ -2608,7 +2689,7 @@ async def _run_extract_pool_connection(
                             await _mark_unhealthy(ws, already_reported=True)
                     resp = await _relay_request(
                         http_client, f"http://127.0.0.1:{daemon.port}", msg,
-                        tool_prefix=tool_prefix,
+                        tool_prefix=tool_prefix, label=label, policy=policy,
                     )
                     # 3bde892a — the private timeout marker is an in-process
                     # signal only; strip it so it never leaks onto the wire. (The
@@ -5288,7 +5369,7 @@ def _build_extractor_proxy_command(
     shell wrapper without this function's own preference-for-direct-executables
     behaviour changing at all.
     """
-    cmd = [npx, "-y", "mcp-proxy", "--port", str(port),
+    cmd = [npx, "-y", MCP_PROXY_PACKAGE, "--port", str(port),
            "--server", "stream", "--stateless"]
     if sys.platform == "win32" and inner_cmd and inner_cmd[0].lower().endswith((".cmd", ".bat")):
         cmd.append("--shell")
@@ -5775,7 +5856,7 @@ def _build_code_proxy_command(
     We now resolve the binary to its 8.3 short-name form when it contains a space
     (:func:`_win_shell_safe_path`), which is space-safe for cmd.exe.
     """
-    cmd = [npx, "-y", "mcp-proxy", "--port", str(port),
+    cmd = [npx, "-y", MCP_PROXY_PACKAGE, "--port", str(port),
            "--server", "stream", "--stateless"]
     if sys.platform == "win32":
         # Always add --shell on Windows: mcp-proxy (Node.js) cannot spawn .exe
@@ -5830,7 +5911,7 @@ def _build_proxy_for_inner(
     """
     if inner_cmd and inner_cmd[0] == "npx":
         inner_cmd = [_win_shell_safe_path(_cached_npx()), *inner_cmd[1:]]
-    cmd = [npx, "-y", "mcp-proxy", "--port", str(port), "--server", "stream"]
+    cmd = [npx, "-y", MCP_PROXY_PACKAGE, "--port", str(port), "--server", "stream"]
     if stateless:
         cmd.append("--stateless")
     if sys.platform == "win32" and inner_cmd and inner_cmd[0].lower().endswith((".cmd", ".bat")):
@@ -6036,7 +6117,7 @@ def _build_proxy_command(
     # --server stream: serve only Streamable HTTP (/mcp), no SSE.
     # --stateless: each POST is handled independently — required for the
     #   tunnel relay's one-shot request/response model (no persistent SSE pipe).
-    cmd = [npx, "-y", "mcp-proxy", "--port", str(port),
+    cmd = [npx, "-y", MCP_PROXY_PACKAGE, "--port", str(port),
            "--server", "stream", "--stateless"]
     if sys.platform == "win32":
         cmd.append("--shell")
@@ -6197,7 +6278,7 @@ def _load_local_policy() -> dict:
     The file looks like::
 
         {
-          "allow_fs_writes": false,
+          "allow_tunnel_writes": false,
           "enable_shell_slot": false,
           "custom_plugins": {"<name>": {"command": ["..."], "env": {"VAR": "value"}}}
         }
@@ -6206,7 +6287,7 @@ def _load_local_policy() -> dict:
     supply a command, an environment, or any of these switches.
     """
     defaults: dict = {
-        "allow_fs_writes": False, "enable_shell_slot": False,
+        "allow_tunnel_writes": False, "enable_shell_slot": False,
         "custom_plugins": {}, "builtin_commands": {},
     }
     try:
@@ -6232,7 +6313,7 @@ def _load_local_policy() -> dict:
         return out
 
     return {
-        "allow_fs_writes": data.get("allow_fs_writes") is True,
+        "allow_tunnel_writes": data.get("allow_tunnel_writes") is True,
         "enable_shell_slot": data.get("enable_shell_slot") is True,
         "custom_plugins": _commands(data.get("custom_plugins")),
         "builtin_commands": _commands(data.get("builtin_commands")),
@@ -6278,15 +6359,15 @@ def _server_config_without_commands(raw_config: Any, policy: dict) -> list:
 
 
 def _enforce_local_slot_policy(plugins: list, policy: dict) -> list:
-    """The shell slot runs arbitrary commands and writes files, so it starts only when this machine enables it.
+    """Exec slots run programs on this machine, so each starts only when this machine enables it.
 
     That holds whatever the hosted config says and whatever local binary detection would auto-enable.
     """
     out: list = []
     for p in plugins:
-        if isinstance(p, dict) and p.get("name") == SHELL_SLOT_NAME and p.get("enabled") and not policy["enable_shell_slot"]:
+        if isinstance(p, dict) and p.get("name") in EXEC_SLOT_NAMES and p.get("enabled") and not policy["enable_shell_slot"]:
             print(
-                f"tunnel: desktop-commander stays off; set enable_shell_slot in {LOCAL_POLICY_FILENAME} "
+                f"tunnel: {p.get('name')} stays off; set enable_shell_slot in {LOCAL_POLICY_FILENAME} "
                 "on this machine to allow it",
                 flush=True,
             )
@@ -6339,62 +6420,222 @@ def _bare_tool_name(name: Any) -> "str | None":
     return re.split(r"__|: ", name)[-1].strip()
 
 
-def _fs_write_denial(msg: dict) -> "dict | None":
-    """The response that refuses a hosted-side filesystem write, or None to let the request through.
+_LOCKED_POLICY: dict = {
+    "allow_tunnel_writes": False, "enable_shell_slot": False, "custom_plugins": {}, "builtin_commands": {},
+}
 
-    Writes stay local unless this machine's policy allows them. A ``tools/call`` for a write tool is refused, and so
-    is a body that cannot be parsed but names a write tool (fail closed). Batches are checked item by item.
-    """
+_SENSITIVE_EXACT_NAMES = frozenset({
+    ".npmrc", ".netrc", ".pypirc", ".git-credentials", ".envrc",
+    "id_rsa", "id_dsa", "id_ecdsa", "id_ed25519",
+    "api_token", LOCAL_POLICY_FILENAME, VERIFICATION_PINS_FILENAME,
+    "secrets.json", "secrets.toml", "credentials.json", "credentials.toml",
+})
+_SENSITIVE_SUFFIXES = (".pem", ".key", ".p12", ".pfx", ".jks", ".keystore", ".kdbx", ".ppk")
+_ENV_TEMPLATE_SUFFIXES = (".example", ".sample", ".template", ".dist")
+
+# Credential-looking values, redacted from anything the tunnel sends back. Name-based refusal cannot see a key
+# pasted into an innocent file, so this catches the value itself.
+_SECRET_VALUE_PATTERNS = (
+    re.compile(r"-----BEGIN [A-Z0-9 ]*PRIVATE KEY-----.*?-----END [A-Z0-9 ]*PRIVATE KEY-----", re.S),
+    re.compile(r"sk_meridian_[A-Za-z0-9_\-]{16,}"),
+    re.compile(r"\bAKIA[0-9A-Z]{16}\b"),
+    re.compile(r"\bgh[pousr]_[A-Za-z0-9]{30,}\b"),
+    re.compile(r"\bxox[abprs]-[A-Za-z0-9-]{10,}"),
+    re.compile(r"\bsk-(?:proj-|ant-)?[A-Za-z0-9_\-]{32,}"),
+    re.compile(r"(?i)[a-z0-9_\-]*(?:password|passwd|secret|api[_-]?key|access[_-]?token|auth[_-]?token|token)\s*[:=]\s*[^\s\"'\\]{8,}"),
+)
+_REDACTED = "[redacted by the Meridian tunnel]"
+
+
+def _bare_names(table: dict, label: "str | None") -> frozenset:
+    """The names a slot label answers to. An unlabelled loop gets the union, so it fails closed."""
+    if label is None:
+        return frozenset().union(*table.values()) if table else frozenset()
+    return table.get(label, frozenset())
+
+
+def _sensitive_file_name(name: str) -> bool:
+    n = name.strip().lower()
+    if not n:
+        return False
+    if n.startswith(".env"):
+        return not n.endswith(_ENV_TEMPLATE_SUFFIXES)
+    return n in _SENSITIVE_EXACT_NAMES or n.endswith(_SENSITIVE_SUFFIXES)
+
+
+def _path_parts(path: str) -> list[str]:
+    return [p for p in re.split(r"[\\/]", path.strip()) if p]
+
+
+def _sensitive_path(path: str) -> bool:
+    """True when a path names a key or credential file. Matches the final name, and .git/config."""
+    parts = _path_parts(path)
+    if not parts:
+        return False
+    if _sensitive_file_name(parts[-1]):
+        return True
+    lowered = [p.lower() for p in parts]
+    return len(lowered) >= 2 and lowered[-2:] == [".git", "config"]
+
+
+def _resolved_sensitive(path: str) -> bool:
+    """A symlink or junction can give an innocent name to a key file. Resolve it locally and check the target."""
     try:
-        raw = base64.b64decode(msg.get("body")) if msg.get("body") else b""
+        if not Path(path).is_absolute():
+            return False
+        real = os.path.realpath(path)
+    except (OSError, ValueError):
+        return False
+    return _sensitive_path(real)
+
+
+def _argument_paths(arguments: Any) -> list[str]:
+    out: list[str] = []
+    if isinstance(arguments, dict):
+        for value in arguments.values():
+            if isinstance(value, str):
+                out.append(value)
+            elif isinstance(value, list):
+                out.extend(v for v in value if isinstance(v, str))
+    return out
+
+
+def _uri_path(uri: str) -> str:
+    from urllib.parse import unquote, urlparse  # noqa: PLC0415
+    parsed = urlparse(uri)
+    return unquote(parsed.path) if parsed.scheme == "file" else uri
+
+
+def _request_body(msg: dict) -> bytes:
+    try:
+        return base64.b64decode(msg.get("body")) if msg.get("body") else b""
     except (ValueError, TypeError):
-        raw = b""
+        return b""
+
+
+def _rpc_calls(msg: dict) -> "tuple[list[dict], bool]":
+    """The JSON-RPC requests in a relayed body, and whether the body parsed at all."""
+    raw = _request_body(msg)
     if not raw:
-        return None
-    unparsed = False
+        return [], True
     try:
         parsed = json.loads(raw)
     except (ValueError, TypeError):
-        unparsed = True
-        parsed = None
-    if unparsed:
-        if not any(name.encode() in raw for name in FS_WRITE_TOOLS):
-            return None
-        write_hit = "unparseable request naming a write tool"
-        rpc_id = None
-    else:
-        calls = parsed if isinstance(parsed, list) else [parsed]
-        write_hit = None
-        rpc_id = calls[0].get("id") if calls and isinstance(calls[0], dict) else None
-        for call in calls:
-            if not isinstance(call, dict) or call.get("method") != "tools/call":
-                continue
-            params = call.get("params")
-            name = params.get("name") if isinstance(params, dict) else None
-            bare = _bare_tool_name(name)
-            if bare in FS_WRITE_TOOLS:
-                write_hit = bare
-                break
-        if write_hit is None:
-            return None
+        return [], False
+    items = parsed if isinstance(parsed, list) else [parsed]
+    return [c for c in items if isinstance(c, dict)], True
+
+
+def _tool_refusal(bare: str, label: "str | None", policy: dict, arguments: Any) -> "str | None":
+    if bare in _bare_names(TUNNEL_EXEC_TOOLS, label) and not policy["enable_shell_slot"]:
+        return f"{bare} runs commands on this machine, and enable_shell_slot is off"
+    if bare in _bare_names(TUNNEL_WRITE_TOOLS, label) and not policy["allow_tunnel_writes"]:
+        return f"{bare} changes files on this machine, and allow_tunnel_writes is off"
+    for candidate in _argument_paths(arguments):
+        if _sensitive_path(candidate):
+            return f"{_path_parts(candidate)[-1] if _path_parts(candidate) else 'a path'} looks like a key or credential file"
+        if label == "fs" and _resolved_sensitive(candidate):
+            return "the path resolves to a key or credential file"
+    return None
+
+
+def _refusal_response(msg: dict, rpc_id: Any, reason: str) -> "tuple[dict, str]":
     body = json.dumps({
         "jsonrpc": "2.0",
         "id": rpc_id,
-        "error": {
-            "code": -32001,
-            "message": (
-                f"filesystem write refused for the tunnel ({write_hit}); writes stay on this machine "
-                f"unless allow_fs_writes is set in {LOCAL_POLICY_FILENAME}"
-            ),
-        },
+        "error": {"code": -32001, "message": f"refused by this machine's tunnel policy: {reason}"},
     }).encode()
-    return {
+    resp = {
         "type": "response",
         "id": msg.get("id"),
         "status": 403,
         "headers": {"content-type": "application/json"},
         "body": base64.b64encode(body).decode(),
     }
+    return resp, reason
+
+
+def _guard_request(msg: dict, label: "str | None", policy: dict) -> "tuple[dict, str] | None":
+    """Refuse a hosted request that would write, run a program, or read a key or credential file.
+
+    Returns ``(response, reason)`` for a refusal, or None to let the request through. A body that cannot be parsed
+    fails closed when it names a blocked tool or a sensitive file.
+    """
+    calls, parsed = _rpc_calls(msg)
+    if not parsed:
+        raw = _request_body(msg).lower()
+        blocked = _bare_names(TUNNEL_WRITE_TOOLS, label) | _bare_names(TUNNEL_EXEC_TOOLS, label)
+        sensitive = [n.encode() for n in _SENSITIVE_EXACT_NAMES] + [b".env"] + [s.encode() for s in _SENSITIVE_SUFFIXES]
+        if any(n.encode() in raw for n in blocked) or any(s in raw for s in sensitive):
+            return _refusal_response(msg, None, "an unreadable request names a blocked tool or file")
+        return None
+    for call in calls:
+        params = call.get("params") if isinstance(call.get("params"), dict) else {}
+        method = call.get("method")
+        if method == "resources/read":
+            uri = params.get("uri")
+            if isinstance(uri, str) and _sensitive_path(_uri_path(uri)):
+                return _refusal_response(msg, call.get("id"), "the resource is a key or credential file")
+            continue
+        if method != "tools/call":
+            continue
+        bare = _bare_tool_name(params.get("name")) or ""
+        reason = _tool_refusal(bare, label, policy, params.get("arguments"))
+        if reason is not None:
+            return _refusal_response(msg, call.get("id"), reason)
+    return None
+
+
+def _redact_text(text: str) -> str:
+    for pattern in _SECRET_VALUE_PATTERNS:
+        text = pattern.sub(_REDACTED, text)
+    return text
+
+
+def _redact_json_value(value: Any) -> Any:
+    if isinstance(value, str):
+        return _redact_text(value)
+    if isinstance(value, list):
+        return [_redact_json_value(v) for v in value]
+    if isinstance(value, dict):
+        return {k: _redact_json_value(v) for k, v in value.items()}
+    return value
+
+
+def _redact_body_text(text: str) -> str:
+    """Redact a relayed body: JSON strings, SSE ``data:`` lines, or plain text."""
+    try:
+        return json.dumps(_redact_json_value(json.loads(text)), ensure_ascii=False)
+    except (ValueError, TypeError):
+        pass
+    if "data:" not in text:
+        return _redact_text(text)
+    lines: list[str] = []
+    for line in text.split("\n"):
+        if not line.startswith("data:"):
+            lines.append(line)
+            continue
+        payload = line[len("data:"):].strip()
+        try:
+            lines.append("data: " + json.dumps(_redact_json_value(json.loads(payload)), ensure_ascii=False))
+        except (ValueError, TypeError):
+            lines.append("data: " + _redact_text(payload))
+    return "\n".join(lines)
+
+
+def _redact_response(resp: dict) -> dict:
+    """Redact credential-looking values from a relayed response body. Binary bodies pass through unchanged."""
+    body_b64 = resp.get("body")
+    if not body_b64:
+        return resp
+    try:
+        text = base64.b64decode(body_b64).decode("utf-8")
+    except (ValueError, TypeError, UnicodeDecodeError):
+        return resp
+    redacted = _redact_body_text(text)
+    if redacted == text:
+        return resp
+    return {**resp, "body": base64.b64encode(redacted.encode("utf-8")).decode()}
 
 
 class _AuthedURL(str):
@@ -6476,10 +6717,34 @@ def _is_denied_root(root: str) -> bool:
     return any(_is_subpath(target, folder) or _is_subpath(folder, target) for folder in folders)
 
 
+# Characters that split or operate on a command line under cmd.exe, plus whitespace, which splits argv.
+_CMD_UNSAFE_ROOT_RE = re.compile(r"[\s&|<>^%!\"'`();,=]")
+
+
+def _unsafe_windows_root(root: str, platform: "str | None" = None) -> bool:
+    """True for a root that mcp-proxy's ``--shell`` on Windows would split or hand to cmd.exe.
+
+    mcp-proxy joins the filesystem server's argv with spaces and gives the line to cmd.exe unescaped. A space can
+    split one root into two served directories, so a root could smuggle in a folder the denylist never checked. A
+    cmd.exe character can run a second command. Neither root is served. POSIX launches pass argv intact, so only
+    Windows refuses them.
+    """
+    if (platform or sys.platform) != "win32":
+        return False
+    return _CMD_UNSAFE_ROOT_RE.search(root) is not None
+
+
 def _allowed_served_roots(roots: "list[str]") -> "list[str]":
     """The roots that may be served. A refused root is logged and dropped, never served."""
     kept: list[str] = []
     for root in roots:
+        if _unsafe_windows_root(root):
+            print(
+                f"tunnel: refused served root {root!r}: it has a space or a cmd.exe character, which mcp-proxy "
+                "cannot pass safely on Windows",
+                flush=True,
+            )
+            continue
         if _is_denied_root(root):
             print(
                 f"tunnel: refused served root {root!r}: it is, or touches, a credential or token folder",
@@ -7188,6 +7453,25 @@ def _apply_tool_prefix(body: bytes, prefix: str | None) -> bytes:
 # ---------------------------------------------------------------------------
 
 async def _relay_request(
+    http_client, local_base: str, msg: dict, *, tool_prefix: str | None = None,
+    label: "str | None" = None, policy: "dict | None" = None,
+) -> dict:
+    """Guard, relay, and redact one server ``request``.
+
+    The guard refuses writes, exec tools, and key or credential files before anything reaches the local proxy, and a
+    refused request is answered with a 403 without being sent. Every relayed body is redacted of credential-looking
+    values. A caller that passes no label and policy gets the locked defaults, so every write and exec tool is refused.
+    """
+    refusal = _guard_request(msg, label, policy or _LOCKED_POLICY)
+    if refusal is not None:
+        resp, reason = refusal
+        print(f"tunnel:{label or 'slot'}: refused a request: {reason}", flush=True)
+        return resp
+    resp = await _relay_request_unchecked(http_client, local_base, msg, tool_prefix=tool_prefix)
+    return _redact_response(resp)
+
+
+async def _relay_request_unchecked(
     http_client, local_base: str, msg: dict, *, tool_prefix: str | None = None
 ) -> dict:
     """Proxy one server ``request`` message to the local mcp-proxy.
@@ -7374,6 +7658,7 @@ async def _run_connection(
                 lifecycle.mark_ready()
             print(f"tunnel:{label}: connected", flush=True)
 
+    policy = _load_local_policy()
     async with websockets.connect(
         ws_url, max_size=None, ping_interval=20, ping_timeout=_WS_PING_TIMEOUT,
         open_timeout=_tunnel_connect_timeout(), **_ws_connect_kwargs(ws_url),
@@ -7395,7 +7680,8 @@ async def _run_connection(
                         continue
                     if msg.get("type") == "request":
                         resp = await _relay_request(
-                            http_client, local_base, msg, tool_prefix=tool_prefix
+                            http_client, local_base, msg, tool_prefix=tool_prefix,
+                            label=label, policy=policy,
                         )
                         await ws.send(json.dumps(resp))
         finally:

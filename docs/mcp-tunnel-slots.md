@@ -114,27 +114,56 @@ synced and missing or invalid means the locked-down defaults:
 
 ```json
 {
-  "allow_fs_writes": false,
+  "allow_tunnel_writes": false,
   "enable_shell_slot": false,
   "builtin_commands": {"code-extractor": {"command": ["uvx", "..."], "env": {}}},
   "custom_plugins": {"my-plugin": {"command": ["node", "server.js"], "env": {}}}
 }
 ```
 
-- `allow_fs_writes` (default `false`): the filesystem server's write tools
-  (`write_file`, `edit_file`, `create_directory`, `move_file`) are refused for
-  tunnel requests. A refused call returns HTTP 403 with a JSON-RPC error. Set it
-  to `true` to allow writes over the tunnel.
-- `enable_shell_slot` (default `false`): the `desktop-commander` slot runs
-  arbitrary commands and writes files, so it starts only when this is `true`.
-  Enabling it from the hosted dashboard has no effect on this machine.
+- `allow_tunnel_writes` (default `false`): tools that change files or stored state
+  are refused for tunnel requests on every slot. That covers the filesystem write
+  tools (`write_file`, `edit_file`, `create_directory`, `move_file`), Serena's
+  edit tools, the word, docs, and outputs writers, and codebase-memory's index
+  writers. A refused call returns HTTP 403 with a JSON-RPC error. Set it to `true`
+  to allow them.
+- `enable_shell_slot` (default `false`): the exec slots run programs on this
+  machine, so they start only when this is `true`. Those are `desktop-commander`,
+  `mcp-debugger`, and `meridian-latex`. Serena's `execute_shell_command` is refused
+  too. Enabling any of them from the hosted dashboard has no effect here.
 - `builtin_commands`: an explicit local command for a built-in slot. The hosted
   config's command is ignored.
 - `custom_plugins`: a custom plugin runs only when its name has a command here. A
   custom plugin defined only in the hosted config is logged and not started.
 
-Only a literal `true` turns a switch on. The filesystem server is pinned to
-`@modelcontextprotocol/server-filesystem@2.0.0` so `npx` cannot silently upgrade it.
+Only a literal `true` turns a switch on. The packages are pinned so `npx` cannot
+silently upgrade them: `@modelcontextprotocol/server-filesystem@2.0.0` and
+`mcp-proxy@6.7.20`.
+
+### Key and credential files, and secret values, never leave through the tunnel
+
+Two layers protect the tunnel, and neither depends on the hosted side behaving:
+
+- **Refused by name.** A request whose arguments name a key or credential file is
+  refused with a 403 before it reaches the local proxy. Names covered: `.env` and
+  `.env.*` (but not `.env.example`, `.env.sample`, `.env.template`, `.env.dist`),
+  `id_rsa`, `id_dsa`, `id_ecdsa`, `id_ed25519`, `*.pem`, `*.key`, `*.p12`, `*.pfx`,
+  `*.jks`, `*.keystore`, `*.kdbx`, `*.ppk`, `.npmrc`, `.netrc`, `.pypirc`,
+  `.git-credentials`, `.envrc`, `secrets.json`, `credentials.json`, the Meridian
+  token and policy files, and `.git/config`. This applies to read tools, to
+  `resources/read` URIs, and to every path argument.
+- **Resolved on the filesystem slot.** A symlink or junction whose target is a key
+  file is refused even when its own name is innocent.
+- **Redacted by value.** Anything the tunnel sends back has credential-looking
+  values replaced with `[redacted by the Meridian tunnel]`. That covers PEM private
+  key blocks, Meridian tokens (`sk_meridian_…`), AWS, GitHub, Slack, and OpenAI-style
+  keys, and `password`, `secret`, `api_key`, and `token` assignments. JSON, SSE, and
+  plain-text bodies are all handled.
+
+Limits: refusal is by name, so a key pasted into an ordinary file is caught only if
+its value matches one of the redaction patterns. Symlinks are resolved on the
+filesystem slot only. Search results from Serena or the filesystem server can still
+contain text from a file with an innocent name.
 
 ### Served roots: credential and token folders are refused
 
@@ -151,6 +180,19 @@ local root list, and the repo-path fallback. The refused folders are:
 Containment is checked in both directions. A root that contains one of these
 folders, such as the home folder itself, is refused too. A refused root is
 logged and dropped. If the check cannot resolve a path, it refuses that root.
+
+### Connection auth, keepalive, and request handling
+
+- The client sends its bearer token in the `Authorization` header. A WebSocket that
+  puts the token in the URL is refused, and its token is never logged. Release
+  ordering matters: ship the client that sends the header before the server change
+  goes live, or older clients cannot connect.
+- The hosted keepalive refreshes a tunnel's session only while that tunnel has
+  relayed a request within `MERIDIAN_TUNNEL_IDLE_KEEPALIVE_S` seconds (default 900).
+  An idle, connected client stops generating database writes.
+- Each request on a socket is served on its own task, so a slow tool call no longer
+  holds up the others. A socket close gives in-flight work 5 seconds before it is
+  cancelled.
 
 ## Claude Desktop
 

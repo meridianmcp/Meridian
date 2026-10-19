@@ -5484,8 +5484,8 @@ project_id = "${displayPid}"`;
   </div>`;
       if (!isHostedMode() && _allRepoPaths.length > 0) {
         const _fsPaths = _allRepoPaths.map((p3) => JSON.stringify(p3)).join(" ");
-        const _fsNpx = `npx -y @modelcontextprotocol/server-filesystem ${_allRepoPaths.map((p3) => JSON.stringify(p3)).join(" ")}`;
-        const _fsClaude = `claude mcp add filesystem -- npx -y @modelcontextprotocol/server-filesystem ${_allRepoPaths.map((p3) => JSON.stringify(p3)).join(" ")}`;
+        const _fsNpx = `npx -y @modelcontextprotocol/server-filesystem@2.0.0 ${_allRepoPaths.map((p3) => JSON.stringify(p3)).join(" ")}`;
+        const _fsClaude = `claude mcp add filesystem -- npx -y @modelcontextprotocol/server-filesystem@2.0.0 ${_allRepoPaths.map((p3) => JSON.stringify(p3)).join(" ")}`;
         html += `<div style="margin-bottom:16px" id="fs-mcp-section-${projectId}">
       <details>
         <summary style="cursor:pointer;list-style:none;display:flex;align-items:center;gap:6px;padding-bottom:6px;border-bottom:1px solid var(--border);margin-bottom:8px">

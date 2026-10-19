@@ -266,7 +266,7 @@ def test_run_connection_relays_request_and_skips_noise(monkeypatch):
         async def __aenter__(self): return self
         async def __aexit__(self, *a): pass
 
-    async def fake_relay(client, base, msg, label="", tool_prefix=None):
+    async def fake_relay(client, base, msg, label="", tool_prefix=None, **_kw):
         relayed.append(msg)
         return {"type": "response", "id": msg["id"], "status": 200}
 
@@ -813,7 +813,7 @@ def test_run_connection_lazy_spawns_on_request_and_relays(monkeypatch):
         async def __aenter__(self): return self
         async def __aexit__(self, *a): pass
 
-    async def fake_relay(client, base, msg, tool_prefix=None):
+    async def fake_relay(client, base, msg, tool_prefix=None, **_kw):
         relayed.append((base, msg))
         return {"type": "response", "id": msg["id"], "status": 200}
 
@@ -1149,7 +1149,7 @@ def test_run_connection_lazy_preflight_reports_unhealthy(monkeypatch):
         async def __aenter__(self): return self
         async def __aexit__(self, *a): pass
 
-    async def fake_relay(client, base, msg, tool_prefix=None):
+    async def fake_relay(client, base, msg, tool_prefix=None, **_kw):
         return {"type": "response", "id": msg["id"], "status": 200}
 
     import httpx as _httpx
@@ -1274,6 +1274,12 @@ def test_run_connection_lazy_reprobe_recovers(monkeypatch):
             self._n += 1
             if self._n <= fail_budget:
                 return json.dumps({"type": "request", "id": str(self._n)})
+            # Requests are served concurrently, so wait until each failed request has been answered before the proxy
+            # recovers. Otherwise the proxy would come back before the failed spawns run.
+            for _ in range(500):
+                if sum(1 for m in sent if m.get("status") == 503) >= fail_budget:
+                    break
+                await asyncio.sleep(0.01)
             # Escalation happened — let the proxy recover and give the re-probe
             # (0.01s) time to fire between pings, then end the stream.
             state["spawn_ok"] = True
@@ -2824,6 +2830,9 @@ def test_run_tunnel_wires_outputs_slot_when_enabled(monkeypatch, tmp_path):
 def test_run_tunnel_wires_latex_slot_when_enabled(monkeypatch, tmp_path):
     """Enabling meridian-latex must spawn it and use the latex reconnect slot."""
     procs = _stub_run_tunnel_spawn(monkeypatch)
+    monkeypatch.setattr(tc, "_load_local_policy", lambda: {
+        "allow_tunnel_writes": False, "enable_shell_slot": True, "custom_plugins": {}, "builtin_commands": {},
+    })
     monkeypatch.setattr(
         tc, "_fetch_me",
         AsyncMock(return_value={
@@ -2848,6 +2857,9 @@ def test_run_tunnel_wires_debug_slot_when_enabled(monkeypatch, tmp_path):
     (BUILTIN_PLUGINS), so it must be added to office_ports/office_proxies and
     NOT get an idle-killer, mirroring Desktop Commander."""
     procs = _stub_run_tunnel_spawn(monkeypatch)
+    monkeypatch.setattr(tc, "_load_local_policy", lambda: {
+        "allow_tunnel_writes": False, "enable_shell_slot": True, "custom_plugins": {}, "builtin_commands": {},
+    })
     monkeypatch.setattr(
         tc, "_fetch_me",
         AsyncMock(return_value={
@@ -3026,7 +3038,7 @@ def test_run_tunnel_extract_command_comes_only_from_local_policy(monkeypatch, tm
     _resolve_extractor_inner_cmd stays uncalled."""
     procs = _stub_run_tunnel_spawn(monkeypatch, code_binary=None)
     monkeypatch.setattr(tc, "_load_local_policy", lambda: {
-        "allow_fs_writes": False, "enable_shell_slot": False, "custom_plugins": {},
+        "allow_tunnel_writes": False, "enable_shell_slot": False, "custom_plugins": {},
         "builtin_commands": {"code-extractor": {"command": ["uvx", "mcp-server-code-extractor"], "env": None}},
     })
     legacy_extractor_calls = []
@@ -3181,7 +3193,7 @@ def test_run_tunnel_spawns_custom_plugin_locally_and_writes_mcp_json(monkeypatch
     at its 127.0.0.1 proxy — never a hosted server route (LOCAL-ONLY)."""
     procs = _stub_run_tunnel_spawn(monkeypatch)
     monkeypatch.setattr(tc, "_load_local_policy", lambda: {
-        "allow_fs_writes": False, "enable_shell_slot": False, "builtin_commands": {},
+        "allow_tunnel_writes": False, "enable_shell_slot": False, "builtin_commands": {},
         "custom_plugins": {"fetch": {"command": ["uvx", "mcp-server-fetch"], "env": None}},
     })
     # Capture every watchdog holder so we can assert the custom slot is covered.
@@ -3225,7 +3237,7 @@ def test_run_tunnel_custom_plugin_repo_path_expanded_at_spawn(monkeypatch, tmp_p
     spawn time (resolve_custom_plugins leaves it intact; the client expands it)."""
     procs = _stub_run_tunnel_spawn(monkeypatch)
     monkeypatch.setattr(tc, "_load_local_policy", lambda: {
-        "allow_fs_writes": False, "enable_shell_slot": False, "builtin_commands": {},
+        "allow_tunnel_writes": False, "enable_shell_slot": False, "builtin_commands": {},
         "custom_plugins": {"myserena": {"command": ["tool", "--project", "{repo_path}"], "env": None}},
     })
     monkeypatch.setattr(tc, "_restore_mcp_json", lambda *a, **k: None)
@@ -3255,7 +3267,7 @@ def test_run_tunnel_custom_only_keeps_tunnel_alive(monkeypatch, tmp_path):
     still serves (the local proxy + mcp.json) — exit 0, not 'nothing to serve'."""
     procs = _stub_run_tunnel_spawn(monkeypatch)
     monkeypatch.setattr(tc, "_load_local_policy", lambda: {
-        "allow_fs_writes": False, "enable_shell_slot": False, "builtin_commands": {},
+        "allow_tunnel_writes": False, "enable_shell_slot": False, "builtin_commands": {},
         "custom_plugins": {"fetch": {"command": ["uvx", "mcp-server-fetch"], "env": None}},
     })
     monkeypatch.setattr(tc, "_restore_mcp_json", lambda *a, **k: None)

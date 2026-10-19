@@ -3847,8 +3847,8 @@ export async function loadSettingsTab(projectId: any, { force = false } = {}) {
   // Local file reading snippet — self-hosted only, only when repo_paths are set
   if (!isHostedMode() && _allRepoPaths.length > 0) {
     const _fsPaths = _allRepoPaths.map(p => JSON.stringify(p)).join(' ');
-    const _fsNpx = `npx -y @modelcontextprotocol/server-filesystem ${_allRepoPaths.map(p => JSON.stringify(p)).join(' ')}`;
-    const _fsClaude = `claude mcp add filesystem -- npx -y @modelcontextprotocol/server-filesystem ${_allRepoPaths.map(p => JSON.stringify(p)).join(' ')}`;
+    const _fsNpx = `npx -y @modelcontextprotocol/server-filesystem@2.0.0 ${_allRepoPaths.map(p => JSON.stringify(p)).join(' ')}`;
+    const _fsClaude = `claude mcp add filesystem -- npx -y @modelcontextprotocol/server-filesystem@2.0.0 ${_allRepoPaths.map(p => JSON.stringify(p)).join(' ')}`;
     html += `<div style="margin-bottom:16px" id="fs-mcp-section-${projectId}">
       <details>
         <summary style="cursor:pointer;list-style:none;display:flex;align-items:center;gap:6px;padding-bottom:6px;border-bottom:1px solid var(--border);margin-bottom:8px">
