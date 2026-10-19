@@ -847,7 +847,17 @@ class TestIndexFileLockAtomicFallback:
             _wait_for_file(ready_path)
             with open(ready_path, encoding="utf-8") as fh:
                 child_pid = int(fh.read().strip())
-            assert child_pid == child.pid
+            # On Windows a venv's python.exe is a launcher: Popen.pid can be the
+            # launcher while the real interpreter (the process that reports
+            # child_pid) is its descendant. Accept either; the owner check below
+            # still pins the exact PID that holds the lock.
+            import psutil
+
+            ancestor_pids = [p.pid for p in psutil.Process(child_pid).parents()]
+            assert child_pid == child.pid or child.pid in ancestor_pids, (
+                f"ready-file pid {child_pid} is neither the spawned process "
+                f"{child.pid} nor one of its descendants"
+            )
 
             owner = OL.read_index_lock_owner(db_path)
             assert owner.held is True
