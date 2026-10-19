@@ -489,10 +489,12 @@ def record_provenance(
     (upsert by normalized path) at
     ``<outputs_dir>/.meridian-outputs-cache/provenance_ledger.json`` -- fully
     local, no hosted call, no DB engine. Calling this again for the same
-    path OVERWRITES the previous record in place; this is NOT an
-    append-only log and no history is kept (corrected bd5b8d79 -- an earlier
-    version of this docstring incorrectly described an append-only JSONL
-    sidecar, which was never the actual implementation).
+    path makes the new record current and moves the previous one into that
+    path's bounded version history (newest 50 superseded records, read with
+    ``get_provenance_history``); this is still one JSON object per path, not
+    an append-only log (corrected bd5b8d79 -- an earlier version of this
+    docstring incorrectly described an append-only JSONL sidecar, which was
+    never the actual implementation).
 
     Args:
       outputs_dir:        Absolute path to the outputs directory.
@@ -515,8 +517,9 @@ def record_provenance(
     Returns:
       The stored record as {path, generating_script, params, sprint_item_id,
       decision_id, note, recorded_at, recorded_at_iso, content_hash,
-      experiment_run_id}, or
-      {error: ...}. ``content_hash`` (bd5b8d79) is a best-effort SHA-256 of
+      experiment_run_id, version}, or
+      {error: ...}. ``version`` is the record's 1-based version for this
+      path. ``content_hash`` (bd5b8d79) is a best-effort SHA-256 of
       ``path``'s on-disk bytes at record time (``None`` if unreadable) --
       used by ``get_provenance_status`` to later detect relocation/drift.
       This is a pure exact-record write; call ``get_provenance_status`` (not
@@ -562,6 +565,30 @@ def get_provenance(outputs_dir: str, path: str) -> dict[str, Any] | None:
       been recorded for this path under this outputs_dir.
     """
     return annotate.get_provenance(outputs_dir, path)
+
+
+@mcp.tool()
+def get_provenance_history(outputs_dir: str, path: str) -> dict[str, Any] | None:
+    """Every retained ``record_provenance`` record for one output file,
+    oldest first, with the current record last.
+
+    Re-recording a path keeps its previous record in a bounded history (the
+    newest 50 superseded records) written in the same atomic ledger update
+    as the new one. ``get_provenance``/``list_provenance`` return only the
+    current record; use this tool to see what changed between runs.
+
+    Args:
+      outputs_dir:  Absolute path to the outputs directory.
+      path:         The output file to look up.
+
+    Returns:
+      None if nothing has been recorded for this path, else {path, versions,
+      current_version, history_dropped, history_limit}. Each entry of
+      ``versions`` has the ``get_provenance`` shape plus ``version``
+      (1-based; stays stable when old entries are dropped past the cap) and
+      ``is_current``.
+    """
+    return annotate.get_provenance_history(outputs_dir, path)
 
 
 @mcp.tool()

@@ -32,9 +32,10 @@ consistent without touching their files):
   - Storage shape: a single JSON object (path -> record dict), read-modify-
     written with an atomic ``os.replace`` -- the same ledger shape
     ``fingerprint.py`` uses, rather than an ever-growing append-only log, so
-    a long-lived project's provenance store doesn't grow unbounded and a
-    fresh call always overwrites (never duplicates) the prior record for a
-    path.
+    a long-lived project's provenance store doesn't grow unbounded. A fresh
+    call makes its record current and moves the prior one into that entry's
+    bounded ``history`` (newest 50 kept, older ones counted in
+    ``history_dropped``), in the same atomic replace.
   - Locking: every write runs inside ``ledger_io.ledger_transaction``, which
     holds ``outputs_local.IndexFileLock`` on the ledger file (cross-process,
     not just cross-thread), writes a unique fsynced temporary file and
@@ -75,11 +76,25 @@ __all__ = [
     "ProvenanceRecord",
     "record_provenance",
     "get_provenance",
+    "get_provenance_history",
     "list_provenance",
 ]
 
 _CACHE_DIRNAME = ".meridian-outputs-cache"
 _LEDGER_FILENAME = "provenance_ledger.json"
+
+# Version history. Every re-record moves the superseded record (without its
+# own history) into the entry's ``history`` list, oldest first, in the same
+# atomic ledger replace that writes the new record -- current record and
+# history can never disagree on disk. The list keeps the newest
+# _HISTORY_LIMIT superseded records; older ones are dropped and counted in
+# ``history_dropped`` so version numbers stay stable. get_provenance and
+# list_provenance hide both keys unless include_history=True;
+# get_provenance_history is the public view.
+_HISTORY_KEY = "history"
+_HISTORY_DROPPED_KEY = "history_dropped"
+_HISTORY_KEYS = (_HISTORY_KEY, _HISTORY_DROPPED_KEY)
+_HISTORY_LIMIT = 50
 
 # Guards ONLY the _ledger_read_cache dict below. Ledger writes are serialised
 # by ledger_io.ledger_transaction (outputs_local.IndexFileLock on the ledger
@@ -187,12 +202,51 @@ def _read_ledger(outputs_dir: str) -> dict[str, dict[str, Any]]:
     return _load_ledger_unlocked(_ledger_path(outputs_dir))
 
 
-def _write_ledger_entry(outputs_dir: str, key: str, record: dict[str, Any]) -> str | None:
-    """Upsert ``record`` under ``key`` inside one cross-process transaction.
+def _history_parts(entry: dict[str, Any]) -> tuple[list[dict[str, Any]], int]:
+    """(superseded snapshots oldest-first, dropped count) of a ledger entry.
+    A legacy entry written before history existed has neither key: ([], 0)."""
+    raw = entry.get(_HISTORY_KEY)
+    history = [dict(h) for h in raw if isinstance(h, dict)] if isinstance(raw, list) else []
+    dropped = entry.get(_HISTORY_DROPPED_KEY)
+    if not isinstance(dropped, int) or isinstance(dropped, bool) or dropped < 0:
+        dropped = 0
+    return history, dropped
 
-    Returns the quarantine path when a corrupt ledger had to be set aside
-    first, else ``None``. Raises ``outputs_local.IndexLockAcquireError`` when
-    another process holds the ledger lock past its timeout.
+
+def _without_history(record: dict[str, Any]) -> dict[str, Any]:
+    return {k: v for k, v in record.items() if k not in _HISTORY_KEYS}
+
+
+def _supersede(
+    prior: dict[str, Any] | None, record: dict[str, Any],
+) -> tuple[dict[str, Any], int]:
+    """Attach the bounded history to ``record``: ``prior`` (minus its own
+    history) becomes the newest snapshot. Returns (entry to store, 1-based
+    version of ``record``). Never mutates ``prior``, which may be shared with
+    the read cache."""
+    history, dropped = _history_parts(prior) if prior is not None else ([], 0)
+    if prior is not None:
+        history.append(_without_history(prior))
+    overflow = len(history) - _HISTORY_LIMIT
+    if overflow > 0:
+        history = history[overflow:]
+        dropped += overflow
+    stored = _without_history(record)
+    stored[_HISTORY_KEY] = history
+    stored[_HISTORY_DROPPED_KEY] = dropped
+    return stored, dropped + len(history) + 1
+
+
+def _write_ledger_entry(
+    outputs_dir: str, key: str, record: dict[str, Any],
+) -> tuple[str | None, int]:
+    """Upsert ``record`` under ``key`` inside one cross-process transaction,
+    moving any existing record for ``key`` into its bounded history.
+
+    Returns ``(quarantine_path, version)``: the path a corrupt ledger was
+    copied to first (else ``None``) and the new record's 1-based version.
+    Raises ``outputs_local.IndexLockAcquireError`` when another process holds
+    the ledger lock past its timeout.
     """
     path = _ledger_path(outputs_dir)
     with ledger_io.ledger_transaction(path) as txn:
@@ -221,9 +275,11 @@ def _write_ledger_entry(outputs_dir: str, key: str, record: dict[str, Any]) -> s
             safe_key = os.path.normcase(os.path.normpath(safe_path)).replace("\\", "/")
             portable[safe_key] = entry
         ledger = portable
-        ledger[key] = record
+        # A legacy absolute-path row was re-keyed above, so it is found here
+        # and becomes history[0] under the relative key.
+        ledger[key], version = _supersede(ledger.get(key), record)
         txn.commit(ledger)  # unique tmp + fsync + atomic os.replace
-        return txn.quarantined_path
+        return txn.quarantined_path, version
 
 
 @dataclass
@@ -274,10 +330,18 @@ def record_provenance(
     Fully local -- no hosted call, no DB engine. Upserts one entry (keyed by
     normalized path) into ``<outputs_dir>/.meridian-outputs-cache/
     provenance_ledger.json``; calling this again for the same path (e.g.
-    after re-running the generating script with different params) simply
-    overwrites the previous record -- no separate update step needed. Paths
+    after re-running the generating script with different params) makes the
+    new record current and moves the previous one into that path's bounded
+    version history (the newest 50 superseded records; see
+    :func:`get_provenance_history`) -- no separate update step needed. Every
+    call creates a version, even with identical content. Paths
     in the persistent ledger are relative to ``outputs_dir``; the read APIs
     resolve them for callers and continue reading legacy absolute-path rows.
+
+    Concurrency: writers in different processes are serialised by the
+    ledger's cross-process lock, so no record is lost. When two processes
+    record the same path, the last writer's record is current and the
+    other's is the version before it (last writer wins the current slot).
 
     Args:
       outputs_dir:        Absolute path to the outputs directory (the shared
@@ -321,7 +385,9 @@ def record_provenance(
     Returns:
       The stored record as a dict (path, generating_script, params,
       sprint_item_id, decision_id, note, recorded_at, recorded_at_iso,
-      content_hash, experiment_run_id, cited_zotero_keys), or
+      content_hash, experiment_run_id, cited_zotero_keys) plus ``version``
+      (1-based count of records ever written for this path since history
+      began, including this one), or
       ``{"error": ...}`` on failure. When the existing ledger was corrupt,
       its bytes are first copied to ``provenance_ledger.json.corrupt-<utc>``
       and the result carries ``ledger_quarantined`` (that file's basename).
@@ -424,7 +490,7 @@ def record_provenance(
     # lock past its timeout) deliberately propagates: fail closed, never a
     # silently dropped record.
     try:
-        quarantined = _write_ledger_entry(outputs_dir, key, stored_record)
+        quarantined, version = _write_ledger_entry(outputs_dir, key, stored_record)
     except (OSError, TypeError, ledger_io.LedgerCorruptError) as exc:
         return {"error": f"failed to write provenance record: {exc}"}
 
@@ -438,6 +504,7 @@ def record_provenance(
         )
 
     result = record.to_dict()
+    result["version"] = version
     if quarantined:
         # The prior ledger was corrupt: its bytes were copied aside before
         # this write replaced it. Basename only -- no machine-local path.
@@ -445,7 +512,34 @@ def record_provenance(
     return result
 
 
-def get_provenance(outputs_dir: str, path: str) -> dict[str, Any] | None:
+def _resolved_path_copy(outputs_dir: str, record: dict[str, Any]) -> dict[str, Any]:
+    """Copy of ``record`` whose relative ``path`` is resolved to absolute --
+    the public API's shape, while on-disk records stay portable."""
+    out = dict(record)
+    path = out.get("path")
+    if isinstance(path, str) and not os.path.isabs(path):
+        out["path"] = resolve_reference(outputs_dir, path)
+    return out
+
+
+def _public_record(
+    outputs_dir: str, record: dict[str, Any], *, include_history: bool,
+) -> dict[str, Any]:
+    """The caller-facing copy of one ledger entry: absolute ``path`` and,
+    unless ``include_history``, no ``history``/``history_dropped`` keys, so
+    get_provenance and list_provenance keep their pre-history shape."""
+    if not include_history:
+        return _resolved_path_copy(outputs_dir, _without_history(record))
+    out = _resolved_path_copy(outputs_dir, record)
+    history, dropped = _history_parts(record)
+    out[_HISTORY_KEY] = [_resolved_path_copy(outputs_dir, h) for h in history]
+    out[_HISTORY_DROPPED_KEY] = dropped
+    return out
+
+
+def get_provenance(
+    outputs_dir: str, path: str, *, include_history: bool = False,
+) -> dict[str, Any] | None:
     """Look up the most recent reproducibility record for ``path``.
 
     Queryable WITHOUT opening/parsing the output file itself -- this reads
@@ -457,6 +551,11 @@ def get_provenance(outputs_dir: str, path: str) -> dict[str, Any] | None:
                     back-slashes/forward-slashes and case differences on
                     Windows are handled the same way as elsewhere in this
                     package).
+      include_history: Also return the record's ``history`` (superseded
+                    records, oldest first) and ``history_dropped`` keys.
+                    Off by default so the record keeps its long-standing
+                    shape; :func:`get_provenance_history` is the versioned
+                    view.
 
     Returns:
       The record dict for `path` (``path``, ``generating_script``,
@@ -494,15 +593,61 @@ def get_provenance(outputs_dir: str, path: str) -> dict[str, Any] | None:
         # Read provenance ledgers written before relative-path storage.
         legacy_key = _normalize_path(path)
         rec = ledger.get(legacy_key) if legacy_key else None
-    if rec is not None and isinstance(rec.get("path"), str) and not os.path.isabs(rec["path"]):
-        # Preserve the public API's absolute-path result while keeping new
-        # on-disk records portable and free of machine-local roots.
-        rec = dict(rec)
-        rec["path"] = resolve_reference(outputs_dir, rec["path"])
-    return dict(rec) if rec is not None else None
+    if not isinstance(rec, dict):
+        return None
+    # Preserve the public API's absolute-path result while keeping new
+    # on-disk records portable and free of machine-local roots.
+    return _public_record(outputs_dir, rec, include_history=include_history)
 
 
-def list_provenance(outputs_dir: str) -> list[dict[str, Any]]:
+def get_provenance_history(outputs_dir: str, path: str) -> dict[str, Any] | None:
+    """Every retained provenance record for ``path``, oldest first.
+
+    Each re-record of a path moves its previous record into a bounded
+    history inside the same ledger entry (one atomic write), so this reads
+    one ledger entry and never opens the output itself.
+
+    Returns ``None`` when nothing was ever recorded for ``path`` (or it is
+    outside ``outputs_dir``), else::
+
+        {"path": <absolute path>,
+         "versions": [<record>, ...],   # oldest first; the last is current
+         "current_version": <int>,
+         "history_dropped": <int>,      # superseded records past the cap
+         "history_limit": 50}
+
+    Every record in ``versions`` has the :func:`get_provenance` shape plus
+    ``version`` (1-based, stable across the cap: the oldest retained
+    record's version is ``history_dropped + 1``) and ``is_current``. A
+    legacy record written before history existed is version 1. Raises
+    ``ledger_io.LedgerCorruptError`` for a corrupt ledger.
+    """
+    rec = get_provenance(outputs_dir, path, include_history=True)
+    if rec is None:
+        return None
+    history, dropped = _history_parts(rec)
+    versions: list[dict[str, Any]] = []
+    for offset, snapshot in enumerate(history):
+        entry = _without_history(snapshot)
+        entry["version"] = dropped + offset + 1
+        entry["is_current"] = False
+        versions.append(entry)
+    current = _without_history(rec)
+    current["version"] = dropped + len(history) + 1
+    current["is_current"] = True
+    versions.append(current)
+    return {
+        "path": current.get("path"),
+        "versions": versions,
+        "current_version": current["version"],
+        "history_dropped": dropped,
+        "history_limit": _HISTORY_LIMIT,
+    }
+
+
+def list_provenance(
+    outputs_dir: str, *, include_history: bool = False,
+) -> list[dict[str, Any]]:
     """Return the reproducibility record for every distinct path ever
     recorded under ``outputs_dir``.
 
@@ -511,14 +656,13 @@ def list_provenance(outputs_dir: str) -> list[dict[str, Any]]:
 
     Returns:
       A list of record dicts (same shape as :func:`get_provenance`'s return
-      value), or ``[]`` if nothing has been recorded yet. Raises
-      ``ledger_io.LedgerCorruptError`` for a corrupt ledger, as
-      :func:`get_provenance` does.
+      value; ``include_history`` works the same way), or ``[]`` if nothing
+      has been recorded yet. Raises ``ledger_io.LedgerCorruptError`` for a
+      corrupt ledger, as :func:`get_provenance` does.
     """
     ledger = _read_ledger(outputs_dir)
-    records = [dict(ledger[key]) for key in sorted(ledger)]
-    for record in records:
-        path = record.get("path")
-        if isinstance(path, str) and not os.path.isabs(path):
-            record["path"] = resolve_reference(outputs_dir, path)
-    return records
+    return [
+        _public_record(outputs_dir, ledger[key], include_history=include_history)
+        for key in sorted(ledger)
+        if isinstance(ledger[key], dict)
+    ]

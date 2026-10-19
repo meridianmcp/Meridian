@@ -74,6 +74,7 @@ and reported a real parse error) — never a raised exception, never a hang.
 | `get_provenance` | Exact-match lookup of one file's `record_provenance` record (ambiguous `None` on a miss — see `get_provenance_status`) |
 | `get_provenance_status` | Richer, ranked per-file provenance answer: exact / directory-fallback / unregistered / unknown / stale-by-script, plus staleness, archival identity, and index-convergence awareness |
 | `list_provenance` | List the latest `record_provenance` record for every path recorded under an outputs directory |
+| `get_provenance_history` | Every retained `record_provenance` record for one file, oldest first with 1-based versions; re-recording keeps the newest 50 superseded records, written in the same atomic ledger update as the new one |
 | `resolve_figure_output` | Forward resolution: a document figure's file path → its generating source (exact match, then relocation-tolerant basename fallback) |
 | `find_outputs_by_source` | Reverse resolution: a script/data source path → the outputs it produced |
 | `bind_artifact_provenance` | Join a document's structural artifacts (figures/tables/equations) to authoritative per-file provenance, fail-closed |
