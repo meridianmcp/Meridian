@@ -75,7 +75,8 @@ and reported a real parse error) — never a raised exception, never a hang.
 | `get_provenance_status` | Richer, ranked per-file provenance answer: exact / directory-fallback / unregistered / unknown / stale-by-script, plus staleness, archival identity, and index-convergence awareness |
 | `list_provenance` | List the latest `record_provenance` record for every path recorded under an outputs directory |
 | `resolve_figure_output` | Forward resolution: a document figure's file path → its generating source (exact match, then relocation-tolerant basename fallback) |
-| `find_outputs_by_source` | Reverse resolution: a script/data source path → the outputs it produced |
+| `find_outputs_by_source` | Reverse resolution: a script/data source path → the outputs it produced (one hop; `limit` ≤ 1000, `search_limit` ≤ 5000; a `truncated` block flags a saturated scan, a partial index, or capped outputs) |
+| `trace_forward_outputs` | Bounded transitive forward trace: a source → every output depending on it through other outputs (BFS, `max_depth` 3 / `max_nodes` 200 by default; caps set a `truncated` flag and reason, never an error; `max_depth=1` equals `find_outputs_by_source`) |
 | `bind_artifact_provenance` | Join a document's structural artifacts (figures/tables/equations) to authoritative per-file provenance, fail-closed |
 | `tag_output` | Fingerprint an output and record it in a persistent ledger stamped with its generating script's content hash |
 | `check_staleness` | Re-hash every ledger-tagged generating script and report which previously-tagged outputs are now stale |

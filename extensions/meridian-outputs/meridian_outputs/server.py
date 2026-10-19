@@ -869,10 +869,54 @@ def find_outputs_by_source(
       canonical_path, kind, size, mtime, csv_columns, json_keys), sorted
       newest-first by mtime. ``total`` is the full match count before
       ``limit`` truncation. ``outputs`` is empty (not an error) when nothing
-      in the tree cites this source.
+      in the tree cites this source. ``truncated`` flags a possibly
+      incomplete answer (``scan_saturated``, ``index_partial``,
+      ``outputs_capped``); ``limits`` reports the effective limits after
+      clamping (``limit`` <= 1000, ``search_limit`` <= 5000).
     """
     return provenance.find_outputs_by_source(
         outputs_dir, source_path, limit=limit, search_limit=search_limit,
+    )
+
+
+@mcp.tool()
+def trace_forward_outputs(
+    outputs_dir: str,
+    source_path: str,
+    max_depth: int = 3,
+    max_nodes: int = 200,
+    limit: int = 25,
+    search_limit: int = 200,
+) -> dict[str, Any]:
+    """Bounded transitive forward trace: a source -> every output that
+    depends on it, directly or through other outputs (gap set C).
+
+    A breadth-first walk over ``find_outputs_by_source``. Hop 1 uses that
+    tool's match rule, so ``max_depth=1`` returns exactly its one-hop
+    answer; hops 2+ match only exact normalised paths. A visited set ends
+    cycles. Caps never raise: hitting one sets ``truncated`` and names the
+    reason.
+
+    Args:
+      outputs_dir:   Absolute path to the outputs directory.
+      source_path:   The script or data file to trace forward from.
+      max_depth:     Max hops from the source (default 3, ceiling 25).
+      max_nodes:     Max dependent outputs returned, source not counted
+                     (default 200, ceiling 5000).
+      limit:         Per-hop output limit (default 25, ceiling 1000).
+      search_limit:  Per-hop search window (default 200, ceiling 5000).
+
+    Returns:
+      ``{source_path, nodes, total, truncated, truncation, limits}``. Each
+      node is a one-hop output row plus ``depth`` and ``parent``.
+      ``truncation`` is ``{reason, reasons, depth_reached, nodes_visited,
+      scan_saturated, index_partial, outputs_capped}``; ``reason`` is one
+      of ``max_nodes``/``max_depth``/``outputs_capped``/``scan_saturated``/
+      ``index_partial``, or ``None`` when nothing was cut short.
+    """
+    return provenance.trace_forward_outputs(
+        outputs_dir, source_path, max_depth=max_depth, max_nodes=max_nodes,
+        limit=limit, search_limit=search_limit,
     )
 
 

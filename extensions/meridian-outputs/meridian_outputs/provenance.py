@@ -81,6 +81,7 @@ from . import outputs_local, provenance_status
 __all__ = [
     "resolve_figure_output",
     "find_outputs_by_source",
+    "trace_forward_outputs",
     "classify_temp_output_ownership",
     "bind_artifact_provenance",
     "RESOLVED",
@@ -192,6 +193,149 @@ def resolve_figure_output(
     return best
 
 
+# Bounded forward trace (gap set C, "forward-trace-cap"). Hard ceilings on
+# the caller-supplied knobs: before this, ``limit``/``search_limit`` were
+# floored at 1 but never capped, so one call could ask the index for an
+# unbounded scan window. A value above its ceiling is clamped (never an
+# error) and the clamp is reported in the response's ``limits`` block.
+FORWARD_LIMIT_CEILING = 1000
+FORWARD_SEARCH_LIMIT_CEILING = 5000
+TRACE_MAX_DEPTH_CEILING = 25
+TRACE_MAX_NODES_CEILING = 5000
+
+# Truncation reasons reported by trace_forward_outputs, in the fixed order
+# ``truncation["reasons"]`` lists them (``truncation["reason"]`` is the first).
+TRUNCATION_REASONS = (
+    "max_nodes",
+    "max_depth",
+    "outputs_capped",
+    "scan_saturated",
+    "index_partial",
+)
+
+
+def _clamp_limit(value: Any, ceiling: int) -> tuple[int, bool]:
+    """Floor ``value`` at 1 and cap it at ``ceiling``; report whether capped."""
+    requested = int(value)
+    effective = min(max(requested, 1), ceiling)
+    return effective, requested > ceiling
+
+
+def _no_truncation() -> dict[str, bool]:
+    return {"scan_saturated": False, "index_partial": False, "outputs_capped": False}
+
+
+def _exact_path_keys(outputs_dir: str, path: Any) -> set[str]:
+    """Exact (non-basename) identity keys for one output/source path.
+
+    Used for hops 2+ of :func:`trace_forward_outputs`, where basename
+    matching over-matches (any ``results.csv`` anywhere would chain onward).
+    Two spellings of the same file compare equal: the path as given, its
+    real absolute form, and -- when it lies under ``outputs_dir`` -- its
+    ``outputs_dir``-relative form, so a ``generating_script`` recorded as
+    ``"sub/a.json"`` matches the indexed ``<outputs_dir>/sub/a.json`` row.
+    Every key goes through :func:`_path_key` (case/slash-insensitive).
+    """
+    raw = str(path or "").strip()
+    if not raw:
+        return set()
+    keys = {_path_key(os.path.normpath(raw))}
+    try:
+        root = os.path.realpath(os.path.abspath(outputs_dir))
+        candidate = raw if os.path.isabs(raw) else os.path.join(root, raw)
+        resolved = os.path.realpath(os.path.abspath(candidate))
+    except (OSError, ValueError):
+        return keys
+    keys.add(_path_key(resolved))
+    try:
+        if os.path.normcase(os.path.commonpath((root, resolved))) == os.path.normcase(root):
+            keys.add(_path_key(os.path.relpath(resolved, root)))
+    except ValueError:
+        pass  # different drive: no outputs_dir-relative spelling exists
+    return keys
+
+
+def _scan_outputs_by_source(
+    outputs_dir: str,
+    source_path: str,
+    *,
+    limit: int,
+    search_limit: int,
+    exact_only: bool,
+) -> dict[str, Any]:
+    """One-hop expander shared by find_outputs_by_source and the trace.
+
+    ``exact_only=False`` is the historical match rule (normalised exact
+    string OR basename). ``exact_only=True`` matches only exact normalised
+    paths (see :func:`_exact_path_keys`); the trace uses it beyond hop 1.
+    """
+    eff_limit, limit_clamped = _clamp_limit(limit, FORWARD_LIMIT_CEILING)
+    eff_search, search_clamped = _clamp_limit(search_limit, FORWARD_SEARCH_LIMIT_CEILING)
+    limits = {
+        "limit": eff_limit,
+        "search_limit": eff_search,
+        "limit_clamped": limit_clamped,
+        "search_limit_clamped": search_clamped,
+    }
+    empty: dict[str, Any] = {
+        "source_path": source_path,
+        "outputs": [],
+        "total": 0,
+        "truncated": _no_truncation(),
+        "limits": limits,
+    }
+    if not source_path or not str(source_path).strip():
+        return empty
+    if not os.path.isdir(outputs_dir):
+        return empty
+
+    target_path = _path_key(source_path)
+    target_base = _basename_key(source_path)
+    exact_keys = _exact_path_keys(outputs_dir, source_path) if exact_only else set()
+    query = os.path.basename(str(source_path).replace("\\", "/").rstrip("/")) or str(source_path)
+    result = outputs_local.search_outputs(
+        outputs_dir, query, limit=eff_search, include_archival=True,
+    )
+    hits = result.get("hits") or []
+
+    matches: list[dict[str, Any]] = []
+    seen_paths: set[str] = set()
+    for hit in hits:
+        gs = hit.get("generating_script")
+        if not gs:
+            continue
+        if exact_only:
+            if not (_exact_path_keys(outputs_dir, gs) & exact_keys):
+                continue
+        elif _path_key(gs) != target_path and _basename_key(gs) != target_base:
+            continue
+        p = hit.get("path")
+        if p in seen_paths:
+            continue
+        seen_paths.add(p)
+        clean = dict(hit)
+        clean.pop("score", None)
+        clean.pop("bm25", None)
+        matches.append(clean)
+
+    matches.sort(key=lambda h: (h.get("mtime") or 0), reverse=True)
+    trimmed = matches[:eff_limit]
+    truncated = {
+        # The search returned a full window: more cited rows may sit past it.
+        "scan_saturated": len(hits) >= eff_search,
+        # The index itself is mid-walk / FTS not built: hits under-report.
+        "index_partial": bool(result.get("partial") or result.get("fts_pending")),
+        "outputs_capped": len(matches) > len(trimmed),
+    }
+    return {
+        "source_path": source_path,
+        "outputs": trimmed,
+        "total": len(matches),
+        "truncated": truncated,
+        "limits": limits,
+    }
+
+
 def find_outputs_by_source(
     outputs_dir: str,
     source_path: str,
@@ -209,55 +353,205 @@ def find_outputs_by_source(
     catch a docx figure quietly citing STALE data: walk the source's outputs
     forward, newest first, and compare against what the docx actually shows.
 
+    One hop only. For transitive dependents (outputs of outputs) use
+    :func:`trace_forward_outputs`, which is bounded by depth and node caps.
+
     Args:
       outputs_dir:   Absolute path to the outputs directory.
       source_path:   The script or data file to trace forward from.
-      limit:         Max number of matched outputs to return.
+      limit:         Max number of matched outputs to return. Floored at 1,
+                     capped at ``FORWARD_LIMIT_CEILING`` (1000).
       search_limit:  How many search_outputs hits to scan before filtering
                      (generous, since only a subset will actually match).
+                     Floored at 1, capped at ``FORWARD_SEARCH_LIMIT_CEILING``
+                     (5000).
 
     Returns:
-      ``{source_path, outputs: [...], total}`` where each output row has the
-      same fields as a ``search_outputs`` hit (path, generating_script,
-      is_archival, canonical_path, kind, size, mtime, csv_columns,
-      json_keys), sorted newest-first by ``mtime``. ``total`` is the full
-      match count before ``limit`` truncation. ``outputs`` is empty (not an
-      error) when nothing in the tree cites this source.
+      ``{source_path, outputs: [...], total, truncated, limits}`` where each
+      output row has the same fields as a ``search_outputs`` hit (path,
+      generating_script, is_archival, canonical_path, kind, size, mtime,
+      csv_columns, json_keys), sorted newest-first by ``mtime``. ``total``
+      is the full match count before ``limit`` truncation. ``outputs`` is
+      empty (not an error) when nothing in the tree cites this source.
+
+      ``truncated`` says whether the answer may be incomplete, as flags
+      (never an error): ``scan_saturated`` -- the search filled its whole
+      ``search_limit`` window, so matches past it were never scanned;
+      ``index_partial`` -- the outputs index reported ``partial`` or
+      ``fts_pending`` (still walking/building), so hits under-report;
+      ``outputs_capped`` -- ``total`` exceeds the returned ``outputs``.
+      ``limits`` reports the effective ``limit``/``search_limit`` and
+      whether each was clamped to its ceiling.
     """
-    empty: dict[str, Any] = {"source_path": source_path, "outputs": [], "total": 0}
-    if not source_path or not str(source_path).strip():
-        return empty
-    if not os.path.isdir(outputs_dir):
-        return empty
-
-    target_path = _path_key(source_path)
-    target_base = _basename_key(source_path)
-    query = os.path.basename(str(source_path).replace("\\", "/").rstrip("/")) or str(source_path)
-    result = outputs_local.search_outputs(
-        outputs_dir, query, limit=max(int(search_limit), 1), include_archival=True,
+    return _scan_outputs_by_source(
+        outputs_dir, source_path, limit=limit, search_limit=search_limit,
+        exact_only=False,
     )
-    hits = result.get("hits") or []
 
-    matches: list[dict[str, Any]] = []
-    seen_paths: set[str] = set()
-    for hit in hits:
-        gs = hit.get("generating_script")
-        if not gs:
-            continue
-        if _path_key(gs) != target_path and _basename_key(gs) != target_base:
-            continue
-        p = hit.get("path")
-        if p in seen_paths:
-            continue
-        seen_paths.add(p)
-        clean = dict(hit)
-        clean.pop("score", None)
-        clean.pop("bm25", None)
-        matches.append(clean)
 
-    matches.sort(key=lambda h: (h.get("mtime") or 0), reverse=True)
-    trimmed = matches[: max(int(limit), 1)]
-    return {"source_path": source_path, "outputs": trimmed, "total": len(matches)}
+def trace_forward_outputs(
+    outputs_dir: str,
+    source_path: str,
+    *,
+    max_depth: int = 3,
+    max_nodes: int = 200,
+    limit: int = 25,
+    search_limit: int = 200,
+) -> dict[str, Any]:
+    """Bounded transitive forward trace: source -> outputs -> their outputs.
+
+    A breadth-first walk that uses the one-hop expander behind
+    :func:`find_outputs_by_source` once per node. Hop 1 keeps that
+    function's match rule (exact normalised string OR basename), so
+    ``max_depth=1`` returns exactly today's one-hop answer. Hops 2+ match
+    only exact normalised paths (an output's absolute or
+    ``outputs_dir``-relative spelling), because basename matching there
+    would chain through any unrelated file that shares a name.
+
+    A visited set keyed by :func:`_path_key` (seeded with the source itself)
+    makes every path appear at most once, so a cycle (A generates B, B
+    generates A) terminates.
+
+    Caps are flags, never errors. The walk stops at ``max_depth`` hops or
+    ``max_nodes`` nodes (the source is not counted), and the response says
+    so.
+
+    Args:
+      outputs_dir:   Absolute path to the outputs directory.
+      source_path:   The script or data file to trace forward from.
+      max_depth:     Max hops from the source (floored at 1, capped at
+                     ``TRACE_MAX_DEPTH_CEILING``).
+      max_nodes:     Max dependent outputs returned (floored at 1, capped at
+                     ``TRACE_MAX_NODES_CEILING``).
+      limit:         Per-hop ``limit`` forwarded to the one-hop expander.
+      search_limit:  Per-hop ``search_limit`` forwarded to the expander.
+
+    Returns:
+      ``{source_path, nodes, total, truncated, truncation, limits}``.
+      ``nodes`` is in BFS order; each node is the one-hop output row plus
+      ``depth`` (1 = cites the source directly) and ``parent`` (the path it
+      was reached from; the caller's ``source_path`` for depth 1).
+      ``truncated`` is a bool. ``truncation`` is ``{reason, reasons,
+      depth_reached, nodes_visited, scan_saturated, index_partial,
+      outputs_capped}``: ``reasons`` lists every cause in the fixed
+      ``TRUNCATION_REASONS`` order and ``reason`` is the first, or ``None``.
+      ``max_depth`` is reported when a node at the depth cap has an
+      unvisited dependent, or when the one extra probe hop that checks this
+      cannot rule one out (the probe's scan saturated or the index is
+      partial). ``scan_saturated``/``index_partial``/``outputs_capped`` are
+      the OR of those flags over every hop the answer includes. A missing
+      ``outputs_dir`` or empty ``source_path`` returns no nodes and
+      ``truncated=False``, matching find_outputs_by_source's empty answer.
+    """
+    eff_depth, depth_clamped = _clamp_limit(max_depth, TRACE_MAX_DEPTH_CEILING)
+    eff_nodes, nodes_clamped = _clamp_limit(max_nodes, TRACE_MAX_NODES_CEILING)
+    eff_limit, limit_clamped = _clamp_limit(limit, FORWARD_LIMIT_CEILING)
+    eff_search, search_clamped = _clamp_limit(search_limit, FORWARD_SEARCH_LIMIT_CEILING)
+    limits = {
+        "max_depth": eff_depth,
+        "max_nodes": eff_nodes,
+        "limit": eff_limit,
+        "search_limit": eff_search,
+        "max_depth_clamped": depth_clamped,
+        "max_nodes_clamped": nodes_clamped,
+        "limit_clamped": limit_clamped,
+        "search_limit_clamped": search_clamped,
+    }
+
+    nodes: list[dict[str, Any]] = []
+    flags = _no_truncation()
+    hit_max_nodes = False
+    hit_max_depth = False
+    depth_reached = 0
+
+    if source_path and str(source_path).strip() and os.path.isdir(outputs_dir):
+        visited: set[str] = set(_exact_path_keys(outputs_dir, source_path))
+        visited.add(_path_key(source_path))
+        frontier: list[tuple[str, int]] = [(source_path, 0)]
+
+        def _expand(node_path: str, depth: int) -> dict[str, Any]:
+            hop = _scan_outputs_by_source(
+                outputs_dir, node_path, limit=eff_limit, search_limit=eff_search,
+                exact_only=depth >= 1,
+            )
+            for key, value in hop["truncated"].items():
+                flags[key] = flags[key] or bool(value)
+            return hop
+
+        def _is_new(row: dict[str, Any]) -> bool:
+            path = row.get("path")
+            if not path:
+                return False
+            return not (_exact_path_keys(outputs_dir, path) | {_path_key(path)}) & visited
+
+        while frontier and not hit_max_nodes:
+            next_frontier: list[tuple[str, int]] = []
+            for node_path, depth in frontier:
+                if depth >= eff_depth:
+                    # Probe one hop past the cap so ``max_depth`` is reported
+                    # only when a dependent lies beyond it, or the probe
+                    # cannot rule one out (its own scan saturated, or the
+                    # index is partial). The probe's flags are NOT merged
+                    # into ``flags``: they describe a hop the answer does
+                    # not include.
+                    if not hit_max_depth:
+                        probe = _scan_outputs_by_source(
+                            outputs_dir, node_path, limit=eff_limit,
+                            search_limit=eff_search, exact_only=True,
+                        )
+                        probe_flags = probe["truncated"]
+                        if (
+                            any(_is_new(row) for row in probe["outputs"])
+                            or probe_flags["scan_saturated"]
+                            or probe_flags["index_partial"]
+                        ):
+                            hit_max_depth = True
+                    continue
+                hop = _expand(node_path, depth)
+                for row in hop["outputs"]:
+                    # Hop 1 keeps every row the one-hop expander returned
+                    # (it already dedupes by path), so max_depth=1 equals
+                    # find_outputs_by_source exactly; later hops skip
+                    # anything already visited, which is what ends cycles.
+                    if depth > 0 and not _is_new(row):
+                        continue
+                    if not row.get("path"):
+                        continue
+                    if len(nodes) >= eff_nodes:
+                        hit_max_nodes = True
+                        break
+                    path = row["path"]
+                    visited.update(_exact_path_keys(outputs_dir, path))
+                    visited.add(_path_key(path))
+                    nodes.append({**row, "depth": depth + 1, "parent": node_path})
+                    depth_reached = max(depth_reached, depth + 1)
+                    next_frontier.append((path, depth + 1))
+                if hit_max_nodes:
+                    break
+            frontier = next_frontier
+
+    active = {
+        "max_nodes": hit_max_nodes,
+        "max_depth": hit_max_depth,
+        "outputs_capped": flags["outputs_capped"],
+        "scan_saturated": flags["scan_saturated"],
+        "index_partial": flags["index_partial"],
+    }
+    reasons = [reason for reason in TRUNCATION_REASONS if active[reason]]
+    return {
+        "source_path": source_path,
+        "nodes": nodes,
+        "total": len(nodes),
+        "truncated": bool(reasons),
+        "truncation": {
+            "reason": reasons[0] if reasons else None,
+            "reasons": reasons,
+            "depth_reached": depth_reached,
+            "nodes_visited": len(nodes),
+            **flags,
+        },
+        "limits": limits,
+    }
 
 
 def classify_temp_output_ownership(outputs_dir: str, path: str) -> dict[str, Any]:
