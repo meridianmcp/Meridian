@@ -216,6 +216,9 @@ class ProvenanceRecord:
     recorded_at: float = 0.0
     recorded_at_iso: str = ""
     content_hash: str | None = None
+    # SHA-256 of the generating script's content at record time (the output's own hash is content_hash).
+    # None when the script cannot be resolved, or on a ledger entry written before this field existed.
+    script_content_hash: str | None = None
     # 3f6b8715 -- W1-M Experiment Registry: optional link to a
     # meridian.db.experiments run row. Defaulted so every existing caller
     # (and every ledger entry written before this field existed) is
@@ -352,6 +355,16 @@ def record_provenance(
         # blocks the (already-durable) provenance write on a hashing failure.
         content_hash = None
 
+    # The generating script's content, not the output's. An edited script is a staleness signal for the output
+    # it produced, and the record keeps the hash it had when the output was recorded. Resolved the way tag_output
+    # resolves a script (the outputs directory, then the working directory); a script that cannot be found leaves
+    # the field None and the record is still written.
+    script_hash: str | None = None
+    if isinstance(generating_script, str) and generating_script:
+        script_file = fingerprint._resolve_script_path(generating_script, search_root=outputs_dir)
+        if script_file is not None:
+            script_hash = fingerprint.script_content_hash(script_file)
+
     now = time.time()
     record = ProvenanceRecord(
         path=resolved_path,
@@ -363,6 +376,7 @@ def record_provenance(
         recorded_at=now,
         recorded_at_iso=datetime.fromtimestamp(now, tz=timezone.utc).isoformat(),
         content_hash=content_hash,
+        script_content_hash=script_hash,
         experiment_run_id=experiment_run_id,
         cited_zotero_keys=cited_zotero_keys,
     )
