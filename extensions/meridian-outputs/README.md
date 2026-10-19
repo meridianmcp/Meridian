@@ -160,6 +160,7 @@ always surfaced together, never silently narrowed to one.
 | `bind_artifact_source_edge` | Record a typed edge between a registered artifact and a source locator (idempotent) |
 | `get_artifact_sources` | Artifact → its bound sources |
 | `get_source_artifacts` | Source → the artifacts it produced |
+| `get_output_lineage` | Joined lineage for one output: the union of registry source edges, the `record_provenance` generating script and the `tag_output` script, each tagged with its origin, each in-tree source joined to its own provenance record (out-of-tree ones marked `not_recorded_outside_outputs_dir`), a script-hash `stale` flag, and the run's inputs (`scope: "run"`); `complete` is false whenever anything is unresolved; one hop |
 | `list_registered_artifacts` | All registered artifacts, optionally filtered by kind/lifecycle_state |
 | `reconcile_legacy_artifact_outputs` | Migration/reconciliation report for legacy outputs (defaults to the `record_provenance` ledger); dry-run preview or real registration; ambiguous/unanchored entries are never silently registered |
 

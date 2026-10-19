@@ -1116,6 +1116,43 @@ def get_source_artifacts(outputs_dir: str, source_locator: str) -> list[dict[str
 
 
 @mcp.tool()
+def get_output_lineage(
+    outputs_dir: str,
+    path: str | None = None,
+    artifact_id: str | None = None,
+    depth: int = 1,
+) -> dict[str, Any]:
+    """Joined lineage for one output (gap set C): output -> its generating
+    sources from every store -> each source's own provenance record, plus
+    the run's inputs, as one fail-closed view.
+
+    Sources are the union of the artifact registry's source edges, the
+    ``record_provenance`` ledger's ``generating_script`` and the
+    ``tag_output`` ledger's script. Each source names its ``origin``; the
+    same script seen by two stores is listed once per store, never merged.
+    A source inside ``outputs_dir`` gets its own provenance record (or is
+    marked ``no_provenance_record``/``not_found``); a source outside is
+    marked ``not_recorded_outside_outputs_dir``. ``stale`` compares a
+    recorded script hash with the script's current hash.
+
+    Args:
+      outputs_dir:  Absolute path to the outputs directory.
+      path:         The output file (must lie inside ``outputs_dir``).
+      artifact_id:  A registered artifact id, instead of or with ``path``.
+      depth:        Hops to follow; only 1 is accepted (deeper is reserved).
+
+    Returns:
+      ``{output, sources, run, complete, unresolved}``, or ``{"error": ...}``
+      for invalid arguments. ``complete`` is True only when at least one
+      source is known and nothing is unresolved. Every path in the result is
+      relative; no machine-local absolute path is returned.
+    """
+    return provenance.get_output_lineage(
+        outputs_dir, path=path, artifact_id=artifact_id, depth=depth,
+    )
+
+
+@mcp.tool()
 def list_registered_artifacts(
     outputs_dir: str, kind: str | None = None, lifecycle_state: str | None = None,
 ) -> list[dict[str, Any]]:

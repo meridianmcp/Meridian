@@ -68,8 +68,11 @@ resolved/ambiguous/unresolved/orphaned outcome and never a silent basename
 guess" -- callers that need a durable, portable identity (rather than a
 one-off per-write provenance check) should prefer
 ``artifact_registry.register_artifact``/``resolve_artifact`` over building
-one on top of this module's basename tier. The two modules do not import
-each other.
+one on top of this module's basename tier. ``artifact_registry`` never
+imports this module; the only dependency in the other direction is
+:func:`get_output_lineage` (gap set C), which reads the registry, the
+provenance and fingerprint ledgers, and the run-manifest ledger through
+deferred imports to join them into one lineage view.
 """
 from __future__ import annotations
 
@@ -84,6 +87,7 @@ __all__ = [
     "trace_forward_outputs",
     "classify_temp_output_ownership",
     "bind_artifact_provenance",
+    "get_output_lineage",
     "RESOLVED",
     "ORPHANED",
     "HASH_MISMATCH",
@@ -959,3 +963,525 @@ def bind_artifact_provenance(
         counts[binding["status"]] = counts.get(binding["status"], 0) + 1
     all_clear = counts[RESOLVED] == len(bindings)
     return {"bindings": bindings, "counts": counts, "all_clear": all_clear}
+
+
+# ---------------------------------------------------------------------------
+# Gap set C, "joined-lineage": output -> its generating sources -> their own
+# provenance records, as ONE view.
+#
+# Three stores each record an output -> source link, and nothing reconciled
+# them: the artifact registry's SourceEdges, the provenance ledger's
+# ``generating_script`` (record_provenance), and the fingerprint ledger's
+# ``generating_script``/``script_path`` (tag_output). get_output_lineage
+# unions all three, tags every source with the store it came from, and never
+# collapses two origins into one entry -- when the stores disagree, the
+# disagreement stays visible. The view is fail-closed: ``complete`` is True
+# only when at least one source is known and every source, the run manifest
+# (if the artifact names a run), and every store read resolved cleanly.
+#
+# The result is portable: every path is outputs_dir-relative or a relative
+# source reference, never a machine-local absolute path (the registry's
+# local_only_path values are stripped via strip_local_metadata).
+# ---------------------------------------------------------------------------
+
+LINEAGE_ORIGIN_REGISTRY = "artifact_registry"
+LINEAGE_ORIGIN_PROVENANCE = "provenance_record"
+LINEAGE_ORIGIN_FINGERPRINT = "fingerprint_ledger"
+_LINEAGE_ORIGIN_RANK = {
+    LINEAGE_ORIGIN_REGISTRY: 0,
+    LINEAGE_ORIGIN_PROVENANCE: 1,
+    LINEAGE_ORIGIN_FINGERPRINT: 2,
+}
+
+# Per-source resolution statuses. Only SOURCE_RECORDED counts as resolved.
+SOURCE_RECORDED = "recorded"
+SOURCE_NO_PROVENANCE_RECORD = "no_provenance_record"
+SOURCE_NOT_FOUND = "not_found"
+SOURCE_OUTSIDE_OUTPUTS_DIR = "not_recorded_outside_outputs_dir"
+
+
+def _portable_locator(outputs_dir: str, value: Any) -> str | None:
+    """A ledger locator safe to return: never a machine-local absolute path.
+
+    Relative values pass through (slashes normalised). An absolute value is
+    rewritten as a reference relative to ``outputs_dir``, or reduced to its
+    basename when it sits on a different volume (the same fallback
+    annotate/fingerprint use when they persist a generating script).
+    """
+    if not isinstance(value, str) or not value.strip():
+        return None
+    raw = value.strip()
+    if not os.path.isabs(raw):
+        return raw.replace("\\", "/")
+    from .path_security import relative_reference
+
+    return relative_reference(outputs_dir, raw) or os.path.basename(raw.replace("\\", "/"))
+
+
+def _relative_output(outputs_dir: str, path: Any) -> str | None:
+    from .path_security import relative_output_path
+
+    try:
+        return relative_output_path(outputs_dir, path)
+    except (TypeError, ValueError):
+        return _portable_locator(outputs_dir, path)
+
+
+def _portable_provenance_record(outputs_dir: str, record: dict[str, Any] | None) -> dict[str, Any] | None:
+    if record is None:
+        return None
+    clean = dict(record)
+    if "path" in clean:
+        clean["path"] = _relative_output(outputs_dir, clean.get("path"))
+    if "generating_script" in clean:
+        clean["generating_script"] = _portable_locator(outputs_dir, clean.get("generating_script"))
+    return clean
+
+
+def _portable_fingerprint_entry(outputs_dir: str, entry: dict[str, Any] | None) -> dict[str, Any] | None:
+    if entry is None:
+        return None
+    clean = dict(entry)
+    for key in ("path", "script_path", "generating_script"):
+        if key in clean:
+            clean[key] = _portable_locator(outputs_dir, clean.get(key))
+    return clean
+
+
+def _portable_artifact(outputs_dir: str, record: dict[str, Any] | None) -> dict[str, Any] | None:
+    if record is None:
+        return None
+    from . import artifact_registry
+
+    clean = artifact_registry.strip_local_metadata(record)
+    for key in ("generator", "source_locator"):
+        if key in clean:
+            clean[key] = _portable_locator(outputs_dir, clean.get(key))
+    return clean
+
+
+def _same_output(outputs_dir: str, ledger_path: Any, target_real: str) -> bool:
+    from .path_security import resolve_reference
+
+    if not isinstance(ledger_path, str) or not ledger_path.strip():
+        return False
+    try:
+        resolved = resolve_reference(outputs_dir, ledger_path)
+    except (OSError, TypeError, ValueError):
+        return False
+    return os.path.normcase(os.path.normpath(resolved)) == os.path.normcase(os.path.normpath(target_real))
+
+
+def _locate_source(outputs_dir: str, locator: str) -> tuple[str, str | None]:
+    """``("inside", <real path>)`` or ``("outside", None)``.
+
+    A relative locator is read relative to ``outputs_dir`` (the convention
+    every ledger in this package uses for stored references); the current
+    working directory is never consulted, so the answer does not depend on
+    where the server process happens to run.
+    """
+    from .path_security import _require_within
+
+    root = os.path.realpath(os.path.abspath(outputs_dir))
+    candidate = locator if os.path.isabs(locator) else os.path.join(root, locator)
+    try:
+        return "inside", _require_within(outputs_dir, candidate)
+    except ValueError:
+        return "outside", None
+
+
+def _resolve_lineage_source(
+    outputs_dir: str,
+    *,
+    origin: str,
+    locator: str,
+    relation: str,
+    location_hint: str | None = None,
+    edge_id: str | None = None,
+) -> dict[str, Any]:
+    """Classify one source and attach its own provenance record if it has one."""
+    from . import annotate
+
+    where, real = _locate_source(outputs_dir, location_hint or locator)
+    entry: dict[str, Any] = {
+        "origin": origin,
+        "locator": locator,
+        "relation": relation,
+        "scope": "output",
+        "location": "inside_outputs_dir" if where == "inside" else "outside_outputs_dir",
+        "path": None,
+        "status": SOURCE_OUTSIDE_OUTPUTS_DIR,
+        "resolved": False,
+        "provenance_record": None,
+        "stale": None,
+        "stale_reason": None,
+        "recorded_script_hash": None,
+        "current_script_hash": None,
+    }
+    if edge_id is not None:
+        entry["edge_id"] = edge_id
+    if where != "inside" or real is None:
+        return entry
+
+    entry["path"] = _relative_output(outputs_dir, real)
+    try:
+        record = annotate.get_provenance(outputs_dir, real)
+    except Exception as exc:  # noqa: BLE001 -- a store failure is reported, never raised
+        entry["status"] = SOURCE_NO_PROVENANCE_RECORD
+        entry["store_error"] = type(exc).__name__
+        return entry
+    if record is not None:
+        entry["status"] = SOURCE_RECORDED
+        entry["resolved"] = True
+        entry["provenance_record"] = _portable_provenance_record(outputs_dir, record)
+    elif os.path.exists(real):
+        entry["status"] = SOURCE_NO_PROVENANCE_RECORD
+    else:
+        entry["status"] = SOURCE_NOT_FOUND
+    return entry
+
+
+def _set_script_staleness(entry: dict[str, Any], recorded: str | None, current: str | None,
+                          *, script_known: bool) -> None:
+    """Fill the stale fields the way fingerprint.check_staleness reasons,
+    except that an absent recorded hash is reported as unknown (None)
+    rather than silently "not stale"."""
+    entry["recorded_script_hash"] = recorded
+    entry["current_script_hash"] = current
+    if not script_known:
+        entry["stale"] = None
+        entry["stale_reason"] = "no generating script was resolved when this link was recorded"
+    elif current is None:
+        entry["stale"] = True
+        entry["stale_reason"] = "generating script no longer readable/present"
+    elif recorded is None:
+        entry["stale"] = None
+        entry["stale_reason"] = "no script hash was recorded, so staleness cannot be confirmed"
+    elif current != recorded:
+        entry["stale"] = True
+        entry["stale_reason"] = "generating script content changed since it was recorded"
+    else:
+        entry["stale"] = False
+        entry["stale_reason"] = "generating script unchanged since it was recorded"
+
+
+def get_output_lineage(
+    outputs_dir: str,
+    *,
+    path: str | None = None,
+    artifact_id: str | None = None,
+    depth: int = 1,
+) -> dict[str, Any]:
+    """Joined lineage for one output: its sources from every store, each
+    source's own provenance record, and the run inputs, as ONE view.
+
+    Exactly how the stores are joined:
+
+      1. The output is located by ``path`` (validated to lie inside
+         ``outputs_dir``) and/or ``artifact_id``. A path is matched to a
+         registry artifact through ``artifact_registry.resolve_artifact``
+         (content hash, then exact prior path sighting -- never a basename
+         guess); an ``artifact_id`` without a ``path`` uses the artifact's
+         most recent local sighting inside ``outputs_dir``.
+      2. Sources are the UNION of the registry's SourceEdges for that
+         artifact, the provenance ledger's ``generating_script`` and the
+         fingerprint ledger's ``generating_script`` (or ``script_path``).
+         Every source carries ``origin`` naming its store; the same script
+         seen by two stores appears twice, once per origin, never merged.
+      3. Each source inside ``outputs_dir`` gets its own provenance record
+         attached (``status="recorded"``) or is marked
+         ``no_provenance_record``/``not_found``. A source outside
+         ``outputs_dir`` is marked ``not_recorded_outside_outputs_dir``.
+         Only ``recorded`` counts as resolved.
+      4. ``stale`` compares the script hash a store recorded with the
+         script's current hash: the fingerprint ledger's tag-time hash, and
+         the provenance record's ``script_content_hash`` when present.
+      5. When the artifact names a ``run_id`` with a run manifest, the run's
+         input hashes are attached under ``run.inputs`` with
+         ``scope="run"`` (they describe the whole run, not this output).
+
+    Args:
+      outputs_dir:  Absolute path to the outputs directory.
+      path:         The output file (inside ``outputs_dir``).
+      artifact_id:  A registered artifact id, instead of or with ``path``.
+      depth:        Hops to follow. Only 1 is accepted: deeper lineage is
+                    reserved (it needs a visited set) and any other value is
+                    an error rather than a silently shallower answer.
+
+    Returns:
+      ``{"error": ...}`` for invalid arguments (missing ``outputs_dir``, a
+      ``path`` outside it, neither ``path`` nor ``artifact_id``, or a
+      ``depth`` other than 1) -- never a traceback. Otherwise ``{output,
+      sources, run, complete, unresolved}``:
+
+        - ``output``: ``{path, artifact_id, artifact_evidence, artifact,
+          provenance_record, fingerprint, provenance_status}`` with every
+          path made portable.
+        - ``sources``: one dict per (origin, locator) -- ``{origin,
+          locator, relation, scope, location, path, status, resolved,
+          provenance_record, stale, stale_reason, recorded_script_hash,
+          current_script_hash}`` plus ``edge_id`` for registry edges --
+          sorted by origin (registry, provenance, fingerprint), then
+          locator.
+        - ``run``: ``None`` when no run is linked, else ``{run_id, found,
+          phase, manifest_hash, command, inputs}``.
+        - ``complete``: True only when ``sources`` is non-empty and
+          ``unresolved`` is empty (fail closed).
+        - ``unresolved``: one dict per gap: an unresolved source, an
+          ambiguous or unknown artifact, a missing run manifest, an
+          unreadable store, or no lineage recorded at all.
+    """
+    from . import annotate, artifact_registry, fingerprint
+    from . import run_manifest as run_manifest_mod
+    from .path_security import _require_within, resolve_reference
+
+    if not outputs_dir or not str(outputs_dir).strip():
+        return {"error": "outputs_dir is required"}
+    if not os.path.isdir(outputs_dir):
+        return {"error": "outputs_dir does not exist"}
+    if isinstance(depth, bool) or not isinstance(depth, int) or depth != 1:
+        return {
+            "error": "depth must be 1: deeper lineage is reserved and not implemented",
+        }
+    has_path = bool(path and str(path).strip())
+    has_id = bool(artifact_id and str(artifact_id).strip())
+    if not has_path and not has_id:
+        return {"error": "path or artifact_id is required"}
+
+    target_real: str | None = None
+    if has_path:
+        try:
+            target_real = _require_within(outputs_dir, str(path))
+        except ValueError as exc:
+            return {"error": str(exc)}
+
+    unresolved: list[dict[str, Any]] = []
+
+    # -- 1. the output and its registry artifact -----------------------------
+    artifact: dict[str, Any] | None = None
+    artifact_evidence: str | None = None
+    try:
+        if has_id:
+            artifact = artifact_registry.get_artifact(outputs_dir, str(artifact_id))
+            if artifact is None:
+                unresolved.append({
+                    "kind": "artifact", "artifact_id": artifact_id,
+                    "reason": "artifact_not_registered",
+                })
+            else:
+                artifact_evidence = "artifact_id"
+        elif target_real is not None:
+            hit = artifact_registry.resolve_artifact(outputs_dir, canonical_path=target_real)
+            if hit["status"] == artifact_registry.RESOLVED:
+                artifact = hit["record"]
+                artifact_evidence = hit["evidence"]
+            elif hit["status"] == artifact_registry.AMBIGUOUS:
+                unresolved.append({
+                    "kind": "artifact", "reason": "artifact_ambiguous",
+                    "candidates": list(hit["candidates"]),
+                })
+    except Exception as exc:  # noqa: BLE001 -- store failure is a gap, not a crash
+        unresolved.append({
+            "kind": "store", "store": LINEAGE_ORIGIN_REGISTRY,
+            "reason": "store_unreadable", "error_type": type(exc).__name__,
+        })
+
+    if target_real is None and artifact is not None:
+        sightings = sorted(
+            artifact.get("local_paths") or [],
+            key=lambda e: e.get("last_seen") or "", reverse=True,
+        )
+        for sighting in sightings:
+            candidate = sighting.get("local_only_path")
+            if not isinstance(candidate, str) or not candidate.strip():
+                continue
+            try:
+                target_real = _require_within(outputs_dir, candidate)
+                break
+            except ValueError:
+                continue
+        if target_real is None:
+            unresolved.append({
+                "kind": "output", "artifact_id": artifact.get("artifact_id"),
+                "reason": "output_path_unknown",
+            })
+
+    provenance_record: dict[str, Any] | None = None
+    fingerprint_entry: dict[str, Any] | None = None
+    status_summary: dict[str, Any] | None = None
+    if target_real is not None:
+        try:
+            provenance_record = annotate.get_provenance(outputs_dir, target_real)
+        except Exception as exc:  # noqa: BLE001
+            unresolved.append({
+                "kind": "store", "store": LINEAGE_ORIGIN_PROVENANCE,
+                "reason": "store_unreadable", "error_type": type(exc).__name__,
+            })
+        try:
+            ledger = fingerprint._read_ledger(outputs_dir)
+            for key in sorted(ledger):
+                entry = ledger[key]
+                if isinstance(entry, dict) and _same_output(
+                    outputs_dir, entry.get("path") or key, target_real,
+                ):
+                    fingerprint_entry = dict(entry)
+                    break
+        except Exception as exc:  # noqa: BLE001
+            unresolved.append({
+                "kind": "store", "store": LINEAGE_ORIGIN_FINGERPRINT,
+                "reason": "store_unreadable", "error_type": type(exc).__name__,
+            })
+        try:
+            status_row = provenance_status.get_provenance_status(outputs_dir, target_real)
+            staleness = status_row.get("staleness") or {}
+            # Summary fields only: the full row repeats the record and its
+            # free-text reasons can embed absolute paths (RELOCATED branch).
+            status_summary = {
+                "provenance_type": status_row.get("provenance_type"),
+                "stale": staleness.get("stale"),
+                "inconclusive": status_row.get("inconclusive"),
+            }
+        except Exception as exc:  # noqa: BLE001 -- output status is advisory
+            status_summary = {"error": type(exc).__name__}
+
+    # -- 2/3/4. sources from every store, never merged across origins -------
+    sources: list[dict[str, Any]] = []
+    if artifact is not None:
+        try:
+            edges = artifact_registry.get_artifact_sources(outputs_dir, artifact["artifact_id"])
+        except Exception as exc:  # noqa: BLE001
+            edges = []
+            unresolved.append({
+                "kind": "store", "store": LINEAGE_ORIGIN_REGISTRY,
+                "reason": "store_unreadable", "error_type": type(exc).__name__,
+            })
+        for edge in edges:
+            locator = _portable_locator(outputs_dir, edge.get("source_locator"))
+            if not locator:
+                continue
+            sources.append(_resolve_lineage_source(
+                outputs_dir, origin=LINEAGE_ORIGIN_REGISTRY, locator=locator,
+                relation=str(edge.get("relation") or "produced_by"),
+                edge_id=edge.get("edge_id"),
+            ))
+
+    if provenance_record is not None:
+        locator = _portable_locator(outputs_dir, provenance_record.get("generating_script"))
+        if locator:
+            entry = _resolve_lineage_source(
+                outputs_dir, origin=LINEAGE_ORIGIN_PROVENANCE, locator=locator,
+                relation="generating_script",
+            )
+            recorded = provenance_record.get("script_content_hash")
+            if recorded is not None:
+                # Resolve the script exactly as record_provenance did when it
+                # captured the hash, so the comparison is like for like.
+                script_file = fingerprint._resolve_script_path(
+                    provenance_record["generating_script"], search_root=outputs_dir,
+                )
+                current = fingerprint.script_content_hash(script_file) if script_file else None
+                _set_script_staleness(entry, recorded, current, script_known=True)
+            else:
+                entry["stale_reason"] = (
+                    "no script hash was recorded, so staleness cannot be confirmed"
+                )
+            sources.append(entry)
+
+    if fingerprint_entry is not None:
+        script_ref = fingerprint_entry.get("script_path")
+        locator = (
+            _portable_locator(outputs_dir, fingerprint_entry.get("generating_script"))
+            or _portable_locator(outputs_dir, script_ref)
+        )
+        if locator:
+            hint = _portable_locator(outputs_dir, script_ref)
+            entry = _resolve_lineage_source(
+                outputs_dir, origin=LINEAGE_ORIGIN_FINGERPRINT, locator=locator,
+                relation="generating_script", location_hint=hint,
+            )
+            recorded = (
+                fingerprint._digest_hex(fingerprint_entry.get("content_digest"))
+                or fingerprint_entry.get("script_hash")
+            )
+            current = (
+                fingerprint.script_content_hash(resolve_reference(outputs_dir, script_ref))
+                if isinstance(script_ref, str) and script_ref else None
+            )
+            _set_script_staleness(
+                entry, recorded, current,
+                script_known=isinstance(script_ref, str) and bool(script_ref),
+            )
+            sources.append(entry)
+
+    sources.sort(key=lambda s: (
+        _LINEAGE_ORIGIN_RANK.get(s["origin"], 99), s["locator"], s["relation"],
+        s.get("edge_id") or "",
+    ))
+    for src in sources:
+        if not src["resolved"]:
+            gap = {
+                "kind": "source", "origin": src["origin"], "locator": src["locator"],
+                "reason": src["status"],
+            }
+            if "store_error" in src:
+                gap["error_type"] = src["store_error"]
+            unresolved.append(gap)
+
+    # -- 5. run-scoped inputs ------------------------------------------------
+    run: dict[str, Any] | None = None
+    run_id = artifact.get("run_id") if artifact is not None else None
+    if isinstance(run_id, str) and run_id.strip():
+        try:
+            manifest = run_manifest_mod.get_run_manifest(outputs_dir, run_id)
+        except Exception as exc:  # noqa: BLE001
+            manifest = None
+            unresolved.append({
+                "kind": "store", "store": "run_manifest",
+                "reason": "store_unreadable", "error_type": type(exc).__name__,
+            })
+        if manifest is None:
+            run = {"run_id": run_id, "found": False, "phase": None,
+                   "manifest_hash": None, "command": None, "inputs": []}
+            unresolved.append({"kind": "run", "run_id": run_id, "reason": "run_manifest_not_found"})
+        else:
+            file_hashes = (manifest.get("input_identity") or {}).get("file_hashes") or {}
+            inputs = [
+                {
+                    "locator": _portable_locator(outputs_dir, raw) or "",
+                    "sha256": digest,
+                    "scope": "run",
+                    "origin": "run_manifest",
+                }
+                for raw, digest in file_hashes.items()
+            ]
+            inputs.sort(key=lambda item: item["locator"])
+            run = {
+                "run_id": run_id,
+                "found": True,
+                "phase": manifest.get("phase"),
+                "manifest_hash": manifest.get("manifest_hash"),
+                "command": (manifest.get("command_identity") or {}).get("tool_name"),
+                "inputs": inputs,
+            }
+
+    if not sources:
+        unresolved.append({"kind": "output", "reason": "no_source_recorded"})
+
+    output = {
+        "path": _relative_output(outputs_dir, target_real) if target_real else None,
+        "artifact_id": artifact.get("artifact_id") if artifact is not None else (
+            artifact_id if has_id else None
+        ),
+        "artifact_evidence": artifact_evidence,
+        "artifact": _portable_artifact(outputs_dir, artifact),
+        "provenance_record": _portable_provenance_record(outputs_dir, provenance_record),
+        "fingerprint": _portable_fingerprint_entry(outputs_dir, fingerprint_entry),
+        "provenance_status": status_summary,
+    }
+    return {
+        "output": output,
+        "sources": sources,
+        "run": run,
+        "complete": bool(sources) and not unresolved,
+        "unresolved": unresolved,
+    }
