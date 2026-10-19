@@ -56,9 +56,11 @@ function createApp(deps) {
   var admission = { host: deps.host, token: deps.token };
   var apiError = v.apiError;
   var invalid = v.invalid;
+  var grants = deps.grants;
 
   if (!tracker) throw new Error('createApp needs deps.tracker');
   if (!Array.isArray(tracker.created)) tracker.created = [];
+  if (!grants) throw new Error('createApp needs deps.grants');
 
   var routes = [
     compileRoute('GET', '/v1/status', false, false, function () {
@@ -128,7 +130,20 @@ function createApp(deps) {
     compileRoute('POST', '/v1/batch', true, false, function (params, body) {
       return runBatch(body);
     }),
+    // Grant routes take the token only. They are not writes, so they need no write grant. See lib/api/grants.js.
+    compileRoute('POST', '/v1/grants', false, false, function (params, body) {
+      return grants.request(body);
+    }, 202),
+    compileRoute('GET', '/v1/grants/:id', false, false, function (params) {
+      return grants.status(params.id);
+    }),
+    compileRoute('DELETE', '/v1/grants/:id', false, false, function (params) {
+      return grants.revoke(params.id);
+    }),
   ];
+
+  // The header that carries a write grant key. Header names arrive in lower case.
+  var GRANT_HEADER = 'meridian-write-grant';
 
   // Writes run one at a time. A failed task does not block the queue behind it.
   var chain = Promise.resolve();
@@ -316,6 +331,17 @@ function createApp(deps) {
         });
       }
       return respond({ status: 404, body: errorBody('not_found', 'No such route.') });
+    }
+    // A write needs a grant key from a person's approval at the desktop. The token alone is not enough.
+    if (match.route.write && !grants.checkKey(request.headers[GRANT_HEADER])) {
+      return respond({
+        status: 403,
+        body: errorBody(
+          'grant_required',
+          'Writes need a grant from the desktop. POST /v1/grants with an app_name, then send the grant key in the ' +
+            'Meridian-Write-Grant header once the desktop answers.'
+        ),
+      });
     }
     var outcome;
     try {

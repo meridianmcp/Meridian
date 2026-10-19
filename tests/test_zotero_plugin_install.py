@@ -24,6 +24,15 @@ import pytest
 from meridian import zotero_bridge_api as bridge
 from meridian import zotero_plugin_install as zpi
 
+
+@pytest.fixture(autouse=True)
+def _no_real_icacls(monkeypatch):
+    """The install restricts the token file with icacls, a real process call the test harness blocks. Stub it here.
+
+    tests/test_zotero_bridge_token_acl.py covers the restriction itself, with the command mocked and on Windows for real.
+    """
+    monkeypatch.setattr(bridge, "_restrict_to_owner", lambda target: None)
+
 XPI_NAME = "meridian-zotero@usemeridian.us.xpi"
 ENV_AUTOINSTALL = "MERIDIAN_ZOTERO_PLUGIN_AUTOINSTALL"
 ENV_DATA_DIR = "MERIDIAN_ZOTERO_DATA_DIR"

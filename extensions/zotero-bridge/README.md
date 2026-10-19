@@ -22,7 +22,15 @@ the old placeholder `update_url`, so it does not auto-update from GitHub), `0.1.
   passed 52 live checks: admission (token, Host, Origin), item, note, attachment, relation, collection, tag, batch
   and BibTeX routes, and error responses. A missing token file left the API off while Zotero ran normally.
   Those checks ran before the limit, collection, restore, linked-file, batch rollback, BibTeX key and creator-role
-  changes listed below, so those changes are not live-checked yet.
+  changes listed below, so those changes are not live-checked yet. They also predate write grants, so writes in those
+  checks would now need a grant key.
+- **Write grants, verified live on 2026-10-19 in a throwaway Zotero 10.0.6 profile.** A write without a grant key was
+  refused with `grant_required`. The desktop prompt showed the app name and the self-reported warning. Allow for 1 hour
+  gave a grant that expired about an hour later, and Allow until Zotero restarts gave one that expired about eight
+  hours later. Deny, Escape and Enter all refused. A refused app name was turned away with `grant_cooldown` when it asked
+  again at once. The key came back once. A
+  write with the key succeeded, one without it was refused, and a revoked key was refused. The live run found one
+  defect, which is fixed: Escape came back as the second button and granted a session, so Deny is now that button.
 - **Linking, verified live on the real Windows resolver.** On 2026-10-17, in a throwaway Zotero 10.0.6 profile with
   the local API on, the link policy gave the expected result for 13 of 13 cases: a plain allowed file, a trailing dot
   on a folder and an 8.3 alias of the allowed folder (all stored at the real path), an allowed folder written with
@@ -50,10 +58,12 @@ Zotero's own restore does. That restore is API-only.
 - A write comes from one of two places: a menu command you choose inside Zotero, or the local write API.
 - The write API listens on `127.0.0.1` only. It answers only a `Host` header of `127.0.0.1:<port>`. It refuses any
   request with an `Origin` header, so a browser page cannot drive it. It needs `Authorization: Bearer <token>`,
-  compared in constant time.
-- **Local trust.** The API trusts every local process that holds the token, and it cannot tell them apart. They share
-  one connection limit of eight. A connection that sends no complete request is closed after ten seconds, so one
-  process can hold a slot for up to ten seconds that way. After an answer, the socket stays open for up to five more
+  compared in constant time. A write also needs a grant key that a person approved at the desktop (see Write grants).
+- **Local trust.** The token admits a request, but it does not grant a write. A write needs a grant that a person
+  approves at the desktop. The API cannot tell that person from another process of the same user, so the desktop
+  prompt is the protection, and it shows the app name as self-reported. The processes share one connection limit of
+  eight. A connection that sends no complete request is closed after ten seconds, so one process can hold a slot for
+  up to ten seconds that way. After an answer, the socket stays open for up to five more
   seconds. This affects local availability only: a local process can keep other callers from connecting.
 - The plugin makes no outbound network calls. There is no file watcher and no timer that picks up outside files.
 - Only `api/listener.js` opens a socket, starts a timer, or names the loopback address. Everything else is pure
@@ -83,6 +93,7 @@ Every request needs these headers:
 
 - `Host: 127.0.0.1:23125`
 - `Authorization: Bearer <token>`
+- `Meridian-Write-Grant: <write_key>`, for any write. Reads and grant requests do not need it. See Write grants.
 - `Content-Type: application/json`, for any request with a body. The body is one JSON object, at most 40 MiB.
 
 Every response is JSON. Errors have the shape `{"error": {"code": "...", "message": "...", "details": {...}}}`.
@@ -90,10 +101,42 @@ Each connection carries one request, and the server closes it after the answer.
 
 ```bash
 TOKEN=$(cat "$HOME/.meridian/local_runner/zotero_bridge/api_token")
-curl -s -X POST http://127.0.0.1:23125/v1/items \
+# 1. Ask for a grant. A person at the desktop answers the prompt.
+curl -s -X POST http://127.0.0.1:23125/v1/grants \
   -H "Host: 127.0.0.1:23125" -H "Authorization: Bearer $TOKEN" -H "Content-Type: application/json" \
+  -d '{"app_name": "My script"}'
+# 2. Poll the grant until its status is granted. The write_key comes back once: keep it.
+curl -s http://127.0.0.1:23125/v1/grants/<grant_id> \
+  -H "Host: 127.0.0.1:23125" -H "Authorization: Bearer $TOKEN"
+# 3. Write with the grant key.
+curl -s -X POST http://127.0.0.1:23125/v1/items \
+  -H "Host: 127.0.0.1:23125" -H "Authorization: Bearer $TOKEN" -H "Meridian-Write-Grant: <write_key>" \
+  -H "Content-Type: application/json" \
   -d '{"item_type": "book", "fields": {"title": "A title"}, "tags": ["reading"]}'
 ```
+
+### Write grants
+
+A write needs a grant key, and a person at the desktop has to approve the grant. A process that holds only the token
+cannot write on its own.
+
+- `POST /v1/grants` with `{"app_name": "..."}` asks for a grant. The answer is `202` and a `grant_id`. Zotero shows a
+  prompt that names the app. Its buttons are **Allow for 1 hour**, **Allow until Zotero restarts** and **Deny**. Deny is
+  the default, so Enter and Escape both refuse.
+- `GET /v1/grants/<grant_id>` reports `pending`, `granted`, `denied`, `expired` or `revoked`. When a grant is first seen
+  as granted, the reply carries `write_key` once. A later request does not return it again.
+- Send the key as `Meridian-Write-Grant: <write_key>` on every write. A write without a live key is refused with
+  `403 grant_required`. The batch route is a write, so each operation in a batch needs the same key.
+- `DELETE /v1/grants/<grant_id>` ends a grant at once.
+- An hour grant ends after one hour. A session grant ends when Zotero restarts, or after eight hours at most. Nothing is
+  written to disk, so a restart clears every grant.
+- Limits: one request can wait for an answer at a time (a second is refused with `grant_busy`). An app name that was
+  refused waits five minutes before it can ask again (`grant_cooldown`). Six requests in ten minutes is the most
+  (`grant_rate_limited`). If Zotero cannot show the prompt, the request is refused. An error never grants anything.
+- The app name is what the requester says it is, and the prompt says so.
+- **What this does not stop.** A grant key goes back to whichever process asked, so approving a request also gives that
+  process its key. The prompt cannot tell the desktop app from another process of the same user, and it cannot see
+  which process asked. Read the app name, and approve only a request you made yourself.
 
 Reads: use Zotero's own local API (`http://127.0.0.1:23119/api/users/0/...`), which Zotero serves when
 "Allow other applications on this computer to communicate with Zotero" is on. The write API does not serve reads.
@@ -124,7 +167,10 @@ Collection responses have the same fields except `date_modified`, because Zotero
 | `DELETE /v1/collections/{key}/items` | `item_keys` | Removes items from the collection. The items stay in the library. |
 | `POST /v1/tags/rename` | `from`, `to` | Renames a tag across the user library. Not allowed inside a batch. |
 | `POST /v1/import/bibtex` | `bibtex`, optional `collection_key`, optional `dry_run` | Returns the plan: what would import, the exact duplicates, and the conflicts. `dry_run: true` writes nothing. A file whose library changes during the parse is refused with 409 `library_changed`, and nothing is imported. Not allowed inside a batch. |
-| `POST /v1/batch` | `operations`: a list of `{method, path, body}` | Runs the operations in one transaction. Any failure rolls the whole batch back and reports `failed_index`. |
+| `POST /v1/batch` | `operations`: a list of `{method, path, body}` | Runs the operations in one transaction. Any failure rolls the whole batch back and reports `failed_index`. Needs a write grant key. |
+| `POST /v1/grants` | `app_name` | Asks a person at the desktop for a write grant. Answers 202 with a `grant_id`. The token is enough here. |
+| `GET /v1/grants/{id}` | none | Reports the grant's status. Returns `write_key` once, when the grant is first granted. The token is enough here. |
+| `DELETE /v1/grants/{id}` | none | Ends the grant at once. The token is enough here. |
 
 Relation objects are the ones Zotero stores. `related_key` links two items in the library. Any other predicate
 needs the `predicate:name` form (for example `dc:replaces`) and an `object` with no spaces.

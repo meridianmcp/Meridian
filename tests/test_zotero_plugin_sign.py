@@ -22,7 +22,14 @@ from pathlib import Path
 
 import pytest
 
+from meridian import zotero_bridge_api as bridge
 from meridian import zotero_plugin_install as zpi
+
+
+@pytest.fixture(autouse=True)
+def _no_real_icacls(monkeypatch):
+    """The install restricts the bridge token file with icacls, a real process call the test harness blocks. Stub it here."""
+    monkeypatch.setattr(bridge, "_restrict_to_owner", lambda target: None)
 from meridian import zotero_plugin_sign as sign
 
 REPO_ROOT = Path(zpi.__file__).resolve().parent.parent

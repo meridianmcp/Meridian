@@ -32,6 +32,7 @@ var MERIDIAN_API_MODULES = [
   'api/http',
   'api/auth',
   'api/validate',
+  'api/grants',
   'api/link_policy',
   'api/items',
   'api/collections',
@@ -523,8 +524,17 @@ async function meridianStartApi() {
   var validate = meridianLib['api/validate'];
   // One tracker serves both write factories and the app, so a rolled-back batch sees every object it touched.
   var tracker = { inBatch: false, touched: [], created: [] };
+  // Write grants: a person approves each app at the desktop. The token alone never writes. See lib/api/grants.js.
+  var grants = meridianLib['api/grants'].createGrants({
+    validate: validate,
+    now: Date.now,
+    randomHex: meridianRandomHex,
+    ask: meridianAskWriteGrant,
+    constantTimeEquals: meridianLib['api/auth'].constantTimeEquals,
+  });
   var app = meridianLib['api/app'].createApp({
     zotero: Zotero,
+    grants: grants,
     version: meridianVersion,
     host: listenerModule.LOOPBACK_HOST + ':' + port,
     token: token,
@@ -576,6 +586,49 @@ function meridianWriteDeps(validate, tracker) {
       return Zotero.getTempDirectory().path;
     },
   };
+}
+
+// The desktop prompt for a write grant. Deny is the default, so Enter and Escape both refuse. The app name is
+// self-reported, and the dialog says so. The request is answered after a short delay, so the HTTP response to the
+// request that asked is sent before the dialog opens.
+function meridianAskWriteGrant(appName) {
+  return Zotero.Promise.delay(50).then(function () {
+    var index = Zotero.Prompt.confirm({
+      title: 'Meridian Zotero Bridge: write access',
+      text:
+        'An app asks to write to your Zotero library:\n\n"' + appName + '"\n\n' +
+        'The app name is what the app says it is. Allow only if you started this request yourself. ' +
+        'A session grant ends when Zotero restarts, or after 8 hours.',
+      // Deny is the second button, because Escape comes back as that button's index. Only the two allow buttons
+      // grant anything, and every other answer, Escape included, refuses.
+      button0: 'Allow for 1 hour',
+      button1: 'Deny',
+      button2: 'Allow until Zotero restarts',
+      defaultButton: 1,
+    });
+    if (index === 0) return 'hour';
+    if (index === 2) return 'session';
+    return 'deny';
+  });
+}
+
+// Random hex from a secure source. Zotero's own keys come from Math.random, which is not enough for a credential,
+// so this uses the platform's generator and fails rather than fall back to a weaker one.
+function meridianRandomHex(bytes) {
+  var buffer = new Uint8Array(bytes);
+  if (typeof crypto !== 'undefined' && crypto && typeof crypto.getRandomValues === 'function') {
+    crypto.getRandomValues(buffer);
+  } else {
+    var generator = Components.classes['@mozilla.org/security/random-generator;1'].createInstance(
+      Components.interfaces.nsIRandomGenerator
+    );
+    buffer = generator.generateRandomBytes(bytes);
+  }
+  return Array.prototype.map
+    .call(buffer, function (b) {
+      return ('0' + b.toString(16)).slice(-2);
+    })
+    .join('');
 }
 
 // The link policy for the write API and the F2 menu. See lib/api/link_policy.js for the rules it applies.

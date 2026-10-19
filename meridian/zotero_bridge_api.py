@@ -10,10 +10,13 @@ not manage comes back byte for byte, whatever its encoding, and a CRLF file stay
 
 from __future__ import annotations
 
+import getpass
 import json
 import os
 import re
 import secrets
+import subprocess
+import sys
 from pathlib import Path
 
 from meridian.local_runner import default_state_dir
@@ -78,18 +81,41 @@ def token_is_usable(path: "Path | str") -> bool:
         return False
 
 
+def _restrict_to_owner(target: Path) -> None:
+    """On Windows, leave the token readable by its owner only.
+
+    The inherited ACL otherwise gives other accounts read access, sandbox groups among them. POSIX already has 0600.
+    This is the same owner-only grant that scripts/install_tunnel.ps1 applies to Meridian's own tunnel files. Failure
+    raises, so an install never reports success over a file other accounts can read.
+    """
+    if sys.platform != "win32":
+        return
+    user = getpass.getuser()
+    result = subprocess.run(
+        ["icacls", str(target), "/inheritance:r", "/grant:r", f"{user}:F"],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    if result.returncode != 0:
+        detail = (result.stderr or result.stdout or "").strip()
+        raise OSError(f"Could not restrict the bridge token file to {user}: {detail}")
+
+
 def ensure_api_token(path: "Path | str") -> str:
     """Create the token file unless it already holds a usable token, which is kept as it is.
 
     Returns ``created`` or ``kept``. An unusable file, including one that does not decode, is replaced. The token
-    value is never returned.
+    value is never returned. On Windows the file is restricted to its owner on every call, so a rerun repairs the ACL.
     """
     target = Path(path)
     if token_is_usable(target):
+        _restrict_to_owner(target)
         return TOKEN_KEPT
     token = TOKEN_PREFIX + secrets.token_urlsafe(32)
     target.parent.mkdir(parents=True, exist_ok=True)
     _write_private(target, (token + "\n").encode("ascii"))
+    _restrict_to_owner(target)
     return TOKEN_CREATED
 
 

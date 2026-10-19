@@ -13,6 +13,28 @@ const { createFakeZotero, createFakeIO } = require('./support/fake-zotero.js');
 const HOST = '127.0.0.1:23125';
 const TOKEN = 'T'.repeat(40);
 
+// Stands in for lib/api/grants.js. The real store is tested in grants.test.js. These tests need a key that works,
+// and they need to see which grant calls reached the store.
+function fakeGrants() {
+  const calls = [];
+  return {
+    calls,
+    request: (body) => {
+      calls.push(['request', body]);
+      return { grant_id: '0'.repeat(32), status: 'pending' };
+    },
+    status: (id) => {
+      calls.push(['status', id]);
+      return { grant_id: id, status: 'pending' };
+    },
+    revoke: (id) => {
+      calls.push(['revoke', id]);
+      return { grant_id: id, status: 'revoked' };
+    },
+    checkKey: (key) => key === WRITE_KEY,
+  };
+}
+
 function build(overrides) {
   const zotero = createFakeZotero();
   const io = createFakeIO();
@@ -42,11 +64,15 @@ function build(overrides) {
       return { dry_run: request.dryRun, would_import: [] };
     },
     log: (error) => errors.push(error),
+    grants: fakeGrants(),
     ...overrides,
   };
   const app = createApp(deps);
   return { app, zotero, errors, importCalls, io, tracker };
 }
+
+// The key a granted desktop approval would hand out. The fake grants store accepts only this key.
+const WRITE_KEY = 'w'.repeat(64);
 
 function request(method, target, options = {}) {
   const headers = {
@@ -54,6 +80,10 @@ function request(method, target, options = {}) {
     authorization: 'Bearer ' + TOKEN,
     ...options.headers,
   };
+  // A write carries a grant key unless a test asks for none. Reads never need one.
+  if (!options.noGrant && method !== 'GET' && !('meridian-write-grant' in headers)) {
+    headers['meridian-write-grant'] = WRITE_KEY;
+  }
   if (options.noAuth) delete headers.authorization;
   const body = options.json !== undefined ? http.utf8Encode(JSON.stringify(options.json)) : options.raw || new Uint8Array(0);
   if (options.json !== undefined && !('content-type' in headers)) {
@@ -314,5 +344,57 @@ test('createApp refuses to start without the shared tracker', () => {
   assert.throws(
     () => createApp({ zotero, validate: v, http, auth, host: HOST, token: TOKEN, items: {}, collections: {} }),
     /needs deps\.tracker/
+  );
+});
+
+test('a write without a grant key is refused with grant_required, even with the right token', async () => {
+  const { app } = build();
+  const out = await call(app, 'POST', '/v1/items', { json: { item_type: 'book', fields: { title: 'x' } }, noGrant: true });
+  assert.equal(out.status, 403);
+  assert.equal(out.body.error.code, 'grant_required');
+});
+
+test('a wrong grant key is refused the same way, so the token alone is never a grant', async () => {
+  const { app } = build();
+  const out = await call(app, 'PATCH', '/v1/items/AAAAAAAA', {
+    json: { fields: {} },
+    headers: { 'meridian-write-grant': 'x'.repeat(64) },
+  });
+  assert.equal(out.status, 403);
+  assert.equal(out.body.error.code, 'grant_required');
+});
+
+test('the batch route is a write, so one grant check covers every operation in it', async () => {
+  const { app } = build();
+  const out = await call(app, 'POST', '/v1/batch', { json: { operations: [] }, noGrant: true });
+  assert.equal(out.body.error.code, 'grant_required');
+});
+
+test('the grant routes need the token but no grant key, and pass their body and ids to the store', async () => {
+  const grants = fakeGrants();
+  const { app } = build({ grants });
+  const asked = await call(app, 'POST', '/v1/grants', { json: { app_name: 'Claude Code' }, noGrant: true });
+  assert.equal(asked.status, 202);
+  assert.equal(asked.body.status, 'pending');
+  const status = await call(app, 'GET', '/v1/grants/' + '0'.repeat(32), { noGrant: true });
+  assert.equal(status.status, 200);
+  const revoked = await call(app, 'DELETE', '/v1/grants/' + '0'.repeat(32), { noGrant: true });
+  assert.equal(revoked.status, 200);
+  assert.deepEqual(grants.calls.map((call) => call[0]), ['request', 'status', 'revoke']);
+  assert.deepEqual(grants.calls[0][1], { app_name: 'Claude Code' });
+});
+
+test('the grant routes still need the token', async () => {
+  const { app } = build();
+  const out = await call(app, 'POST', '/v1/grants', { json: { app_name: 'x' }, noAuth: true, noGrant: true });
+  assert.equal(out.status, 401);
+});
+
+test('createApp refuses to start without the grant store', () => {
+  const zotero = createFakeZotero();
+  const tracker = { inBatch: false, touched: [], created: [] };
+  assert.throws(
+    () => createApp({ zotero, validate: v, http, auth, host: HOST, token: TOKEN, items: {}, collections: {}, tracker }),
+    /needs deps\.grants/
   );
 });
