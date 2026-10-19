@@ -44,6 +44,10 @@ __version__ = "0.1.0"
 # reach it must come after that name exists.
 from .provenance import trace_forward_outputs
 
+# Gap set C -- one-file checksummed backup/export of the Outputs ledgers.
+# Also after __version__: bundle imports run_manifest.
+from .bundle import export_bundle, import_bundle, verify_bundle
+
 __all__ = [
     "ScriptTaggedFingerprint",
     "StalenessResult",
@@ -63,4 +67,7 @@ __all__ = [
     "invalidate_variant",
     "put_cached_variant",
     "trace_forward_outputs",
+    "export_bundle",
+    "verify_bundle",
+    "import_bundle",
 ]

@@ -1764,6 +1764,105 @@ def get_run_manifest_envelope(outputs_dir: str, run_id: str) -> dict[str, Any]:
     return research_evidence.envelope_to_dict(envelope)
 
 
+# Gap set C, "backup-export". ``bundle`` is imported inside each tool rather
+# than in the module-level import block above, so this addition does not
+# touch lines other in-flight changes to this file also edit.
+
+
+@mcp.tool()
+def export_outputs_bundle(
+    outputs_dir: str,
+    bundle_path: str = ".meridian-outputs-cache/bundles/meridian-outputs-bundle.json",
+) -> dict[str, Any]:
+    """Back up every Outputs ledger (provenance, fingerprint, run manifest,
+    artifact registry) plus index metadata to ONE checksummed JSON file
+    (gap set C).
+
+    Each member carries a sha256 over its canonical JSON; ``bundle_digest``
+    covers every member digest bound to its name. The file is written via a
+    temp file and an atomic replace. ``index.duckdb`` is NOT included (it is
+    rebuildable). Registry ``local_only_path`` values are stripped (set to
+    null). A ledger that exists but is empty or not valid JSON refuses the
+    export instead of being backed up as empty.
+
+    Args:
+      outputs_dir:  Absolute path to the outputs directory.
+      bundle_path:  Where to write, inside ``outputs_dir`` (relative paths
+                    are relative to it). Defaults to a file under
+                    ``.meridian-outputs-cache/bundles/``, which the index
+                    walk skips. May not name a live ledger or index file.
+
+    Returns:
+      ``{"exported": True, "bundle_path", "bundle_digest", "members",
+      "local_only_paths_stripped"}`` or ``{"exported": False, "error"}``.
+    """
+    from . import bundle
+
+    return bundle.export_bundle(outputs_dir, bundle_path)
+
+
+@mcp.tool()
+def verify_outputs_bundle(outputs_dir: str, bundle_path: str) -> dict[str, Any]:
+    """Recompute every checksum in an Outputs bundle and report what does
+    not match (gap set C). Read-only.
+
+    Checksums detect corruption and accidental edits, not deliberate
+    tampering by someone able to recompute them.
+
+    Args:
+      outputs_dir:  Absolute path to the outputs directory.
+      bundle_path:  The bundle file, inside ``outputs_dir``.
+
+    Returns:
+      ``{"verified", "format", "schema_version", "bundle_digest",
+      "bundle_digest_ok", "members", "mismatches", "missing", "unexpected",
+      "malformed", "errors"}``. ``verified`` is True only when everything
+      checks out.
+    """
+    from . import bundle
+
+    return bundle.verify_bundle(bundle_path, outputs_dir=outputs_dir)
+
+
+@mcp.tool()
+def import_outputs_bundle(
+    outputs_dir: str,
+    bundle_path: str,
+    dry_run: bool = True,
+    overwrite: bool = False,
+    accept_hash_algo_mismatch: bool = False,
+) -> dict[str, Any]:
+    """Verify an Outputs bundle and merge its ledgers into ``outputs_dir``
+    (gap set C). Dry run by default: pass ``dry_run=False`` to write.
+
+    Fail-closed: refuses (writing nothing) if verification fails, if the
+    bundle's hash-algorithm versions differ from this install's (unless
+    ``accept_hash_algo_mismatch=True``, which flags it), if a target ledger
+    exists but is unreadable, or if any key conflicts with a different
+    existing entry (unless ``overwrite=True``). Keys only in the target are
+    always kept; on overwrite a registry artifact keeps the target's own
+    local path sightings.
+
+    Args:
+      outputs_dir:                Absolute path to the outputs directory.
+      bundle_path:                The bundle file, inside ``outputs_dir``.
+      dry_run:                    Plan only (default True).
+      overwrite:                  Replace conflicting entries.
+      accept_hash_algo_mismatch:  Proceed, flagged, across a version
+                                  mismatch.
+
+    Returns:
+      ``{"imported", "dry_run", "refused", "reason", "verification",
+      "hash_algo", "members", "would_write", "written_members"}``.
+    """
+    from . import bundle
+
+    return bundle.import_bundle(
+        bundle_path, outputs_dir, dry_run=dry_run, overwrite=overwrite,
+        accept_hash_algo_mismatch=accept_hash_algo_mismatch,
+    )
+
+
 def main() -> None:
     """Console entry point (``uvx --from <path> meridian-outputs-mcp``)."""
     mcp.run()

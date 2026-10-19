@@ -208,6 +208,26 @@ this package, with no second codec.
 | `list_run_manifests` | List every run-manifest record started under an outputs directory |
 | `get_run_manifest_envelope` | Typed, lossless `RUN`-kind `ProvenanceEnvelope` for one run manifest |
 
+### Ledger backup / export bundle (gap set C)
+
+`meridian_outputs.bundle` writes the four ledgers above (provenance,
+fingerprint, run manifest, artifact registry) plus an `index_meta` record
+to ONE JSON file: `{"format": "meridian-outputs-bundle", "schema_version":
+1, "members": {name: {sha256, size, payload}}, "bundle_digest"}`. Each
+member's sha256 is over its canonical JSON; `bundle_digest` covers every
+member digest bound to its name, so two exports of identical state have the
+same digest. The file is written through a temp file and an atomic replace.
+`index.duckdb` is not included (it is rebuildable), and registry
+`local_only_path` values are stripped. Checksums detect corruption, not
+deliberate tampering. Bundle paths must lie inside `outputs_dir`; the default
+sits under `.meridian-outputs-cache/bundles/`, which the index walk skips.
+
+| Tool | Description |
+|------|-------------|
+| `export_outputs_bundle` | Write every ledger plus index metadata to one checksummed bundle; refuses if a ledger file is empty or not valid JSON rather than backing it up as empty |
+| `verify_outputs_bundle` | Recompute every member digest and the bundle digest; reports `mismatches`, `missing`, `unexpected`, `malformed`, `errors` (read-only) |
+| `import_outputs_bundle` | Verify, then merge a bundle into `outputs_dir`; dry run by default, refuses on any verification failure, hash-algorithm version mismatch (unless accepted), unreadable target ledger, or conflict (unless `overwrite`) |
+
 ### Derived-artifact cache & fast variant rendering (item 19917525)
 
 `meridian_outputs.derived_cache` is a real, persisted, keyed cache from
