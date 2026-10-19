@@ -21,7 +21,7 @@ from meridian.local_runner import default_state_dir
 from meridian.routes import tunnel as tun
 
 PROJECT = "5787cc92-ba7d-4788-b17c-28ab7938b839"
-PROXY_TOKEN = "@modelcontextprotocol/server-filesystem"
+PROXY_TOKEN = tc.FS_SERVER_PACKAGE
 
 
 @pytest.fixture

@@ -260,10 +260,10 @@ def test_invalidate_cached_token_tolerates_missing_config_file(monkeypatch, tmp_
 
 def test_ws_url_builders_include_host_param_when_hostname_available(monkeypatch):
     monkeypatch.setattr(tc, "_local_host_id", lambda: "my-machine")
-    assert "&host=my-machine" in tc._ws_url("https://x", "t", "tok")
-    assert "&host=my-machine" in tc._ws_code_url("https://x", "t", "tok")
-    assert "&host=my-machine" in tc._ws_extract_url("https://x", "t", "tok")
-    assert "&host=my-machine" in tc._ws_office_url("https://x", "t", "tok", "ppt")
+    assert "?host=my-machine" in tc._ws_url("https://x", "t", "tok")
+    assert "?host=my-machine" in tc._ws_code_url("https://x", "t", "tok")
+    assert "?host=my-machine" in tc._ws_extract_url("https://x", "t", "tok")
+    assert "?host=my-machine" in tc._ws_office_url("https://x", "t", "tok", "ppt")
 
 
 def test_ws_url_builders_omit_host_param_when_hostname_unavailable(monkeypatch):

@@ -80,17 +80,17 @@ def test_write_cached_token_recovers_from_malformed_existing(monkeypatch, tmp_pa
 def test_ws_url_passthrough_for_non_http_base():
     # base lacks http:// or https:// → used verbatim as ws_base.
     url = tc._ws_url("wss://already", "t", "tok")
-    assert url.startswith("wss://already/tunnel/t?token=")
+    assert url.startswith("wss://already/tunnel/t")
 
 
 def test_ws_code_url_passthrough_for_non_http_base():
     url = tc._ws_code_url("custom-base", "t", "tok")
-    assert url.startswith("custom-base/tunnel-code/t?token=")
+    assert url.startswith("custom-base/tunnel-code/t")
 
 
 def test_ws_extract_url_passthrough_for_non_http_base():
     url = tc._ws_extract_url("custom-base", "t", "tok")
-    assert url.startswith("custom-base/tunnel-extract/t?token=")
+    assert url.startswith("custom-base/tunnel-extract/t")
 
 
 # ---------------------------------------------------------------------------
@@ -2755,7 +2755,7 @@ def test_run_tunnel_office_slot_child_gets_utf8_stdio_env(monkeypatch, tmp_path)
 
 
 def test_run_tunnel_command_overrides_and_index(monkeypatch, tmp_path):
-    """Custom commands for all three slots + code_dirs auto-index."""
+    """Hosted commands for all three slots are ignored; hosted ports still apply; code_dirs auto-index."""
     procs = _stub_run_tunnel_spawn(monkeypatch)
     plugins = [
         {"slot": "fs", "enabled": True, "command": ["fs-custom"], "port": 9001},
@@ -2781,6 +2781,11 @@ def test_run_tunnel_command_overrides_and_index(monkeypatch, tmp_path):
                      code_dirs=[str(tmp_path)])
     assert rc == 0
     assert len(procs) == 3
+    # The hosted side chose no command: each slot runs its own default.
+    spawned = " ".join(" ".join(p.cmd) for p in procs)
+    assert "fs-custom" not in spawned
+    assert "codegraph" not in spawned
+    assert "ext-custom" not in spawned
     # code-intel index was scheduled for the provided code_dir on its port.
     assert indexed and indexed[0][0] == 9002
 
@@ -3013,14 +3018,17 @@ def test_run_tunnel_legacy_resolved_list_extract_none_falls_back_to_serena_defau
     ), "extract slot must never silently launch the obsolete extractor package"
 
 
-def test_run_tunnel_explicit_legacy_extractor_override_still_honored(monkeypatch, tmp_path):
-    """ada39096 — the flip side of the defaulting fix above: a tenant who
-    EXPLICITLY configures the old mcp-server-code-extractor command for the
-    extract slot must still get it (an explicit choice is never overridden),
-    via the generic custom-command path — not via _resolve_extractor_inner_cmd,
-    which stays uncalled either way now that it is no longer wired into this
-    decision as an implicit fallback."""
+def test_run_tunnel_extract_command_comes_only_from_local_policy(monkeypatch, tmp_path):
+    """ada39096 — the flip side of the defaulting fix above, with the authority moved to this machine.
+
+    A built-in slot's command is never taken from the hosted config. This machine's local policy can name it
+    (``builtin_commands``), and that explicit local choice is honored. The hosted command is ignored, and
+    _resolve_extractor_inner_cmd stays uncalled."""
     procs = _stub_run_tunnel_spawn(monkeypatch, code_binary=None)
+    monkeypatch.setattr(tc, "_load_local_policy", lambda: {
+        "allow_fs_writes": False, "enable_shell_slot": False, "custom_plugins": {},
+        "builtin_commands": {"code-extractor": {"command": ["uvx", "mcp-server-code-extractor"], "env": None}},
+    })
     legacy_extractor_calls = []
     monkeypatch.setattr(
         tc, "_resolve_extractor_inner_cmd",
@@ -3031,7 +3039,7 @@ def test_run_tunnel_explicit_legacy_extractor_override_still_honored(monkeypatch
         AsyncMock(return_value={
             "tenant_id": "t", "plan": "pro",
             "tunnel_plugins_config": {
-                "code-extractor": {"command": ["uvx", "mcp-server-code-extractor"]},
+                "code-extractor": {"command": ["hostile-server-cmd"]},
             },
         }),
     )
@@ -3039,8 +3047,9 @@ def test_run_tunnel_explicit_legacy_extractor_override_still_honored(monkeypatch
 
     rc = _run_tunnel(token="sk_tok", base_url="https://x", repo_path=str(tmp_path))
     assert rc == 0
-    assert len(procs) == 2  # fs + the explicitly-overridden extract proxy
+    assert len(procs) == 2  # fs + the locally-approved extract proxy
     assert any("mcp-server-code-extractor" in p.cmd for p in procs), [p.cmd for p in procs]
+    assert not any("hostile-server-cmd" in p.cmd for p in procs)
     assert not any("serena-agent" in p.cmd for p in procs)
     assert legacy_extractor_calls == []
 
@@ -3142,7 +3151,7 @@ def test_run_tunnel_code_and_extract_popen_raise_are_warned(monkeypatch, tmp_pat
 
     def popen(cmd, *a, **k):
         # fs proxy (server-filesystem) starts; code-intel + extractor blow up.
-        if "@modelcontextprotocol/server-filesystem" in cmd:
+        if tc.FS_SERVER_PACKAGE in cmd:
             return FakeProc()
         raise RuntimeError("proxy spawn failed")
 
@@ -3171,6 +3180,10 @@ def test_run_tunnel_spawns_custom_plugin_locally_and_writes_mcp_json(monkeypatch
     gains a custom:<name> entry) and is written into the local .mcp.json pointing
     at its 127.0.0.1 proxy — never a hosted server route (LOCAL-ONLY)."""
     procs = _stub_run_tunnel_spawn(monkeypatch)
+    monkeypatch.setattr(tc, "_load_local_policy", lambda: {
+        "allow_fs_writes": False, "enable_shell_slot": False, "builtin_commands": {},
+        "custom_plugins": {"fetch": {"command": ["uvx", "mcp-server-fetch"], "env": None}},
+    })
     # Capture every watchdog holder so we can assert the custom slot is covered.
     seen_labels = []
 
@@ -3211,6 +3224,10 @@ def test_run_tunnel_custom_plugin_repo_path_expanded_at_spawn(monkeypatch, tmp_p
     """{repo_path} in a custom plugin command is expanded to the served repo at
     spawn time (resolve_custom_plugins leaves it intact; the client expands it)."""
     procs = _stub_run_tunnel_spawn(monkeypatch)
+    monkeypatch.setattr(tc, "_load_local_policy", lambda: {
+        "allow_fs_writes": False, "enable_shell_slot": False, "builtin_commands": {},
+        "custom_plugins": {"myserena": {"command": ["tool", "--project", "{repo_path}"], "env": None}},
+    })
     monkeypatch.setattr(tc, "_restore_mcp_json", lambda *a, **k: None)
     monkeypatch.setattr(
         tc, "_fetch_me",
@@ -3237,6 +3254,10 @@ def test_run_tunnel_custom_only_keeps_tunnel_alive(monkeypatch, tmp_path):
     """With every built-in slot disabled but one custom plugin enabled, the tunnel
     still serves (the local proxy + mcp.json) — exit 0, not 'nothing to serve'."""
     procs = _stub_run_tunnel_spawn(monkeypatch)
+    monkeypatch.setattr(tc, "_load_local_policy", lambda: {
+        "allow_fs_writes": False, "enable_shell_slot": False, "builtin_commands": {},
+        "custom_plugins": {"fetch": {"command": ["uvx", "mcp-server-fetch"], "env": None}},
+    })
     monkeypatch.setattr(tc, "_restore_mcp_json", lambda *a, **k: None)
     monkeypatch.setattr(
         tc, "_fetch_me",

@@ -24,6 +24,7 @@ from typing import Any
 
 import asyncio
 import base64
+import inspect
 import json
 import os
 import re
@@ -66,6 +67,15 @@ _MAX_BACKOFF = 30.0
 # slow-but-alive relay never trips it, while still bounding genuine dead-peer
 # detection to a reasonable ping_interval + ping_timeout = ~65s worst case.
 _WS_PING_TIMEOUT = 45.0
+
+# Pinned: `npx -y` with no version pulls whatever is latest on every tunnel start. 2.0.0 is the version that
+# `latest` resolved to when this pin was added, so pinning changes nothing today and stops silent upgrades.
+FS_SERVER_PACKAGE = "@modelcontextprotocol/server-filesystem@2.0.0"
+
+# Tools on the filesystem server that change files. The server exposes no read-only switch, so the tunnel client
+# refuses these calls unless this machine's local policy allows writes.
+FS_WRITE_TOOLS = frozenset({"write_file", "edit_file", "create_directory", "move_file"})
+SHELL_SLOT_NAME = "desktop-commander"
 # 0b3ea61a — every websockets.connect() below sets ping_interval/ping_timeout
 # explicitly (676e53a3, above) but never set open_timeout — the CONNECT itself
 # (TCP+TLS+HTTP Upgrade handshake) silently inherited the websockets library's
@@ -2024,9 +2034,8 @@ def _safe_disconnect_reason(exc: BaseException) -> str:
     """Stringify a reconnect-loop exception for a stderr print, with any
     embedded bearer token scrubbed first (ff9d2963).
 
-    The WS tunnel URL still carries the token as a ``?token=`` query param
-    (see the module note above ``_ws_url`` — a genuine ``websockets``
-    header-kwarg-version constraint, not an oversight) and several
+    Tunnel WS URLs no longer carry the token (it is an Authorization header),
+    but a caller can still pass a URL that does, and several
     ``websockets`` exceptions stringify by embedding the URI verbatim — e.g.
     ``websockets.exceptions.InvalidURI.__str__`` returns
     ``f"{self.uri} isn't a valid URI: {self.msg}"``. Printing ``str(exc)``
@@ -2208,10 +2217,12 @@ async def _run_connection_lazy(
                 lifecycle.mark_ready()
             print(f"tunnel:{label}: connected (lazy mode)", flush=True)
 
+    background: set[asyncio.Task] = set()
+    policy = _load_local_policy()
     try:
         async with websockets.connect(
             ws_url, max_size=None, ping_interval=20, ping_timeout=_WS_PING_TIMEOUT,
-            open_timeout=_tunnel_connect_timeout(),
+            open_timeout=_tunnel_connect_timeout(), **_ws_connect_kwargs(ws_url),
         ) as ws:
             if lifecycle is not None:
                 lifecycle.mark_ws_open()
@@ -2262,13 +2273,14 @@ async def _run_connection_lazy(
                             )
                         continue
                     if msg.get("type") == "run_verification":
-                        # run_verification: run THIS machine's pinned command for the project. The server
-                        # sends only the project id, never a command, so it cannot choose what runs here.
-                        req_id = msg.get("id", "")
-                        run_result = await _handle_run_verification(msg.get("project_id") or "")
-                        run_result["type"] = "run_cmd_result"
-                        run_result["id"] = req_id
-                        await ws.send(json.dumps(run_result))
+                        # run_verification runs THIS machine's pinned command for the project. The server sends
+                        # only the project id, never a command. It runs as a background task: awaiting it here
+                        # would stop this loop from reading pings and other requests for up to the run timeout.
+                        answer = asyncio.ensure_future(_answer_run_verification(
+                            ws, msg.get("id", ""), msg.get("project_id") or "",
+                        ))
+                        background.add(answer)
+                        answer.add_done_callback(background.discard)
                         continue
                     if msg.get("type") == "run_cmd":
                         # Remote shell strings are refused. The server no longer sends them; this refuses any that
@@ -2311,6 +2323,12 @@ async def _run_connection_lazy(
                                 # _preflight_slot already reported unhealthy; just
                                 # start the background re-probe.
                                 await _mark_unhealthy(already_reported=True)
+                        if label == "fs" and not policy["allow_fs_writes"]:
+                            denial = _fs_write_denial(msg)
+                            if denial is not None:
+                                print(f"tunnel:{label}: refused a hosted-side write", flush=True)
+                                await ws.send(json.dumps(denial))
+                                continue
                         proxy.touch()
                         resp = await _relay_request(
                             http_client, local_base, msg, tool_prefix=tool_prefix
@@ -2363,6 +2381,9 @@ async def _run_connection_lazy(
                             await _kill_on_request_timeout(proxy)
                         await ws.send(json.dumps(resp))
     finally:
+        # A verification still running when the socket closes has no one left to answer.
+        for _bg in background:
+            _bg.cancel()
         # Stop the background re-probe when the connection closes so it doesn't
         # outlive the WebSocket it reports on (a3410a9c).
         if _reprobe_task is not None:
@@ -4958,21 +4979,16 @@ def _local_host_id() -> str:
 
 
 def _ws_url(base_url: str, tenant_id: str, token: str) -> str:
-    """Build the tunnel WebSocket URL with the token as a query param.
+    """Build the tunnel WebSocket URL. The bearer token travels in the Authorization header, never in the URL.
 
-    The token is passed via ``?token=`` (which the server accepts as an
-    explicitly legacy-gated, redacted-in-logs fallback — see
-    ``meridian/routes/tunnel.py``'s ``_extract_ws_auth_token`` module note,
-    ff9d2963) rather than an Authorization header, because we don't depend on
-    the ``websockets`` version's header kwarg name (``extra_headers`` on
-    12.x/13.x vs ``additional_headers`` on 14.x+ — ``pyproject.toml`` pins
-    only ``websockets>=12.0``, open-ended). Any code that stringifies a
-    connection exception built from this URL (e.g. reconnect-loop logging)
-    MUST redact it first — see :func:`_safe_disconnect_reason`.
+    A query-string token lands in proxy and access logs, so the URL carries
+    only ``?host=``. The token rides on the returned :class:`_AuthedURL` and is
+    sent by :func:`_ws_connect_kwargs`. Code that stringifies a connection
+    exception still should not log the raw URL — see :func:`_safe_disconnect_reason`.
 
-    e37187f3 — also carries ``&host=`` (this machine's hostname) so the
-    server can register this connection per-host instead of evicting
-    whatever else is connected for this tenant.
+    e37187f3 — carries ``host=`` (this machine's hostname) so the server can
+    register this connection per-host instead of evicting whatever else is
+    connected for this tenant.
     """
     base = base_url.rstrip("/")
     if base.startswith("https://"):
@@ -4982,11 +4998,11 @@ def _ws_url(base_url: str, tenant_id: str, token: str) -> str:
     else:
         ws_base = base
     from urllib.parse import quote
-    url = f"{ws_base}/tunnel/{tenant_id}?token={quote(token, safe='')}"
+    url = f"{ws_base}/tunnel/{tenant_id}"
     _host = _local_host_id()
     if _host:
-        url += f"&host={quote(_host, safe='')}"
-    return url
+        url += f"?host={quote(_host, safe='')}"
+    return _authed_url(url, token)
 
 
 def _permanent_url(base_url: str, tenant_id: str) -> str:
@@ -5018,11 +5034,11 @@ def _ws_code_url(base_url: str, tenant_id: str, token: str) -> str:
     else:
         ws_base = base
     from urllib.parse import quote
-    url = f"{ws_base}/tunnel-code/{tenant_id}?token={quote(token, safe='')}"
+    url = f"{ws_base}/tunnel-code/{tenant_id}"
     _host = _local_host_id()
     if _host:
-        url += f"&host={quote(_host, safe='')}"
-    return url
+        url += f"?host={quote(_host, safe='')}"
+    return _authed_url(url, token)
 
 
 def _permanent_code_url(base_url: str, tenant_id: str) -> str:
@@ -5043,11 +5059,11 @@ def _ws_extract_url(base_url: str, tenant_id: str, token: str) -> str:
     else:
         ws_base = base
     from urllib.parse import quote
-    url = f"{ws_base}/tunnel-extract/{tenant_id}?token={quote(token, safe='')}"
+    url = f"{ws_base}/tunnel-extract/{tenant_id}"
     _host = _local_host_id()
     if _host:
-        url += f"&host={quote(_host, safe='')}"
-    return url
+        url += f"?host={quote(_host, safe='')}"
+    return _authed_url(url, token)
 
 
 def _permanent_extract_url(base_url: str, tenant_id: str) -> str:
@@ -5085,11 +5101,11 @@ def _ws_office_url(base_url: str, tenant_id: str, token: str, slot: str) -> str:
     else:
         ws_base = base
     from urllib.parse import quote
-    url = f"{ws_base}/tunnel-{slot}/{tenant_id}?token={quote(token, safe='')}"
+    url = f"{ws_base}/tunnel-{slot}/{tenant_id}"
     _host = _local_host_id()
     if _host:
-        url += f"&host={quote(_host, safe='')}"
-    return url
+        url += f"?host={quote(_host, safe='')}"
+    return _authed_url(url, token)
 
 
 def _permanent_office_url(base_url: str, tenant_id: str, slot: str) -> str:
@@ -6024,7 +6040,7 @@ def _build_proxy_command(
            "--server", "stream", "--stateless"]
     if sys.platform == "win32":
         cmd.append("--shell")
-    cmd += ["--", "npx", "-y", "@modelcontextprotocol/server-filesystem", *dirs]
+    cmd += ["--", "npx", "-y", FS_SERVER_PACKAGE, *dirs]
     return cmd
 
 
@@ -6166,6 +6182,119 @@ def _load_verification_pin(project_id: str) -> "dict | None":
     return {"cmd": cmd.strip(), "cwd": (cwd or "").strip() or None}
 
 
+LOCAL_POLICY_FILENAME = "local_policy.json"
+
+
+def _local_policy_path() -> "Path":
+    """This machine's tunnel policy file, in the local-runner state folder. Never synced, never from the server."""
+    from .local_runner import default_state_dir  # noqa: PLC0415
+    return default_state_dir() / LOCAL_POLICY_FILENAME
+
+
+def _load_local_policy() -> dict:
+    """This machine's own decisions about what the tunnel may do. Missing or invalid means the safest defaults.
+
+    The file looks like::
+
+        {
+          "allow_fs_writes": false,
+          "enable_shell_slot": false,
+          "custom_plugins": {"<name>": {"command": ["..."], "env": {"VAR": "value"}}}
+        }
+
+    Only ``true`` turns a switch on. The hosted config can name which plugins run and on which ports. It cannot
+    supply a command, an environment, or any of these switches.
+    """
+    defaults: dict = {
+        "allow_fs_writes": False, "enable_shell_slot": False,
+        "custom_plugins": {}, "builtin_commands": {},
+    }
+    try:
+        data = json.loads(_local_policy_path().read_text(encoding="utf-8-sig"))
+    except (OSError, ValueError):
+        return defaults
+    if not isinstance(data, dict):
+        return defaults
+    from .tunnel_plugins import _coerce_command  # noqa: PLC0415
+
+    def _commands(section: Any) -> dict:
+        out: dict = {}
+        if not isinstance(section, dict):
+            return out
+        for name, entry in section.items():
+            if not isinstance(name, str) or not isinstance(entry, dict):
+                continue
+            cmd = _coerce_command(entry.get("command"))
+            if not cmd:
+                continue
+            env = entry.get("env") if isinstance(entry.get("env"), dict) else None
+            out[name.strip()] = {"command": cmd, "env": env}
+        return out
+
+    return {
+        "allow_fs_writes": data.get("allow_fs_writes") is True,
+        "enable_shell_slot": data.get("enable_shell_slot") is True,
+        "custom_plugins": _commands(data.get("custom_plugins")),
+        "builtin_commands": _commands(data.get("builtin_commands")),
+    }
+
+
+def _server_config_without_commands(raw_config: Any, policy: dict) -> list:
+    """The hosted plugin config with every server-supplied command and environment removed.
+
+    Built-in entries keep their non-command overrides (enabled, port, pool). A built-in's command comes only from
+    this machine's ``builtin_commands``, and a custom entry runs only when ``custom_plugins`` names its command.
+    Anything else is dropped and logged, so a hosted config can never make this machine run a command it did not
+    pick locally.
+    """
+    from .tunnel_plugins import _iter_plugin_items, sanitize_plugin_config_secrets, builtin_names  # noqa: PLC0415
+    builtins = set(builtin_names())
+    items: list = []
+    for it in _iter_plugin_items(sanitize_plugin_config_secrets(raw_config)):
+        name = str(it.get("name") or "").strip()
+        if not name:
+            continue
+        clean = {k: v for k, v in it.items() if k not in ("command", "env")}
+        if name in builtins:
+            local_builtin = policy["builtin_commands"].get(name)
+            if local_builtin is not None:
+                clean["command"] = local_builtin["command"]
+                if local_builtin["env"]:
+                    clean["env"] = local_builtin["env"]
+        else:
+            local = policy["custom_plugins"].get(name)
+            if local is None:
+                print(
+                    f"tunnel: custom plugin {name!r} has no command in {LOCAL_POLICY_FILENAME} on this "
+                    "machine; it will not start",
+                    flush=True,
+                )
+                continue
+            clean["command"] = local["command"]
+            if local["env"]:
+                clean["env"] = local["env"]
+        items.append(clean)
+    return items
+
+
+def _enforce_local_slot_policy(plugins: list, policy: dict) -> list:
+    """The shell slot runs arbitrary commands and writes files, so it starts only when this machine enables it.
+
+    That holds whatever the hosted config says and whatever local binary detection would auto-enable.
+    """
+    out: list = []
+    for p in plugins:
+        if isinstance(p, dict) and p.get("name") == SHELL_SLOT_NAME and p.get("enabled") and not policy["enable_shell_slot"]:
+            print(
+                f"tunnel: desktop-commander stays off; set enable_shell_slot in {LOCAL_POLICY_FILENAME} "
+                "on this machine to allow it",
+                flush=True,
+            )
+            p = {**p, "enabled": False}
+        out.append(p)
+    return out
+
+
 def _not_run_result(status: str, message: str) -> dict:
     return {
         "status": status,
@@ -6182,6 +6311,122 @@ def _not_run_result(status: str, message: str) -> dict:
 def _run_refused() -> dict:
     """The answer to a remote shell string. Nothing runs."""
     return _not_run_result("refused", _RUN_REFUSED_MESSAGE)
+
+
+async def _answer_run_verification(ws: Any, req_id: str, project_id: str) -> None:
+    """Run this machine's pinned command and send the structured result back on the tunnel.
+
+    Runs as its own task: a verification can take up to the run timeout, and the message loop must keep reading
+    pings and other requests while it runs.
+    """
+    run_result = await _handle_run_verification(project_id)
+    run_result["type"] = "run_cmd_result"
+    run_result["id"] = req_id
+    try:
+        await ws.send(json.dumps(run_result))
+    except Exception:  # noqa: BLE001 — the socket closed while the command ran; the server already gave up on it
+        return
+
+
+def _bare_tool_name(name: Any) -> "str | None":
+    """A tool name without its server or slot prefix.
+
+    ``filesystem__write_file`` and ``Filesystem: write_file`` both give ``write_file``. The relay prefixes names
+    in tools/list, so a write check that only handles one form would be bypassed by the other.
+    """
+    if not isinstance(name, str):
+        return None
+    return re.split(r"__|: ", name)[-1].strip()
+
+
+def _fs_write_denial(msg: dict) -> "dict | None":
+    """The response that refuses a hosted-side filesystem write, or None to let the request through.
+
+    Writes stay local unless this machine's policy allows them. A ``tools/call`` for a write tool is refused, and so
+    is a body that cannot be parsed but names a write tool (fail closed). Batches are checked item by item.
+    """
+    try:
+        raw = base64.b64decode(msg.get("body")) if msg.get("body") else b""
+    except (ValueError, TypeError):
+        raw = b""
+    if not raw:
+        return None
+    unparsed = False
+    try:
+        parsed = json.loads(raw)
+    except (ValueError, TypeError):
+        unparsed = True
+        parsed = None
+    if unparsed:
+        if not any(name.encode() in raw for name in FS_WRITE_TOOLS):
+            return None
+        write_hit = "unparseable request naming a write tool"
+        rpc_id = None
+    else:
+        calls = parsed if isinstance(parsed, list) else [parsed]
+        write_hit = None
+        rpc_id = calls[0].get("id") if calls and isinstance(calls[0], dict) else None
+        for call in calls:
+            if not isinstance(call, dict) or call.get("method") != "tools/call":
+                continue
+            params = call.get("params")
+            name = params.get("name") if isinstance(params, dict) else None
+            bare = _bare_tool_name(name)
+            if bare in FS_WRITE_TOOLS:
+                write_hit = bare
+                break
+        if write_hit is None:
+            return None
+    body = json.dumps({
+        "jsonrpc": "2.0",
+        "id": rpc_id,
+        "error": {
+            "code": -32001,
+            "message": (
+                f"filesystem write refused for the tunnel ({write_hit}); writes stay on this machine "
+                f"unless allow_fs_writes is set in {LOCAL_POLICY_FILENAME}"
+            ),
+        },
+    }).encode()
+    return {
+        "type": "response",
+        "id": msg.get("id"),
+        "status": 403,
+        "headers": {"content-type": "application/json"},
+        "body": base64.b64encode(body).decode(),
+    }
+
+
+class _AuthedURL(str):
+    """A tunnel WebSocket URL that carries its bearer token as an ``Authorization`` header, never in the URL.
+
+    A token in a query string lands in proxy and access logs. The connect call reads ``auth_headers`` off this
+    object. Being a ``str`` subclass means every reconnect loop that already passes the URL around carries the
+    header without any signature change.
+    """
+
+    auth_headers: dict
+
+
+def _authed_url(url: str, token: str) -> "_AuthedURL":
+    out = _AuthedURL(url)
+    out.auth_headers = {"Authorization": f"Bearer {token}"}
+    return out
+
+
+def _ws_connect_kwargs(ws_url: Any) -> dict:
+    """The header kwarg for ``websockets.connect``, chosen from the installed version's signature.
+
+    The name differs across websockets releases (``extra_headers`` in 12/13, ``additional_headers`` in 14+), and
+    ``pyproject.toml`` allows any 12+.
+    """
+    headers = getattr(ws_url, "auth_headers", None)
+    if not headers:
+        return {}
+    import websockets  # noqa: PLC0415
+    params = inspect.signature(websockets.connect).parameters
+    key = "additional_headers" if "additional_headers" in params else "extra_headers"
+    return {key: dict(headers)}
 
 
 async def _handle_run_verification(project_id: str) -> dict:
@@ -6206,11 +6451,15 @@ def _denied_root_folders() -> "list[Path]":
     folders.append(default_state_dir())
     appdata = os.environ.get("APPDATA")
     if appdata:
-        folders.append(Path(appdata) / "Zotero")
+        folders.extend(Path(appdata) / name for name in _DENIED_APPDATA_FOLDERS)
     return folders
 
 
-_DENIED_HOME_FOLDERS = (".meridian", ".ssh", ".gnupg", ".aws", ".azure", ".kube", ".docker")
+_DENIED_HOME_FOLDERS = (
+    ".meridian", ".ssh", ".gnupg", ".aws", ".azure", ".kube", ".docker",
+    ".config/gh", ".config/gcloud", ".config/op",
+)
+_DENIED_APPDATA_FOLDERS = ("Zotero", "GitHub CLI", "gcloud")
 
 
 def _is_denied_root(root: str) -> bool:
@@ -6341,13 +6590,13 @@ async def _handle_run_cmd(cmd: "str | list", cwd: "str | None") -> dict:
 def _add_fs_roots_to_cmd(cmd: "list[str]", new_roots: "list[str]") -> "tuple[list[str], bool]":
     """Append *new_roots* to an existing ``_build_proxy_command`` result.
 
-    Finds the ``@modelcontextprotocol/server-filesystem`` token in *cmd* and
+    Finds the ``FS_SERVER_PACKAGE`` token in *cmd* and
     appends any roots that are not already present.  Returns ``(updated_cmd,
     changed)`` — if nothing was added *changed* is ``False`` and *cmd* is
     returned unchanged.
     """
     try:
-        idx = cmd.index("@modelcontextprotocol/server-filesystem")
+        idx = cmd.index(FS_SERVER_PACKAGE)
     except ValueError:
         return cmd, False
     existing: set[str] = set(cmd[idx + 1:])
@@ -6365,7 +6614,7 @@ def _set_fs_roots_on_cmd(cmd: "list[str]", roots: "list[str]") -> "tuple[list[st
     with EXACTLY *roots* (normalized, deduped, order preserved).
 
     Unlike :func:`_add_fs_roots_to_cmd` (which only appends), this rebuilds the
-    trailing dir list after the ``@modelcontextprotocol/server-filesystem`` token
+    trailing dir list after the ``FS_SERVER_PACKAGE`` token
     so a removal shrinks the served set. Returns ``(updated_cmd, changed)`` —
     *changed* is ``False`` (and *cmd* returned unchanged) when the token is absent
     or the requested dirs already match the current ones. An empty/all-blank
@@ -6373,7 +6622,7 @@ def _set_fs_roots_on_cmd(cmd: "list[str]", roots: "list[str]") -> "tuple[list[st
     at least one dir, so we never strip it down to zero.
     """
     try:
-        idx = cmd.index("@modelcontextprotocol/server-filesystem")
+        idx = cmd.index(FS_SERVER_PACKAGE)
     except ValueError:
         return cmd, False
     new_dirs: list[str] = []
@@ -7127,7 +7376,7 @@ async def _run_connection(
 
     async with websockets.connect(
         ws_url, max_size=None, ping_interval=20, ping_timeout=_WS_PING_TIMEOUT,
-        open_timeout=_tunnel_connect_timeout(),
+        open_timeout=_tunnel_connect_timeout(), **_ws_connect_kwargs(ws_url),
     ) as ws:
         if lifecycle is not None:
             lifecycle.mark_ws_open()
@@ -7878,10 +8127,26 @@ async def run_tunnel(
     # (tunnel_plugins_config) so binary-detection applies; fall back to the
     # server-resolved list for older servers that don't send the raw config.
     detected = detect_office_binaries()
+    # The hosted config may choose which plugins run and their ports. It never supplies a command or an
+    # environment, and the shell slot starts only when this machine's local policy enables it.
+    local_policy = _load_local_policy()
     if "tunnel_plugins_config" in me:
-        plugins = resolve_plugins(me.get("tunnel_plugins_config"), detected_slots=detected)
+        server_cfg = _server_config_without_commands(me.get("tunnel_plugins_config"), local_policy)
+        plugins = _enforce_local_slot_policy(
+            resolve_plugins(server_cfg, detected_slots=detected), local_policy,
+        )
     else:
-        plugins = me.get("tunnel_plugins") or resolve_plugins(None, detected_slots=detected)
+        # Legacy servers send a resolved slot list (entries keyed by "slot", not "name") and no raw config, so
+        # there are no custom plugins to start. Only the command and environment fields come out of the list.
+        server_cfg = []
+        legacy = me.get("tunnel_plugins") or resolve_plugins(None, detected_slots=detected)
+        plugins = _enforce_local_slot_policy(
+            [
+                {k: v for k, v in p.items() if k not in ("command", "env")} if isinstance(p, dict) else p
+                for p in legacy
+            ],
+            local_policy,
+        )
     by_slot = {p.get("slot"): p for p in plugins if isinstance(p, dict)}
     fs_plugin = by_slot.get("fs") or {}
     code_plugin = by_slot.get("code") or {}
@@ -8323,7 +8588,7 @@ async def run_tunnel(
 
     # 4c. Custom plugins (LOCAL-ONLY) — still eagerly spawned because they serve
     #     the local .mcp.json directly without a server relay route.
-    custom_plugins = resolve_custom_plugins(me.get("tunnel_plugins_config"))
+    custom_plugins = resolve_custom_plugins(server_cfg)
     running_custom: list[dict] = []
     # proc_holders is kept for custom plugins (eager, no lazy-spawn).
     proc_holders: list[dict] = []

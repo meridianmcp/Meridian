@@ -105,6 +105,37 @@ lives only on the machine that runs the tunnel and is never synced.
 A missing project, a malformed file, or an invalid entry pins nothing, and
 `run_verification` then returns `not_configured` without running anything.
 
+### Local policy: this machine decides what runs and what writes
+
+The hosted side chooses which plugins run and on which ports. It never supplies a
+command, an environment, or a switch that starts a shell or a write path. Those
+come from `local_policy.json` in the local-runner state folder, which is never
+synced and missing or invalid means the locked-down defaults:
+
+```json
+{
+  "allow_fs_writes": false,
+  "enable_shell_slot": false,
+  "builtin_commands": {"code-extractor": {"command": ["uvx", "..."], "env": {}}},
+  "custom_plugins": {"my-plugin": {"command": ["node", "server.js"], "env": {}}}
+}
+```
+
+- `allow_fs_writes` (default `false`): the filesystem server's write tools
+  (`write_file`, `edit_file`, `create_directory`, `move_file`) are refused for
+  tunnel requests. A refused call returns HTTP 403 with a JSON-RPC error. Set it
+  to `true` to allow writes over the tunnel.
+- `enable_shell_slot` (default `false`): the `desktop-commander` slot runs
+  arbitrary commands and writes files, so it starts only when this is `true`.
+  Enabling it from the hosted dashboard has no effect on this machine.
+- `builtin_commands`: an explicit local command for a built-in slot. The hosted
+  config's command is ignored.
+- `custom_plugins`: a custom plugin runs only when its name has a command here. A
+  custom plugin defined only in the hosted config is logged and not started.
+
+Only a literal `true` turns a switch on. The filesystem server is pinned to
+`@modelcontextprotocol/server-filesystem@2.0.0` so `npx` cannot silently upgrade it.
+
 ### Served roots: credential and token folders are refused
 
 The filesystem slot never serves a root that is, contains, or sits inside a
@@ -113,7 +144,9 @@ local root list, and the repo-path fallback. The refused folders are:
 
 - `~/.meridian` and the local-runner state folder
 - `~/.ssh`, `~/.gnupg`, `~/.aws`, `~/.azure`, `~/.kube`, `~/.docker`
+- `~/.config/gh`, `~/.config/gcloud`, `~/.config/op`
 - `%APPDATA%\Zotero`, the Zotero profile folder that holds the bridge's preference lines
+- `%APPDATA%\GitHub CLI`, `%APPDATA%\gcloud`
 
 Containment is checked in both directions. A root that contains one of these
 folders, such as the home folder itself, is refused too. A refused root is

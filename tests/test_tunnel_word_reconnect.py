@@ -184,10 +184,12 @@ def test_word_slot_ws_url_routes_to_tunnel_word():
     """The word slot's socket URL must hit the /tunnel-word/ route with the token
     URL-encoded (this is the URL _reconnect_loop_lazy is handed for the word slot)."""
     url = tc._ws_office_url("https://usemeridian.us", "tenant-42", "sk/with+special=", "word")
-    assert url.startswith("wss://usemeridian.us/tunnel-word/tenant-42?token=")
+    assert url.startswith("wss://usemeridian.us/tunnel-word/tenant-42")
     # token is percent-encoded (no raw / + = leaking into the query string)
     assert "sk/with+special=" not in url
-    assert "sk%2Fwith%2Bspecial%3D" in url
+    assert url.auth_headers == {"Authorization": "Bearer sk/with+special="}
     # http base downgrades to ws:// (local dev), still the word route.
     local = tc._ws_office_url("http://127.0.0.1:8000", "t", "tok", "word")
-    assert local.startswith("ws://127.0.0.1:8000/tunnel-word/t?token=tok")
+    assert local.startswith("ws://127.0.0.1:8000/tunnel-word/t")
+    assert "tok" not in local.replace("tunnel-word", "")
+    assert local.auth_headers == {"Authorization": "Bearer tok"}

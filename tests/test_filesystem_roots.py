@@ -138,10 +138,10 @@ def test_union_filesystem_roots_keeps_path_with_space():
 
 def test_build_proxy_command_uses_roots_when_provided():
     cmd = tc._build_proxy_command("npx", "/home/me", 8808, roots=["/a", "/b"])
-    assert "@modelcontextprotocol/server-filesystem" in cmd
+    assert tc.FS_SERVER_PACKAGE in cmd
     # Both roots are appended as the served dirs.
     sep = cmd.index("--")
-    assert cmd[sep + 1:] == ["npx", "-y", "@modelcontextprotocol/server-filesystem", "/a", "/b"]
+    assert cmd[sep + 1:] == ["npx", "-y", tc.FS_SERVER_PACKAGE, "/a", "/b"]
 
 
 def test_build_proxy_command_falls_back_to_repo_path():
@@ -292,7 +292,7 @@ def test_add_fs_roots_to_cmd_appends_new_roots():
     cmd = tc._build_proxy_command("npx", "/home/me", 8808, roots=["/a"])
     updated, changed = tc._add_fs_roots_to_cmd(cmd, ["/b", "/c"])
     assert changed is True
-    assert "@modelcontextprotocol/server-filesystem" in updated
+    assert tc.FS_SERVER_PACKAGE in updated
     assert "/b" in updated
     assert "/c" in updated
     assert "/a" in updated
@@ -572,7 +572,7 @@ def test_set_fs_roots_on_cmd_replaces_dirs_exactly():
     cmd = tc._build_proxy_command("npx", "/home/me", 8808, roots=["/a", "/b", "/c"])
     updated, changed = tc._set_fs_roots_on_cmd(cmd, ["/a", "/c"])
     assert changed is True
-    idx = updated.index("@modelcontextprotocol/server-filesystem")
+    idx = updated.index(tc.FS_SERVER_PACKAGE)
     assert updated[idx + 1:] == ["/a", "/c"]  # /b removed, order kept
 
 
@@ -581,7 +581,7 @@ def test_set_fs_roots_on_cmd_dequotes_and_dedupes():
     cmd = tc._build_proxy_command("npx", "/home/me", 8808, roots=["/a"])
     updated, changed = tc._set_fs_roots_on_cmd(cmd, ['"/x"', "/x", "  /y  "])
     assert changed is True
-    idx = updated.index("@modelcontextprotocol/server-filesystem")
+    idx = updated.index(tc.FS_SERVER_PACKAGE)
     assert updated[idx + 1:] == ["/x", "/y"]
 
 
@@ -669,7 +669,7 @@ def test_run_connection_lazy_handles_set_fs_roots(monkeypatch):
 
     asyncio.run(tc._run_connection_lazy("wss://x/tunnel/t", proxy, "fs"))
 
-    idx = proxy.cmd.index("@modelcontextprotocol/server-filesystem")
+    idx = proxy.cmd.index(tc.FS_SERVER_PACKAGE)
     assert proxy.cmd[idx + 1:] == ["/a", "/c"]  # exactly the new set, de-quoted
     assert "/b" not in proxy.cmd                 # the removed root is gone
     assert kills["n"] == 1 and respawns["n"] == 1

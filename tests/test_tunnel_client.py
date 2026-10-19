@@ -170,19 +170,19 @@ def test_openai_tunnel_adapter_snapshot_never_touches_meridian_tunnel_state(monk
 
 def test_ws_url_https_to_wss():
     url = tc._ws_url("https://usemeridian.us", "tenant-123", "sk_tok")
-    assert url.startswith("wss://usemeridian.us/tunnel/tenant-123?token=")
-    assert "token=sk_tok" in url
+    assert url.startswith("wss://usemeridian.us/tunnel/tenant-123")
+    assert "sk_tok" not in url
 
 
 def test_ws_url_http_to_ws():
     url = tc._ws_url("http://localhost:7878", "t1", "tok")
-    assert url.startswith("ws://localhost:7878/tunnel/t1?token=")
+    assert url.startswith("ws://localhost:7878/tunnel/t1")
 
 
 def test_ws_url_quotes_token():
     url = tc._ws_url("https://x", "t", "a/b+c d")
     # '/', '+', and space must be percent-encoded
-    assert "a%2Fb%2Bc%20d" in url
+    assert url.auth_headers == {"Authorization": "Bearer a/b+c d"}
 
 
 # ---------------------------------------------------------------------------
@@ -231,13 +231,13 @@ def test_sse_url_targets_sse_endpoint():
 
 def test_ws_code_url_https_to_wss():
     url = tc._ws_code_url("https://usemeridian.us", "tenant-123", "sk_tok")
-    assert url.startswith("wss://usemeridian.us/tunnel-code/tenant-123?token=")
-    assert "token=sk_tok" in url
+    assert url.startswith("wss://usemeridian.us/tunnel-code/tenant-123")
+    assert "sk_tok" not in url
 
 
 def test_ws_code_url_http_to_ws():
     url = tc._ws_code_url("http://localhost:7878", "t1", "tok")
-    assert url.startswith("ws://localhost:7878/tunnel-code/t1?token=")
+    assert url.startswith("ws://localhost:7878/tunnel-code/t1")
 
 
 def test_permanent_code_url():
@@ -249,13 +249,13 @@ def test_permanent_code_url():
 
 def test_ws_extract_url_https_to_wss():
     url = tc._ws_extract_url("https://usemeridian.us", "tenant-123", "sk_tok")
-    assert url.startswith("wss://usemeridian.us/tunnel-extract/tenant-123?token=")
-    assert "token=sk_tok" in url
+    assert url.startswith("wss://usemeridian.us/tunnel-extract/tenant-123")
+    assert "sk_tok" not in url
 
 
 def test_ws_extract_url_http_to_ws():
     url = tc._ws_extract_url("http://localhost:7878", "t1", "tok")
-    assert url.startswith("ws://localhost:7878/tunnel-extract/t1?token=")
+    assert url.startswith("ws://localhost:7878/tunnel-extract/t1")
 
 
 def test_permanent_extract_url():
@@ -286,12 +286,12 @@ def test_build_proxy_command_structure():
     assert "--stateless" in cmd
     # The separator + the wrapped filesystem server must be present.
     assert "--" in cmd
-    assert "@modelcontextprotocol/server-filesystem" in cmd
+    assert tc.FS_SERVER_PACKAGE in cmd
     assert cmd[-1] == "/repo"
     # mcp-proxy comes before the separator; filesystem server after it.
     sep = cmd.index("--")
     assert "mcp-proxy" in cmd[:sep]
-    assert "@modelcontextprotocol/server-filesystem" in cmd[sep:]
+    assert tc.FS_SERVER_PACKAGE in cmd[sep:]
     # Inner command is bare npx (resolved by mcp-proxy / the shell), not a path.
     assert cmd[sep + 1] == "npx"
 
@@ -5439,7 +5439,7 @@ def test_spawn_with_cache_retry_dependency_missing_uses_thorough_clear_and_repor
     diagnostics = tc.SlotDiagnostics(slot="fs")
     result = tc._spawn_with_cache_retry(
         ["npx", "-y", "mcp-proxy", "--", "npx", "-y",
-         "@modelcontextprotocol/server-filesystem"],
+         tc.FS_SERVER_PACKAGE],
         None, "fs", diagnostics,
     )
 
