@@ -1,0 +1,690 @@
+"""Ledger safety under multiple writers (meridian_outputs.ledger_io).
+
+The provenance ledger (annotate.record_provenance) and the fingerprint ledger
+(fingerprint.tag_output) used to be guarded by an in-process lock only, shared
+one fixed ``.tmp`` name, never fsynced, and read a corrupt file as ``{}``.
+These tests pin the fixed behaviour:
+
+  - four REAL processes writing 10 entries each lose none of the 40;
+  - a failed ``os.replace`` leaves the prior ledger byte-for-byte intact and
+    no temporary file behind;
+  - ``os.fsync`` runs before ``os.replace``;
+  - corrupt bytes are quarantined (copied aside, warning logged), never
+    silently wiped, and lock-free readers raise instead of reporting empty;
+  - a ledger lock held by another process fails closed with
+    ``IndexLockAcquireError`` inside the timeout;
+  - a read nested inside a transaction does not deadlock on the
+    non-reentrant lock;
+  - a same-size, same-mtime replacement is seen by the next read.
+"""
+from __future__ import annotations
+
+import json
+import logging
+import os
+import subprocess
+import sys
+import threading
+import time
+from pathlib import Path
+
+import pytest
+
+sys.path.insert(0, str(Path(__file__).parent.parent))
+from meridian_outputs import annotate as AN
+from meridian_outputs import fingerprint as FP
+from meridian_outputs import ledger_io as LIO
+from meridian_outputs import outputs_local as OL
+
+_EXT_ROOT = str(Path(__file__).parent.parent)
+_LOCK_TIMEOUT_ENV = "MERIDIAN_OUTPUTS_LOCK_TIMEOUT_SECONDS"
+
+
+@pytest.fixture(autouse=True)
+def _no_fast_index(monkeypatch: pytest.MonkeyPatch) -> None:
+    """record_provenance's best-effort DuckDB priority registration is not
+    under test here; stubbing it keeps these tests on the JSON ledgers and
+    fast."""
+    monkeypatch.setattr(OL, "register_priority_path", lambda *a, **k: None)
+
+
+def _outputs(tmp_path: Path) -> Path:
+    out = tmp_path / "outputs"
+    out.mkdir(exist_ok=True)
+    return out
+
+
+def _write(path: Path, text: str) -> Path:
+    path.write_text(text, encoding="utf-8")
+    return path
+
+
+def _cache_files(outputs: Path) -> list[str]:
+    cache = outputs / ".meridian-outputs-cache"
+    return sorted(os.listdir(cache)) if cache.is_dir() else []
+
+
+def _wait_for_file(path: str, *, timeout: float = 60.0) -> None:
+    deadline = time.monotonic() + timeout
+    while not os.path.exists(path):
+        if time.monotonic() > deadline:
+            raise TimeoutError(f"{path!r} was never created within {timeout}s")
+        time.sleep(0.02)
+
+
+# ---------------------------------------------------------------------------
+# Cross-process writers
+# ---------------------------------------------------------------------------
+
+_WRITER_SCRIPT = r"""
+import os, sys, time
+ext_dir, outputs_dir, script_path, worker_id, count, ready_path, gate_path = sys.argv[1:8]
+count = int(count)
+sys.path.insert(0, ext_dir)
+from meridian_outputs import annotate, fingerprint, outputs_local
+
+# Keep this worker on the two JSON ledgers; the DuckDB index has its own
+# multiprocess tests.
+outputs_local.register_priority_path = lambda *a, **k: None
+
+paths = []
+for i in range(count):
+    p = os.path.join(outputs_dir, "w%s_%02d.csv" % (worker_id, i))
+    with open(p, "w", encoding="utf-8") as fh:
+        fh.write("worker,i\n%s,%d\n" % (worker_id, i))
+    paths.append(p)
+
+with open(ready_path, "w", encoding="utf-8") as fh:
+    fh.write(str(os.getpid()))
+deadline = time.monotonic() + 120.0
+while not os.path.exists(gate_path):
+    if time.monotonic() > deadline:
+        sys.exit(3)
+    time.sleep(0.005)
+
+for i, p in enumerate(paths):
+    rec = annotate.record_provenance(
+        outputs_dir, p, generating_script=script_path,
+        params={"worker": worker_id, "i": i},
+    )
+    if "error" in rec:
+        sys.stderr.write(rec["error"] + "\n")
+        sys.exit(4)
+    fingerprint.tag_output(p, outputs_dir, script_path=script_path)
+"""
+
+
+class TestCrossProcessWriters:
+    def test_four_processes_ten_writes_each_all_forty_entries_survive(
+        self, tmp_path: Path,
+    ) -> None:
+        outputs = _outputs(tmp_path)
+        script = _write(outputs / "gen.py", "print('gen')\n")
+        gate = tmp_path / "gate"
+        workers, per_worker = 4, 10
+        env = dict(os.environ)
+        env[_LOCK_TIMEOUT_ENV] = "120"  # contention must wait, never time out
+        procs = []
+        ready_paths = []
+        try:
+            for w in range(workers):
+                ready = tmp_path / f"ready_{w}"
+                ready_paths.append(ready)
+                procs.append(subprocess.Popen(
+                    [
+                        sys.executable, "-c", _WRITER_SCRIPT, _EXT_ROOT,
+                        str(outputs), str(script), str(w), str(per_worker),
+                        str(ready), str(gate),
+                    ],
+                    env=env, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                ))
+            for ready in ready_paths:
+                _wait_for_file(str(ready), timeout=120.0)
+            gate.write_text("go", encoding="utf-8")  # all four start together
+            for proc in procs:
+                _, err = proc.communicate(timeout=240)
+                assert proc.returncode == 0, err.decode("utf-8", "replace")
+        finally:
+            for proc in procs:
+                if proc.poll() is None:
+                    proc.kill()
+
+        expected = {f"w{w}_{i:02d}.csv" for w in range(workers) for i in range(per_worker)}
+        cache = outputs / ".meridian-outputs-cache"
+        provenance = json.loads((cache / "provenance_ledger.json").read_text(encoding="utf-8"))
+        fingerprints = json.loads((cache / "fingerprint_ledger.json").read_text(encoding="utf-8"))
+        assert set(provenance) == expected
+        assert set(fingerprints) == expected
+        for key, rec in provenance.items():
+            worker, index = key[1:-4].split("_")
+            assert rec["params"] == {"worker": worker, "i": int(index)}
+        leftovers = [n for n in _cache_files(outputs) if n.endswith((".tmp", ".lock"))]
+        assert leftovers == []
+
+
+# ---------------------------------------------------------------------------
+# Atomic write: failure leaves the prior ledger intact, fsync before replace
+# ---------------------------------------------------------------------------
+
+class TestAtomicWrite:
+    def test_replace_failure_keeps_prior_provenance_ledger_and_no_tmp(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        outputs = _outputs(tmp_path)
+        a = _write(outputs / "a.csv", "x\n1\n")
+        b = _write(outputs / "b.csv", "x\n2\n")
+        assert "error" not in AN.record_provenance(str(outputs), str(a))
+        ledger = Path(AN._ledger_path(str(outputs)))
+        before = ledger.read_bytes()
+
+        def _boom(src: str, dst: str) -> None:
+            raise OSError("simulated replace failure")
+
+        with monkeypatch.context() as m:
+            m.setattr(os, "replace", _boom)
+            result = AN.record_provenance(str(outputs), str(b))
+
+        assert "error" in result
+        assert ledger.read_bytes() == before
+        assert not [n for n in _cache_files(outputs) if n.endswith(".tmp")]
+        assert [r["path"] for r in AN.list_provenance(str(outputs))] == [str(a.resolve())]
+
+    def test_replace_failure_keeps_prior_fingerprint_ledger_and_no_tmp(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        outputs = _outputs(tmp_path)
+        script = _write(outputs / "gen.py", "print(1)\n")
+        a = _write(outputs / "a.csv", "x\n1\n")
+        b = _write(outputs / "b.csv", "x\n2\n")
+        FP.tag_output(str(a), str(outputs), script_path=str(script))
+        ledger = Path(FP._ledger_path(str(outputs)))
+        before = ledger.read_bytes()
+
+        def _boom(src: str, dst: str) -> None:
+            raise OSError("simulated replace failure")
+
+        with monkeypatch.context() as m:
+            m.setattr(os, "replace", _boom)
+            with pytest.raises(OSError, match="simulated"):
+                FP.tag_output(str(b), str(outputs), script_path=str(script))
+
+        assert ledger.read_bytes() == before
+        assert not [n for n in _cache_files(outputs) if n.endswith(".tmp")]
+
+    def test_fsync_runs_before_replace(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        outputs = _outputs(tmp_path)
+        a = _write(outputs / "a.csv", "x\n1\n")
+        events: list[str] = []
+        real_fsync, real_replace = os.fsync, os.replace
+
+        def _fsync(fd: int) -> None:
+            events.append("fsync")
+            real_fsync(fd)
+
+        def _replace(src: str, dst: str) -> None:
+            events.append("replace:" + os.path.basename(dst))
+            real_replace(src, dst)
+
+        with monkeypatch.context() as m:
+            m.setattr(os, "fsync", _fsync)
+            m.setattr(os, "replace", _replace)
+            assert "error" not in AN.record_provenance(str(outputs), str(a))
+
+        replace_at = events.index("replace:provenance_ledger.json")
+        assert "fsync" in events[:replace_at]
+
+    def test_unserialisable_value_raises_before_any_rename(self, tmp_path: Path) -> None:
+        ledger = tmp_path / "ledger.json"
+        LIO.write_ledger_atomic(str(ledger), {"a": 1})
+        before = ledger.read_bytes()
+        with pytest.raises(TypeError):
+            LIO.write_ledger_atomic(str(ledger), {"a": object()})
+        assert ledger.read_bytes() == before
+        assert sorted(os.listdir(tmp_path)) == ["ledger.json"]
+
+    def test_transient_sharing_violation_on_replace_is_retried(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        ledger = tmp_path / "ledger.json"
+        real_replace = os.replace
+        failures = {"left": 2}
+
+        def _flaky(src: str, dst: str) -> None:
+            if failures["left"]:
+                failures["left"] -= 1
+                raise PermissionError("sharing violation")
+            real_replace(src, dst)
+
+        monkeypatch.setattr(LIO, "_SHARING_RETRY_SLEEP_SECONDS", 0.0)
+        with monkeypatch.context() as m:
+            m.setattr(os, "replace", _flaky)
+            LIO.write_ledger_atomic(str(ledger), {"k": "v"})
+        assert json.loads(ledger.read_text(encoding="utf-8")) == {"k": "v"}
+        assert failures["left"] == 0
+
+    def test_persistent_sharing_violation_on_read_is_raised(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        ledger = tmp_path / "ledger.json"
+        ledger.write_text("{}", encoding="utf-8")
+        calls = {"n": 0}
+
+        def _always(*_a, **_k):
+            calls["n"] += 1
+            raise PermissionError("sharing violation")
+
+        monkeypatch.setattr(LIO, "_SHARING_RETRY_SLEEP_SECONDS", 0.0)
+        # A module-level ``open`` shadows the builtin for ledger_io only.
+        monkeypatch.setattr(LIO, "open", _always, raising=False)
+        with pytest.raises(PermissionError):
+            LIO.read_ledger_strict(str(ledger))
+        assert calls["n"] == LIO._SHARING_RETRIES
+
+    def test_posix_directory_fsync_is_best_effort(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        opened: list[str] = []
+
+        def _open(path: str, flags: int, *a, **k) -> int:
+            opened.append(path)
+            raise OSError("directories cannot be opened here")
+
+        with monkeypatch.context() as m:
+            m.setattr(LIO.os, "name", "posix")
+            m.setattr(LIO.os, "open", _open)
+            LIO._fsync_directory(str(tmp_path))  # must not raise
+        assert opened == [str(tmp_path)]
+        LIO._fsync_directory(str(tmp_path))  # real platform: never raises
+
+
+# ---------------------------------------------------------------------------
+# Strict reads and quarantine
+# ---------------------------------------------------------------------------
+
+_GARBAGE = b'{"results.csv": {"path": "results.csv", "note": "trunc'
+
+
+class TestStrictReadAndQuarantine:
+    def test_missing_ledger_reads_empty(self, tmp_path: Path) -> None:
+        assert LIO.read_ledger_strict(str(tmp_path / "nope.json")) == {}
+
+    @pytest.mark.parametrize(
+        "raw, reason",
+        [
+            (b"", "empty"),
+            (b"   \n", "empty"),
+            (b"\xff\xfe\x00not utf8", "UTF-8"),
+            (_GARBAGE, "not valid JSON"),
+            (b"[1, 2, 3]", "list, not an object"),
+        ],
+    )
+    def test_damaged_bytes_raise_never_read_as_empty(
+        self, tmp_path: Path, raw: bytes, reason: str,
+    ) -> None:
+        ledger = tmp_path / "ledger.json"
+        ledger.write_bytes(raw)
+        with pytest.raises(LIO.LedgerCorruptError) as exc_info:
+            LIO.read_ledger_strict(str(ledger))
+        assert reason in str(exc_info.value)
+        assert str(tmp_path) not in str(exc_info.value)  # basename only
+
+    def test_provenance_write_quarantines_corrupt_bytes_and_warns(
+        self, tmp_path: Path, caplog: pytest.LogCaptureFixture,
+    ) -> None:
+        outputs = _outputs(tmp_path)
+        a = _write(outputs / "a.csv", "x\n1\n")
+        ledger = Path(AN._ledger_path(str(outputs)))
+        ledger.write_bytes(_GARBAGE)
+
+        with caplog.at_level(logging.WARNING, logger="meridian_outputs.ledger_io"):
+            result = AN.record_provenance(str(outputs), str(a))
+
+        assert "error" not in result
+        quarantined = [n for n in _cache_files(outputs) if ".corrupt-" in n]
+        assert len(quarantined) == 1
+        assert result["ledger_quarantined"] == quarantined[0]
+        cache = outputs / ".meridian-outputs-cache"
+        assert (cache / quarantined[0]).read_bytes() == _GARBAGE
+        assert any("corrupt" in r.getMessage() for r in caplog.records)
+        # The live ledger is valid again and holds the new entry.
+        assert list(json.loads(ledger.read_text(encoding="utf-8"))) == ["a.csv"]
+
+    def test_fingerprint_write_quarantines_corrupt_bytes(self, tmp_path: Path) -> None:
+        outputs = _outputs(tmp_path)
+        script = _write(outputs / "gen.py", "print(1)\n")
+        a = _write(outputs / "a.csv", "x\n1\n")
+        ledger = Path(FP._ledger_path(str(outputs)))
+        ledger.write_bytes(b"")  # what a crash after create leaves behind
+
+        FP.tag_output(str(a), str(outputs), script_path=str(script))
+
+        quarantined = [n for n in _cache_files(outputs) if ".corrupt-" in n]
+        assert len(quarantined) == 1
+        assert (outputs / ".meridian-outputs-cache" / quarantined[0]).read_bytes() == b""
+        assert list(json.loads(ledger.read_text(encoding="utf-8"))) == ["a.csv"]
+
+    def test_lock_free_readers_raise_on_corrupt_ledgers_and_never_quarantine(
+        self, tmp_path: Path,
+    ) -> None:
+        outputs = _outputs(tmp_path)
+        Path(AN._ledger_path(str(outputs))).write_bytes(_GARBAGE)
+        Path(FP._ledger_path(str(outputs))).write_bytes(_GARBAGE)
+
+        with pytest.raises(LIO.LedgerCorruptError):
+            AN.list_provenance(str(outputs))
+        with pytest.raises(LIO.LedgerCorruptError):
+            AN.get_provenance(str(outputs), str(outputs / "results.csv"))
+        with pytest.raises(LIO.LedgerCorruptError):
+            FP.check_staleness(str(outputs))
+        with pytest.raises(LIO.LedgerCorruptError):
+            FP.find_stale_by_script(str(outputs), str(outputs / "gen.py"))
+        assert not [n for n in _cache_files(outputs) if ".corrupt-" in n]
+
+    def test_failed_quarantine_copy_leaves_corrupt_ledger_untouched(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        outputs = _outputs(tmp_path)
+        script = _write(outputs / "gen.py", "print(1)\n")
+        a = _write(outputs / "a.csv", "x\n1\n")
+        prov = Path(AN._ledger_path(str(outputs)))
+        fing = Path(FP._ledger_path(str(outputs)))
+        prov.write_bytes(_GARBAGE)
+        fing.write_bytes(_GARBAGE)
+
+        def _no_space(path: str) -> str:
+            raise OSError("disk full")
+
+        monkeypatch.setattr(LIO, "quarantine_ledger", _no_space)
+        result = AN.record_provenance(str(outputs), str(a))
+        assert "error" in result and "quarantine copy failed" in result["error"]
+        with pytest.raises(LIO.LedgerCorruptError, match="quarantine copy failed"):
+            FP.tag_output(str(a), str(outputs), script_path=str(script))
+        assert prov.read_bytes() == _GARBAGE
+        assert fing.read_bytes() == _GARBAGE
+
+    def test_quarantine_never_overwrites_an_existing_copy(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        ledger = tmp_path / "ledger.json"
+        ledger.write_bytes(b"second")
+        fixed = str(ledger) + ".corrupt-FIXED"
+        Path(fixed).write_bytes(b"first")
+        monkeypatch.setattr(LIO, "_quarantine_name", lambda path: fixed)
+
+        copy = LIO.quarantine_ledger(str(ledger))
+
+        assert copy == fixed + "-1"
+        assert Path(fixed).read_bytes() == b"first"
+        assert Path(copy).read_bytes() == b"second"
+
+    def test_quarantine_of_missing_ledger_is_none(self, tmp_path: Path) -> None:
+        assert LIO.quarantine_ledger(str(tmp_path / "gone.json")) is None
+
+    def test_transaction_creates_directory_and_commits(self, tmp_path: Path) -> None:
+        ledger = tmp_path / "new" / "dir" / "ledger.json"
+        with LIO.ledger_transaction(str(ledger)) as txn:
+            assert txn.load() == {}
+            txn.commit({"k": 1})
+        assert txn.committed is True
+        assert txn.quarantined_path is None
+        assert json.loads(ledger.read_text(encoding="utf-8")) == {"k": 1}
+        assert not os.path.exists(str(ledger) + ".lock")
+
+
+# ---------------------------------------------------------------------------
+# Lock contention with another process: fail closed inside the timeout
+# ---------------------------------------------------------------------------
+
+_HOLDER_SCRIPT = r"""
+import os, sys, time
+sys.modules["portalocker"] = None  # same atomic-create lock as the test process
+ext_dir, ready_path, release_path = sys.argv[1:4]
+ledger_paths = sys.argv[4:]
+sys.path.insert(0, ext_dir)
+from meridian_outputs import outputs_local
+locks = [outputs_local.IndexFileLock(p, session_id="holder") for p in ledger_paths]
+for lock in locks:
+    lock.acquire()
+with open(ready_path, "w", encoding="utf-8") as fh:
+    fh.write(str(os.getpid()))
+deadline = time.monotonic() + 60.0
+while not os.path.exists(release_path) and time.monotonic() < deadline:
+    time.sleep(0.02)
+for lock in locks:
+    lock.release()
+"""
+
+
+class TestLockContention:
+    def test_ledger_locked_by_another_process_raises_within_timeout(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        outputs = _outputs(tmp_path)
+        script = _write(outputs / "gen.py", "print(1)\n")
+        a = _write(outputs / "a.csv", "x\n1\n")
+        b = _write(outputs / "b.csv", "x\n2\n")
+        assert "error" not in AN.record_provenance(str(outputs), str(a))
+        FP.tag_output(str(a), str(outputs), script_path=str(script))
+        prov = Path(AN._ledger_path(str(outputs)))
+        fing = Path(FP._ledger_path(str(outputs)))
+        prov_before, fing_before = prov.read_bytes(), fing.read_bytes()
+
+        ready = tmp_path / "ready"
+        release = tmp_path / "release"
+        holder = subprocess.Popen([
+            sys.executable, "-c", _HOLDER_SCRIPT, _EXT_ROOT,
+            str(ready), str(release), str(prov), str(fing),
+        ])
+        try:
+            _wait_for_file(str(ready))
+            monkeypatch.setitem(sys.modules, "portalocker", None)
+            monkeypatch.setenv(_LOCK_TIMEOUT_ENV, "0.5")
+
+            start = time.monotonic()
+            with pytest.raises(OL.IndexLockAcquireError):
+                AN.record_provenance(str(outputs), str(b))
+            with pytest.raises(OL.IndexLockAcquireError):
+                FP.tag_output(str(b), str(outputs), script_path=str(script))
+            elapsed = time.monotonic() - start
+            assert elapsed < 10.0, f"fail-closed path took {elapsed:.1f}s"
+            assert prov.read_bytes() == prov_before  # nothing silently written
+            assert fing.read_bytes() == fing_before
+            assert holder.poll() is None  # the owner was never disturbed
+        finally:
+            release.write_text("release", encoding="utf-8")
+            assert holder.wait(timeout=30) == 0
+
+        # Once released, the same writes succeed.
+        assert "error" not in AN.record_provenance(str(outputs), str(b))
+        assert len(AN.list_provenance(str(outputs))) == 2
+
+
+class TestIndexFileLockSharingViolations:
+    """Two Windows failure modes the multi-writer test above exposed in
+    IndexFileLock's atomic-create fallback: a release whose os.remove hits a
+    sharing violation (a waiter is reading the lease) and an O_EXCL create
+    that is denied while the previous lock file is delete-pending."""
+
+    def test_release_retries_a_transient_sharing_violation(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        monkeypatch.setitem(sys.modules, "portalocker", None)
+        monkeypatch.setattr(OL, "_LOCK_REMOVE_RETRY_SLEEP_SECONDS", 0.0)
+        db_path = str(tmp_path / "ledger.json")
+        lock = OL.IndexFileLock(db_path)
+        lock.acquire()
+        real_remove = os.remove
+        failures = {"left": 3}
+
+        def _flaky_remove(path: str) -> None:
+            if path.endswith(".lock") and failures["left"]:
+                failures["left"] -= 1
+                raise PermissionError("sharing violation")
+            real_remove(path)
+
+        with monkeypatch.context() as m:
+            m.setattr(os, "remove", _flaky_remove)
+            lock.release()
+        assert failures["left"] == 0
+        assert not os.path.exists(db_path + ".lock")
+        # The same process can take the lock again immediately.
+        again = OL.IndexFileLock(db_path, timeout=1.0)
+        again.acquire()
+        again.release()
+
+    def test_release_gives_up_with_a_warning_and_never_raises(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+        caplog: pytest.LogCaptureFixture,
+    ) -> None:
+        monkeypatch.setattr(OL, "_LOCK_REMOVE_RETRY_SLEEP_SECONDS", 0.0)
+        monkeypatch.setattr(OL, "_LOCK_REMOVE_RETRIES", 3)
+        lock_file = tmp_path / "x.lock"
+        lock_file.write_text("{}", encoding="utf-8")
+
+        def _denied(path: str) -> None:
+            raise PermissionError("sharing violation")
+
+        with caplog.at_level(logging.WARNING, logger=OL.__name__):
+            with monkeypatch.context() as m:
+                m.setattr(os, "remove", _denied)
+                OL._remove_released_lock_file(str(lock_file))
+        assert any("still held open" in r.getMessage() for r in caplog.records)
+        OL._remove_released_lock_file(str(tmp_path / "missing.lock"))  # no error
+
+        def _other(path: str) -> None:
+            raise OSError("read-only filesystem")
+
+        with monkeypatch.context() as m:
+            m.setattr(os, "remove", _other)
+            OL._remove_released_lock_file(str(lock_file))  # logged, not raised
+
+    def test_acquire_retries_a_transient_access_denied_create(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        monkeypatch.setitem(sys.modules, "portalocker", None)
+        db_path = str(tmp_path / "ledger.json")
+        real_open = os.open
+        failures = {"left": 2}
+
+        def _flaky_open(path, flags, *a, **k):
+            if str(path).endswith(".lock") and failures["left"]:
+                failures["left"] -= 1
+                raise PermissionError("delete pending")
+            return real_open(path, flags, *a, **k)
+
+        lock = OL.IndexFileLock(db_path, timeout=5.0)
+        with monkeypatch.context() as m:
+            m.setattr(os, "open", _flaky_open)
+            lock.acquire()
+        try:
+            assert failures["left"] == 0
+            assert lock._lock_mode == "atomic_create"
+        finally:
+            lock.release()
+
+    def test_acquire_fails_closed_when_create_stays_denied(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        monkeypatch.setitem(sys.modules, "portalocker", None)
+        monkeypatch.setattr(OL, "_LOCK_CREATE_DENIED_GRACE_SECONDS", 0.2)
+        db_path = str(tmp_path / "ledger.json")
+        real_open = os.open
+
+        def _denied(path, flags, *a, **k):
+            if str(path).endswith(".lock"):
+                raise PermissionError("access denied")
+            return real_open(path, flags, *a, **k)
+
+        lock = OL.IndexFileLock(db_path, timeout=30.0)
+        start = time.monotonic()
+        with monkeypatch.context() as m:
+            m.setattr(os, "open", _denied)
+            with pytest.raises(OL.IndexLockAcquireError, match="failed to create lock file"):
+                lock.acquire()
+        assert time.monotonic() - start < 10.0
+        # The in-process lock was released on failure.
+        assert lock._thread_lock.acquire(blocking=False)
+        lock._thread_lock.release()
+
+
+# ---------------------------------------------------------------------------
+# Non-reentrant lock: nested reads inside a transaction
+# ---------------------------------------------------------------------------
+
+class TestNestedReadInsideTransaction:
+    def test_reads_inside_a_provenance_transaction_do_not_deadlock(
+        self, tmp_path: Path,
+    ) -> None:
+        outputs = _outputs(tmp_path)
+        a = _write(outputs / "a.csv", "x\n1\n")
+        assert "error" not in AN.record_provenance(str(outputs), str(a), note="n1")
+        ledger_path = AN._ledger_path(str(outputs))
+        seen: dict[str, object] = {}
+
+        def _run() -> None:
+            with LIO.ledger_transaction(ledger_path) as txn:
+                loaded = txn.load(AN._load_ledger_unlocked)
+                seen["read"] = AN._read_ledger(str(outputs))
+                seen["list"] = AN.list_provenance(str(outputs))
+                seen["get"] = AN.get_provenance(str(outputs), str(a))
+                txn.commit(loaded)
+
+        worker = threading.Thread(target=_run, daemon=True)
+        worker.start()
+        worker.join(timeout=30)
+        assert not worker.is_alive(), "nested read deadlocked inside the transaction"
+        assert list(seen["read"]) == ["a.csv"]  # type: ignore[arg-type]
+        assert seen["get"]["note"] == "n1"  # type: ignore[index]
+        # The lock was released: an ordinary write still goes through.
+        b = _write(outputs / "b.csv", "x\n2\n")
+        assert "error" not in AN.record_provenance(str(outputs), str(b))
+
+
+# ---------------------------------------------------------------------------
+# Read cache: same size, same mtime, different file
+# ---------------------------------------------------------------------------
+
+class TestReadCacheSignature:
+    def test_same_size_same_mtime_replacement_is_visible(self, tmp_path: Path) -> None:
+        outputs = _outputs(tmp_path)
+        a = _write(outputs / "a.csv", "x\n1\n")
+        assert "error" not in AN.record_provenance(str(outputs), str(a), note="aaaa")
+        assert AN.list_provenance(str(outputs))[0]["note"] == "aaaa"  # cache filled
+
+        ledger = AN._ledger_path(str(outputs))
+        old = os.stat(ledger)
+        raw = Path(ledger).read_bytes()
+        swapped = raw.replace(b'"aaaa"', b'"bbbb"')
+        assert len(swapped) == len(raw)
+        staging = ledger + ".swap"
+        Path(staging).write_bytes(swapped)
+        os.utime(staging, ns=(old.st_atime_ns, old.st_mtime_ns))
+        os.replace(staging, ledger)
+        new = os.stat(ledger)
+        assert (new.st_size, new.st_mtime_ns) == (old.st_size, old.st_mtime_ns)
+        if new.st_ino == old.st_ino:
+            pytest.skip("filesystem does not report distinct inode numbers")
+
+        assert AN.list_provenance(str(outputs))[0]["note"] == "bbbb"
+        assert AN.get_provenance(str(outputs), str(a))["note"] == "bbbb"
+
+    def test_unchanged_ledger_is_served_from_cache(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        outputs = _outputs(tmp_path)
+        a = _write(outputs / "a.csv", "x\n1\n")
+        assert "error" not in AN.record_provenance(str(outputs), str(a))
+        AN.list_provenance(str(outputs))
+        parses = {"n": 0}
+        real = LIO.read_ledger_strict
+
+        def _counting(path: str):
+            parses["n"] += 1
+            return real(path)
+
+        monkeypatch.setattr(LIO, "read_ledger_strict", _counting)
+        for _ in range(5):
+            assert len(AN.list_provenance(str(outputs))) == 1
+        assert parses["n"] == 0

@@ -35,11 +35,13 @@ consistent without touching their files):
     a long-lived project's provenance store doesn't grow unbounded and a
     fresh call always overwrites (never duplicates) the prior record for a
     path.
-  - Locking: a plain in-process ``threading.Lock`` (NOT
-    ``outputs_local.IndexFileLock``'s cross-process portalocker layer) --
-    mirroring ``fingerprint.py``'s own reasoning: this is a lower-stakes,
-    mostly-single-writer sidecar, not the shared FTS index, so cross-process
-    exclusivity isn't warranted for it either.
+  - Locking: every write runs inside ``ledger_io.ledger_transaction``, which
+    holds ``outputs_local.IndexFileLock`` on the ledger file (cross-process,
+    not just cross-thread), writes a unique fsynced temporary file and
+    replaces the ledger atomically. A corrupt ledger is quarantined to
+    ``provenance_ledger.json.corrupt-<utc>`` instead of being read as empty.
+    Readers stay lock-free and strict: they raise
+    ``ledger_io.LedgerCorruptError`` rather than report an empty ledger.
   - Reuse over duplication: falls back to ``outputs_local.file_fingerprint``
     for a best-effort ``generating_script`` hint when the caller doesn't
     supply one explicitly, the same helper ``fingerprint.py`` builds on, so
@@ -51,7 +53,6 @@ rest of the ``meridian_outputs`` package.
 """
 from __future__ import annotations
 
-import json
 import logging
 import os
 import threading
@@ -60,7 +61,7 @@ from dataclasses import asdict, dataclass, field
 from datetime import datetime, timezone
 from typing import Any
 
-from . import fingerprint, outputs_local
+from . import fingerprint, ledger_io, outputs_local
 from .path_security import (
     relative_output_path,
     relative_reference,
@@ -80,18 +81,16 @@ __all__ = [
 _CACHE_DIRNAME = ".meridian-outputs-cache"
 _LEDGER_FILENAME = "provenance_ledger.json"
 
-# In-process only (no cross-process portalocker layer) -- see module
-# docstring: this ledger is a lower-stakes, mostly-single-writer sidecar, not
-# the shared FTS index, mirroring fingerprint.py's own lock choice/rationale.
+# Guards ONLY the _ledger_read_cache dict below. Ledger writes are serialised
+# by ledger_io.ledger_transaction (outputs_local.IndexFileLock on the ledger
+# file, cross-process). That lock's in-process part is a plain, non-reentrant
+# threading.Lock, so nothing called inside a transaction may take it again:
+# the writer reads through _load_ledger_unlocked, which only ever holds this
+# RLock for the few instructions that touch the cache dict.
 #
-# fa600e42 -- RLock, not Lock: _write_ledger_entry acquires this lock and
-# THEN calls _read_ledger (its own read-modify-write pattern); _read_ledger
-# now ALSO acquires this same lock internally (to guard the fa600e42 cache
-# dict added below). A plain, non-reentrant Lock re-acquired by the same
-# thread in that nested call blocks forever -- confirmed live (a real test
-# run hung indefinitely on the very first record_provenance call once the
-# cache was added). RLock allows the same thread to re-enter safely while
-# still serializing genuinely concurrent threads exactly as before.
+# fa600e42 -- RLock, not Lock: kept reentrant so a caller that already holds
+# it (none today) can never deadlock on the cache, the hang fa600e42 hit when
+# the cache was first added under a plain Lock.
 _write_lock = threading.RLock()
 
 
@@ -129,7 +128,7 @@ def _ledger_path(outputs_dir: str) -> str:
     return os.path.join(_cache_dir(outputs_dir), _LEDGER_FILENAME)
 
 
-# fa600e42 -- path -> (mtime, size, parsed ledger dict). Avoids re-reading
+# fa600e42 -- path -> (stat signature, parsed ledger dict). Avoids re-reading
 # and re-JSON-parsing an UNCHANGED ledger file on every call: originally a
 # non-issue (this ledger had no caller that read it in a loop), but
 # provenance_status.get_provenance_status's new relocation-detection tier
@@ -138,40 +137,66 @@ def _ledger_path(outputs_dir: str) -> str:
 # callers (bind_artifact_provenance, build_provenance_envelope) that can
 # call it once per path against a project with a large accumulated ledger
 # -- an O(N) re-parse of the same unchanged file for an N-path batch,
-# without this cache. Staleness signature is the SAME mtime+size check this
-# whole package already relies on throughout outputs_local.py for file-
-# change detection -- not a new class of risk this package doesn't already
-# accept elsewhere. Guarded by the same _write_lock ledger writes already
-# use, so a reader can never observe a torn read of the cache tuple.
-_ledger_read_cache: dict[str, tuple[float, int, dict[str, dict[str, Any]]]] = {}
+# without this cache.
+#
+# The signature is (st_mtime_ns, st_size, st_ino). mtime+size alone served a
+# stale ledger after a same-size rewrite inside one mtime tick; every ledger
+# write is an atomic replace of a NEW file, so st_ino changes on each write
+# even when size and mtime do not. An in-place rewrite that keeps size,
+# mtime and inode is not detected (that would need a content hash); no
+# writer in this package rewrites the ledger in place.
+_LedgerSig = tuple[int, int, int]
+_ledger_read_cache: dict[str, tuple[_LedgerSig, dict[str, dict[str, Any]]]] = {}
 
 
-def _read_ledger(outputs_dir: str) -> dict[str, dict[str, Any]]:
-    path = _ledger_path(outputs_dir)
+def _ledger_sig(st: os.stat_result) -> _LedgerSig:
+    return (st.st_mtime_ns, st.st_size, st.st_ino)
+
+
+def _load_ledger_unlocked(path: str) -> dict[str, dict[str, Any]]:
+    """Strict, cache-aware read of the ledger at ``path``.
+
+    Takes no ledger lock (only ``_write_lock`` around the cache dict), so it
+    is safe both for lock-free readers and inside
+    ``ledger_io.ledger_transaction``, whose lock is not reentrant. Returns
+    ``{}`` only for a missing ledger; raises ``ledger_io.LedgerCorruptError``
+    for a corrupt one. The parse is cached only when the file's signature is
+    the same before and after reading, so a concurrent replace can never pin
+    the new bytes under the old signature.
+    """
     try:
-        st = os.stat(path)
-    except OSError:
+        before = _ledger_sig(os.stat(path))
+    except FileNotFoundError:
         return {}
     with _write_lock:
         cached = _ledger_read_cache.get(path)
-        if cached is not None and cached[0] == st.st_mtime and cached[1] == st.st_size:
-            return dict(cached[2])
+        if cached is not None and cached[0] == before:
+            return dict(cached[1])
+    data = ledger_io.read_ledger_strict(path)
     try:
-        with open(path, "r", encoding="utf-8") as fh:
-            data = json.load(fh)
-    except (OSError, ValueError):
-        return {}
-    if not isinstance(data, dict):
-        return {}
-    with _write_lock:
-        _ledger_read_cache[path] = (st.st_mtime, st.st_size, data)
+        after = _ledger_sig(os.stat(path))
+    except OSError:
+        after = None
+    if after == before:
+        with _write_lock:
+            _ledger_read_cache[path] = (before, data)
     return dict(data)
 
 
-def _write_ledger_entry(outputs_dir: str, key: str, record: dict[str, Any]) -> None:
+def _read_ledger(outputs_dir: str) -> dict[str, dict[str, Any]]:
+    return _load_ledger_unlocked(_ledger_path(outputs_dir))
+
+
+def _write_ledger_entry(outputs_dir: str, key: str, record: dict[str, Any]) -> str | None:
+    """Upsert ``record`` under ``key`` inside one cross-process transaction.
+
+    Returns the quarantine path when a corrupt ledger had to be set aside
+    first, else ``None``. Raises ``outputs_local.IndexLockAcquireError`` when
+    another process holds the ledger lock past its timeout.
+    """
     path = _ledger_path(outputs_dir)
-    with _write_lock:
-        ledger = _read_ledger(outputs_dir)
+    with ledger_io.ledger_transaction(path) as txn:
+        ledger = txn.load(_load_ledger_unlocked)
         # An update also scrubs legacy absolute-path rows that were written
         # before this module started storing relative references.
         portable: dict[str, dict[str, Any]] = {}
@@ -197,10 +222,8 @@ def _write_ledger_entry(outputs_dir: str, key: str, record: dict[str, Any]) -> N
             portable[safe_key] = entry
         ledger = portable
         ledger[key] = record
-        tmp = path + ".tmp"
-        with open(tmp, "w", encoding="utf-8") as fh:
-            json.dump(ledger, fh, indent=2, sort_keys=True)
-        os.replace(tmp, path)  # atomic on both POSIX and Windows
+        txn.commit(ledger)  # unique tmp + fsync + atomic os.replace
+        return txn.quarantined_path
 
 
 @dataclass
@@ -299,7 +322,11 @@ def record_provenance(
       The stored record as a dict (path, generating_script, params,
       sprint_item_id, decision_id, note, recorded_at, recorded_at_iso,
       content_hash, experiment_run_id, cited_zotero_keys), or
-      ``{"error": ...}`` on failure.
+      ``{"error": ...}`` on failure. When the existing ledger was corrupt,
+      its bytes are first copied to ``provenance_ledger.json.corrupt-<utc>``
+      and the result carries ``ledger_quarantined`` (that file's basename).
+      Raises ``outputs_local.IndexLockAcquireError`` when another process
+      holds the ledger lock past its timeout (fail closed, nothing written).
 
     bd5b8d79 -- ``content_hash`` is a best-effort SHA-256 of ``path``'s
     on-disk bytes AT THE MOMENT this record is written, via
@@ -393,9 +420,12 @@ def record_provenance(
             or os.path.basename(generating_script)
         )
 
+    # outputs_local.IndexLockAcquireError (another process holds the ledger
+    # lock past its timeout) deliberately propagates: fail closed, never a
+    # silently dropped record.
     try:
-        _write_ledger_entry(outputs_dir, key, stored_record)
-    except (OSError, TypeError) as exc:
+        quarantined = _write_ledger_entry(outputs_dir, key, stored_record)
+    except (OSError, TypeError, ledger_io.LedgerCorruptError) as exc:
         return {"error": f"failed to write provenance record: {exc}"}
 
     try:
@@ -407,7 +437,12 @@ def record_provenance(
             path, outputs_dir, exc_info=True,
         )
 
-    return record.to_dict()
+    result = record.to_dict()
+    if quarantined:
+        # The prior ledger was corrupt: its bytes were copied aside before
+        # this write replaced it. Basename only -- no machine-local path.
+        result["ledger_quarantined"] = os.path.basename(quarantined)
+    return result
 
 
 def get_provenance(outputs_dir: str, path: str) -> dict[str, Any] | None:
@@ -429,6 +464,9 @@ def get_provenance(outputs_dir: str, path: str) -> dict[str, Any] | None:
       ``recorded_at``, ``recorded_at_iso``, ``content_hash``,
       ``experiment_run_id``, ``cited_zotero_keys``), or None if nothing has
       ever been recorded for this path under this outputs_dir.
+
+    Raises ``ledger_io.LedgerCorruptError`` when the ledger exists but is not
+    a JSON object: a damaged ledger is never reported as "nothing recorded".
 
     Deliberately a PURE exact-match primitive -- bd5b8d79. A bare ``None``
     here is ambiguous ("never recorded" vs. "recorded, but this path was
@@ -473,7 +511,9 @@ def list_provenance(outputs_dir: str) -> list[dict[str, Any]]:
 
     Returns:
       A list of record dicts (same shape as :func:`get_provenance`'s return
-      value), or ``[]`` if nothing has been recorded yet.
+      value), or ``[]`` if nothing has been recorded yet. Raises
+      ``ledger_io.LedgerCorruptError`` for a corrupt ledger, as
+      :func:`get_provenance` does.
     """
     ledger = _read_ledger(outputs_dir)
     records = [dict(ledger[key]) for key in sorted(ledger)]

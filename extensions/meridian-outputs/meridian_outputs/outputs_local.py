@@ -1100,6 +1100,40 @@ def read_index_lock_owner(
     )
 
 
+# Windows: every waiting acquirer reads the holder's lease
+# (read_index_lock_owner), which keeps the lock file open for a moment
+# without FILE_SHARE_DELETE, so the holder's os.remove on release can fail
+# with a sharing violation. Swallowing that once left the lock file behind
+# carrying a LIVE pid: other processes waited it out as an active owner and
+# the holder deadlocked on its own next acquire (found by the ledger
+# multi-writer test, tests/test_ledger_concurrency.py). The reader's open is
+# brief, so a short bounded retry clears it.
+_LOCK_REMOVE_RETRIES = 100
+_LOCK_REMOVE_RETRY_SLEEP_SECONDS = 0.02
+# How long consecutive access-denied errors on the atomic create are treated
+# as a transient delete-pending lock file; see IndexFileLock._acquire_atomic.
+_LOCK_CREATE_DENIED_GRACE_SECONDS = 5.0
+
+
+def _remove_released_lock_file(lock_path: str) -> None:
+    for _ in range(_LOCK_REMOVE_RETRIES):
+        try:
+            os.remove(lock_path)
+            return
+        except FileNotFoundError:
+            return  # already reclaimed by another process: same end state
+        except PermissionError:
+            time.sleep(_LOCK_REMOVE_RETRY_SLEEP_SECONDS)
+        except OSError:
+            _log.debug("IndexFileLock: could not remove %r", lock_path, exc_info=True)
+            return
+    _log.warning(
+        "IndexFileLock: released lock file %r is still held open by another "
+        "process after %d attempts; waiters will treat it as held until its "
+        "heartbeat goes stale", lock_path, _LOCK_REMOVE_RETRIES,
+    )
+
+
 class IndexFileLock:
     """Exclusive write lock for one index DB file.
 
@@ -1208,10 +1242,31 @@ class IndexFileLock:
         )
         deadline = None if effective_timeout is None else time.monotonic() + effective_timeout
         poll = self._ATOMIC_POLL_INITIAL
+        denied_since: float | None = None
         while True:
             try:
                 fd = os.open(lock_path, os.O_CREAT | os.O_EXCL | os.O_RDWR)
+            except PermissionError as exc:
+                # Windows: a lock file the previous holder just deleted can
+                # sit in delete-pending state while some other handle (an
+                # indexer, antivirus, a lease reader) is still open on it, and
+                # O_EXCL create then fails with access denied instead of
+                # FileExistsError. Transient: retry for a short grace period
+                # (and never past the deadline), then fail as before.
+                now = time.monotonic()
+                denied_since = now if denied_since is None else denied_since
+                if (
+                    now - denied_since > _LOCK_CREATE_DENIED_GRACE_SECONDS
+                    or (deadline is not None and now >= deadline)
+                ):
+                    raise IndexLockAcquireError(
+                        f"failed to create lock file {lock_path!r}: {exc}"
+                    ) from exc
+                time.sleep(poll)
+                poll = min(poll * 1.5, self._ATOMIC_POLL_MAX)
+                continue
             except FileExistsError:
+                denied_since = None
                 owner = read_index_lock_owner(self._db_path)
                 if owner.is_stale:
                     try:
@@ -1307,10 +1362,7 @@ class IndexFileLock:
                     # effort: if this races a concurrent stale-reclaim from
                     # another process, both sides converge on the same "free"
                     # end state regardless of who wins.
-                    try:
-                        os.remove(self._canonical + ".lock")
-                    except OSError:
-                        pass
+                    _remove_released_lock_file(self._canonical + ".lock")
                 self._file_handle = None
                 self._lock_mode = None
                 self._last_heartbeat_write = None

@@ -266,6 +266,12 @@ self-consistent, not merely present.
 - The local index cache is auto-added to `.gitignore` on first use.
 - Concurrent index writes are serialised through `IndexFileLock`
   (threading + optional cross-process portalocker).
+- Provenance and fingerprint ledger writes hold the same cross-process
+  `IndexFileLock` on the ledger file (`meridian_outputs.ledger_io`), write a
+  unique fsynced temporary file, and replace the ledger atomically. A
+  corrupt ledger is copied to `<ledger>.corrupt-<utc>` before it is
+  rewritten and is never read as empty; lock contention past the timeout
+  raises `IndexLockAcquireError` instead of dropping the write.
 - Same inputs always produce the same results (deterministic path ordering,
   stable sort, no non-reproducible set/dict iteration in output paths).
 
