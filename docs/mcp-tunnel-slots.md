@@ -79,6 +79,46 @@ ever printing the raw command or argv, since a custom slot override can embed
 a secret (mirrors `serena_pool._command_hash`'s non-reversible-diagnostics
 rationale for the same reason).
 
+### Remote shell and verification: pinned locally
+
+The server never sends a shell string to the tunnel client. `run_cmd` is refused
+(`status: "refused"`), and nothing is spawned for it.
+
+`run_verification` sends only the project id. The client runs the command pinned
+for that project in its own pins file, and reports the command it ran back to the
+server. The server's `test_cmd` value is informational and is not executed.
+
+The pins file is `verification_commands.json`, in the local-runner state folder
+(`~/.meridian/local_runner/`, or `MERIDIAN_LOCAL_RUNNER_STATE_DIR` when set). It
+lives only on the machine that runs the tunnel and is never synced.
+
+```json
+{
+  "5787cc92-ba7d-4788-b17c-28ab7938b839": {
+    "cmd": "pixi run test",
+    "cwd": "C:\\Users\\you\\Documents\\Meridian\\repository"
+  }
+}
+```
+
+`cmd` is required, non-empty, and at most 2000 characters. `cwd` is optional.
+A missing project, a malformed file, or an invalid entry pins nothing, and
+`run_verification` then returns `not_configured` without running anything.
+
+### Served roots: credential and token folders are refused
+
+The filesystem slot never serves a root that is, contains, or sits inside a
+credential or token folder. This covers `filesystem_roots` from the server, the
+local root list, and the repo-path fallback. The refused folders are:
+
+- `~/.meridian` and the local-runner state folder
+- `~/.ssh`, `~/.gnupg`, `~/.aws`, `~/.azure`, `~/.kube`, `~/.docker`
+- `%APPDATA%\Zotero`, the Zotero profile folder that holds the bridge's preference lines
+
+Containment is checked in both directions. A root that contains one of these
+folders, such as the home folder itself, is refused too. A refused root is
+logged and dropped. If the check cannot resolve a path, it refuses that root.
+
 ## Claude Desktop
 
 Claude Desktop does not read a project-local `.mcp.json`; it reads

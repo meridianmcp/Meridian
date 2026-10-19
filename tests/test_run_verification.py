@@ -7,7 +7,7 @@ Coverage:
   4. MCP tool registration / schema shape is correct.
   5. _parse_test_counts parses pytest-style summary lines.
   6. _handle_run_cmd produces the right structure on success and on error.
-  7. send_run_cmd_control returns not_connected when no FS socket.
+  7. send_verification_control returns not_connected when no FS socket.
 
 Follows the stubbing style of test_searchgraph_projectid_hint.py and
 test_docx_tunnel_write_lock.py — tunnel state monkeypatched directly, no
@@ -175,14 +175,14 @@ async def test_handle_run_cmd_timeout_kills_child_process(monkeypatch):
 
 
 # ---------------------------------------------------------------------------
-# 3. send_run_cmd_control: not_connected when no FS socket
+# 3. send_verification_control: not_connected when no FS socket
 # ---------------------------------------------------------------------------
 
 @pytest.mark.asyncio
-async def test_send_run_cmd_control_not_connected():
+async def test_send_verification_control_not_connected():
     """With no active FS socket the function returns status='not_connected', never raises."""
     tun._tunnel_sockets.pop("tenant-nc", None)
-    result = await tun.send_run_cmd_control("tenant-nc", cmd="pytest", cwd=None)
+    result = await tun.send_verification_control("tenant-nc", "proj-nc")
     assert result["status"] == "not_connected"
     assert result["exit_code"] is None
     assert result["passed"] is None
@@ -190,7 +190,7 @@ async def test_send_run_cmd_control_not_connected():
 
 
 # ---------------------------------------------------------------------------
-# 3b. d0f05438 — send_run_cmd_control must not let a force-cancelled pending
+# 3b. d0f05438 — send_verification_control must not let a force-cancelled pending
 #     future escape as a bare, message-less asyncio.CancelledError.
 # ---------------------------------------------------------------------------
 
@@ -202,14 +202,14 @@ class _NeverRespondsWS:
 
 
 @pytest.mark.asyncio
-async def test_send_run_cmd_control_force_cancelled_future_returns_legible_status():
+async def test_send_verification_control_force_cancelled_future_returns_legible_status():
     """tunnel_ws's disconnect cleanup calls ``fut.cancel()`` on every pending
     run_cmd future for a tenant whose FS socket just dropped — e.g. a server
     redeploy wiping the in-memory socket registry mid-``run_verification``.
     Before d0f05438, awaiting that force-cancelled future re-raised
     ``asyncio.CancelledError`` — a ``BaseException`` (not ``Exception``) since
     Python 3.8 — which slipped past ``except Exception`` and propagated
-    uncaught out of ``send_run_cmd_control``, surfacing to the MCP caller as a
+    uncaught out of ``send_verification_control``, surfacing to the MCP caller as a
     bare, message-less dispatch failure instead of an honest, retryable
     status. It must now return a legible dict, and the pending-request map
     must still be cleaned up.
@@ -220,7 +220,7 @@ async def test_send_run_cmd_control_force_cancelled_future_returns_legible_statu
     tun._tunnel_sockets[tenant_id] = _NeverRespondsWS()
     try:
         task = _asyncio.ensure_future(
-            tun.send_run_cmd_control(tenant_id, cmd="pytest", cwd=None)
+            tun.send_verification_control(tenant_id, "proj-cancel")
         )
         # Wait for the pending future to be registered, then force-cancel it —
         # exactly what tunnel_ws's disconnect cleanup does on a dropped socket.
@@ -243,9 +243,9 @@ async def test_send_run_cmd_control_force_cancelled_future_returns_legible_statu
 
 
 @pytest.mark.asyncio
-async def test_send_run_cmd_control_task_cancel_resolves_bounded_not_hung():
+async def test_send_verification_control_task_cancel_resolves_bounded_not_hung():
     """Cancelling the enclosing TASK (not just the pending future) is
-    indistinguishable, from inside ``send_run_cmd_control``, from tunnel_ws's
+    indistinguishable, from inside ``send_verification_control``, from tunnel_ws's
     disconnect cleanup calling ``fut.cancel()`` directly — asyncio.Task.cancel()
     cancels whatever the task is currently awaiting (``fut``, via wait_for), so
     ``fut.cancelled()`` is True in both cases and there is no reliable signal to
@@ -262,7 +262,7 @@ async def test_send_run_cmd_control_task_cancel_resolves_bounded_not_hung():
     tun._tunnel_sockets[tenant_id] = _NeverRespondsWS()
     try:
         task = _asyncio.ensure_future(
-            tun.send_run_cmd_control(tenant_id, cmd="pytest", cwd=None)
+            tun.send_verification_control(tenant_id, "proj-cancel")
         )
         for _ in range(200):
             if tun._pending_run_cmd_reqs:
@@ -322,7 +322,7 @@ async def test_run_verification_not_configured_via_db(db):
 
 @pytest.mark.asyncio
 async def test_run_verification_tunnel_success(db, monkeypatch):
-    """send_run_cmd_control is called with the right args and result is propagated."""
+    """send_verification_control is called with the right args and result is propagated."""
     proj = await db_module.create_project(db, name="test-cmd-pass")
     await db_module.set_executor_config(db, proj["id"], {
         "test_cmd": "pixi run test",
@@ -331,9 +331,8 @@ async def test_run_verification_tunnel_success(db, monkeypatch):
 
     called = {}
 
-    async def _fake_run_cmd(tenant_id, cmd, cwd=None):
-        called["cmd"] = cmd
-        called["cwd"] = cwd
+    async def _fake_run_cmd(tenant_id, project_id):
+        called["project"] = project_id
         called["tenant"] = tenant_id
         return {
             "status": "ok",
@@ -344,7 +343,7 @@ async def test_run_verification_tunnel_success(db, monkeypatch):
             "stderr_tail": "",
         }
 
-    monkeypatch.setattr(tun, "send_run_cmd_control", _fake_run_cmd)
+    monkeypatch.setattr(tun, "send_verification_control", _fake_run_cmd)
     monkeypatch.setattr(tun, "has_active_tunnel", lambda tid: True)
 
     exec_cfg = await db_module.get_executor_config(db, proj["id"]) or {}
@@ -354,10 +353,11 @@ async def test_run_verification_tunnel_success(db, monkeypatch):
     assert test_cmd == "pixi run test"
     assert repo_path == "/repo"
 
-    result = await tun.send_run_cmd_control("t1", cmd=test_cmd, cwd=repo_path or None)
+    result = await tun.send_verification_control("t1", proj["id"])
 
-    assert called["cmd"] == "pixi run test"
-    assert called["cwd"] == "/repo"
+    # The server sends only the project id. The command is pinned on the client, not sent from here.
+    assert called["project"] == proj["id"]
+    assert called["tenant"] == "t1"
     assert result["status"] == "ok"
     assert result["exit_code"] == 0
     assert result["passed"] == 42
@@ -370,14 +370,14 @@ async def test_run_verification_tunnel_success(db, monkeypatch):
 
 @pytest.mark.asyncio
 async def test_run_verification_tunnel_failure(db, monkeypatch):
-    """Non-zero exit_code from send_run_cmd_control is returned, not treated as error."""
+    """Non-zero exit_code from send_verification_control is returned, not treated as error."""
     proj = await db_module.create_project(db, name="test-cmd-fail")
     await db_module.set_executor_config(db, proj["id"], {
         "test_cmd": "pytest",
         "repo_path": "",
     })
 
-    async def _fake_run_cmd(tenant_id, cmd, cwd=None):
+    async def _fake_run_cmd(tenant_id, project_id):
         return {
             "status": "ok",
             "exit_code": 1,
@@ -387,9 +387,9 @@ async def test_run_verification_tunnel_failure(db, monkeypatch):
             "stderr_tail": "FAILED test_foo.py::test_bar",
         }
 
-    monkeypatch.setattr(tun, "send_run_cmd_control", _fake_run_cmd)
+    monkeypatch.setattr(tun, "send_verification_control", _fake_run_cmd)
 
-    result = await tun.send_run_cmd_control("t2", cmd="pytest", cwd=None)
+    result = await tun.send_verification_control("t2", "proj-fail")
     assert result["exit_code"] == 1
     assert result["passed"] == 10
     assert result["failed"] == 3

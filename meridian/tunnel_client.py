@@ -2261,14 +2261,20 @@ async def _run_connection_lazy(
                                 flush=True,
                             )
                         continue
-                    if msg.get("type") == "run_cmd":
-                        # 0e973e52 — run_verification: spawn test_cmd as a real local
-                        # process and send the structured result back to the server.
-                        # Only the FS slot handles this; other slots ignore it.
+                    if msg.get("type") == "run_verification":
+                        # run_verification: run THIS machine's pinned command for the project. The server
+                        # sends only the project id, never a command, so it cannot choose what runs here.
                         req_id = msg.get("id", "")
-                        cmd_val = msg.get("cmd") or ""
-                        cwd_val = (msg.get("cwd") or "").strip() or None
-                        run_result = await _handle_run_cmd(cmd_val, cwd_val)
+                        run_result = await _handle_run_verification(msg.get("project_id") or "")
+                        run_result["type"] = "run_cmd_result"
+                        run_result["id"] = req_id
+                        await ws.send(json.dumps(run_result))
+                        continue
+                    if msg.get("type") == "run_cmd":
+                        # Remote shell strings are refused. The server no longer sends them; this refuses any that
+                        # arrive, so a remote caller cannot run an arbitrary command through this client.
+                        req_id = msg.get("id", "")
+                        run_result = _run_refused()
                         run_result["type"] = "run_cmd_result"
                         run_result["id"] = req_id
                         await ws.send(json.dumps(run_result))
@@ -6006,7 +6012,11 @@ def _build_proxy_command(
     Note: with ``--shell`` mcp-proxy concatenates args unescaped, so a
     directory containing spaces is not yet supported on Windows.
     """
-    dirs = [_normalize_path_arg(r) for r in (roots or []) if _normalize_path_arg(r)] or [repo_path]
+    requested = [_normalize_path_arg(r) for r in (roots or []) if _normalize_path_arg(r)]
+    # A root that is, or touches, a credential or token folder is never served, including the repo_path fallback.
+    # If every requested root is refused, nothing is served, which fails closed rather than falling back to a
+    # folder the user did not choose.
+    dirs = _allowed_served_roots(requested) if requested else _allowed_served_roots([repo_path])
     # --server stream: serve only Streamable HTTP (/mcp), no SSE.
     # --stateless: each POST is handled independently — required for the
     #   tunnel relay's one-shot request/response model (no persistent SSE pipe).
@@ -6112,6 +6122,123 @@ def _shell_subprocess_env() -> "dict[str, str] | None":
     if py_dir not in parts:
         env["PATH"] = py_dir + (os.pathsep + existing_path if existing_path else "")
     return env
+
+
+VERIFICATION_PINS_FILENAME = "verification_commands.json"
+_PIN_COMMAND_MAX = 2000
+_RUN_REFUSED_MESSAGE = (
+    "Remote shell commands are disabled. Pin the test command for this project in "
+    f"{VERIFICATION_PINS_FILENAME} in your Meridian local-runner folder on this machine."
+)
+_NOT_PINNED_MESSAGE = (
+    "No test command is pinned for this project on this machine. Add the project to "
+    f"{VERIFICATION_PINS_FILENAME} in your Meridian local-runner folder, then run it again."
+)
+
+
+def _verification_pins_path() -> "Path":
+    """The pins file: on this machine, in the local-runner folder that holds the bridge token. Never synced."""
+    from .local_runner import default_state_dir  # noqa: PLC0415
+    return default_state_dir() / VERIFICATION_PINS_FILENAME
+
+
+def _load_verification_pin(project_id: str) -> "dict | None":
+    """The pinned ``{"cmd", "cwd"}`` for a project, or None when there is none or the file is not valid.
+
+    The file is ``{"<project_id>": {"cmd": "...", "cwd": "..."}}``. Anything that is not that shape is ignored,
+    so a damaged file pins nothing. Never raises.
+    """
+    try:
+        data = json.loads(_verification_pins_path().read_text(encoding="utf-8-sig"))
+    except (OSError, ValueError):
+        return None
+    if not isinstance(data, dict):
+        return None
+    entry = data.get(project_id)
+    if not isinstance(entry, dict):
+        return None
+    cmd = entry.get("cmd")
+    if not isinstance(cmd, str) or not cmd.strip() or len(cmd) > _PIN_COMMAND_MAX:
+        return None
+    cwd = entry.get("cwd")
+    if cwd is not None and not isinstance(cwd, str):
+        return None
+    return {"cmd": cmd.strip(), "cwd": (cwd or "").strip() or None}
+
+
+def _not_run_result(status: str, message: str) -> dict:
+    return {
+        "status": status,
+        "message": message,
+        "cmd": None,
+        "exit_code": None,
+        "passed": None,
+        "failed": None,
+        "stdout_tail": "",
+        "stderr_tail": "",
+    }
+
+
+def _run_refused() -> dict:
+    """The answer to a remote shell string. Nothing runs."""
+    return _not_run_result("refused", _RUN_REFUSED_MESSAGE)
+
+
+async def _handle_run_verification(project_id: str) -> dict:
+    """Run this machine's pinned command for a project and return the structured result.
+
+    The command and the working directory come only from the pins file here. The server supplies just the
+    project id. The result reports the command that ran, so the server can record it.
+    """
+    pin = _load_verification_pin(project_id) if isinstance(project_id, str) and project_id else None
+    if pin is None:
+        return _not_run_result("not_configured", _NOT_PINNED_MESSAGE)
+    result = await _handle_run_cmd(pin["cmd"], pin["cwd"])
+    result["cmd"] = pin["cmd"]
+    return result
+
+
+def _denied_root_folders() -> "list[Path]":
+    """Folders a served root may not be, contain, or sit inside: the bridge token and other credential stores."""
+    from .local_runner import default_state_dir  # noqa: PLC0415
+    home = Path.home()
+    folders = [home / name for name in _DENIED_HOME_FOLDERS]
+    folders.append(default_state_dir())
+    appdata = os.environ.get("APPDATA")
+    if appdata:
+        folders.append(Path(appdata) / "Zotero")
+    return folders
+
+
+_DENIED_HOME_FOLDERS = (".meridian", ".ssh", ".gnupg", ".aws", ".azure", ".kube", ".docker")
+
+
+def _is_denied_root(root: str) -> bool:
+    """True when a served root is, contains, or lies inside a credential or token folder. Fails closed.
+
+    Containment in both directions matters: a root that contains the token folder would serve it just as a root
+    inside it does.
+    """
+    try:
+        target = Path(root).resolve()
+        folders = [folder.resolve() for folder in _denied_root_folders()]
+    except (OSError, RuntimeError, ValueError):
+        return True
+    return any(_is_subpath(target, folder) or _is_subpath(folder, target) for folder in folders)
+
+
+def _allowed_served_roots(roots: "list[str]") -> "list[str]":
+    """The roots that may be served. A refused root is logged and dropped, never served."""
+    kept: list[str] = []
+    for root in roots:
+        if _is_denied_root(root):
+            print(
+                f"tunnel: refused served root {root!r}: it is, or touches, a credential or token folder",
+                flush=True,
+            )
+            continue
+        kept.append(root)
+    return kept
 
 
 async def _handle_run_cmd(cmd: "str | list", cwd: "str | None") -> dict:
@@ -6224,10 +6351,10 @@ def _add_fs_roots_to_cmd(cmd: "list[str]", new_roots: "list[str]") -> "tuple[lis
     except ValueError:
         return cmd, False
     existing: set[str] = set(cmd[idx + 1:])
-    to_add = [
+    to_add = _allowed_served_roots([
         nr for nr in (_normalize_path_arg(r) for r in new_roots)
         if nr and nr not in existing
-    ]
+    ])
     if not to_add:
         return cmd, False
     return cmd[:idx + 1] + list(cmd[idx + 1:]) + to_add, True
@@ -6254,6 +6381,7 @@ def _set_fs_roots_on_cmd(cmd: "list[str]", roots: "list[str]") -> "tuple[list[st
         nr = _normalize_path_arg(r)
         if nr and nr not in new_dirs:
             new_dirs.append(nr)
+    new_dirs = _allowed_served_roots(new_dirs)
     if not new_dirs:
         # Refuse to leave the filesystem server with zero dirs.
         return cmd, False

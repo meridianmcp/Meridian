@@ -193,12 +193,12 @@ Store project-level executor defaults so worker sessions start with repo path, e
 | `repo_path` | string | optional |  |
 | `repo_paths` | array | optional | Known locations [{cwd, hostname}] — merged into existing repo_paths, not overwritten. |
 | `env_file` | string | optional |  |
-| `test_cmd` | string | optional |  |
+| `test_cmd` | string | optional | Informational. `run_verification` does not run this value. The command that runs is pinned on the local machine in `verification_commands.json` (see `docs/mcp-tunnel-slots.md`). |
 | `test_min` | integer | optional |  |
 | `deploy_cmd` | string | optional |  |
 | `shell_type` | string | optional |  |
 | `branch` | string | optional |  |
-| `filesystem_roots` | array | optional | Directories the tunnel's filesystem connector may serve (unioned across the tenant's projects). Overwrites the existing list. |
+| `filesystem_roots` | array | optional | Directories the tunnel's filesystem connector may serve (unioned across the tenant's projects). Overwrites the existing list. The tunnel client refuses any root that is, contains, or sits inside a credential or token folder (`~/.meridian`, `~/.ssh`, `~/.gnupg`, `~/.aws`, `~/.azure`, `~/.kube`, `~/.docker`, the local-runner state folder, `%APPDATA%\Zotero`). |
 | `serena_repo_path` | string | optional | b970fe07 — default repo path for Serena (the tunnel's code-extractor slot). Auto-fetched at tunnel start; used only when --repo is not passed on the CLI. |
 | `codebase_code_dirs` | array | optional | b970fe07 — directories codebase-memory-mcp (the tunnel's code-intel slot) auto-indexes. Deduped-union across the tenant's projects; used only when --code-dir is not passed on the CLI. Overwrites the existing list. |
 | `context_threshold` | integer | optional | Turns before a context-budget warning is surfaced to the session. |

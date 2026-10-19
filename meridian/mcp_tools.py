@@ -159,7 +159,7 @@ _TOOL_EXAMPLES: dict[str, str] = {
     "get_session_activity": 'get_session_activity(session_id="session-uuid")',
     "set_active_repo": 'set_active_repo(repo_path="C:\\\\Users\\\\me\\\\project")',
     "analyze_model_efficiency": 'analyze_model_efficiency(title="Refactor auth across 12 files + migration", file_count=12, touches_resources=["auth_db", "sessions_table"], size="xl")',
-    "run_verification": 'run_verification(project_id="abc-123")  # runs stored test_cmd on your local machine via tunnel',
+    "run_verification": 'run_verification(project_id="abc-123")  # runs the test command pinned on your local machine (verification_commands.json); remote callers cannot change it',
     "add_custom_hook": 'add_custom_hook(project_id="abc-123", name="no-secrets", event="PreToolUse", matcher="Read|Bash", script_sh="grep -q SECRET_KEY <<<\\"$(cat)\\" && exit 2 || exit 0", blocking=True)',
     "get_custom_hooks": 'get_custom_hooks(project_id="abc-123", event="PreToolUse")',
     "delete_custom_hook": 'delete_custom_hook(project_id="abc-123", hook_id="hook-uuid")',
@@ -4661,20 +4661,21 @@ _MCP_TOOLS_LIST: list[dict[str, Any]] = [
          "required": []}},
     {"name": "run_verification",
      "description":
-        "0e973e52 — run the project's stored test_cmd on YOUR local machine via the "
-        "tunnel and return a REAL, structured result — not self-reported. "
+        "0e973e52 — run the test command PINNED for this project on YOUR local machine "
+        "(verification_commands.json in your Meridian local-runner folder) via the tunnel, "
+        "and return a REAL, structured result — not self-reported. A remote caller cannot "
+        "change the command: the server sends only the project id. "
         "Fields: {exit_code, passed, failed, stdout_tail, stderr_tail, status, timed_out, "
-        "verification_run_id}. Pass verification_run_id to complete_wave_gate — the "
-        "server-recorded run, not a hand-typed result, is what unlocks a wave gate "
-        "(0ff5e59f). "
-        "Returns {status: 'not_configured'} (never an error) when no test_cmd is set; "
-        "call set_executor_config(test_cmd='pixi run test') first. "
+        "test_cmd (the command that ran), verification_run_id}. Pass verification_run_id to "
+        "complete_wave_gate — the server-recorded run, not a hand-typed result, is what "
+        "unlocks a wave gate (0ff5e59f). "
+        "Returns {status: 'not_configured'} (never an error) when no command is pinned on "
+        "this machine for the project. "
         "Requires an active `meridian --tunnel`; the hosted server has no access to "
         "your machine (same architectural class as ingest_document / search_code_semantic "
-        "/ search_outputs — decision 0dedff91). "
-        "Per-project: only runs when test_cmd is configured for that project.",
+        "/ search_outputs — decision 0dedff91).",
      "inputSchema": {"type": "object", "properties": {
-         "project_id": {"type": "string", "description": "Meridian project id — whose stored test_cmd to run."},
+         "project_id": {"type": "string", "description": "Meridian project id — the project whose pinned command to run on this machine."},
          "project_name": {"type": "string", "description": "Project name — an alternative to project_id; resolved to the id internally. project_id wins if both are given."}},
          "required": []}},
     {"name": "analyze_model_efficiency",

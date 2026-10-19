@@ -6819,8 +6819,8 @@ async def _handle_tunnel_tools(
         return result
 
     if name == "run_verification":
-        # 0e973e52 — run the project's stored test_cmd on the caller's local
-        # machine via the FS tunnel and return a structured real result.
+        # 0e973e52 — run the test command pinned on the caller's local machine
+        # via the FS tunnel and return a structured real result.
         # ARCHITECTURAL REQUIREMENT (decision 0dedff91): this MUST run on the
         # caller's machine via the tunnel — the hosted server can never reach a
         # caller's test suite. This is the exact same class of mistake that
@@ -6829,27 +6829,9 @@ async def _handle_tunnel_tools(
         if not project_id:
             raise ValueError("project_id is required")
 
-        # Load the project's stored executor config to get test_cmd and cwd.
-        exec_cfg = await db_module.get_executor_config(db, project_id) or {}
-        test_cmd = (exec_cfg.get("test_cmd") or "").strip()
-        repo_path = (exec_cfg.get("repo_path") or "").strip()
-
-        if not test_cmd:
-            # Clean, honest "not configured" — never an error or fabricated pass.
-            return {
-                "status": "not_configured",
-                "message": (
-                    "No test_cmd is configured for this project. "
-                    "Call set_executor_config(project_id=..., test_cmd='...') to set one."
-                ),
-                "project_id": project_id,
-                "exit_code": None,
-                "passed": None,
-                "failed": None,
-                "stdout_tail": "",
-                "stderr_tail": "",
-            }
-
+        # The command is PINNED on the caller's machine (verification_commands.json there). The server stores no
+        # command that could be run, and it sends only the project id. The tunnel client runs its own pinned command
+        # and reports back which command ran. A remote caller therefore cannot choose what runs on the machine.
         if tenant is None:
             raise ValueError("run_verification requires an authenticated tenant (tunnel mode)")
         tenant_id = tenant.get("id", "")
@@ -6868,7 +6850,7 @@ async def _handle_tunnel_tools(
                     "Start `meridian --tunnel` in your terminal to enable it."
                 ),
                 "project_id": project_id,
-                "test_cmd": test_cmd,
+                "test_cmd": None,
                 "exit_code": None,
                 "passed": None,
                 "failed": None,
@@ -6885,17 +6867,11 @@ async def _handle_tunnel_tools(
         run_record = await db_module.create_verification_run(
             db,
             project_id,
-            test_cmd,
-            cwd=repo_path or None,
-            worktree=(exec_cfg.get("worktree") or "").strip() or None,
+            "pinned on the caller's machine",
             actor=tenant_id,
         )
 
-        result = await _tunnel_mod.send_run_cmd_control(
-            tenant_id,
-            cmd=test_cmd,
-            cwd=repo_path or None,
-        )
+        result = await _tunnel_mod.send_verification_control(tenant_id, project_id)
 
         # Consume the persisted record with the real, synchronous outcome —
         # this call is the ONLY place a verification run is ever marked
@@ -6914,11 +6890,10 @@ async def _handle_tunnel_tools(
             message=result.get("message"),
         )
 
-        # Enrich the result with project context so the caller has everything.
+        # Enrich the result with project context. The command shown is the one the client says it ran.
         result["project_id"] = project_id
-        result["test_cmd"] = test_cmd
-        if repo_path:
-            result["cwd"] = repo_path
+        result["test_cmd"] = result.get("cmd")
+        result.pop("cmd", None)
         result["verification_run_id"] = completed_run["id"]
         return result
 

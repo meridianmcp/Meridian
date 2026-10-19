@@ -8,9 +8,9 @@ Coverage:
      no real int exit_code, or a bool masquerading as one), and accepts an
      honest nonzero exit / a genuinely exit_code-less non-'ok' status.
   3. run_verification (meridian/mcp/handler.py) wiring: persists a run BEFORE
-     dispatch and completes it with the REAL send_run_cmd_control result
-     right after the one synchronous wait — never creates a row for a
-     dispatch that never happened (not_configured).
+     dispatch and completes it with the REAL send_verification_control result
+     right after the one synchronous wait. The hosted/no-tunnel path still
+     records an honest not_connected run because a dispatch was attempted.
   4. The Windows shell-string exit-code-masking root cause fix in
      meridian.tunnel_client._shell_subprocess_env — the actual mechanism
      behind test_run_verification.py::test_handle_run_cmd_shell_string now
@@ -167,23 +167,22 @@ async def test_list_verification_runs_returns_all_and_filters_by_status(db):
 
 # ---------------------------------------------------------------------------
 # run_verification handler wiring — persists BEFORE dispatch, completes with
-# the ONE real synchronous send_run_cmd_control result (no detached monitor).
+# the ONE real synchronous send_verification_control result (no detached monitor).
 # ---------------------------------------------------------------------------
 
 @pytest.mark.asyncio
 async def test_run_verification_handler_persists_and_completes_run(db, monkeypatch):
     proj = await db_module.create_project(db, name="vr-handler-ok")
-    await db_module.set_executor_config(db, proj["id"], {
-        "test_cmd": "pixi run test", "repo_path": "/repo",
-    })
 
-    async def _fake_run_cmd(tenant_id, cmd, cwd=None):
+    async def _fake_verification(tenant_id, project_id):
+        assert project_id == proj["id"]
         return {
             "status": "ok", "exit_code": 0, "passed": 5, "failed": 0,
             "stdout_tail": "5 passed", "stderr_tail": "",
+            "cmd": "pixi run test",
         }
 
-    monkeypatch.setattr(tun, "send_run_cmd_control", _fake_run_cmd)
+    monkeypatch.setattr(tun, "send_verification_control", _fake_verification)
     monkeypatch.setattr(tun, "has_active_tunnel", lambda tid: True)
 
     result = await mh._dispatch_mcp_tool(
@@ -193,14 +192,17 @@ async def test_run_verification_handler_persists_and_completes_run(db, monkeypat
 
     assert result["status"] == "ok"
     assert result["exit_code"] == 0
+    # The command shown is the one the local client says it ran (pinned locally).
+    assert result["test_cmd"] == "pixi run test"
+    assert "cmd" not in result
     run_id = result["verification_run_id"]
     assert run_id
 
     persisted = await db_module.get_verification_run(db, run_id)
     assert persisted["status"] == "ok"
     assert persisted["exit_code"] == 0
-    assert persisted["command"] == "pixi run test"
-    assert persisted["cwd"] == "/repo"
+    assert persisted["command"] == "pinned on the caller's machine"
+    assert persisted["cwd"] is None
     assert persisted["actor"] == "tenant-vr-ok"
     assert persisted["started_at"] is not None
     assert persisted["ended_at"] is not None
@@ -209,15 +211,16 @@ async def test_run_verification_handler_persists_and_completes_run(db, monkeypat
 @pytest.mark.asyncio
 async def test_run_verification_handler_persists_nonzero_exit_honestly(db, monkeypatch):
     proj = await db_module.create_project(db, name="vr-handler-fail")
-    await db_module.set_executor_config(db, proj["id"], {"test_cmd": "pytest"})
 
-    async def _fake_run_cmd(tenant_id, cmd, cwd=None):
+    async def _fake_verification(tenant_id, project_id):
         return {
             "status": "ok", "exit_code": 1, "passed": 2, "failed": 1,
             "stdout_tail": "", "stderr_tail": "FAILED test_x",
+            "cmd": "pytest",
         }
 
-    monkeypatch.setattr(tun, "send_run_cmd_control", _fake_run_cmd)
+    monkeypatch.setattr(tun, "send_verification_control", _fake_verification)
+    monkeypatch.setattr(tun, "has_active_tunnel", lambda tid: True)
 
     result = await mh._dispatch_mcp_tool(
         "run_verification", {"project_id": proj["id"]}, db, "/tmp",
@@ -231,17 +234,25 @@ async def test_run_verification_handler_persists_nonzero_exit_honestly(db, monke
 
 
 @pytest.mark.asyncio
-async def test_run_verification_handler_not_configured_creates_no_run_record(db):
-    """No test_cmd configured -> nothing was ever dispatched -> no lifecycle row."""
-    proj = await db_module.create_project(db, name="vr-handler-not-configured")
+async def test_run_verification_handler_no_tunnel_completes_run_as_not_connected(db, monkeypatch):
+    """No tunnel connected -> a dispatch was attempted and could not reach the
+    local client -> the persisted run is completed honestly as not_connected,
+    never as a fabricated ok or a silently dropped row."""
+    proj = await db_module.create_project(db, name="vr-handler-not-connected")
+    monkeypatch.setattr(tun, "_tunnel_sockets", {})
+    monkeypatch.setattr(tun, "has_active_tunnel", lambda tid: False)
+
     result = await mh._dispatch_mcp_tool(
         "run_verification", {"project_id": proj["id"]}, db, "/tmp",
         tenant={"id": "tenant-vr-nc"},
     )
-    assert result["status"] == "not_configured"
-    assert "verification_run_id" not in result
+    assert result["status"] == "not_connected"
+    assert result["exit_code"] is None
+    assert result["verification_run_id"]
     runs = await db_module.list_verification_runs(db, proj["id"])
-    assert runs == []
+    assert len(runs) == 1
+    assert runs[0]["status"] == "not_connected"
+    assert runs[0]["exit_code"] is None
 
 
 # ---------------------------------------------------------------------------

@@ -3572,15 +3572,13 @@ def _run_cmd_timeout() -> float:
     return 300.0
 
 
-async def send_run_cmd_control(
-    tenant_id: str,
-    cmd: str | list[str],
-    cwd: str | None = None,
-) -> dict:
-    """0e973e52 — send a run_cmd control message over the FS WebSocket.
+async def send_verification_control(tenant_id: str, project_id: str) -> dict:
+    """Ask the tenant's local tunnel client to run its PINNED test command for a project.
 
-    Sends ``{"type": "run_cmd", "id": "<uuid>", "cmd": ..., "cwd": ...}`` to the
-    tenant's local tunnel client and awaits a ``{"type": "run_cmd_result", ...}``
+    Sends ``{"type": "run_verification", "id": "<uuid>", "project_id": ...}`` over the FS
+    WebSocket. The server never sends a command string: the client looks up the command in
+    its own local pins file (verification_commands.json) and runs only that. A remote caller
+    therefore cannot choose what runs on the machine. Awaits a ``{"type": "run_cmd_result", ...}``
     reply. Returns a structured result dict::
 
         {
@@ -3616,10 +3614,9 @@ async def send_run_cmd_control(
 
     try:
         await ws.send_json({
-            "type": "run_cmd",
+            "type": "run_verification",
             "id": req_id,
-            "cmd": cmd,
-            "cwd": cwd or "",
+            "project_id": project_id,
         })
         result = await asyncio.wait_for(fut, timeout=_run_cmd_timeout())
     except asyncio.TimeoutError:
