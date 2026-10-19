@@ -62,7 +62,7 @@ from dataclasses import asdict, dataclass, field
 from datetime import datetime, timezone
 from typing import Any
 
-from . import fingerprint, ledger_io, outputs_local
+from . import environment, fingerprint, ledger_io, outputs_local
 from .path_security import (
     relative_output_path,
     relative_reference,
@@ -308,6 +308,14 @@ class ProvenanceRecord:
     # 93a8b26b -- optional opaque Zotero item keys cited by this output.
     # Resolution stays with consumers that already have Zotero access.
     cited_zotero_keys: list[str] | None = None
+    # Optional opaque link to the run_manifest run that produced this output
+    # (run_manifest.start_run_manifest's run_id). Not validated here.
+    run_id: str | None = None
+    # environment.capture_environment() at record time: interpreter,
+    # platform, this package's version and the direct runtime dependencies'
+    # installed versions. Absent (None) on ledger rows written before it
+    # existed; readers return those rows unchanged.
+    reproduction: dict[str, Any] | None = None
 
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)
@@ -324,6 +332,7 @@ def record_provenance(
     note: str | None = None,
     experiment_run_id: str | None = None,
     cited_zotero_keys: list[str] | None = None,
+    run_id: str | None = None,
 ) -> dict[str, Any]:
     """Attach lightweight reproducibility metadata to one output file.
 
@@ -381,11 +390,22 @@ def record_provenance(
       cited_zotero_keys:   Optional (93a8b26b) Zotero item keys cited by this
                            output. Stored as an opaque list; this standalone
                            package does not resolve keys or make hosted calls.
+      run_id:              Optional ``run_manifest`` run id that produced
+                           this output, stored as an opaque string (not
+                           checked against the run-manifest ledger), so the
+                           per-output record joins to the run's manifest.
+
+    Every record also carries ``reproduction``: the
+    :func:`environment.capture_environment` snapshot (interpreter version,
+    platform, this package's version, and the installed versions of the
+    direct runtime dependencies), captured once per process. The command
+    line is deliberately not recorded (it can hold secrets or local paths).
 
     Returns:
       The stored record as a dict (path, generating_script, params,
       sprint_item_id, decision_id, note, recorded_at, recorded_at_iso,
-      content_hash, experiment_run_id, cited_zotero_keys) plus ``version``
+      content_hash, script_content_hash, experiment_run_id,
+      cited_zotero_keys, run_id, reproduction) plus ``version``
       (1-based count of records ever written for this path since history
       began, including this one), or
       ``{"error": ...}`` on failure. When the existing ledger was corrupt,
@@ -472,6 +492,8 @@ def record_provenance(
         script_content_hash=script_hash,
         experiment_run_id=experiment_run_id,
         cited_zotero_keys=cited_zotero_keys,
+        run_id=run_id,
+        reproduction=environment.capture_environment(),
     )
 
     key = os.path.normcase(os.path.normpath(stored_path)).replace("\\", "/")
@@ -561,8 +583,10 @@ def get_provenance(
       The record dict for `path` (``path``, ``generating_script``,
       ``params``, ``sprint_item_id``, ``decision_id``, ``note``,
       ``recorded_at``, ``recorded_at_iso``, ``content_hash``,
-      ``experiment_run_id``, ``cited_zotero_keys``), or None if nothing has
-      ever been recorded for this path under this outputs_dir.
+      ``experiment_run_id``, ``cited_zotero_keys``, ``run_id``,
+      ``reproduction``), or None if nothing has ever been recorded for this
+      path under this outputs_dir. A row written before a field existed is
+      returned as stored, without that key.
 
     Raises ``ledger_io.LedgerCorruptError`` when the ledger exists but is not
     a JSON object: a damaged ledger is never reported as "nothing recorded".

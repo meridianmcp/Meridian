@@ -70,7 +70,7 @@ and reported a real parse error) — never a raised exception, never a hang.
 | Tool | Description |
 |------|-------------|
 | `annotate_outputs` | Add/update a human annotation for a file or directory |
-| `record_provenance` | Attach machine-oriented reproducibility metadata (generating script, params, content hash) to one output file |
+| `record_provenance` | Attach machine-oriented reproducibility metadata (generating script, params, content hash, optional `run_id`) to one output file; every record also stores a `reproduction` block (Python version, platform, package version, installed versions of the direct runtime dependencies) |
 | `get_provenance` | Exact-match lookup of one file's `record_provenance` record (ambiguous `None` on a miss — see `get_provenance_status`) |
 | `get_provenance_status` | Richer, ranked per-file provenance answer: exact / directory-fallback / unregistered / unknown / stale-by-script, plus staleness, archival identity, and index-convergence awareness |
 | `list_provenance` | List the latest `record_provenance` record for every path recorded under an outputs directory |
@@ -90,7 +90,7 @@ in the core repo) resolves against:
 
 | Tool | Description |
 |------|-------------|
-| `record_provenance` | Attach reproducibility metadata (generating script, params, sprint item/decision) to one output file |
+| `record_provenance` | Attach reproducibility metadata (generating script, params, sprint item/decision, run id, interpreter and dependency versions) to one output file |
 | `get_provenance` | Exact-match lookup of one output file's recorded provenance; a bare `None` is ambiguous, prefer `get_provenance_status` |
 | `get_provenance_status` | Richer, authoritative per-file provenance answer — exact record vs. directory-note fallback vs. unregistered vs. unknown, plus content-hash staleness |
 | `list_provenance` | List the latest provenance record for every path recorded under an outputs directory |

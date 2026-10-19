@@ -66,15 +66,12 @@ import hashlib
 import json
 import logging
 import os
-import platform
 import subprocess
-import sys
 import threading
 from datetime import datetime, timezone
 from typing import Any, Callable
 
-from . import __version__ as _PACKAGE_VERSION
-from . import artifact_registry, fingerprint, outputs_local, research_evidence
+from . import artifact_registry, environment, fingerprint, outputs_local, research_evidence
 
 _log = logging.getLogger(__name__)
 
@@ -472,6 +469,12 @@ def start_run_manifest(
         if repo_dir else {"head": None, "dirty_files": []}
     )
     cache_dir = _cache_dir(outputs_dir)
+    # Same snapshot record_provenance stores as `reproduction`, so the run's
+    # package identity and each output's record cannot drift apart. Only the
+    # four long-standing fields go into package_identity: adding the
+    # dependency versions here would change manifest_hash and make a resumed
+    # run that was started before this change look like an identity collision.
+    env = environment.capture_environment()
 
     manifest: dict[str, Any] = {
         "schema_version": _SCHEMA_VERSION,
@@ -486,10 +489,10 @@ def start_run_manifest(
             "args": dict(command_args or {}),
         },
         "package_identity": {
-            "name": "meridian_outputs",
-            "version": _PACKAGE_VERSION,
-            "python_version": sys.version.split()[0],
-            "platform": platform.platform(),
+            "name": env["package_name"],
+            "version": env["package_version"],
+            "python_version": env["python_version"],
+            "platform": env["platform"],
         },
         "repo_identity": {"repo_dir": repo_dir, **git_state},
         "input_identity": {

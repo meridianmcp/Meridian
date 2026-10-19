@@ -479,6 +479,7 @@ def record_provenance(
     decision_id: str | None = None,
     note: str | None = None,
     experiment_run_id: str | None = None,
+    run_id: str | None = None,
 ) -> dict[str, Any]:
     """Attach lightweight reproducibility metadata to one output file.
 
@@ -513,13 +514,19 @@ def record_provenance(
                           omitting it is unchanged behavior. Stored as an
                           opaque string, not validated against a live run
                           (this extension has no DB engine access).
+      run_id:              Optional ``start_run_manifest`` run id that
+                          produced this output; stored as an opaque string
+                          so the record joins to that run's manifest.
 
     Returns:
       The stored record as {path, generating_script, params, sprint_item_id,
       decision_id, note, recorded_at, recorded_at_iso, content_hash,
-      experiment_run_id, version}, or
-      {error: ...}. ``version`` is the record's 1-based version for this
-      path. ``content_hash`` (bd5b8d79) is a best-effort SHA-256 of
+      script_content_hash, experiment_run_id, run_id, reproduction,
+      version}, or {error: ...}. ``version`` is the record's 1-based version
+      for this path. ``reproduction`` holds the interpreter version,
+      platform, this package's version and the installed versions of its
+      direct runtime dependencies at record time (``None`` for one that is
+      not installed); the command line is not recorded. ``content_hash`` (bd5b8d79) is a best-effort SHA-256 of
       ``path``'s on-disk bytes at record time (``None`` if unreadable) --
       used by ``get_provenance_status`` to later detect relocation/drift.
       This is a pure exact-record write; call ``get_provenance_status`` (not
@@ -535,6 +542,7 @@ def record_provenance(
         decision_id=decision_id,
         note=note,
         experiment_run_id=experiment_run_id,
+        run_id=run_id,
     )
 
 
