@@ -148,6 +148,29 @@ def _fingerprint_import_setup(root: Path) -> tuple[Path, Path]:
     return target, gen
 
 
+def _member_import_setup(root: Path, name: str) -> Path:
+    """A bundle whose only change for the target is one run-manifest row or
+    one registry artifact (``name``), copied into a target that already has
+    its own row of that ledger."""
+    gen = root / "gen.py"
+    gen.write_text("print(1)\n", encoding="utf-8")
+    src = _empty_target(root, f"{name}_src")
+    target = _empty_target(root, f"{name}_dst")
+    for od, tag in ((src, "src"), (target, "dst")):
+        (od / f"{tag}.csv").write_text(f"x\n{tag}\n", encoding="utf-8")
+        if name == "run_manifest_ledger":
+            run_manifest.start_run_manifest(str(od), run_id=f"run-{tag}", command_name="gen",
+                                            input_paths=[str(gen)])
+        else:
+            artifact_registry.register_artifact(str(od), "figure", canonical_path=str(od / f"{tag}.csv"),
+                                                generator="gen.py")
+    _export(src)
+    _copy_bundle(src, "backup/bundle.json", target)
+    dry = B.import_bundle("incoming.json", str(target))
+    assert dry["would_write"] == [name], dry
+    return target
+
+
 class TestExport:
     def test_envelope_shape_and_member_digests(self, populated) -> None:
         result = _export(populated["outputs"])
@@ -1364,6 +1387,79 @@ class TestImport:
         if result["imported"]:
             assert result["written_members"] == ["fingerprint_ledger"]
             assert "a.csv" in keys
+        else:
+            assert result["reason"] == "concurrent_modification"
+
+    @pytest.mark.parametrize("name", ["run_manifest_ledger", "artifact_registry"])
+    def test_cross_process_commit_inside_the_write_window_is_not_lost(
+        self, tmp_path, monkeypatch, name,
+    ) -> None:
+        """F6: the run-manifest and registry writers move their
+        read-modify-write under ledger_io.ledger_transaction, the
+        cross-process lock. The import must hold that lock for these two
+        members as well, not only the module's in-process _write_lock: a
+        writer holding just the cross-process lock (one in another process)
+        that commits between the import's re-check and its replace would
+        otherwise be overwritten. The racing writer takes only
+        ledger_transaction, on the path the module itself writes."""
+        target = _member_import_setup(tmp_path, name)
+        od = str(target)
+        if name == "run_manifest_ledger":
+            path = run_manifest._ledger_path(od, create=False)
+            racing_key = "run-racing"
+
+            def _add(ledger: dict) -> None:
+                ledger[racing_key] = {"run_id": racing_key, "phase": "in_progress"}
+
+            def _keys() -> set[str]:
+                return set(run_manifest._read_ledger_strict(od))
+        else:
+            path = artifact_registry._registry_path(od, create=False)
+            racing_key = "racing-artifact"
+
+            def _add(ledger: dict) -> None:
+                ledger.setdefault("artifacts", {})[racing_key] = {
+                    "artifact_id": racing_key, "local_paths": [],
+                }
+
+            def _keys() -> set[str]:
+                return set(artifact_registry._read_registry_strict(od)["artifacts"])
+
+        before = _keys()
+        ledger = os.path.normcase(os.path.abspath(path))
+        real_write = B._atomic_write_json
+        writer: dict[str, Any] = {}
+
+        def _commit_under_the_ledger_lock() -> None:
+            try:
+                with ledger_io.ledger_transaction(path) as txn:
+                    data = txn.load()
+                    _add(data)
+                    txn.commit(data)
+            except BaseException as exc:  # noqa: BLE001 -- surfaced by the assert below
+                writer["error"] = exc
+
+        def _write_with_a_racing_writer(p, obj, *, indent):
+            if os.path.normcase(os.path.abspath(p)) == ledger and "thread" not in writer:
+                writer["thread"] = threading.Thread(target=_commit_under_the_ledger_lock, daemon=True)
+                writer["thread"].start()
+                # Without the cross-process lock the commit lands right here,
+                # inside the window. Under it the writer waits for this
+                # import to release the lock, then commits on top of it.
+                writer["thread"].join(timeout=1.5)
+            real_write(p, obj, indent=indent)
+
+        monkeypatch.setattr(B, "_atomic_write_json", _write_with_a_racing_writer)
+        result = B.import_bundle("incoming.json", od, dry_run=False)
+        assert "thread" in writer, "the import never wrote the ledger"
+        writer["thread"].join(timeout=60)
+        assert not writer["thread"].is_alive()
+        assert "error" not in writer, writer.get("error")
+        after = _keys()
+        assert before | {racing_key} <= after, f"a concurrent commit was overwritten: {after}"
+        if result["imported"]:
+            assert result["written_members"] == [name]
+            assert len(after) == len(before) + 2  # the imported row and the racing one
         else:
             assert result["reason"] == "concurrent_modification"
 
