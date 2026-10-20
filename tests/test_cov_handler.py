@@ -3409,13 +3409,24 @@ def test_dispatch_set_active_repo_not_connected(monkeypatch):
         _run(db.close())
 
 
+def _answering_extract_ws(sink):
+    """A fake extract socket that records each message and answers set_active_repo the way the tunnel client does."""
+    class _Ws:
+        async def send_json(self, obj):
+            sink.append(obj)
+            if obj.get("type") == "set_active_repo":
+                from meridian.routes import tunnel as _tn  # noqa: PLC0415
+                fut = _tn._pending_active_repo.get(obj.get("id"))
+                if fut is not None and not fut.done():
+                    fut.set_result({"type": "active_repo_result", "id": obj["id"], "ok": True, "reason": None})
+    return _Ws()
+
+
 def test_dispatch_set_active_repo_ok(monkeypatch):
     """set_active_repo with a live extract WS returns ok status."""
     sent = []
 
-    class _FakeWS:
-        async def send_json(self, obj):
-            sent.append(obj)
+    _FakeWS = lambda: _answering_extract_ws(sent)  # noqa: E731
 
     from meridian.routes import tunnel as tn
     monkeypatch.setattr(tn, "_tunnel_extract_sockets", {"t1": _FakeWS()})
@@ -3427,7 +3438,7 @@ def test_dispatch_set_active_repo_ok(monkeypatch):
         ))
         assert result["status"] == "ok"
         assert result["repo_path"] == "/my/repo"
-        assert sent == [{"type": "set_active_repo", "repo_path": "/my/repo"}]
+        assert [(m["type"], m["repo_path"]) for m in sent] == [("set_active_repo", "/my/repo")]
     finally:
         _run(db.close())
 
@@ -3502,9 +3513,7 @@ def test_start_session_sends_active_repo_and_fs_roots(monkeypatch):
     extract_sent = []
     fs_sent = []
 
-    class _FakeExtractWS:
-        async def send_json(self, obj):
-            extract_sent.append(obj)
+    _FakeExtractWS = lambda: _answering_extract_ws(extract_sent)  # noqa: E731
 
     class _FakeFsWS:
         async def send_json(self, obj):
@@ -3527,7 +3536,7 @@ def test_start_session_sends_active_repo_and_fs_roots(monkeypatch):
             {"project_id": pid, "session_name": "chat"}, db, "/tmp",
             tenant={"id": "t1"},
         ))
-        assert {"type": "set_active_repo", "repo_path": "C:/repo/here"} in extract_sent
+        assert "C:/repo/here" in [x.get("repo_path") for x in extract_sent if x.get("type") == "set_active_repo"]
         assert {"type": "add_fs_roots", "roots": ["C:/repo/here"]} in fs_sent
     finally:
         _run(db.close())
@@ -3539,9 +3548,7 @@ def test_start_session_unions_repo_path_and_filesystem_roots(monkeypatch):
     extract_sent = []
     fs_sent = []
 
-    class _FakeExtractWS:
-        async def send_json(self, obj):
-            extract_sent.append(obj)
+    _FakeExtractWS = lambda: _answering_extract_ws(extract_sent)  # noqa: E731
 
     class _FakeFsWS:
         async def send_json(self, obj):
@@ -3569,7 +3576,7 @@ def test_start_session_unions_repo_path_and_filesystem_roots(monkeypatch):
         assert {"type": "add_fs_roots",
                 "roots": ["C:/repo", "D:/Outputs", "E:/data"]} in fs_sent
         # Serena indexes one project — it stays pinned to repo_path.
-        assert {"type": "set_active_repo", "repo_path": "C:/repo"} in extract_sent
+        assert "C:/repo" in [x.get("repo_path") for x in extract_sent if x.get("type") == "set_active_repo"]
     finally:
         _run(db.close())
 
@@ -3580,9 +3587,7 @@ def test_start_session_filesystem_roots_only_no_repo_path(monkeypatch):
     extract_sent = []
     fs_sent = []
 
-    class _FakeExtractWS:
-        async def send_json(self, obj):
-            extract_sent.append(obj)
+    _FakeExtractWS = lambda: _answering_extract_ws(extract_sent)  # noqa: E731
 
     class _FakeFsWS:
         async def send_json(self, obj):
@@ -3606,7 +3611,7 @@ def test_start_session_filesystem_roots_only_no_repo_path(monkeypatch):
             tenant={"id": "t1"},
         ))
         assert {"type": "add_fs_roots", "roots": ["D:/Outputs", "E:/data"]} in fs_sent
-        assert {"type": "set_active_repo", "repo_path": "D:/Outputs"} in extract_sent
+        assert "D:/Outputs" in [x.get("repo_path") for x in extract_sent if x.get("type") == "set_active_repo"]
     finally:
         _run(db.close())
 
@@ -3666,9 +3671,7 @@ def test_start_session_no_repo_path_sends_nothing(monkeypatch):
     """No repo_path configured → no control messages, start_session still works."""
     extract_sent = []
 
-    class _FakeExtractWS:
-        async def send_json(self, obj):
-            extract_sent.append(obj)
+    _FakeExtractWS = lambda: _answering_extract_ws(extract_sent)  # noqa: E731
 
     from meridian.routes import tunnel as tn
     monkeypatch.setattr(tn, "_tunnel_extract_sockets", {"t1": _FakeExtractWS()})

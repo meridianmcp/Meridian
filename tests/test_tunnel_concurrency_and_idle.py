@@ -133,6 +133,28 @@ def test_keepalive_skips_a_live_tunnel_with_no_cached_database(monkeypatch):
     assert asyncio.run(tun.keepalive_tunnel_sessions(app=SimpleNamespace())) == []
 
 
+def test_keepalive_touches_a_live_session_at_most_once_per_interval(monkeypatch):
+    import meridian._deps as deps
+
+    touched: list[str] = []
+
+    async def fake_touch(conn):
+        touched.append(conn)
+        return [f"session-{conn}"]
+
+    monkeypatch.setattr(tun, "active_tunnel_tenant_ids", lambda: {"busy"})
+    monkeypatch.setattr(deps, "_tenant_db_cache", {"busy": "conn-busy"})
+    monkeypatch.setattr(tun.db_module, "touch_latest_active_session", fake_touch)
+    monkeypatch.setattr(tun, "_keepalive_last_at", {})
+
+    first = asyncio.run(tun.keepalive_tunnel_sessions(app=SimpleNamespace()))
+    second = asyncio.run(tun.keepalive_tunnel_sessions(app=SimpleNamespace()))
+
+    assert first == ["session-conn-busy"]
+    assert second == []
+    assert touched == ["conn-busy"]
+
+
 # ---------------------------------------------------------------------------
 # header-only WebSocket auth
 # ---------------------------------------------------------------------------

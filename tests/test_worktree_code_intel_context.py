@@ -51,6 +51,12 @@ class _FakeExtractWS:
         if self._raise:
             raise RuntimeError("ws broken")
         self.sent.append(obj)
+        # Answer set_active_repo the way the tunnel client does, so the root is accepted and cached.
+        if obj.get("type") == "set_active_repo":
+            from meridian.routes import tunnel as _tn  # noqa: PLC0415
+            fut = _tn._pending_active_repo.get(obj.get("id"))
+            if fut is not None and not fut.done():
+                fut.set_result({"type": "active_repo_result", "id": obj["id"], "ok": True, "reason": None})
 
 
 @pytest.fixture(autouse=True)
@@ -236,7 +242,7 @@ async def test_activate_succeeds_and_returns_fingerprint(db):
     assert result["repo_path"] == "meridian"
     assert result["worktree"]["worktree_id"] == wt["id"]
     assert result["worktree"]["branch"] == "worktree/ok1"
-    assert ws.sent == [{"type": "set_active_repo", "repo_path": "meridian"}]
+    assert [(m["type"], m["repo_path"]) for m in ws.sent] == [("set_active_repo", "meridian")]
     # 4d9ad87b cache contract is untouched by this module — still updated.
     assert tn._tenant_active_repo["tenant-ok"] == "meridian"
 
@@ -374,7 +380,7 @@ def test_dispatch_set_active_repo_worktree_id_takes_precedence_over_repo_path():
                 db, "/tmp", tenant={"id": "t-dispatch2"},
             ))
             assert result["repo_path"] == "meridian"
-            assert ws.sent == [{"type": "set_active_repo", "repo_path": "meridian"}]
+            assert [(m["type"], m["repo_path"]) for m in ws.sent] == [("set_active_repo", "meridian")]
         finally:
             tn._tunnel_extract_sockets.pop("t-dispatch2", None)
             tn._tenant_active_repo.pop("t-dispatch2", None)

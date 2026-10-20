@@ -672,7 +672,7 @@ def test_extract_slot_diagnostics_serena_default_never_leaks_custom_argv(monkeyp
     diag = tc._extract_slot_diagnostics("serena-default", None, "/repo")
     assert diag == {
         "kind": "serena-default",
-        "package": "serena-agent",
+        "package": "serena-agent==1.5.3",
         "python_runtime": "/env/bin/python",
         "cwd": "/repo",
         "uvx_available": True,

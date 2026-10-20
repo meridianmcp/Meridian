@@ -6807,6 +6807,10 @@ async def _handle_tunnel_tools(
         tenant_id = tenant.get("id", "")
         from ..routes import tunnel as _tunnel_mod  # noqa: PLC0415
         result = await _tunnel_mod.send_active_repo_control(tenant_id, repo_path)
+        if result.get("status") in ("refused", "unconfirmed"):
+            raise ValueError(
+                f"the tunnel did not accept repo_path ({repo_path!r}): {result.get('message')}"
+            )
         if result.get("status") == "not_connected":
             raise ValueError(
                 "tunnel not connected — run `meridian --tunnel` in your terminal "

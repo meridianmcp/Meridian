@@ -1335,6 +1335,22 @@ class _FakeExtractWS:
         self.sent.append(obj)
 
 
+class _AckingExtractWS:
+    """Extract-slot stand-in that answers set_active_repo the way the tunnel client does."""
+
+    def __init__(self, accept=True, reason=None):
+        self.sent = []
+        self.accept = accept
+        self.reason = reason
+
+    async def send_json(self, obj):
+        self.sent.append(obj)
+        if obj.get("type") == "set_active_repo":
+            fut = tn._pending_active_repo.get(obj.get("id"))
+            if fut is not None and not fut.done():
+                fut.set_result({"type": "active_repo_result", "id": obj["id"], "ok": self.accept, "reason": self.reason})
+
+
 def test_send_active_repo_control_not_connected():
     # No extract socket for this tenant → not_connected status.
     result = asyncio.run(tn.send_active_repo_control("no-tenant", "/some/repo"))
@@ -1343,11 +1359,22 @@ def test_send_active_repo_control_not_connected():
 
 
 def test_send_active_repo_control_ok():
-    ws = _FakeExtractWS()
+    ws = _AckingExtractWS()
     tn._tunnel_extract_sockets["t1"] = ws
     result = asyncio.run(tn.send_active_repo_control("t1", "/my/repo"))
     assert result == {"status": "ok", "repo_path": "/my/repo"}
-    assert ws.sent == [{"type": "set_active_repo", "repo_path": "/my/repo"}]
+    assert len(ws.sent) == 1
+    assert ws.sent[0]["type"] == "set_active_repo" and ws.sent[0]["repo_path"] == "/my/repo"
+    assert ws.sent[0]["id"]
+
+
+def test_send_active_repo_control_refused_by_the_tunnel_is_not_cached():
+    tn._tenant_active_repo.pop("t-refused", None)
+    tn._tunnel_extract_sockets["t-refused"] = _AckingExtractWS(accept=False, reason="a credential folder")
+    result = asyncio.run(tn.send_active_repo_control("t-refused", "/secret/repo"))
+    assert result["status"] == "refused"
+    assert "credential folder" in result["message"]
+    assert "t-refused" not in tn._tenant_active_repo
 
 
 def test_send_active_repo_control_send_error():
@@ -1362,17 +1389,18 @@ def test_send_active_repo_control_send_error():
 # 4d9ad87b — _tenant_active_repo cache + X-Meridian-Repo-Path injection
 # ---------------------------------------------------------------------------
 
-def test_send_active_repo_control_updates_cache():
-    """send_active_repo_control always updates _tenant_active_repo (even without a WS)."""
+def test_send_active_repo_control_without_a_socket_does_not_cache_the_root():
+    """No extract socket means nothing accepted the root, so the cache is left alone."""
     tn._tenant_active_repo.pop("rpc-tenant", None)
     tn._tunnel_extract_sockets.pop("rpc-tenant", None)
-    asyncio.run(tn.send_active_repo_control("rpc-tenant", "/cached/repo"))
-    assert tn._tenant_active_repo.get("rpc-tenant") == "/cached/repo"
+    result = asyncio.run(tn.send_active_repo_control("rpc-tenant", "/cached/repo"))
+    assert result["status"] == "not_connected"
+    assert "rpc-tenant" not in tn._tenant_active_repo
 
 
 def test_send_active_repo_control_with_ws_updates_cache_and_sends(monkeypatch):
     """send_active_repo_control with a live WS updates the cache AND sends the control msg."""
-    ws = _FakeExtractWS()
+    ws = _AckingExtractWS()
     tn._tunnel_extract_sockets["rpc-ws-tenant"] = ws
     tn._tenant_active_repo.pop("rpc-ws-tenant", None)
     result = asyncio.run(tn.send_active_repo_control("rpc-ws-tenant", "/ws/repo"))
@@ -1481,7 +1509,7 @@ def test_set_tunnel_active_repo_route_updates_cache(monkeypatch):
     before this call.
     """
     tenant_id = _patch_active_repo_auth(monkeypatch)
-    ws = _FakeExtractWS()
+    ws = _AckingExtractWS()
     tn._tunnel_extract_sockets[tenant_id] = ws
     tn._tenant_active_repo.pop(tenant_id, None)
 
@@ -1489,7 +1517,8 @@ def test_set_tunnel_active_repo_route_updates_cache(monkeypatch):
 
     assert resp.status_code == 200
     assert tn._tenant_active_repo.get(tenant_id) == "/worktrees/W"
-    assert ws.sent == [{"type": "set_active_repo", "repo_path": "/worktrees/W"}]
+    assert len(ws.sent) == 1
+    assert ws.sent[0]["type"] == "set_active_repo" and ws.sent[0]["repo_path"] == "/worktrees/W"
 
 
 def test_set_tunnel_active_repo_route_not_sticky_across_calls(monkeypatch):
@@ -1498,7 +1527,7 @@ def test_set_tunnel_active_repo_route_not_sticky_across_calls(monkeypatch):
     earlier in the same process (i.e. not sticky/cached across active repos).
     """
     tenant_id = _patch_active_repo_auth(monkeypatch, tenant_id="wt-sticky-tenant")
-    ws = _FakeExtractWS()
+    ws = _AckingExtractWS()
     tn._tunnel_extract_sockets[tenant_id] = ws
     tn._tenant_active_repo.pop(tenant_id, None)
     tn._tunnel_tool_routes[tenant_id] = {"extractor__find_symbol": "extract"}
@@ -1518,9 +1547,9 @@ def test_set_tunnel_active_repo_route_not_sticky_across_calls(monkeypatch):
         "active repo must reflect the LATEST switch, not the main repo root "
         "issued earlier in the same process"
     )
-    assert ws.sent == [
-        {"type": "set_active_repo", "repo_path": main_repo},
-        {"type": "set_active_repo", "repo_path": worktree},
+    assert [(m["type"], m["repo_path"]) for m in ws.sent] == [
+        ("set_active_repo", main_repo),
+        ("set_active_repo", worktree),
     ]
 
     # A generic (no explicit repo_path) call_tunnel_tool call — the shape every
@@ -1541,9 +1570,7 @@ def test_set_tunnel_active_repo_route_not_sticky_across_calls(monkeypatch):
 
 
 def test_set_tunnel_active_repo_route_not_connected(monkeypatch):
-    """No extract WS registered → 503 not_connected, but the cache still updates
-    (mirrors send_active_repo_control's always-update-the-cache contract) so a
-    tunnel that reconnects later immediately picks up the right repo."""
+    """No extract WS registered → 503 not_connected. Nothing accepted the root, so the cache is not changed."""
     tenant_id = _patch_active_repo_auth(monkeypatch, tenant_id="wt-noconn-tenant")
     tn._tunnel_extract_sockets.pop(tenant_id, None)
     tn._tenant_active_repo.pop(tenant_id, None)
@@ -1551,7 +1578,7 @@ def test_set_tunnel_active_repo_route_not_connected(monkeypatch):
     resp = asyncio.run(tn.set_tunnel_active_repo(_FakeActiveRepoReq("/worktrees/W2")))
 
     assert resp.status_code == 503
-    assert tn._tenant_active_repo.get(tenant_id) == "/worktrees/W2"
+    assert tenant_id not in tn._tenant_active_repo
 
 
 def test_set_tunnel_active_repo_route_invalid_auth(monkeypatch):

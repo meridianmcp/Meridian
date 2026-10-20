@@ -128,7 +128,7 @@ CUSTOM_SLOT_PORTS = {"p0": 8814, "p1": 8815, "p2": 8816, "p3": 8817}
 # project ships no ``serena`` console script), so we pin ``uvx --from
 # serena-agent`` and invoke the ``serena`` entrypoint it provides.
 SERENA_EXTRACT_COMMAND: list[str] = [
-    "uvx", "--from", "serena-agent", "serena", "start-mcp-server",
+    "uvx", "--from", "serena-agent==1.5.3", "serena", "start-mcp-server",
     "--context", "claude-code",
     # Don't pop a browser tab to Serena's web dashboard on every tunnel (re)start
     # — the tunnel runs Serena headless behind the proxy. ``--open-web-dashboard
@@ -209,6 +209,8 @@ BUILTIN_PLUGINS: list[dict[str, Any]] = [
         #   - post-344dd5e / pre-744d191: headless flag present, but
         #     --context ide-assistant (deprecated name, since renamed to
         #     claude-code).
+        #   - before the pin to serena-agent==1.5.3: the same command with the package unpinned, which is what
+        #     tenants who saved an override before the pin have stored.
         "previous_defaults": [
             ["uvx", "mcp-server-code-extractor"],
             [
@@ -219,6 +221,12 @@ BUILTIN_PLUGINS: list[dict[str, Any]] = [
             [
                 "uvx", "--from", "serena-agent", "serena", "start-mcp-server",
                 "--context", "ide-assistant",
+                "--open-web-dashboard", "false",
+                "--project", "{repo_path}",
+            ],
+            [
+                "uvx", "--from", "serena-agent", "serena", "start-mcp-server",
+                "--context", "claude-code",
                 "--open-web-dashboard", "false",
                 "--project", "{repo_path}",
             ],
@@ -240,7 +248,10 @@ BUILTIN_PLUGINS: list[dict[str, Any]] = [
         "enabled": False,
         "builtin": True,
         "core": False,
-        "command": ["uvx", "powerpoint-mcp"],
+        # Pinned to the release whose tool list the guard's allowlist was checked against (see tunnel_client.py).
+        "command": ["uvx", "powerpoint-mcp==0.0.27"],
+        # The unpinned command tenants may have saved before the pin; an override of it is flagged as stale.
+        "previous_defaults": [["uvx", "powerpoint-mcp"]],
         "env": {},
         # powerpoint-mcp self-prefixes its tools — leave empty to avoid doubling.
         "prefix": None,
@@ -434,7 +445,10 @@ BUILTIN_PLUGINS: list[dict[str, Any]] = [
         "enabled": False,
         "builtin": True,
         "core": False,
-        "command": ["uvx", "zotero-mcp"],
+        # Pinned to the release whose tool list the guard's allowlist was checked against (see tunnel_client.py).
+        "command": ["uvx", "zotero-mcp==0.3.1"],
+        # The unpinned command tenants may have saved before the pin; an override of it is flagged as stale.
+        "previous_defaults": [["uvx", "zotero-mcp"]],
         "env": {"ZOTERO_LOCAL": "true"},
         # zotero-mcp exposes bare tool names — no self-prefix, so the server
         # bridge namespaces them via SLOT_DISPLAY_NAMES ("zotero" → "zotero-mcp__…").

@@ -89,7 +89,34 @@ FS_WRITE_TOOLS = frozenset({"write_file", "edit_file", "create_directory", "move
 SERENA_WRITE_TOOLS = frozenset({
     "create_text_file", "replace_content", "replace_symbol_body", "insert_after_symbol", "insert_before_symbol",
     "rename_symbol", "safe_delete_symbol", "write_memory", "edit_memory", "delete_memory", "rename_memory",
+    # Serena 1.5.3 line editing and project removal (ReplaceLinesTool, DeleteLinesTool, InsertAtLineTool, RemoveProjectTool).
+    "replace_lines", "delete_lines", "insert_at_line", "remove_project",
 })
+# Serena's tool names that read as writes whatever else they are called (a JetBrains rename, for instance). A name that
+# contains one of these is a write on the extract slot.
+SERENA_WRITE_KEYWORDS = ("replace", "insert", "delete", "create", "rename", "write", "edit", "remove", "move", "inline")
+# desktop-commander's tools that change files (its shell is gated separately by enable_shell_slot).
+DC_WRITE_TOOLS = frozenset({"create_directory", "edit_block", "move_file", "set_config_value", "write_file", "write_pdf"})
+# meridian-latex tools that change stored state: provenance, leases, claims and snapshots.
+LATEX_WRITE_TOOLS = frozenset({
+    "claim_node", "lease_document", "mark_provenance_synced", "record_provenance", "release_claim", "snapshot_document",
+})
+# powerpoint-mcp 0.0.27 tools that change a presentation. Its ``evaluate`` runs code and is in TUNNEL_EXEC_TOOLS.
+PPT_WRITE_TOOLS = frozenset({
+    "add_animation", "add_slide_with_layout", "add_speaker_notes", "manage_presentation", "manage_slide",
+    "populate_placeholder", "switch_slide",
+    # These two save screenshots to disk, so they are writes too.
+    "slide_snapshot", "analyze_template",
+})
+# Slots whose every tool runs a program (desktop-commander, mcp-debugger, meridian-latex). Their tools need the shell switch.
+EXEC_SLOT_LABELS = frozenset({"dc", "debug", "latex"})
+# The tools that are read-only on the pinned server versions. A call on one of these slots that is not on the list is
+# refused unless allow_tunnel_writes is on, so an unknown or newly added tool counts as a write. Checked against
+# zotero-mcp 0.3.1 (three tools, all reads) and powerpoint-mcp 0.0.27.
+SLOT_READ_ALLOWLIST: dict[str, frozenset] = {
+    "zotero": frozenset({"get_item_fulltext", "get_item_metadata", "search_items"}),
+    "ppt": frozenset({"list_templates"}),
+}
 CODEBASE_WRITE_TOOLS = frozenset({"delete_project", "index_repository", "ingest_traces", "manage_adr"})
 WORD_WRITE_TOOLS = frozenset({
     "add_break", "add_bullet_list", "add_heading", "add_image", "add_list", "add_numbered_list",
@@ -125,9 +152,15 @@ TUNNEL_WRITE_TOOLS: dict[str, frozenset] = {
     "word": WORD_WRITE_TOOLS,
     "docs": DOCS_WRITE_TOOLS,
     "outputs": OUTPUTS_WRITE_TOOLS,
+    "dc": DC_WRITE_TOOLS,
+    "latex": LATEX_WRITE_TOOLS,
+    "ppt": PPT_WRITE_TOOLS,
 }
-# Serena can also run a shell. That tool counts as exec, gated by the shell switch like the exec slots.
-TUNNEL_EXEC_TOOLS: dict[str, frozenset] = {"extract": frozenset({"execute_shell_command"})}
+# Serena can also run a shell, and powerpoint-mcp's evaluate runs code. Both count as exec, gated by the shell switch.
+TUNNEL_EXEC_TOOLS: dict[str, frozenset] = {
+    "extract": frozenset({"execute_shell_command"}),
+    "ppt": frozenset({"evaluate"}),
+}
 # 0b3ea61a — every websockets.connect() below sets ping_interval/ping_timeout
 # explicitly (676e53a3, above) but never set open_timeout — the CONNECT itself
 # (TCP+TLS+HTTP Upgrade handshake) silently inherited the websockets library's
@@ -2314,6 +2347,8 @@ async def _run_connection_lazy(
             resp = await _relay_request(
                 http_client, local_base, msg, tool_prefix=tool_prefix,
                 label=label, policy=policy,
+                roots=_served_dirs(proxy.cmd) if label == "fs" else (),
+                strict_tools=label == "extract",
             )
             # Auto-add: if access was denied and the path falls under
             # a known repo_path, silently expand and retry once (b9d1b606).
@@ -2324,10 +2359,12 @@ async def _run_connection_lazy(
                 except Exception:
                     dp = None
                 if dp is not None:
+                    # A root the hosted side revoked with set_fs_roots is not re-added by auto-add.
+                    revoked_dirs = getattr(proxy, "revoked_dirs", set())
                     anchor = next(
                         (
                             r for r in _known
-                            if _is_subpath(dp, Path(r))
+                            if _is_subpath(dp, Path(r)) and str(Path(r)) not in revoked_dirs
                         ),
                         None,
                     )
@@ -2350,6 +2387,8 @@ async def _run_connection_lazy(
                                     http_client, local_base, msg,
                                     tool_prefix=tool_prefix,
                                     label=label, policy=policy,
+                                    roots=_served_dirs(proxy.cmd) if label == "fs" else (),
+                                    strict_tools=label == "extract",
                                 )
             # 3bde892a — request-timeout watchdog. If the relay to a
             # freshly-lazy-spawned slot TIMED OUT (mcp-proxy hung on
@@ -2412,22 +2451,48 @@ async def _run_connection_lazy(
                                 flush=True,
                             )
                         continue
+                    if msg.get("type") == "set_active_repo":
+                        # A custom extract command takes its project from its own command line, so it cannot be moved to
+                        # another repo from the hosted side. The answer says so, instead of the request going unanswered.
+                        if msg.get("id") is not None:
+                            await ws.send(json.dumps({
+                                "type": "active_repo_result", "id": msg.get("id"), "ok": False,
+                                "reason": "this extract command does not take a repo from the hosted side",
+                            }))
+                        continue
                     if msg.get("type") == "set_fs_roots":
                         # live-fs-roots — full-list REPLACE: rebuild the fs proxy's
                         # allowed dirs to EXACTLY these roots (a removal shrinks the
                         # served set, which add_fs_roots cannot do), then respawn.
                         want_roots: list[str] = msg.get("roots") or []
+                        requested = list(dict.fromkeys(r for r in (_normalize_path_arg(x) for x in want_roots) if r))
+                        # An explicit empty list removes every root, and a set in which every root is refused is treated
+                        # the same way. Either way the previous set is not kept: the slot serves nothing until a valid set
+                        # arrives, because the filesystem server cannot start without a directory.
+                        if not requested or not _allowed_served_roots(requested):
+                            _cleared_before = set(_served_dirs(proxy.cmd))
+                            proxy.cmd = _clear_served_dirs(proxy.cmd)
+                            proxy.revoked_dirs = getattr(proxy, "revoked_dirs", set()) | {str(Path(d)) for d in _cleared_before}
+                            if proxy.is_running:
+                                proxy.kill()
+                            print(
+                                f"tunnel:{label}: set_fs_roots cleared the served set; the slot serves nothing until a valid set arrives",
+                                flush=True,
+                            )
+                            continue
                         updated_cmd, changed = _set_fs_roots_on_cmd(proxy.cmd, want_roots)
                         if changed:
+                            _before = set(_served_dirs(proxy.cmd))
                             proxy.cmd = updated_cmd
+                            _after = {str(Path(d)) for d in _served_dirs(updated_cmd)}
+                            # Roots dropped by this set are revoked against auto-add; roots named again are not.
+                            _revoked = getattr(proxy, "revoked_dirs", set()) | {str(Path(d)) for d in _before}
+                            proxy.revoked_dirs = _revoked - _after
                             if proxy.is_running:
                                 proxy.kill()
                                 await proxy.ensure_running()
-                            served = [
-                                d for d in (_normalize_path_arg(r) for r in want_roots) if d
-                            ]
                             print(
-                                f"tunnel:{label}: set allowed dirs → {served}",
+                                f"tunnel:{label}: set allowed dirs -> {_allowed_served_roots(requested)}",
                                 flush=True,
                             )
                         continue
@@ -2632,17 +2697,20 @@ async def _run_extract_pool_connection(
                     if msg.get("type") == "ping":
                         continue
                     if msg.get("type") == "set_active_repo":
+                        # Every set_active_repo is answered, so the hosted side caches a root only once this machine has
+                        # accepted it. A refused root leaves the active repo where it was.
                         new_path = str(msg.get("repo_path") or "").strip()
-                        if new_path:
-                            refusal = _serena_root_refusal(new_path)
-                            if refusal is not None:
-                                print(f"tunnel:extract: refused active repo {new_path!r}: {refusal}", flush=True)
-                                continue
+                        refusal = _serena_root_refusal(new_path) if new_path else "the root is empty"
+                        if refusal is None:
                             pool.default_repo_path = pool._normalize(new_path)
-                            print(
-                                f"tunnel:extract: active repo → {pool.default_repo_path}",
-                                flush=True,
-                            )
+                            print(f"tunnel:extract: active repo → {pool.default_repo_path}", flush=True)
+                        else:
+                            print(f"tunnel:extract: refused active repo {new_path!r}: {refusal}", flush=True)
+                        if msg.get("id") is not None:
+                            await ws.send(json.dumps({
+                                "type": "active_repo_result", "id": msg.get("id"),
+                                "ok": refusal is None, "reason": refusal,
+                            }))
                         continue
                     if msg.get("type") != "request":
                         continue
@@ -2701,7 +2769,7 @@ async def _run_extract_pool_connection(
                             await _mark_unhealthy(ws, already_reported=True)
                     resp = await _relay_request(
                         http_client, f"http://127.0.0.1:{daemon.port}", msg,
-                        tool_prefix=tool_prefix, label=label, policy=policy,
+                        tool_prefix=tool_prefix, label=label, policy=policy, roots=(repo_path,),
                     )
                     # 3bde892a — the private timeout marker is an in-process
                     # signal only; strip it so it never leaks onto the wire. (The
@@ -6459,11 +6527,6 @@ _SECRET_VALUE_PATTERNS = (
 _REDACTED = "[redacted by the Meridian tunnel]"
 
 
-# Built-in slots a hosted caller can switch on but that have no write list yet. Their tools can change files whatever
-# they are called, so every call on them is refused unless this machine allows tunnel writes.
-UNLISTED_WRITE_SLOTS = frozenset({"ppt", "zotero"})
-
-
 def _bare_names(table: dict, label: "str | None") -> frozenset:
     """The names a slot label answers to. An unlabelled loop gets the union, so it fails closed."""
     if label is None:
@@ -6521,7 +6584,7 @@ def _resolved_sensitive(path: str) -> bool:
         real = os.path.realpath(path)
     except (OSError, ValueError):
         return False
-    return _sensitive_path(real)
+    return _sensitive_path(real) or _is_denied_root(real)
 
 
 def _argument_paths(arguments: Any) -> list[str]:
@@ -6585,13 +6648,29 @@ def _rpc_calls(msg: dict) -> "tuple[list[dict], bool]":
     return [c for c in items if isinstance(c, dict)], True
 
 
-def _tool_refusal(bare: str, label: "str | None", policy: dict, arguments: Any) -> "str | None":
+def _tool_refusal(
+    bare: str, label: "str | None", policy: dict, arguments: Any, roots: "tuple[str, ...]" = (),
+    strict_tools: bool = False,
+) -> "str | None":
+    if label in EXEC_SLOT_LABELS and not policy["enable_shell_slot"]:
+        return f"{bare} is on the {label} slot, which runs programs on this machine, and enable_shell_slot is off"
     if bare in _bare_names(TUNNEL_EXEC_TOOLS, label) and not policy["enable_shell_slot"]:
         return f"{bare} runs commands on this machine, and enable_shell_slot is off"
-    if label in UNLISTED_WRITE_SLOTS and not policy["allow_tunnel_writes"]:
-        return f"{bare} is on the {label} slot, which has no read-only list, and allow_tunnel_writes is off"
+    # A custom extract command has no read-only list, so every tool on it is a write unless tunnel writes are allowed.
+    if strict_tools and not policy["allow_tunnel_writes"]:
+        return f"{bare} is on a custom extract command, which has no read-only list, and allow_tunnel_writes is off"
+    # A slot whose server is read-only has an allowlist. A call outside it is a write for the purposes of the guard, so an
+    # unknown tool, or one a newer server release added, is refused unless this machine allows tunnel writes.
+    if (label in SLOT_READ_ALLOWLIST and bare not in SLOT_READ_ALLOWLIST[label]
+            and bare not in _bare_names(TUNNEL_EXEC_TOOLS, label) and not policy["allow_tunnel_writes"]):
+        return f"{bare} is not on the read-only list for the {label} slot, and allow_tunnel_writes is off"
+    # A custom slot runs a command this machine chose, but its tools are not known here, so they are treated as writes.
+    if label is not None and label in (policy.get("custom_plugins") or {}) and not policy["allow_tunnel_writes"]:
+        return f"{bare} is on the {label} custom slot, which has no read-only list, and allow_tunnel_writes is off"
     if bare in _bare_names(TUNNEL_WRITE_TOOLS, label) and not policy["allow_tunnel_writes"]:
         return f"{bare} changes files on this machine, and allow_tunnel_writes is off"
+    if label == "extract" and not policy["allow_tunnel_writes"] and any(k in bare for k in SERENA_WRITE_KEYWORDS):
+        return f"{bare} looks like a write on the extract slot, and allow_tunnel_writes is off"
     from .repo_scope import ambiguous_path_spelling  # noqa: PLC0415
 
     for candidate in _path_keyed_values(arguments):
@@ -6601,9 +6680,26 @@ def _tool_refusal(bare: str, label: "str | None", policy: dict, arguments: Any) 
     for candidate in _argument_paths(arguments):
         if _sensitive_path(candidate):
             return f"{_path_parts(candidate)[-1] if _path_parts(candidate) else 'a path'} looks like a key or credential file"
-        if label == "fs" and _resolved_sensitive(candidate):
+        # A symlink or junction can carry a credential folder under an innocent name. Resolve absolute paths on every slot.
+        if _resolved_sensitive(candidate):
             return "the path resolves to a key or credential file"
+    # A relative path is served from a root, so a link inside that root is resolved from the root and checked too.
+    for candidate in _path_keyed_values(arguments):
+        for root in roots:
+            if _relative_resolves_sensitive(root, candidate):
+                return "the path resolves through a link to a key or credential folder"
     return None
+
+
+def _relative_resolves_sensitive(root: str, relative: str) -> bool:
+    """True when a relative path, resolved from *root*, lands on a key file or inside a credential folder."""
+    try:
+        if not relative or Path(relative).is_absolute():
+            return False
+        real = os.path.realpath(os.path.join(root, relative))
+    except (OSError, ValueError):
+        return False
+    return _sensitive_path(real) or _is_denied_root(real)
 
 
 def _refusal_response(msg: dict, rpc_id: Any, reason: str) -> "tuple[dict, str]":
@@ -6629,7 +6725,9 @@ def _ambiguous_file_uri(uri: str) -> bool:
     return parsed.scheme == "file" and bool(parsed.netloc)
 
 
-def _guard_request(msg: dict, label: "str | None", policy: dict) -> "tuple[dict, str] | None":
+def _guard_request(
+    msg: dict, label: "str | None", policy: dict, roots: "tuple[str, ...]" = (), strict_tools: bool = False,
+) -> "tuple[dict, str] | None":
     """Refuse a hosted request that would write, run a program, or read a key or credential file.
 
     Returns ``(response, reason)`` for a refusal, or None to let the request through. A body that is not readable
@@ -6657,7 +6755,7 @@ def _guard_request(msg: dict, label: "str | None", policy: dict) -> "tuple[dict,
         if method != "tools/call":
             continue
         bare = _bare_tool_name(params.get("name")) or ""
-        reason = _tool_refusal(bare, label, policy, params.get("arguments"))
+        reason = _tool_refusal(bare, label, policy, params.get("arguments"), roots, strict_tools)
         if reason is not None:
             return _refusal_response(msg, call.get("id"), reason)
     return None
@@ -6986,6 +7084,25 @@ async def _handle_run_cmd(cmd: "str | list", cwd: "str | None") -> dict:
             "stdout_tail": "",
             "stderr_tail": "",
         }
+
+
+def _served_dirs(cmd: "list[str]") -> "tuple[str, ...]":
+    """The directories the filesystem server in *cmd* serves, or empty for any other command."""
+    try:
+        idx = cmd.index(FS_SERVER_PACKAGE)
+    except ValueError:
+        return ()
+    return tuple(cmd[idx + 1:])
+
+
+def _clear_served_dirs(cmd: "list[str]") -> "list[str]":
+    """*cmd* with every served directory removed. The filesystem server then has none and cannot start, so the slot serves
+    nothing until a valid root set replaces it."""
+    try:
+        idx = cmd.index(FS_SERVER_PACKAGE)
+    except ValueError:
+        return list(cmd)
+    return list(cmd[: idx + 1])
 
 
 def _add_fs_roots_to_cmd(cmd: "list[str]", new_roots: "list[str]") -> "tuple[list[str], bool]":
@@ -7590,7 +7707,8 @@ def _apply_tool_prefix(body: bytes, prefix: str | None) -> bytes:
 
 async def _relay_request(
     http_client, local_base: str, msg: dict, *, tool_prefix: str | None = None,
-    label: "str | None" = None, policy: "dict | None" = None,
+    label: "str | None" = None, policy: "dict | None" = None, roots: "tuple[str, ...]" = (),
+    strict_tools: bool = False,
 ) -> dict:
     """Guard, relay, and redact one server ``request``.
 
@@ -7598,7 +7716,7 @@ async def _relay_request(
     refused request is answered with a 403 without being sent. Every relayed body is redacted of credential-looking
     values. A caller that passes no label and policy gets the locked defaults, so every write and exec tool is refused.
     """
-    refusal = _guard_request(msg, label, policy or _LOCKED_POLICY)
+    refusal = _guard_request(msg, label, policy or _LOCKED_POLICY, roots, strict_tools)
     if refusal is not None:
         resp, reason = refusal
         print(f"tunnel:{label or 'slot'}: refused a request: {reason}", flush=True)

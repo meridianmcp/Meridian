@@ -279,6 +279,13 @@ _tenant_active_repo: dict[str, str] = {}
 _pending_reqs: dict[str, asyncio.Future[dict]] = {}
 _pending_code_reqs: dict[str, asyncio.Future[dict]] = {}
 _pending_extract_reqs: dict[str, asyncio.Future[dict]] = {}
+# set_active_repo messages waiting for the tunnel's active_repo_result. The root is cached only when it is accepted.
+_pending_active_repo: dict[str, asyncio.Future[dict]] = {}
+ACTIVE_REPO_ACK_TIMEOUT_S = 10.0
+# The keepalive touches a connected tunnel's session at most this often. A session needs a touch within its TTL, not on
+# every one-minute tick, so this keeps the database writes bounded without letting a live session go stale (4b698ea5).
+TUNNEL_KEEPALIVE_MIN_INTERVAL_S = 300.0
+_keepalive_last_at: dict[str, float] = {}
 _pending_ppt_reqs: dict[str, asyncio.Future[dict]] = {}
 _pending_word_reqs: dict[str, asyncio.Future[dict]] = {}
 _pending_dc_reqs: dict[str, asyncio.Future[dict]] = {}
@@ -1119,6 +1126,11 @@ async def tunnel_extract_ws(ws: WebSocket, tenant_id: str) -> None:
                     quarantine_reason=msg.get("quarantine_reason"),
                 )
                 continue
+            if msg_type == "active_repo_result":
+                ack_fut = _pending_active_repo.get(msg.get("id"))
+                if ack_fut is not None and not ack_fut.done():
+                    ack_fut.set_result(msg)
+                continue
             if msg_type == "response":
                 req_id = msg.get("id")
                 fut = _pending_extract_reqs.get(req_id)
@@ -1406,6 +1418,10 @@ async def set_tunnel_active_repo(request: Request) -> Response:
     status = result.get("status")
     if status == "not_connected":
         return Response(content=json.dumps(result), status_code=503, media_type="application/json")
+    if status == "refused":
+        return Response(content=json.dumps(result), status_code=422, media_type="application/json")
+    if status == "unconfirmed":
+        return Response(content=json.dumps(result), status_code=504, media_type="application/json")
     if status == "error":
         return Response(content=json.dumps(result), status_code=502, media_type="application/json")
 
@@ -1417,7 +1433,9 @@ async def send_active_repo_control(tenant_id: str, repo_path: str) -> dict[str, 
 
     Called by the MCP handler AND the ``/tunnel/active-repo`` HTTP route (no
     HTTP round-trip needed from the former). Returns a status dict with
-    ``status`` of ``"ok"``, ``"not_connected"``, or ``"error"``.
+    ``status`` of ``"ok"``, ``"refused"`` (the tunnel rejected the root),
+    ``"unconfirmed"`` (no answer within ACTIVE_REPO_ACK_TIMEOUT_S), ``"not_connected"``,
+    or ``"error"``. Only ``"ok"`` changes the cached active repo.
 
     4d9ad87b — always updates _tenant_active_repo so subsequent call_tunnel_tool
     calls can inject X-Meridian-Repo-Path without a separate set_active_repo.
@@ -1427,15 +1445,37 @@ async def send_active_repo_control(tenant_id: str, repo_path: str) -> dict[str, 
     through here so the cache never goes stale relative to the WS control
     message actually sent to the tunnel client.
     """
-    _tenant_active_repo[tenant_id] = repo_path
     ws = _tunnel_extract_sockets.get(tenant_id)
     if ws is None:
         return {"status": "not_connected", "message": "no active extract tunnel — start meridian --tunnel first"}
+    # The cache is written only after the tunnel accepts the root. The tunnel answers every set_active_repo with an
+    # active_repo_result, so a root it refuses is never cached and never routed to.
+    req_id = uuid.uuid4().hex
+    fut: asyncio.Future[dict] = asyncio.get_running_loop().create_future()
+    _pending_active_repo[req_id] = fut
+
+    async def _exchange() -> dict:
+        await ws.send_json({"type": "set_active_repo", "id": req_id, "repo_path": repo_path})
+        return await fut
+
     try:
-        await ws.send_json({"type": "set_active_repo", "repo_path": repo_path})
-        return {"status": "ok", "repo_path": repo_path}
+        ack = await asyncio.wait_for(_exchange(), timeout=ACTIVE_REPO_ACK_TIMEOUT_S)
+    except asyncio.TimeoutError:
+        return {
+            "status": "unconfirmed",
+            "message": (
+                "the tunnel did not confirm the repo in time, so the active repo is unchanged. A Meridian client older than "
+                "this server does not answer set_active_repo: update the client."
+            ),
+        }
     except Exception as exc:  # noqa: BLE001
         return {"status": "error", "message": str(exc)}
+    finally:
+        _pending_active_repo.pop(req_id, None)
+    if not ack.get("ok"):
+        return {"status": "refused", "message": str(ack.get("reason") or "the tunnel refused this root")}
+    _tenant_active_repo[tenant_id] = repo_path
+    return {"status": "ok", "repo_path": repo_path}
 
 
 # ---------------------------------------------------------------------------
@@ -4354,15 +4394,20 @@ async def keepalive_tunnel_sessions(app: Any) -> "list[str]":
     from .._deps import _tenant_db_cache  # noqa: PLC0415
 
     refreshed: list[str] = []
+    now = time.monotonic()
     for tenant_id in active_tunnel_tenant_ids():
         conn = _tenant_db_cache.get(tenant_id)
         if conn is None:
             continue  # no MCP activity yet → nothing to keep alive
+        last = _keepalive_last_at.get(tenant_id)
+        if last is not None and now - last < TUNNEL_KEEPALIVE_MIN_INTERVAL_S:
+            continue  # refreshed recently; a session needs one touch per interval, not one per tick
         try:
             # <infra-fix> — now returns every genuinely-recent-activity session
             # refreshed this tick (list), not a single "most recent" winner.
             sids = await db_module.touch_latest_active_session(conn)
             refreshed.extend(sids)
+            _keepalive_last_at[tenant_id] = now  # stamped only after a successful touch, so a failure retries next tick
         except Exception:  # noqa: BLE001 — a failed bump must not kill the loop
             _log.debug("tunnel keepalive: touch failed for tenant %s", tenant_id[:8])
     return refreshed

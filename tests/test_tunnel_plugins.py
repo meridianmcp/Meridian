@@ -37,7 +37,7 @@ def test_resolve_defaults_returns_builtins_in_order():
     assert by_name["powerpoint"]["enabled"] is False
     assert by_name["word"]["enabled"] is False
     assert by_name["desktop-commander"]["enabled"] is False
-    assert by_name["powerpoint"]["command"] == ["uvx", "powerpoint-mcp"]
+    assert by_name["powerpoint"]["command"] == ["uvx", "powerpoint-mcp==0.0.27"]
     # 5b065c2e — the word slot's default launcher is `uvx docx-mcp` (swapped from
     # docx-mcp-server). This assertion is the unit half of that item; the live
     # spawn is covered by tests/test_tunnel_word_docx_mcp_integration.py.
@@ -157,7 +157,7 @@ def test_plugin_by_slot():
 
 def test_expand_command_substitutes_repo_path_in_serena_default():
     out = tp.expand_command(tp.SERENA_EXTRACT_COMMAND, repo_path="/home/me/proj")
-    assert out == ["uvx", "--from", "serena-agent", "serena", "start-mcp-server",
+    assert out == ["uvx", "--from", "serena-agent==1.5.3", "serena", "start-mcp-server",
                    "--context", "claude-code", "--open-web-dashboard", "false",
                    "--project", "/home/me/proj"]
     # The module-level constant must not be mutated by expansion.
@@ -169,7 +169,7 @@ def test_serena_extract_default_pins_serena_agent_distribution():
     # console script, so uvx must install the ``serena-agent`` distribution and
     # run the ``serena`` entrypoint it provides.
     cmd = tp.SERENA_EXTRACT_COMMAND
-    assert cmd[:4] == ["uvx", "--from", "serena-agent", "serena"]
+    assert cmd[:4] == ["uvx", "--from", "serena-agent==1.5.3", "serena"]
     assert "serena" not in cmd[1:3]  # not invoked as a bare ``uvx serena``
 
 

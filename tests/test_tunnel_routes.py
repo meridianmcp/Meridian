@@ -1214,13 +1214,21 @@ class _FakeHeaderOnlyActiveRepoReq:
 
 
 class _FakeExtractSocket:
-    """Minimal stand-in for the extract-slot WS: just records sends."""
+    """Stand-in for the extract-slot WS. It records sends and answers set_active_repo the way the tunnel client does:
+    with an active_repo_result that accepts or refuses the root."""
 
-    def __init__(self):
+    def __init__(self, accept=True, reason=None, answer=True):
         self.sent = []
+        self.accept = accept
+        self.reason = reason
+        self.answer = answer
 
     async def send_json(self, obj):
         self.sent.append(obj)
+        if obj.get("type") == "set_active_repo" and self.answer:
+            fut = tn._pending_active_repo.get(obj.get("id"))
+            if fut is not None and not fut.done():
+                fut.set_result({"type": "active_repo_result", "id": obj["id"], "ok": self.accept, "reason": self.reason})
 
 
 def test_active_repo_route_still_accepts_header_token(monkeypatch):
@@ -1234,6 +1242,24 @@ def test_active_repo_route_still_accepts_header_token(monkeypatch):
     ))
     assert resp.status_code == 200
     assert tn._tenant_active_repo.get(tenant_id) == "/worktrees/W"
+
+
+def test_active_repo_is_cached_only_after_the_tunnel_accepts_it():
+    tn._tenant_active_repo.pop("tenant-ack", None)
+    tn._tunnel_extract_sockets["tenant-ack"] = _FakeExtractSocket(accept=False, reason="a credential folder")
+    result = asyncio.run(tn.send_active_repo_control("tenant-ack", "/x/proj"))
+    assert result["status"] == "refused"
+    assert "credential folder" in result["message"]
+    assert "tenant-ack" not in tn._tenant_active_repo
+
+
+def test_active_repo_without_an_answer_is_unconfirmed_and_not_cached(monkeypatch):
+    monkeypatch.setattr(tn, "ACTIVE_REPO_ACK_TIMEOUT_S", 0.05)
+    tn._tenant_active_repo.pop("tenant-silent", None)
+    tn._tunnel_extract_sockets["tenant-silent"] = _FakeExtractSocket(answer=False)
+    result = asyncio.run(tn.send_active_repo_control("tenant-silent", "/x/proj"))
+    assert result["status"] == "unconfirmed"
+    assert "tenant-silent" not in tn._tenant_active_repo
 
 
 # ---------------------------------------------------------------------------

@@ -558,9 +558,30 @@ def test_alternate_data_stream_on_any_file_is_refused():
     assert _refused(_read_request("docs.md::$DATA")) is not None
 
 
-@pytest.mark.parametrize("label,name", [("ppt", "add_slide"), ("zotero", "search_items")])
+@pytest.mark.parametrize("label,name", [("ppt", "add_slide"), ("zotero", "add_item"), ("zotero", "delete_item")])
 def test_unlisted_slot_calls_are_refused_by_default(label, name):
     assert _refused(_request_msg(_call(name)), label=label) is not None
+
+
+@pytest.mark.parametrize("label,name", [
+    ("zotero", "search_items"), ("zotero", "get_item_metadata"), ("zotero", "get_item_fulltext"),
+    ("ppt", "list_templates"),
+])
+def test_read_only_tools_on_read_only_slots_pass_by_default(label, name):
+    assert _refused(_request_msg(_call(name)), label=label) is None
+
+
+def test_powerpoint_evaluate_is_exec_and_needs_the_shell_switch():
+    msg = _request_msg(_call("evaluate"))
+    assert tc._guard_request(msg, "ppt", {**tc._LOCKED_POLICY, "allow_tunnel_writes": True}) is not None
+    assert tc._guard_request(msg, "ppt", {**tc._LOCKED_POLICY, "enable_shell_slot": True}) is None
+
+
+def test_custom_slot_tools_are_writes_unless_allowed():
+    policy = {**tc._LOCKED_POLICY, "custom_plugins": {"mytool": {"command": ["x"]}}}
+    assert tc._guard_request(_request_msg(_call("anything")), "mytool", policy) is not None
+    assert tc._guard_request(_request_msg(_call("anything")), "mytool",
+                             {**policy, "allow_tunnel_writes": True}) is None
 
 
 def test_unlisted_slot_calls_pass_when_the_local_policy_allows_writes():
@@ -778,3 +799,91 @@ def test_docker_registry_config_is_refused_wherever_it_sits(path):
 def test_a_credential_folder_named_as_the_path_is_refused(path):
     # A search or listing rooted at the folder would return the files inside it, so the folder itself is refused.
     assert _refused(_read_request(path)) is not None
+
+
+# ---------------------------------------------------------------------------
+# this round: the shared Serena pin, root-relative links, revoked roots, and the set_active_repo acknowledgement
+# ---------------------------------------------------------------------------
+
+def test_pinned_serena_command_is_still_recognised_as_serena():
+    from meridian.serena_pool import is_serena_command  # noqa: PLC0415
+    assert is_serena_command(["uvx", "--from", "serena-agent==1.5.3", "serena", "start-mcp-server"]) is True
+    assert is_serena_command(["uvx", "--from", "serena-agent", "serena", "start-mcp-server"]) is True
+    assert is_serena_command(["uvx", "--from", "other-tool", "other", "start-mcp-server"]) is False
+
+
+def test_a_revoked_served_set_has_no_directories_left(local_home):
+    cmd = tc._build_proxy_command("npx", str(local_home / "proj"), port=9000)
+    cleared = tc._clear_served_dirs(cmd)
+    assert cleared[-1] == tc.FS_SERVER_PACKAGE
+    assert tc._served_dirs(cleared) == ()
+
+
+def test_a_link_inside_a_root_into_a_credential_folder_is_refused(local_home, tmp_path):
+    import os as _os  # noqa: PLC0415
+    root = tmp_path / "project"
+    root.mkdir()
+    target = local_home / ".ssh"
+    target.mkdir(exist_ok=True)
+    link = root / "linked"
+    try:
+        _os.symlink(str(target), str(link), target_is_directory=True)
+    except (OSError, NotImplementedError):
+        pytest.skip("this machine cannot create directory links")
+    assert tc._relative_resolves_sensitive(str(root), "linked/id_ed25519") is True
+    assert tc._relative_resolves_sensitive(str(root), "src/main.py") is False
+
+
+def test_extract_loop_answers_set_active_repo_with_the_outcome(monkeypatch, local_home):
+    project = str(local_home / "proj")
+    refused = json.dumps({"type": "set_active_repo", "id": "a1", "repo_path": str(local_home / ".ssh")})
+    accepted = json.dumps({"type": "set_active_repo", "id": "a2", "repo_path": project})
+    pool = _FakePool()
+    ws = _FakeExtractWS([refused, accepted])
+    monkeypatch.setattr(websockets, "connect", lambda url, **kw: ws)
+    url = tc._authed_url("wss://usemeridian.us/tunnel-extract/tenant-1", "sk_meridian_secret123")
+    asyncio.run(tc._run_extract_pool_connection(url, pool, str(local_home), label="extract"))
+    answers = [json.loads(s) for s in ws.sent if '"active_repo_result"' in s]
+    by_id = {a["id"]: a for a in answers}
+    assert by_id["a1"]["ok"] is False and by_id["a1"]["reason"]
+    assert by_id["a2"]["ok"] is True
+    assert pool.default_repo_path == project
+
+
+# ---------------------------------------------------------------------------
+# this round's review fixes: screenshot tools are writes, exec labels need the shell switch, custom extract is strict
+# ---------------------------------------------------------------------------
+
+@pytest.mark.parametrize("name", ["slide_snapshot", "analyze_template", "add_slide_with_layout"])
+def test_powerpoint_tools_that_save_files_are_writes(name):
+    assert _refused(_request_msg(_call(name)), label="ppt") is not None
+
+
+def test_powerpoint_list_templates_is_read_only_and_passes():
+    assert _refused(_request_msg(_call("list_templates")), label="ppt") is None
+
+
+def test_desktop_commander_config_write_needs_tunnel_writes():
+    msg = _request_msg(_call("set_config_value"))
+    shell_on = {**tc._LOCKED_POLICY, "enable_shell_slot": True}
+    assert tc._guard_request(msg, "dc", shell_on) is not None
+    assert tc._guard_request(msg, "dc", {**shell_on, "allow_tunnel_writes": True}) is None
+
+
+@pytest.mark.parametrize("label,name", [("debug", "start_debugging"), ("latex", "lint_tex"), ("dc", "read_file")])
+def test_exec_slot_tools_are_refused_without_the_shell_switch(label, name):
+    assert tc._guard_request(_request_msg(_call(name)), label, tc._LOCKED_POLICY) is not None
+    assert tc._guard_request(_request_msg(_call(name)), label,
+                             {**tc._LOCKED_POLICY, "enable_shell_slot": True}) is None
+
+
+def test_custom_extract_command_has_no_read_only_list():
+    msg = _request_msg(_call("find_symbol"))
+    assert tc._guard_request(msg, "extract", tc._LOCKED_POLICY, strict_tools=True) is not None
+    assert tc._guard_request(msg, "extract", {**tc._LOCKED_POLICY, "allow_tunnel_writes": True},
+                             strict_tools=True) is None
+
+
+def test_absolute_link_into_a_denied_folder_is_refused(local_home):
+    assert tc._resolved_sensitive(str(local_home / ".meridian")) is True
+    assert tc._resolved_sensitive(str(local_home / "proj" / "readme.md")) is False

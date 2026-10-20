@@ -145,7 +145,9 @@ def is_serena_command(cmd: Any) -> bool:
     if not isinstance(cmd, (list, tuple)):
         return False
     tokens = [str(t) for t in cmd]
-    return "serena-agent" in tokens and "start-mcp-server" in tokens
+    # The package token may carry a pin (``serena-agent==1.5.3``): the pin does not change what the command is.
+    has_package = any(t == "serena-agent" or t.startswith("serena-agent==") for t in tokens)
+    return has_package and "start-mcp-server" in tokens
 
 
 def ensure_serena_headless(cmd: Any) -> Any:
@@ -258,7 +260,7 @@ def build_serena_command(repo_path: str, port: int) -> list[str]:
     silently drift from the shared headless-by-default guarantee.
     """
     cmd = [
-        "uvx", "--from", "serena-agent", "serena", "start-mcp-server",
+        "uvx", "--from", "serena-agent==1.5.3", "serena", "start-mcp-server",
         "--context", "claude-code",
         "--transport", "streamable-http",
         "--port", str(port),

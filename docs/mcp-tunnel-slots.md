@@ -124,9 +124,22 @@ synced and missing or invalid means the locked-down defaults:
 - `allow_tunnel_writes` (default `false`): tools that change files or stored state
   are refused for tunnel requests on every slot. That covers the filesystem write
   tools (`write_file`, `edit_file`, `create_directory`, `move_file`), Serena's
-  edit tools, the word, docs, and outputs writers, and codebase-memory's index
-  writers. A refused call returns HTTP 403 with a JSON-RPC error. Set it to `true`
-  to allow them.
+  edit tools (including its line-edit and project-removal tools), the word, docs,
+  and outputs writers, codebase-memory's index writers, desktop-commander's file
+  writers, meridian-latex's state writers, and powerpoint-mcp's presentation
+  writers. A custom slot's tools are treated as writes, because this machine
+  does not know what they do. A refused call returns HTTP 403 with a JSON-RPC
+  error. Set it to `true` to allow them.
+- **Read-only slots.** `zotero` and `ppt` have a read-only list each. Zotero's
+  reads are `get_item_fulltext`, `get_item_metadata`, and `search_items`. PowerPoint's
+  are `analyze_template`, `list_templates`, and `slide_snapshot`. Any other tool on
+  those slots, including one a newer server release adds, is refused unless
+  `allow_tunnel_writes` is `true`. PowerPoint's `evaluate` runs code and needs
+  `enable_shell_slot` instead.
+- **Extract slot keyword net.** A Serena tool whose name contains `replace`,
+  `insert`, `delete`, `create`, `rename`, `write`, `edit`, `remove`, `move`, or
+  `inline` counts as a write, so a tool added later with one of those names is not
+  missed.
 - `enable_shell_slot` (default `false`): the exec slots run programs on this
   machine, so they start only when this is `true`. Those are `desktop-commander`,
   `mcp-debugger`, and `meridian-latex`. Serena's `execute_shell_command` is refused
@@ -136,9 +149,11 @@ synced and missing or invalid means the locked-down defaults:
 - `custom_plugins`: a custom plugin runs only when its name has a command here. A
   custom plugin defined only in the hosted config is logged and not started.
 
-Only a literal `true` turns a switch on. The packages are pinned so `npx` cannot
-silently upgrade them: `@modelcontextprotocol/server-filesystem@2.0.0` and
-`mcp-proxy@6.7.20`.
+Only a literal `true` turns a switch on. The packages are pinned so `npx` and `uvx`
+cannot silently upgrade them: `@modelcontextprotocol/server-filesystem@2.0.0`,
+`mcp-proxy@6.7.20`, `serena-agent==1.5.3`, `zotero-mcp==0.3.1`, and
+`powerpoint-mcp==0.0.27`. The read-only lists and the write lists were checked
+against these versions, so a bump needs them checked again.
 
 ### Key and credential files, and secret values, never leave through the tunnel
 
@@ -152,8 +167,10 @@ Two layers protect the tunnel, and neither depends on the hosted side behaving:
   `.git-credentials`, `.envrc`, `secrets.json`, `credentials.json`, the Meridian
   token and policy files, and `.git/config`. This applies to read tools, to
   `resources/read` URIs, and to every path argument.
-- **Resolved on the filesystem slot.** A symlink or junction whose target is a key
-  file is refused even when its own name is innocent.
+- **Resolved on every slot.** An absolute path, and a relative path resolved from
+  the root it is served from, is followed through any symlink or junction. A link
+  whose target is a key file, or sits inside a credential folder, is refused even
+  when the link's own name is innocent.
 - **Redacted by value.** Anything the tunnel sends back has credential-looking
   values replaced with `[redacted by the Meridian tunnel]`. That covers PEM private
   key blocks, Meridian tokens (`sk_meridian_…`), AWS, GitHub, Slack, and OpenAI-style
@@ -161,9 +178,10 @@ Two layers protect the tunnel, and neither depends on the hosted side behaving:
   plain-text bodies are all handled.
 
 Limits: refusal is by name, so a key pasted into an ordinary file is caught only if
-its value matches one of the redaction patterns. Symlinks are resolved on the
-filesystem slot only. Search results from Serena or the filesystem server can still
-contain text from a file with an innocent name.
+its value matches one of the redaction patterns. A search or listing that the
+filesystem server or Serena runs across a project can still return text from a file
+with an innocent name, when the search does not name the file itself. A search
+rooted at a credential folder is refused.
 
 ### Served roots: credential and token folders are refused
 
@@ -188,8 +206,16 @@ logged and dropped. If the check cannot resolve a path, it refuses that root.
   ordering matters: ship the client that sends the header before the server change
   goes live, or older clients cannot connect.
 - The hosted keepalive refreshes the session of every connected tunnel, including one
-  that has made no tool call for a long run (4b698ea5). It touches only tenants whose
-  project database is already open, so it never opens a new connection.
+  that has made no tool call for a long run (4b698ea5). It touches a session at most
+  once every five minutes, and only for tenants whose project database is already
+  open, so it never opens a new connection.
+- `set_active_repo` is acknowledged. The hosted side caches a root only after this
+  machine accepts it. A refused root returns HTTP 422 (or a refused error from the
+  MCP tool), and an answer that never arrives returns HTTP 504 and leaves the active
+  repo where it was.
+- A `set_fs_roots` message in which every root is refused clears the served set, so
+  the filesystem slot serves nothing until a valid set arrives. It does not keep
+  serving the roots it had.
 - Each request on a socket is served on its own task, so a slow tool call no longer
   holds up the others. A socket close gives in-flight work 5 seconds before it is
   cancelled.
