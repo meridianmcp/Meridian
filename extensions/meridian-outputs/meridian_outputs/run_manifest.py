@@ -167,8 +167,8 @@ def _read_ledger(outputs_dir: str) -> dict[str, dict[str, Any]]:
 
 def _read_ledger_strict(outputs_dir: str) -> dict[str, dict[str, Any]]:
     """Strict read for staleness lookups (:func:`check_input_staleness`,
-    :func:`run_ids_for_output`) and the writers
-    (:func:`_read_ledger_for_write`): ``{}`` only for a missing ledger. Bytes that
+    :func:`run_ids_for_output`), the writers (:func:`_read_ledger_for_write`)
+    and bundle export/import: ``{}`` only for a missing ledger. Bytes that
     are not a JSON object, or a run row that is not an object, raise
     ``ledger_io.LedgerCorruptError`` -- an unreadable ledger is never read
     as "no run covers this output". :func:`_read_ledger` keeps its lenient
