@@ -19,6 +19,7 @@ These tests pin the fixed behaviour:
 """
 from __future__ import annotations
 
+import hashlib
 import json
 import logging
 import os
@@ -394,7 +395,7 @@ class TestStrictReadAndQuarantine:
         prov.write_bytes(_GARBAGE)
         fing.write_bytes(_GARBAGE)
 
-        def _no_space(path: str) -> str:
+        def _no_space(path: str, raw: bytes | None = None) -> str:
             raise OSError("disk full")
 
         monkeypatch.setattr(LIO, "quarantine_ledger", _no_space)
@@ -441,6 +442,26 @@ class TestStrictReadAndQuarantine:
 
     def test_quarantine_of_missing_ledger_is_none(self, tmp_path: Path) -> None:
         assert LIO.quarantine_ledger(str(tmp_path / "gone.json")) is None
+
+    def test_raise_quarantined_copies_the_rejected_bytes_not_the_current_file(
+        self, tmp_path: Path,
+    ) -> None:
+        """S-R4-9: raise_quarantined re-read the file, so bytes written after
+        the strict parse failed were quarantined instead of the bad ones."""
+        ledger = tmp_path / "ledger.json"
+        ledger.write_bytes(b'{"rewritten": true}')  # replaced after the parse failed
+        exc = LIO.LedgerCorruptError(str(ledger), "file is not valid JSON")
+        with pytest.raises(LIO.LedgerCorruptError) as info:
+            LIO.raise_quarantined(exc, _GARBAGE)
+        copy = Path(info.value.quarantine_path)
+        assert copy.read_bytes() == _GARBAGE
+        digest = hashlib.sha256(_GARBAGE).hexdigest()[:LIO._QUARANTINE_DIGEST_CHARS]
+        assert copy.name == f"ledger.json.corrupt-{digest}"
+        assert ledger.read_bytes() == b'{"rewritten": true}'
+        # The same rejected bytes reuse that copy, even once the file is gone.
+        ledger.unlink()
+        assert LIO.quarantine_ledger(str(ledger), _GARBAGE) == str(copy)
+        assert sorted(os.listdir(tmp_path)) == [copy.name]
 
     def test_transaction_creates_directory_and_commits(self, tmp_path: Path) -> None:
         ledger = tmp_path / "new" / "dir" / "ledger.json"

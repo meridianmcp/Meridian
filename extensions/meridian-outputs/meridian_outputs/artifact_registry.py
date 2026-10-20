@@ -197,15 +197,10 @@ def _read_registry(outputs_dir: str) -> dict[str, Any]:
     return data
 
 
-def _read_registry_strict(outputs_dir: str) -> dict[str, Any]:
-    """Strict read: an empty registry only for a missing file. Bytes that are
-    not a JSON object, ``artifacts`` that is not an object of objects, or
-    ``edges`` that is not a list of objects raise
-    ``ledger_io.LedgerCorruptError`` instead of being normalised to empty the
-    way :func:`_read_registry` does. An absent ``artifacts``/``edges`` key
-    reads as empty. Takes no lock."""
-    path = _registry_path(outputs_dir, create=False)
-    data = ledger_io.read_ledger_strict(path)
+def _parse_registry_strict(path: str, raw: bytes | None) -> dict[str, Any]:
+    """:func:`_read_registry_strict`'s checks over bytes already read
+    (``None``: no registry file)."""
+    data = {} if raw is None else ledger_io.parse_ledger_bytes(path, raw)
     artifacts = data.setdefault("artifacts", {})
     edges = data.setdefault("edges", [])
     if not isinstance(artifacts, dict) or not all(isinstance(r, dict) for r in artifacts.values()):
@@ -215,17 +210,32 @@ def _read_registry_strict(outputs_dir: str) -> dict[str, Any]:
     return data
 
 
+def _read_registry_strict(outputs_dir: str) -> dict[str, Any]:
+    """Strict read: an empty registry only for a missing file. Bytes that are
+    not a JSON object, ``artifacts`` that is not an object of objects, or
+    ``edges`` that is not a list of objects raise
+    ``ledger_io.LedgerCorruptError`` instead of being normalised to empty the
+    way :func:`_read_registry` does. An absent ``artifacts``/``edges`` key
+    reads as empty. Takes no lock."""
+    path = _registry_path(outputs_dir, create=False)
+    return _parse_registry_strict(path, ledger_io._read_bytes(path))
+
+
 def _read_registry_for_write(outputs_dir: str) -> dict[str, Any]:
     """The writers' read, taken under ``_write_lock``. A corrupt registry is
     quarantined and ``ledger_io.LedgerCorruptError`` raised
     (``ledger_io.raise_quarantined``), so it is never read as empty and
     replaced by a one-artifact registry. Continuing from empty would also
     drop the content-hash conflict check :func:`register_artifact` makes
-    against the existing record. Nothing is written."""
+    against the existing record. Nothing is written. The file is read once
+    and the quarantine copies exactly the bytes that failed: ``_write_lock``
+    is in-process only, so another process may replace the file meanwhile."""
+    path = _registry_path(outputs_dir, create=False)
+    raw = ledger_io._read_bytes(path)
     try:
-        return _read_registry_strict(outputs_dir)
+        return _parse_registry_strict(path, raw)
     except ledger_io.LedgerCorruptError as exc:
-        ledger_io.raise_quarantined(exc)
+        ledger_io.raise_quarantined(exc, raw)
 
 
 def _write_registry(outputs_dir: str, registry: dict[str, Any]) -> None:

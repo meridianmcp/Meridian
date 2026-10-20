@@ -176,7 +176,13 @@ def _read_ledger_strict(outputs_dir: str) -> dict[str, dict[str, Any]]:
     as "no run covers this output". :func:`_read_ledger` keeps its lenient
     behaviour for plain listings."""
     path = _ledger_path(outputs_dir, create=False)
-    ledger = ledger_io.read_ledger_strict(path)
+    return _parse_ledger_strict(path, ledger_io._read_bytes(path))
+
+
+def _parse_ledger_strict(path: str, raw: "bytes | None") -> dict[str, dict[str, Any]]:
+    """:func:`_read_ledger_strict`'s checks over bytes already read
+    (``None``: no ledger file)."""
+    ledger = {} if raw is None else ledger_io.parse_ledger_bytes(path, raw)
     for record in ledger.values():
         if not isinstance(record, dict):
             kind = "null" if record is None else type(record).__name__
@@ -191,11 +197,16 @@ def _read_ledger_for_write(outputs_dir: str) -> dict[str, dict[str, Any]]:
     replaced by an entry-only ledger. Continuing from empty (as the
     provenance ledger's writer does) would also drop the per-run
     immutability check :func:`start_run_manifest` makes against the existing
-    record. Any other read ``OSError`` propagates; nothing is written."""
+    record. Any other read ``OSError`` propagates; nothing is written. The
+    file is read once and the quarantine copies exactly the bytes that
+    failed: ``_write_lock`` is in-process only, so another process may
+    replace the file meanwhile."""
+    path = _ledger_path(outputs_dir, create=False)
+    raw = ledger_io._read_bytes(path)
     try:
-        return _read_ledger_strict(outputs_dir)
+        return _parse_ledger_strict(path, raw)
     except ledger_io.LedgerCorruptError as exc:
-        ledger_io.raise_quarantined(exc)
+        ledger_io.raise_quarantined(exc, raw)
 
 
 def _write_ledger_entry(outputs_dir: str, key: str, record: dict[str, Any]) -> None:
