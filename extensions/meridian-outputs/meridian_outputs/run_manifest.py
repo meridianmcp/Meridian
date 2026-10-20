@@ -823,6 +823,12 @@ def list_run_manifests(outputs_dir: str) -> "list[dict[str, Any]]":
 # ---------------------------------------------------------------------------
 
 _STALE_INPUT_STATUSES = ("changed", "missing", "appeared", "unreadable", "unverifiable")
+_LEGACY_RELATIVE_REASON = (
+    "relative input recorded before input_stat existed: its only hash is of the "
+    "path as given against the run's start-time working directory, which was not "
+    "recorded, so the file it describes is unknown -- staleness cannot be "
+    "confirmed either way"
+)
 
 
 def _classify_input(
@@ -872,22 +878,27 @@ def check_input_staleness(
     input and catches it.
 
     Each input gets a status: ``unchanged``, ``absent`` (absent at start and
-    still absent), or one of the stale statuses ``changed``, ``missing``,
-    ``appeared`` (absent at start, present now), ``unreadable`` and
-    ``unverifiable`` (no start-time hash). Inputs are keyed relative to
-    ``outputs_dir`` (absolute when on another volume); a relative input path
-    is resolved against ``outputs_dir``, and compared with the
-    ``input_stat`` hash :func:`start_run_manifest` took of that same file.
-    A manifest written before ``input_stat`` existed has no stat baseline,
-    so every input is re-hashed against ``input_identity.file_hashes``
-    (``baseline="legacy_hash_only"``), each resolved against ``outputs_dir``.
-    Those identity hashes are of the path as given, so a relative input
-    started from a working directory other than ``outputs_dir`` can report
-    ``changed``/``appeared`` there -- fail closed, never missed.
+    still absent), ``unknown`` (see below), or one of the stale statuses
+    ``changed``, ``missing``, ``appeared`` (absent at start, present now),
+    ``unreadable`` and ``unverifiable`` (no start-time hash). Inputs are
+    keyed relative to ``outputs_dir`` (absolute when on another volume); a
+    relative input path is resolved against ``outputs_dir``, and compared
+    with the ``input_stat`` hash :func:`start_run_manifest` took of that
+    same file. A manifest written before ``input_stat`` existed has no stat
+    baseline, so every input is re-hashed against
+    ``input_identity.file_hashes`` (``baseline="legacy_hash_only"``). Those
+    identity hashes are of the path as given: an absolute input is compared
+    as before, but a relative one was hashed against the start-time working
+    directory, which the record does not keep, so which file its hash
+    describes is unknown. Such an input is reported ``unknown`` and never
+    compared, since a comparison against the ``outputs_dir`` file could
+    read a real change as ``unchanged``.
 
     Returns ``{run_id, strict, baseline, stale, reason, inputs, stale_inputs,
-    stale_outputs, hashed_count}``. ``stale_outputs`` lists the run's
-    finalized output paths (as recorded) when any input is stale, else
+    stale_outputs, hashed_count}``. ``stale`` is ``True`` when any input is
+    stale, ``None`` (unknown, never ``False``) when none is stale but an
+    input is ``unknown``, else ``False``. ``stale_outputs`` lists the run's
+    finalized output paths (as recorded) when ``stale`` is ``True``, else
     ``[]``; it is also ``[]`` for a run that was never finalized.
 
     Raises:
@@ -905,17 +916,30 @@ def check_input_staleness(
 
     baseline = manifest.get("input_stat")
     mode = "stat_and_hash"
+    unresolvable: set[str] = set()
     if not isinstance(baseline, dict):
         mode = "legacy_hash_only"
         baseline = {}
         hashes = (manifest.get("input_identity") or {}).get("file_hashes") or {}
         for given, sha in hashes.items():
             key = _input_key(outputs_dir, _resolve_ref(outputs_dir, given))
-            baseline[key] = {"exists": sha is not None, "size": None, "mtime_ns": None, "sha256": sha}
+            if os.path.isabs(str(given)):
+                baseline[key] = {"exists": sha is not None, "size": None, "mtime_ns": None, "sha256": sha}
+            else:
+                # The identity hash of a relative input is of the path as
+                # given against the start-time working directory, which the
+                # record does not keep: which file it describes is unknown.
+                unresolvable.add(key)
+        unresolvable.difference_update(baseline)  # an absolute spelling of it was recorded
+        for key in unresolvable:
+            baseline[key] = {}
 
     inputs: list[dict[str, Any]] = []
     hashed_count = 0
     for key in sorted(baseline):
+        if key in unresolvable:
+            inputs.append({"input": key, "status": "unknown", "reason": _LEGACY_RELATIVE_REASON})
+            continue
         base = baseline[key] if isinstance(baseline[key], dict) else {}
         status, reason, hashed = _classify_input(
             _key_path(outputs_dir, key), base, strict=strict,
@@ -924,14 +948,21 @@ def check_input_staleness(
         inputs.append({"input": key, "status": status, "reason": reason})
 
     stale_inputs = [i["input"] for i in inputs if i["status"] in _STALE_INPUT_STATUSES]
+    unknown_inputs = [i["input"] for i in inputs if i["status"] == "unknown"]
     outputs = sorted(((manifest.get("output_identity") or {}).get("file_hashes") or {}))
-    stale = bool(stale_inputs)
+    stale: "bool | None" = True if stale_inputs else (None if unknown_inputs else False)
     if not inputs:
         reason = "run recorded no inputs"
     elif stale:
         reason = (
             f"{len(stale_inputs)} of {len(inputs)} input(s) changed since run start: "
             + ", ".join(f"{i['input']} ({i['status']})" for i in inputs if i["input"] in stale_inputs)
+        )
+    elif unknown_inputs:
+        reason = (
+            f"{len(unknown_inputs)} of {len(inputs)} input(s) cannot be checked: "
+            + ", ".join(f"{k} (unknown)" for k in unknown_inputs)
+            + " -- staleness cannot be confirmed either way"
         )
     else:
         reason = f"all {len(inputs)} input(s) unchanged since run start"
