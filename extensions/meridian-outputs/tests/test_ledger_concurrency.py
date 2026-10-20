@@ -31,6 +31,7 @@ import sys
 import tempfile
 import threading
 import time
+from contextlib import contextmanager
 from pathlib import Path
 
 import pytest
@@ -662,6 +663,45 @@ class TestLedgerTempFileSweep:
             LIO.write_ledger_atomic(str(ledger), {"k": 2})
         assert stale.exists()
         assert json.loads(ledger.read_text(encoding="utf-8")) == {"k": 2}
+
+    @pytest.mark.parametrize("failing", ["stat", "is_file"])
+    def test_an_entry_that_cannot_be_stat_ed_is_skipped_and_the_sweep_goes_on(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, failing: str,
+    ) -> None:
+        """R6-D: one entry whose is_file() or stat() raised OSError (removed
+        or locked between the listing and the stat) aborted the whole sweep,
+        so every other stale temporary file stayed behind."""
+        ledger = tmp_path / "ledger.json"
+        bad = _aged(tmp_path / f"ledger.json.{'1' * 8}.tmp", 2 * 3600)
+        stale = _aged(tmp_path / f"ledger.json.{'2' * 8}.tmp", 2 * 3600)
+        real_scandir = os.scandir
+
+        class _Entry:
+            def __init__(self, real: os.DirEntry) -> None:
+                self._real, self.name, self.path = real, real.name, real.path
+
+            def is_file(self, *, follow_symlinks: bool = True) -> bool:
+                if failing == "is_file" and self.name == bad.name:
+                    raise PermissionError("is_file failed")
+                return self._real.is_file(follow_symlinks=follow_symlinks)
+
+            def stat(self, *, follow_symlinks: bool = True) -> os.stat_result:
+                if failing == "stat" and self.name == bad.name:
+                    raise FileNotFoundError("stat failed")
+                return self._real.stat(follow_symlinks=follow_symlinks)
+
+        @contextmanager
+        def _scandir(path: str):
+            with real_scandir(path) as entries:
+                # The failing entry first, so the sweep must get past it.
+                yield sorted((_Entry(e) for e in entries), key=lambda e: e.name != bad.name)
+
+        with monkeypatch.context() as m:
+            m.setattr(os, "scandir", _scandir)
+            LIO.write_ledger_atomic(str(ledger), {"k": 3})
+        assert bad.exists()  # skipped, left for a later write
+        assert not stale.exists()
+        assert json.loads(ledger.read_text(encoding="utf-8")) == {"k": 3}
 
 
 # ---------------------------------------------------------------------------

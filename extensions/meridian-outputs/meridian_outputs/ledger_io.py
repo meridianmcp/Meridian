@@ -316,14 +316,22 @@ def _sweep_stale_temps(directory: str, basename: str) -> None:
         + r"\.[0-9a-f]{%d}\.tmp" % (2 * _TEMP_TOKEN_BYTES)
     )
     cutoff = time.time() - _STALE_TEMP_SECONDS
+    stale: list[str] = []
     try:
         with os.scandir(directory) as entries:
-            stale = [
-                entry.path for entry in entries
-                if pattern.fullmatch(os.path.normcase(entry.name))
-                and entry.is_file(follow_symlinks=False)
-                and entry.stat(follow_symlinks=False).st_mtime < cutoff
-            ]
+            for entry in entries:
+                if not pattern.fullmatch(os.path.normcase(entry.name)):
+                    continue
+                # Per entry: one temp removed or locked between the listing
+                # and its stat is skipped, never the end of the sweep.
+                try:
+                    if (
+                        entry.is_file(follow_symlinks=False)
+                        and entry.stat(follow_symlinks=False).st_mtime < cutoff
+                    ):
+                        stale.append(entry.path)
+                except OSError:
+                    continue
     except OSError:
         return
     for leftover in stale:
