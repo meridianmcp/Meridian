@@ -23,7 +23,9 @@ import hashlib
 import json
 import logging
 import os
+import re
 import socket
+import stat
 import subprocess
 import sys
 import threading
@@ -488,6 +490,63 @@ class TestAtomicWrite:
             LIO._fsync_directory(str(tmp_path))  # must not raise
         assert opened == [str(tmp_path)]
         LIO._fsync_directory(str(tmp_path))  # real platform: never raises
+
+
+# ---------------------------------------------------------------------------
+# Temporary files: default mode (F7)
+# ---------------------------------------------------------------------------
+
+class TestLedgerTempFileMode:
+    """F7: the temporary file came from tempfile.mkstemp, which creates it
+    0600 whatever the umask, and os.replace keeps that mode on the ledger.
+    Another account or container reading a bind-mounted outputs directory
+    then got PermissionError, and the lenient readers reported empty."""
+
+    def test_temp_file_is_created_exclusively_with_mode_0666(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        ledger = tmp_path / "ledger.json"
+        real_open = os.open
+        calls: list[tuple[str, int, int]] = []
+
+        def _spy(path, flags, mode=0o777, *args, **kwargs):
+            if str(path).endswith(".tmp"):
+                calls.append((os.path.basename(path), flags, mode))
+            return real_open(path, flags, mode, *args, **kwargs)
+
+        with monkeypatch.context() as m:
+            m.setattr(os, "open", _spy)
+            LIO.write_ledger_atomic(str(ledger), {"k": [1, 2]})
+
+        assert len(calls) == 1, calls
+        name, flags, mode = calls[0]
+        assert mode == 0o666  # the umask applies, as for open(path, "w")
+        assert flags & os.O_CREAT and flags & os.O_EXCL
+        binary = getattr(os, "O_BINARY", 0)
+        assert flags & binary == binary
+        assert re.fullmatch(r"ledger\.json\.[0-9a-f]{16}\.tmp", name), name
+        raw = ledger.read_bytes()
+        assert b"\r\r\n" not in raw  # no CRT text-mode translation on Windows
+        assert json.loads(raw.decode("utf-8")) == {"k": [1, 2]}
+        assert sorted(os.listdir(tmp_path)) == ["ledger.json"]
+
+    @pytest.mark.skipif(os.name != "posix", reason="POSIX permission bits")
+    @pytest.mark.parametrize("umask", [0o022, 0o002])
+    def test_ledger_mode_follows_the_umask_like_a_plain_open(
+        self, tmp_path: Path, umask: int,
+    ) -> None:
+        ledger = tmp_path / "ledger.json"
+        reference = tmp_path / "reference.json"
+        previous = os.umask(umask)
+        try:
+            LIO.write_ledger_atomic(str(ledger), {"k": 1})
+            with open(reference, "w", encoding="utf-8") as fh:
+                fh.write("{}")
+        finally:
+            os.umask(previous)
+        mode = stat.S_IMODE(os.stat(ledger).st_mode)
+        assert mode == 0o666 & ~umask
+        assert mode == stat.S_IMODE(os.stat(reference).st_mode)
 
 
 # ---------------------------------------------------------------------------

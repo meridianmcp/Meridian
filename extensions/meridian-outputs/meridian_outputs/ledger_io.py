@@ -63,7 +63,7 @@ import hashlib
 import json
 import logging
 import os
-import tempfile
+import secrets
 import time
 from contextlib import contextmanager
 from typing import Any, Callable, Iterator, NoReturn
@@ -290,18 +290,31 @@ def _fsync_directory(directory: str) -> None:
         os.close(fd)
 
 
+# Random bytes in a temporary file's name: "<ledger basename>.<hex>.tmp".
+_TEMP_TOKEN_BYTES = 8
+
+
 def write_ledger_atomic(path: str, data: dict[str, Any]) -> None:
     """Replace ``path`` with ``data`` as JSON, atomically and durably.
 
-    Writes a uniquely named temporary file in the same directory (so two
-    writers can never share one), flushes it, calls ``os.fsync`` on it, then
-    moves it over ``path`` with ``os.replace``. On any failure the temporary
-    file is removed and the previous ledger is untouched. ``TypeError`` from
-    a non-JSON-serialisable value is raised before anything is renamed.
+    Writes a uniquely named temporary file (``<ledger>.<16 hex>.tmp``) in the
+    same directory, created exclusively (``O_EXCL``) so two writers can never
+    share one, flushes it, calls ``os.fsync`` on it, then moves it over
+    ``path`` with ``os.replace``. The file is created with mode ``0o666``
+    and the process umask applied, as ``open(path, "w")`` would, so the
+    ledger stays readable to the other accounts or containers the umask
+    allows (``tempfile.mkstemp`` would force ``0o600``). On any failure the
+    temporary file is removed and the previous ledger is untouched.
+    ``TypeError`` from a non-JSON-serialisable value is raised before
+    anything is renamed.
     """
     directory = os.path.dirname(os.path.abspath(path)) or "."
-    fd, tmp = tempfile.mkstemp(
-        prefix=os.path.basename(path) + ".", suffix=".tmp", dir=directory,
+    tmp = os.path.join(
+        directory,
+        f"{os.path.basename(path)}.{secrets.token_hex(_TEMP_TOKEN_BYTES)}.tmp",
+    )
+    fd = os.open(
+        tmp, os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_BINARY", 0), 0o666,
     )
     try:
         with os.fdopen(fd, "w", encoding="utf-8") as fh:
