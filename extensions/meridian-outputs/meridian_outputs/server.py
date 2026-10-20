@@ -1839,6 +1839,7 @@ def get_run_manifest_envelope(outputs_dir: str, run_id: str) -> dict[str, Any]:
 def export_outputs_bundle(
     outputs_dir: str,
     bundle_path: str = ".meridian-outputs-cache/bundles/meridian-outputs-bundle.json",
+    overwrite: bool = False,
 ) -> dict[str, Any]:
     """Back up every Outputs ledger (provenance, fingerprint, run manifest,
     artifact registry) plus index metadata to ONE checksummed JSON file
@@ -1856,7 +1857,11 @@ def export_outputs_bundle(
       bundle_path:  Where to write, inside ``outputs_dir`` (relative paths
                     are relative to it). Defaults to a file under
                     ``.meridian-outputs-cache/bundles/``, which the index
-                    walk skips. May not name a live ledger or index file.
+                    walk skips. Inside ``.meridian-outputs-cache`` only that
+                    ``bundles/`` subdirectory is allowed, and a ``:`` outside
+                    a drive letter is refused.
+      overwrite:    Replace a file that already exists at ``bundle_path``
+                    (default False: an existing file refuses the export).
 
     Returns:
       ``{"exported": True, "bundle_path", "bundle_digest", "members",
@@ -1864,7 +1869,7 @@ def export_outputs_bundle(
     """
     from . import bundle
 
-    return bundle.export_bundle(outputs_dir, bundle_path)
+    return bundle.export_bundle(outputs_dir, bundle_path, overwrite=overwrite)
 
 
 @mcp.tool()

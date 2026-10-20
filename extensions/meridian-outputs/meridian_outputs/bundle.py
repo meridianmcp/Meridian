@@ -96,9 +96,14 @@ Merge and conflict rules (import)
 Paths
 -----
 ``bundle_path`` must resolve inside ``outputs_dir``
-(:func:`path_security._require_within`, symlink-aware) and must not name a
-live ledger or index file. A relative ``bundle_path`` is relative to
-``outputs_dir``. The default, ``.meridian-outputs-cache/bundles/
+(:func:`path_security._require_within`, symlink-aware). Inside
+``.meridian-outputs-cache`` only the ``bundles/`` subdirectory may hold a
+bundle: everything else there is live state (the ledgers, ``index.duckdb``,
+the ``*.lock`` files the index and ledger writers hold, the derived cache).
+A ``:`` anywhere but a drive letter is refused, since on Windows it names an
+alternate data stream of another file. Export also refuses to replace an
+existing file unless ``overwrite=True``. A relative ``bundle_path`` is
+relative to ``outputs_dir``. The default, ``.meridian-outputs-cache/bundles/
 meridian-outputs-bundle.json``, sits in a dot-directory, which the outputs
 walk skips, so the bundle is never indexed as an output itself. Results
 report the bundle path relative to ``outputs_dir``, never absolute.
@@ -137,6 +142,7 @@ MAX_BUNDLE_BYTES = 1 << 30  # 1 GiB: refuse to json-parse anything larger
 INDEX_META = "index_meta"
 
 _CACHE_DIRNAME = ".meridian-outputs-cache"
+_BUNDLES_SUBDIR = "bundles"  # the only part of the cache a bundle may live in
 _LOCK_TIMEOUT_SECONDS = 30.0
 _CONFLICT_LIST_CAP = 500
 
@@ -206,18 +212,56 @@ def _ledger_file(outputs_dir: str, filename: str) -> str:
     return os.path.join(_cache_dir(outputs_dir), filename)
 
 
+def _inside(path: str, root: str) -> bool:
+    """``path`` is ``root`` or below it, compared case-insensitively.
+
+    Case-insensitive on every platform: on a case-insensitive filesystem
+    (Windows, default macOS) ``.MERIDIAN-OUTPUTS-CACHE`` is the cache, and on
+    a case-sensitive one refusing a look-alike directory costs nothing.
+    """
+    path_key, root_key = os.path.normcase(path).lower(), os.path.normcase(root).lower()
+    try:
+        return os.path.commonpath((root_key, path_key)) == root_key
+    except ValueError:  # different drives
+        return False
+
+
+def _stream_separator_error(bundle_path: Any) -> str | None:
+    """Refuse a ``:`` outside the drive letter: on Windows ``name:stream``
+    writes an alternate data stream of ``name``, an existing file."""
+    if not isinstance(bundle_path, (str, os.PathLike)):
+        return None  # _require_within reports the type problem
+    raw = os.fsdecode(os.fspath(bundle_path))
+    if ":" in os.path.splitdrive(raw)[1]:
+        return "bundle_path rejected: ':' is only allowed in a drive letter"
+    return None
+
+
 def _resolve_bundle_path(outputs_dir: str, bundle_path: Any) -> tuple[str | None, str | None]:
     """``(real_path, None)`` or ``(None, error)``; never leaks an absolute path."""
+    stream_error = _stream_separator_error(bundle_path)
+    if stream_error:
+        return None, stream_error
     try:
         real = _require_within(outputs_dir, bundle_path)
     except ValueError as exc:
         return None, f"bundle_path rejected: {exc}"
     cache_real = os.path.realpath(os.path.join(os.path.realpath(outputs_dir), _CACHE_DIRNAME))
-    if (
-        os.path.normcase(os.path.dirname(real)) == os.path.normcase(cache_real)
-        and os.path.basename(real).lower() in _PROTECTED_CACHE_FILES
-    ):
-        return None, "bundle_path rejected: it names a live ledger or index file"
+    if _inside(real, cache_real):
+        if (
+            os.path.normcase(os.path.dirname(real)).lower() == os.path.normcase(cache_real).lower()
+            and os.path.basename(real).lower() in _PROTECTED_CACHE_FILES
+        ):
+            return None, "bundle_path rejected: it names a live ledger or index file"
+        # Not realpath'd on purpose: ``real`` is already fully resolved, so a
+        # bundles/ link back into the cache cannot pass this check.
+        bundles_dir = os.path.join(cache_real, _BUNDLES_SUBDIR)
+        if not _inside(real, bundles_dir) or _inside(bundles_dir, real):
+            return None, (
+                f"bundle_path rejected: inside {_CACHE_DIRNAME} only the "
+                f"{_BUNDLES_SUBDIR}/ subdirectory may hold a bundle (the rest "
+                "is live ledger, index, lock and derived-cache state)"
+            )
     if os.path.isdir(real):
         return None, "bundle_path rejected: it names a directory"
     return real, None
@@ -360,14 +404,21 @@ def _payload_shape_error(name: str, payload: Any) -> str | None:
 # Export
 # ---------------------------------------------------------------------------
 
-def export_bundle(outputs_dir: str, bundle_path: str | None = None) -> dict[str, Any]:
+def export_bundle(
+    outputs_dir: str, bundle_path: str | None = None, *, overwrite: bool = False,
+) -> dict[str, Any]:
     """Write every Outputs ledger plus index metadata to one verified file.
 
     Args:
       outputs_dir:  Absolute path to the outputs directory.
       bundle_path:  Where to write, inside ``outputs_dir`` (relative paths are
                     relative to it). Defaults to
-                    :data:`DEFAULT_BUNDLE_RELPATH`.
+                    :data:`DEFAULT_BUNDLE_RELPATH`. Inside
+                    ``.meridian-outputs-cache`` only its ``bundles/``
+                    subdirectory is allowed.
+      overwrite:    Replace a file that already exists at ``bundle_path``.
+                    Off by default, so an export never silently replaces a
+                    user's file or an earlier bundle.
 
     Returns:
       ``{"exported": True, "bundle_path", "bundle_digest", "members":
@@ -382,6 +433,12 @@ def export_bundle(outputs_dir: str, bundle_path: str | None = None) -> dict[str,
     target, error = _resolve_bundle_path(outputs_dir, bundle_path or DEFAULT_BUNDLE_RELPATH)
     if target is None:
         return {"exported": False, "error": error}
+    if not overwrite and os.path.lexists(target):
+        return {
+            "exported": False,
+            "error": "bundle_path rejected: a file already exists there "
+                     "(pass overwrite=True to replace it)",
+        }
 
     payloads: dict[str, Any] = {}
     errors: list[str] = []

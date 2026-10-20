@@ -207,6 +207,102 @@ class TestExport:
         result = B.export_bundle(str(populated["outputs"]), "somedir")
         assert result == {"exported": False, "error": "bundle_path rejected: it names a directory"}
 
+    @pytest.mark.parametrize("rel", [
+        ".meridian-outputs-cache/index.duckdb.lock",
+        ".MERIDIAN-OUTPUTS-CACHE/index.duckdb.lock",
+        ".meridian-outputs-cache/bundles/../index.duckdb.lock",
+        ".meridian-outputs-cache/provenance_ledger.json.lock",
+        ".meridian-outputs-cache/derived/manifest.json",
+        ".meridian-outputs-cache/derived/artifacts/abc.png",
+        ".meridian-outputs-cache/bundles",
+    ])
+    def test_cache_files_outside_bundles_dir_are_refused_even_with_overwrite(
+        self, populated, rel,
+    ) -> None:
+        """B1: the lock, derived-cache and other live files in the cache are
+        never an export target -- index.duckdb.lock being replaced wedged
+        every index writer."""
+        cache = populated["outputs"] / ".meridian-outputs-cache"
+        lock = cache / "index.duckdb.lock"
+        manifest = cache / "derived" / "manifest.json"
+        artifact = cache / "derived" / "artifacts" / "abc.png"
+        artifact.parent.mkdir(parents=True)
+        for path in (lock, manifest, artifact):
+            path.write_bytes(b"live state")
+        try:
+            before = _snapshot(populated["outputs"])
+            result = B.export_bundle(str(populated["outputs"]), rel, overwrite=True)
+            assert result["exported"] is False
+            assert "bundles/ subdirectory" in result["error"]
+            for path in (lock, manifest, artifact):
+                assert path.read_bytes() == b"live state"
+            assert not (cache / "bundles").exists()
+            assert _snapshot(populated["outputs"]) == before
+        finally:
+            # A planted lock file reads as "held" to IndexFileLock, which
+            # would stall the index cache's close at teardown -- the very
+            # wedge this test guards against.
+            lock.unlink()
+
+    def test_existing_user_file_is_refused_without_overwrite(self, populated) -> None:
+        """B1: an existing file at bundle_path is never silently replaced."""
+        results = populated["outputs"] / "results.csv"
+        results.write_text("x,y\n1,2\n", encoding="utf-8")
+        refused = B.export_bundle(str(populated["outputs"]), "results.csv")
+        assert refused == {
+            "exported": False,
+            "error": "bundle_path rejected: a file already exists there "
+                     "(pass overwrite=True to replace it)",
+        }
+        assert results.read_text(encoding="utf-8") == "x,y\n1,2\n"
+
+        replaced = B.export_bundle(str(populated["outputs"]), "results.csv", overwrite=True)
+        assert replaced["exported"] is True
+        assert B.verify_bundle(str(results))["verified"] is True
+
+    def test_existing_bundle_at_default_path_needs_overwrite(self, populated) -> None:
+        od = str(populated["outputs"])
+        first = B.export_bundle(od)
+        assert first["exported"] is True
+        again = B.export_bundle(od)
+        assert again["exported"] is False
+        assert "already exists" in again["error"]
+        assert B.export_bundle(od, overwrite=True)["exported"] is True
+
+    @pytest.mark.parametrize("rel", [
+        "results.csv:hidden",
+        "backup.json:evil",
+        ".meridian-outputs-cache/bundles/b.json::$DATA",
+        "sub/name:stream:$DATA",
+    ])
+    def test_stream_suffixed_name_is_refused(self, populated, rel) -> None:
+        """B1: on Windows ``name:stream`` writes an alternate data stream of
+        an existing file, so a ':' outside the drive letter is refused."""
+        results = populated["outputs"] / "results.csv"
+        results.write_text("x,y\n1,2\n", encoding="utf-8")
+        result = B.export_bundle(str(populated["outputs"]), rel, overwrite=True)
+        assert result == {
+            "exported": False,
+            "error": "bundle_path rejected: ':' is only allowed in a drive letter",
+        }
+        assert results.read_text(encoding="utf-8") == "x,y\n1,2\n"
+        assert not (populated["outputs"] / "backup.json").exists()
+        assert not (populated["outputs"] / "sub").exists()
+
+    def test_drive_qualified_absolute_path_inside_outputs_is_allowed(self, populated) -> None:
+        target = populated["outputs"] / "abs_bundle.json"
+        result = B.export_bundle(str(populated["outputs"]), str(target))
+        assert result["exported"] is True
+        assert result["bundle_path"] == "abs_bundle.json"
+
+    def test_verify_refuses_cache_paths_outside_bundles_dir(self, populated) -> None:
+        report = B.verify_bundle(
+            ".meridian-outputs-cache/derived/manifest.json",
+            outputs_dir=str(populated["outputs"]),
+        )
+        assert report["verified"] is False
+        assert "bundles/ subdirectory" in report["errors"][0]
+
     def test_missing_outputs_dir(self, tmp_path) -> None:
         assert B.export_bundle(str(tmp_path / "nope"), "x.json") == {
             "exported": False, "error": "outputs_dir does not exist",
@@ -659,6 +755,19 @@ class TestWiring:
 
         default = inspect.signature(srv.export_outputs_bundle).parameters["bundle_path"].default
         assert default == B.DEFAULT_BUNDLE_RELPATH
+
+    def test_mcp_export_passes_overwrite_through(self, populated) -> None:
+        import inspect
+
+        from meridian_outputs import server as srv
+
+        params = inspect.signature(srv.export_outputs_bundle).parameters
+        assert params["overwrite"].default is False
+        od = str(populated["outputs"])
+        assert srv.export_outputs_bundle(od)["exported"] is True
+        again = srv.export_outputs_bundle(od)
+        assert again["exported"] is False and "already exists" in again["error"]
+        assert srv.export_outputs_bundle(od, overwrite=True)["exported"] is True
 
     def test_readme_documents_the_tools(self) -> None:
         readme = (Path(__file__).parent.parent / "README.md").read_text(encoding="utf-8")
