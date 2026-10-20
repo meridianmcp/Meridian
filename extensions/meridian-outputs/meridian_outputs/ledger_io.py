@@ -291,8 +291,12 @@ def _fsync_directory(directory: str) -> None:
         os.close(fd)
 
 
-# Random bytes in a temporary file's name: "<ledger basename>.<hex>.tmp".
-_TEMP_TOKEN_BYTES = 8
+# Random bytes in a temporary file's name: "<ledger basename>.<8 hex>.tmp".
+# Four bytes keep the name exactly as long as the tempfile.mkstemp name it
+# replaced ("<basename>.<8 chars>.tmp"); a longer token pushed a cache
+# directory near the Windows MAX_PATH limit (no long-path support) over it,
+# and every ledger write there failed. O_EXCL still refuses a clash.
+_TEMP_TOKEN_BYTES = 4
 # A temporary file is renamed or removed within moments of its creation; one
 # older than this is what a crash between create and os.replace left behind.
 _STALE_TEMP_SECONDS = 3600.0
@@ -302,7 +306,7 @@ def _sweep_stale_temps(directory: str, basename: str) -> None:
     """Remove ``basename``'s leftover temporary files in ``directory``.
 
     Only names :func:`write_ledger_atomic` itself creates for this ledger
-    (``<basename>.<16 hex>.tmp``, compared case-insensitively where the
+    (``<basename>.<8 hex>.tmp`` exactly, compared case-insensitively where the
     filesystem is) and only regular files whose mtime is older than
     :data:`_STALE_TEMP_SECONDS`, so a temporary file another writer is still
     filling is never touched. Best-effort: a file that cannot be listed,
@@ -332,7 +336,7 @@ def _sweep_stale_temps(directory: str, basename: str) -> None:
 def write_ledger_atomic(path: str, data: dict[str, Any]) -> None:
     """Replace ``path`` with ``data`` as JSON, atomically and durably.
 
-    Writes a uniquely named temporary file (``<ledger>.<16 hex>.tmp``) in the
+    Writes a uniquely named temporary file (``<ledger>.<8 hex>.tmp``) in the
     same directory, created exclusively (``O_EXCL``) so two writers can never
     share one, flushes it, calls ``os.fsync`` on it, then moves it over
     ``path`` with ``os.replace``. The file is created with mode ``0o666``
