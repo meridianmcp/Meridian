@@ -523,3 +523,45 @@ class TestCorruptRegistryWriters:
         assert Path(quarantined).name.startswith("artifact_registry.json.corrupt-")
         assert Path(quarantined).read_bytes() == truncated
         assert str(tmp_path) not in str(info.value)  # basename only in the message
+
+
+# ---------------------------------------------------------------------------
+# Strict read validates the containers (S-F9)
+# ---------------------------------------------------------------------------
+
+def _write_registry_text(tmp_path: Path, text: str) -> Path:
+    registry = tmp_path / ".meridian-outputs-cache" / "artifact_registry.json"
+    registry.parent.mkdir(parents=True, exist_ok=True)
+    registry.write_text(text, encoding="utf-8")
+    return registry
+
+
+class TestStrictRegistryShape:
+    @pytest.mark.parametrize("text", [
+        '{"artifacts": [], "edges": []}',
+        '{"artifacts": [{"artifact_id": "a"}], "edges": []}',
+        '{"artifacts": {"a": null}, "edges": []}',
+        '{"artifacts": null}',
+        '{"artifacts": {}, "edges": {}}',
+        '{"artifacts": {}, "edges": ["e"]}',
+    ])
+    def test_wrong_containers_raise_not_read_as_empty(self, tmp_path: Path, text: str) -> None:
+        _write_registry_text(tmp_path, text)
+        with pytest.raises(ledger_io.LedgerCorruptError):
+            AR._read_registry_strict(str(tmp_path))
+        # The lenient reader still normalises (plain lookups are unchanged).
+        assert isinstance(AR._read_registry(str(tmp_path))["artifacts"], dict)
+
+    def test_missing_file_or_keys_read_as_an_empty_registry(self, tmp_path: Path) -> None:
+        assert AR._read_registry_strict(str(tmp_path)) == {"artifacts": {}, "edges": []}
+        _write_registry_text(tmp_path, "{}")
+        assert AR._read_registry_strict(str(tmp_path)) == {"artifacts": {}, "edges": []}
+
+    def test_writer_refuses_a_registry_whose_artifacts_is_a_list(self, tmp_path: Path) -> None:
+        text = '{"artifacts": [{"artifact_id": "a"}], "edges": []}'
+        registry = _write_registry_text(tmp_path, text)
+        with pytest.raises(ledger_io.LedgerCorruptError) as info:
+            AR.register_artifact(str(tmp_path), "figure", generator="c.py")
+        assert registry.read_text(encoding="utf-8") == text
+        assert info.value.quarantine_path is not None
+        assert Path(info.value.quarantine_path).read_text(encoding="utf-8") == text

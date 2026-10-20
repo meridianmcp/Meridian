@@ -376,6 +376,16 @@ class TestExport:
         assert "run_manifest_ledger: reader failed (OSError)" in result["errors"]
         assert not (populated["outputs"] / "x.json").exists()
 
+    def test_registry_with_artifacts_list_refuses_export(self, populated) -> None:
+        """S-F9: the registry reader normalised a list to {}, so the shape
+        check never saw live damage and an empty registry was exported."""
+        registry = _ledger_path(populated["outputs"], "artifact_registry")
+        registry.write_text('{"artifacts": [{"artifact_id": "a"}], "edges": []}', encoding="utf-8")
+        result = B.export_bundle(str(populated["outputs"]), "x.json")
+        assert result["exported"] is False
+        assert "artifact_registry: reader failed (LedgerCorruptError)" in result["errors"]
+        assert not (populated["outputs"] / "x.json").exists()
+
     def test_failed_replace_leaves_no_temp_file_and_no_bundle(self, populated, monkeypatch) -> None:
         def _fail(_src, _dst):
             raise OSError("disk full")

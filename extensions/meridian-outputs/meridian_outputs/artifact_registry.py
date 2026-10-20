@@ -199,12 +199,19 @@ def _read_registry(outputs_dir: str) -> dict[str, Any]:
 
 def _read_registry_strict(outputs_dir: str) -> dict[str, Any]:
     """Strict read: an empty registry only for a missing file. Bytes that are
-    not a JSON object raise ``ledger_io.LedgerCorruptError`` instead of
-    reading as empty the way :func:`_read_registry` does. Takes no lock."""
+    not a JSON object, ``artifacts`` that is not an object of objects, or
+    ``edges`` that is not a list of objects raise
+    ``ledger_io.LedgerCorruptError`` instead of being normalised to empty the
+    way :func:`_read_registry` does. An absent ``artifacts``/``edges`` key
+    reads as empty. Takes no lock."""
     path = _registry_path(outputs_dir, create=False)
     data = ledger_io.read_ledger_strict(path)
-    data.setdefault("artifacts", {})
-    data.setdefault("edges", [])
+    artifacts = data.setdefault("artifacts", {})
+    edges = data.setdefault("edges", [])
+    if not isinstance(artifacts, dict) or not all(isinstance(r, dict) for r in artifacts.values()):
+        raise ledger_io.LedgerCorruptError(path, "artifacts is not an object of artifact records")
+    if not isinstance(edges, list) or not all(isinstance(e, dict) for e in edges):
+        raise ledger_io.LedgerCorruptError(path, "edges is not a list of edge objects")
     return data
 
 
