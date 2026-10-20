@@ -181,8 +181,9 @@ The ``provenance_type`` -> :class:`~research_evidence.ResolverStatus` mapping
     same-path :data:`EXACT` match's 0.95) -- content identity IS confirmed
     by hash, just at a different path than originally recorded; the reason
     string names the matched prior path. ``STALE`` (as for
-    :data:`STALE_BY_SCRIPT`) when ``script_staleness`` shows the matched
-    record's tagged generating script changed or ``input_staleness`` shows
+    :data:`STALE_BY_SCRIPT`) when ``script_staleness`` shows the generating
+    script tagged for this copy's bytes changed (see
+    :func:`_relocated_script_staleness`) or ``input_staleness`` shows
     an input of the matched record's run changed, and ``AMBIGUOUS`` while
     script or input staleness is unknown.
   - :data:`AMBIGUOUS` (this module's ``provenance_type``, not to be confused
@@ -460,6 +461,97 @@ def _stale_by_script_result(outputs_dir: str, path: str) -> dict[str, Any] | Non
         if annotate._normalize_path(result.path) == target:
             return result.to_dict()
     return None
+
+
+def _row_signature_differs(outputs_dir: str, path: str) -> bool:
+    """True when the fingerprint row tagged for ``path`` records
+    ``csv_columns``/``json_keys`` (read by ``fingerprint.tag_output`` from
+    the output's bytes) that the file now at ``path`` does not have: that
+    row was tagged on other bytes.
+
+    A fingerprint row records no hash of the output it was tagged on, so
+    this can only refute a row, never confirm one. ``False`` when the row
+    records neither field, or when the row or the file cannot be read.
+    ``path`` is matched to a row the way :func:`_stale_by_script_result`
+    matches it."""
+    try:
+        resolved = resolve_reference(outputs_dir, path.strip())
+    except (OSError, TypeError, ValueError):
+        resolved = path
+    target = annotate._normalize_path(resolved)
+    try:
+        ledger = fingerprint._read_ledger(outputs_dir)
+    except (ledger_io.LedgerCorruptError, OSError):
+        return False
+    for key, row in ledger.items():
+        if annotate._normalize_path(resolve_reference(outputs_dir, key)) != target:
+            continue
+        recorded = (row.get("csv_columns"), row.get("json_keys"))
+        if recorded == (None, None):
+            return False
+        try:
+            current = outputs_local.file_fingerprint(path)
+        except Exception:  # noqa: BLE001 -- unreadable file: cannot refute
+            return False
+        return recorded != (current.csv_columns, current.json_keys)
+    return False
+
+
+def _relocated_script_staleness(
+    outputs_dir: str, path: str, match_path: Any, record_hash: str | None,
+) -> dict[str, Any] | None:
+    """Script staleness for a :data:`RELOCATED` copy at ``path``, read from
+    the fingerprint row that describes THIS copy's bytes.
+
+    A fingerprint row records no hash of the output it was tagged on (its
+    ``script_hash``/``content_digest`` are the script's), so a row is tied
+    to bytes through the file now at its path. ``record_hash`` is the
+    matched record's ``content_hash``; the basename tier has none, and the
+    copy's own current hash stands in for it.
+
+      1. The row at ``path`` when the file there hashes to ``record_hash``
+         and the row's ``csv_columns``/``json_keys`` do not contradict that
+         file (:func:`_row_signature_differs`): a row an unrelated earlier
+         file left at this path is skipped.
+      2. Otherwise the row at ``match_path``, only while the file there
+         still hashes to ``record_hash``.
+      3. Otherwise ``None`` -- no row describes this copy, the same answer
+         as never tagged -- when ``match_path`` has no row, or holds a file
+         with other bytes (regenerated: its row is taken to describe that
+         file). When ``match_path`` has a row but no readable file to tie it
+         to (moved away, deleted) or the copy cannot be hashed, the row's
+         dict with ``is_stale`` ``None``: unknown, never stale, never
+         verified.
+
+    An unreadable fingerprint ledger gives :func:`_stale_by_script_result`'s
+    ``error="ledger_unreadable"`` dict."""
+    own = _stale_by_script_result(outputs_dir, path)
+    if own is not None and own.get("error"):
+        return own
+    current_hash = fingerprint.script_content_hash(path) if os.path.isfile(path) else None
+    expected = record_hash if record_hash is not None else current_hash
+    holds_record = current_hash is not None and current_hash == expected
+    if own is not None and holds_record and not _row_signature_differs(outputs_dir, path):
+        return own
+    matched = _stale_by_script_result(outputs_dir, match_path)
+    if matched is None or matched.get("error"):
+        return matched
+    match_hash = (
+        fingerprint.script_content_hash(match_path) if os.path.isfile(match_path) else None
+    )
+    if holds_record and match_hash == expected:
+        return matched
+    if holds_record and match_hash is not None:
+        return None
+    return {
+        **matched,
+        "is_stale": None,
+        "reason": (
+            f"the fingerprint row at {match_path!r} cannot be tied to this "
+            "copy's bytes (no readable file there, or this copy could not be "
+            "hashed) -- script staleness cannot be confirmed either way"
+        ),
+    }
 
 
 def _store_error_detail(exc: BaseException) -> str:
@@ -782,8 +874,10 @@ def get_provenance_status(outputs_dir: str, path: str) -> dict[str, Any]:
           ``record`` is that resolved row, ``staleness`` notes the weaker,
           basename-only evidence). ``relocation_evidence`` (additive) is
           ``"content_hash"`` or ``"basename"`` so a caller can tell which.
-          ``script_staleness`` is looked up at ``record["path"]`` (the
-          matched record's generator), never at this moved path.
+          ``script_staleness`` comes from the fingerprint row that describes
+          this copy's bytes: this path's own row, else the row at
+          ``record["path"]`` while the file there still holds those bytes,
+          else ``None`` or unknown (see :func:`_relocated_script_staleness`).
         - :data:`AMBIGUOUS` -- same as :data:`RELOCATED`, but MORE THAN ONE
           candidate matches -- either by content hash (fa600e42; ``record``
           is ``None``, the matches are listed verbatim under a new
@@ -889,10 +983,12 @@ def get_provenance_status(outputs_dir: str, path: str) -> dict[str, Any]:
                     "appears to have been relocated/renamed"
                 ),
             },
-            # The matched record's generator, looked up at the path that
-            # record was matched by -- never at this moved path, whose own
-            # fingerprint row (if any) describes some other file.
-            "script_staleness": _stale_by_script_result(outputs_dir, match.get("path")),
+            # From the fingerprint row that describes these bytes: this
+            # path's own row, else the matched path's while its file still
+            # holds them (see _relocated_script_staleness).
+            "script_staleness": _relocated_script_staleness(
+                outputs_dir, path, match.get("path"), current_hash,
+            ),
             "archival": indexed["archival"],
             "convergence": indexed["convergence"],
             "relocation_evidence": "content_hash",
@@ -963,7 +1059,9 @@ def get_provenance_status(outputs_dir: str, path: str) -> dict[str, Any]:
                     "are left unknown rather than guessed"
                 ),
             },
-            "script_staleness": _stale_by_script_result(outputs_dir, basename_hit.get("path")),
+            "script_staleness": _relocated_script_staleness(
+                outputs_dir, path, basename_hit.get("path"), None,
+            ),
             "archival": indexed["archival"],
             "convergence": indexed["convergence"],
             "relocation_evidence": "basename",
