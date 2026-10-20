@@ -931,6 +931,81 @@ class TestStaleByScript:
 
 
 # ---------------------------------------------------------------------------
+# A provenance-ledger row that is not an object is corruption, not absence
+# ---------------------------------------------------------------------------
+
+class TestNonObjectProvenanceRow:
+    @pytest.mark.parametrize("row", ["null", "3", '"x"', "[1]"])
+    def test_non_object_row_raises_instead_of_reading_as_absent(
+        self, tmp_path: Path, row: str,
+    ) -> None:
+        from meridian_outputs import ledger_io as LIO
+
+        output = tmp_path / "result.csv"
+        output.write_text("a,b\n1,2\n", encoding="utf-8")
+        Path(AN._ledger_path(str(tmp_path))).write_text(
+            '{"result.csv": ' + row + "}", encoding="utf-8",
+        )
+
+        with pytest.raises(LIO.LedgerCorruptError, match="not an object"):
+            AN.get_provenance(str(tmp_path), str(output))
+        with pytest.raises(LIO.LedgerCorruptError, match="not an object"):
+            AN.list_provenance(str(tmp_path))
+
+    @duckdb_required
+    def test_null_row_is_never_unregistered_or_unavailable(self, tmp_path: Path) -> None:
+        """A null row used to read as "no record": an indexed path came back
+        UNREGISTERED and a confirmed-absent one UNKNOWN (UNAVAILABLE in the
+        envelope), hiding the corruption."""
+        from meridian_outputs import ledger_io as LIO
+
+        output = tmp_path / "result.csv"
+        output.write_text("a,b\n1,2\n", encoding="utf-8")
+        idx = OL._get_cached_index(str(tmp_path))
+        idx.rebuild()
+        assert idx.get_convergence_state().converged is True  # sanity
+        gone = tmp_path / "gone.csv"  # never created: confirmed absent
+        Path(AN._ledger_path(str(tmp_path))).write_text(
+            '{"result.csv": null}', encoding="utf-8",
+        )
+
+        for path in (output, gone):
+            with pytest.raises(LIO.LedgerCorruptError, match="not an object"):
+                PS.get_provenance_status(str(tmp_path), str(path))
+
+        envelope = PS.build_provenance_envelope(str(tmp_path), [str(output), str(gone)])
+        for record in envelope.records:
+            assert record.resolver.status is RE.ResolverStatus.AMBIGUOUS
+            assert record.resolver.status is not RE.ResolverStatus.UNAVAILABLE
+            assert record.attributes["store_error"] == "ledger_unreadable"
+            assert record.attributes["provenance_type"] not in (PS.UNREGISTERED, PS.UNKNOWN)
+            assert record.partial is True
+
+    def test_writer_still_drops_a_null_row_without_quarantining_the_ledger(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """The row check is on the read path only: record_provenance keeps
+        the good rows and drops the bad one, as before."""
+        import json
+
+        monkeypatch.setattr(AN.outputs_local, "register_priority_path", lambda *_a, **_k: None)
+        keep = tmp_path / "keep.csv"
+        keep.write_text("a\n1\n", encoding="utf-8")
+        AN.record_provenance(str(tmp_path), str(keep), note="keep")
+        ledger_file = Path(AN._ledger_path(str(tmp_path)))
+        data = json.loads(ledger_file.read_text(encoding="utf-8"))
+        data["bad.csv"] = None
+        ledger_file.write_text(json.dumps(data), encoding="utf-8")
+
+        new = tmp_path / "new.csv"
+        new.write_text("a\n2\n", encoding="utf-8")
+        result = AN.record_provenance(str(tmp_path), str(new), note="new")
+        assert "error" not in result
+        assert "ledger_quarantined" not in result
+        assert sorted(r["note"] for r in AN.list_provenance(str(tmp_path))) == ["keep", "new"]
+
+
+# ---------------------------------------------------------------------------
 # Canonical/archival identity (item d3374b0e)
 # ---------------------------------------------------------------------------
 

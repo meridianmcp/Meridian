@@ -203,8 +203,22 @@ def _load_ledger_unlocked(path: str) -> dict[str, dict[str, Any]]:
 
 
 def _read_ledger(outputs_dir: str) -> dict[str, dict[str, Any]]:
-    # A missing cache directory reads as a missing ledger ({}), never created.
-    return _load_ledger_unlocked(_ledger_path(outputs_dir, create=False))
+    """Strict read for every reader: ``{}`` only for a missing ledger (a
+    missing cache directory reads as a missing ledger and is never
+    created). A row that is not a JSON object (e.g. ``{"a.csv": null}``)
+    is corruption: it raises ``ledger_io.LedgerCorruptError``, as
+    ``fingerprint._read_ledger`` does, so a damaged row is never read as
+    "nothing recorded" for that path. The writer keeps reading through
+    :func:`_load_ledger_unlocked`, which does not check rows, so one bad row
+    is dropped on the next write instead of quarantining the whole ledger.
+    """
+    path = _ledger_path(outputs_dir, create=False)
+    ledger = _load_ledger_unlocked(path)
+    for entry in ledger.values():
+        if not isinstance(entry, dict):
+            kind = "null" if entry is None else type(entry).__name__
+            raise ledger_io.LedgerCorruptError(path, f"a row is {kind}, not an object")
+    return ledger
 
 
 def _history_parts(entry: dict[str, Any]) -> tuple[list[dict[str, Any]], int]:
@@ -594,7 +608,8 @@ def get_provenance(
       returned as stored, without that key.
 
     Raises ``ledger_io.LedgerCorruptError`` when the ledger exists but is not
-    a JSON object: a damaged ledger is never reported as "nothing recorded".
+    a JSON object, or holds a row that is not an object: a damaged ledger is
+    never reported as "nothing recorded".
 
     Deliberately a PURE exact-match primitive -- bd5b8d79. A bare ``None``
     here is ambiguous ("never recorded" vs. "recorded, but this path was
