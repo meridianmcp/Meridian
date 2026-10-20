@@ -199,6 +199,26 @@ class TestExport:
         assert (populated["outputs"] / ".meridian-outputs-cache" / "bundles"
                 / "meridian-outputs-bundle.json").is_file()
 
+    def test_export_into_a_fresh_cache_gitignores_it(self, tmp_path) -> None:
+        """B-F13: the ledger readers no longer create the cache dir, so an
+        export to the default path created .meridian-outputs-cache/bundles
+        with no .gitignore entry, leaving the bundle (and the cache) for
+        git to pick up."""
+        fresh = tmp_path / "fresh_outputs"
+        fresh.mkdir()
+        result = B.export_bundle(str(fresh))
+        assert result["exported"] is True, result
+        gitignore = fresh / ".gitignore"
+        assert gitignore.is_file()
+        assert "/.meridian-outputs-cache/" in gitignore.read_text(encoding="utf-8").splitlines()
+
+    def test_export_outside_the_cache_does_not_create_it(self, tmp_path) -> None:
+        fresh = tmp_path / "fresh_outputs"
+        fresh.mkdir()
+        assert B.export_bundle(str(fresh), "backup/bundle.json")["exported"] is True
+        assert not (fresh / ".meridian-outputs-cache").exists()
+        assert not (fresh / ".gitignore").exists()
+
     def test_empty_outputs_dir_exports_empty_members(self, tmp_path) -> None:
         result = _export(tmp_path)
         assert result["members"]["provenance_ledger"]["entries"] == 0

@@ -115,7 +115,9 @@ accepted. Export also refuses to replace an
 existing file unless ``overwrite=True``. A relative ``bundle_path`` is
 relative to ``outputs_dir``. The default, ``.meridian-outputs-cache/bundles/
 meridian-outputs-bundle.json``, sits in a dot-directory, which the outputs
-walk skips, so the bundle is never indexed as an output itself. Results
+walk skips, so the bundle is never indexed as an output itself; an export
+into the cache creates the cache directory and its ``.gitignore`` entry
+first, as every other cache writer does. Results
 report the bundle path relative to ``outputs_dir``, never absolute.
 
 NO hosted call is made anywhere in this module.
@@ -635,8 +637,12 @@ def export_bundle(
         "bundle_digest": bundle_digest,
     }
     try:
-        # The ledger readers above already created and gitignored the cache
-        # dir; _atomic_write_json creates any bundle subdirectory itself.
+        # The ledger readers never create the cache dir, so a bundle bound
+        # for it (the default path) first creates and gitignores it;
+        # _atomic_write_json creates any bundle subdirectory itself.
+        cache_real = os.path.realpath(os.path.join(os.path.realpath(outputs_dir), _CACHE_DIRNAME))
+        if _inside(target, cache_real):
+            _ensure_cache_dir(outputs_dir)
         # Without overwrite the publish is create-only: the check above ran
         # before the ledgers were read, and another export may have
         # published to the same path since.
