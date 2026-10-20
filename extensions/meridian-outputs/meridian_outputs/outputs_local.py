@@ -1570,7 +1570,8 @@ _PDF_TIMEOUT_SECONDS = 5.0
 # members, counted by walking the central directory before zipfile parses
 # it (more, a malformed or inconsistent directory, or an unreadable archive
 # means filename-only; a well-formed ZIP64 archive, as numpy writes past
-# 2 GiB, is walked like any other), and at
+# 2 GiB, is walked like any other) in a directory of at most
+# _NPZ_MAX_CENTRAL_DIRECTORY_BYTES, and at
 # most _NPZ_MAX_HEADER_BYTES decompressed bytes read from each member, which
 # must be stored or deflated. .npy stays filename-only
 # (_METADATA_ONLY_SUFFIXES).
@@ -2154,6 +2155,11 @@ _ZIP64_END_LEN = 56
 _ZIP64_EXTRA_ID = 0x0001
 _ZIP_CENTRAL_SIG = b"PK\x01\x02"
 _ZIP_CENTRAL_LEN = 46
+# zipfile reads the whole central directory into memory and splits each
+# record's extra field by repeated slicing, which is quadratic in the extra
+# length; 256 records with 64 KiB extras is about 16 MiB of directory and
+# far more work. numpy's directory for 256 members is about 15 KB.
+_NPZ_MAX_CENTRAL_DIRECTORY_BYTES = 1 << 20
 
 
 def _zip_end_record(fh: Any) -> tuple[int, bytes] | None:
@@ -2234,7 +2240,9 @@ def _zip_central_directory_problem(fh: Any) -> str | None:
     is walked here first, record by record, reading only each record's
     fixed 46-byte header (plus, for a record with a saturated 32-bit size
     or offset, its extra field), and the walk stops at record
-    ``_NPZ_MAX_MEMBERS + 1``.
+    ``_NPZ_MAX_MEMBERS + 1``. A directory larger than
+    ``_NPZ_MAX_CENTRAL_DIRECTORY_BYTES`` is refused before the walk, since
+    ``zipfile`` would read all of it and parse every record's extra field.
 
     ZIP64 is read the way ``zipfile`` reads it: numpy archives past 2 GiB
     carry a ZIP64 end record and locator, and ZIP64 extra fields holding
@@ -2272,6 +2280,11 @@ def _zip_central_directory_problem(fh: Any) -> str | None:
         return "ZIP64 marker without a ZIP64 end record"
     if disk or cd_disk or disk_entries != total_entries or cd_offset + cd_size != cd_end:
         return "inconsistent end-of-central-directory offsets"
+    if cd_size > _NPZ_MAX_CENTRAL_DIRECTORY_BYTES:
+        return (
+            f"central directory of {cd_size} bytes exceeds the cap of "
+            f"{_NPZ_MAX_CENTRAL_DIRECTORY_BYTES} bytes"
+        )
     count = 0
     pos = cd_offset
     while pos < cd_end:

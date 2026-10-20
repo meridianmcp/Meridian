@@ -522,6 +522,42 @@ class TestNpzDegradesToFilenameOnly:
         assert OL._npz_array_summary("many.npz", data) is None
         assert calls == []
 
+    def test_central_directory_over_the_byte_cap_is_refused_unparsed(
+        self, monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """B-F15: the walk bounded the record count but not the directory's
+        bytes. 17 records (far under the member cap) whose extra fields hold
+        16,000 empty subfields each make a 1.09 MB directory, and zipfile's
+        per-record extra parsing is quadratic in the extra length. The
+        archive is refused before a record is read or zipfile is built."""
+        extra = struct.pack("<2H", 0xCAFE, 0) * 16_000
+        buf = io.BytesIO()
+        with zipfile.ZipFile(buf, "w") as zf:
+            for i in range(17):
+                info = zipfile.ZipInfo(f"a{i:02d}.npy")
+                info.extra = extra
+                zf.writestr(info, _npy_bytes("<f8", (1,)))
+        data = buf.getvalue()
+        cd_size = struct.unpack_from("<L", data, data.rfind(b"PK\x05\x06") + 12)[0]
+        assert cd_size > 1 << 20
+        fh = _CountingBytesIO(data)
+        calls = _forbid_zipfile(monkeypatch)
+        assert OL._zip_central_directory_problem(fh) == (
+            f"central directory of {cd_size} bytes exceeds the cap of {1 << 20} bytes"
+        )
+        assert OL._NPZ_MAX_CENTRAL_DIRECTORY_BYTES == 1 << 20
+        assert fh.central_headers_read == 0
+        assert OL._npz_array_summary("padded.npz", data) is None
+        assert calls == []
+
+    def test_numpy_sized_directory_is_far_under_the_byte_cap(self) -> None:
+        """256 members named like numpy's (``arr_0.npy`` ...) make a
+        directory of a few KB, nowhere near the byte cap."""
+        data = _npz_bytes({f"arr_{i}": b"" for i in range(OL._NPZ_MAX_MEMBERS)})
+        cd_size = struct.unpack_from("<L", data, data.rfind(b"PK\x05\x06") + 12)[0]
+        assert cd_size * 50 < OL._NPZ_MAX_CENTRAL_DIRECTORY_BYTES
+        assert OL._zip_central_directory_problem(io.BytesIO(data)) is None
+
     def test_under_declared_count_below_the_cap_is_refused(
         self, monkeypatch: pytest.MonkeyPatch,
     ) -> None:
