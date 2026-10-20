@@ -869,10 +869,54 @@ def find_outputs_by_source(
       canonical_path, kind, size, mtime, csv_columns, json_keys), sorted
       newest-first by mtime. ``total`` is the full match count before
       ``limit`` truncation. ``outputs`` is empty (not an error) when nothing
-      in the tree cites this source.
+      in the tree cites this source. ``truncated`` flags a possibly
+      incomplete answer (``scan_saturated``, ``index_partial``,
+      ``outputs_capped``); ``limits`` reports the effective limits after
+      clamping (``limit`` <= 1000, ``search_limit`` <= 5000).
     """
     return provenance.find_outputs_by_source(
         outputs_dir, source_path, limit=limit, search_limit=search_limit,
+    )
+
+
+@mcp.tool()
+def trace_forward_outputs(
+    outputs_dir: str,
+    source_path: str,
+    max_depth: int = 3,
+    max_nodes: int = 200,
+    limit: int = 25,
+    search_limit: int = 200,
+) -> dict[str, Any]:
+    """Bounded transitive forward trace: a source -> every output that
+    depends on it, directly or through other outputs (gap set C).
+
+    A breadth-first walk over ``find_outputs_by_source``. Hop 1 uses that
+    tool's match rule, so ``max_depth=1`` returns exactly its one-hop
+    answer; hops 2+ match only exact normalised paths. A visited set ends
+    cycles. Caps never raise: hitting one sets ``truncated`` and names the
+    reason.
+
+    Args:
+      outputs_dir:   Absolute path to the outputs directory.
+      source_path:   The script or data file to trace forward from.
+      max_depth:     Max hops from the source (default 3, ceiling 25).
+      max_nodes:     Max dependent outputs returned, source not counted
+                     (default 200, ceiling 5000).
+      limit:         Per-hop output limit (default 25, ceiling 1000).
+      search_limit:  Per-hop search window (default 200, ceiling 5000).
+
+    Returns:
+      ``{source_path, nodes, total, truncated, truncation, limits}``. Each
+      node is a one-hop output row plus ``depth`` and ``parent``.
+      ``truncation`` is ``{reason, reasons, depth_reached, nodes_visited,
+      scan_saturated, index_partial, outputs_capped}``; ``reason`` is one
+      of ``max_nodes``/``max_depth``/``outputs_capped``/``scan_saturated``/
+      ``index_partial``, or ``None`` when nothing was cut short.
+    """
+    return provenance.trace_forward_outputs(
+        outputs_dir, source_path, max_depth=max_depth, max_nodes=max_nodes,
+        limit=limit, search_limit=search_limit,
     )
 
 
@@ -1069,6 +1113,43 @@ def get_artifact_sources(outputs_dir: str, artifact_id: str) -> list[dict[str, A
 def get_source_artifacts(outputs_dir: str, source_locator: str) -> list[dict[str, Any]]:
     """Source -> the artifacts it produced (item e1c979e3). Sorted, deterministic."""
     return artifact_registry.get_source_artifacts(outputs_dir, source_locator)
+
+
+@mcp.tool()
+def get_output_lineage(
+    outputs_dir: str,
+    path: str | None = None,
+    artifact_id: str | None = None,
+    depth: int = 1,
+) -> dict[str, Any]:
+    """Joined lineage for one output (gap set C): output -> its generating
+    sources from every store -> each source's own provenance record, plus
+    the run's inputs, as one fail-closed view.
+
+    Sources are the union of the artifact registry's source edges, the
+    ``record_provenance`` ledger's ``generating_script`` and the
+    ``tag_output`` ledger's script. Each source names its ``origin``; the
+    same script seen by two stores is listed once per store, never merged.
+    A source inside ``outputs_dir`` gets its own provenance record (or is
+    marked ``no_provenance_record``/``not_found``); a source outside is
+    marked ``not_recorded_outside_outputs_dir``. ``stale`` compares a
+    recorded script hash with the script's current hash.
+
+    Args:
+      outputs_dir:  Absolute path to the outputs directory.
+      path:         The output file (must lie inside ``outputs_dir``).
+      artifact_id:  A registered artifact id, instead of or with ``path``.
+      depth:        Hops to follow; only 1 is accepted (deeper is reserved).
+
+    Returns:
+      ``{output, sources, run, complete, unresolved}``, or ``{"error": ...}``
+      for invalid arguments. ``complete`` is True only when at least one
+      source is known and nothing is unresolved. Every path in the result is
+      relative; no machine-local absolute path is returned.
+    """
+    return provenance.get_output_lineage(
+        outputs_dir, path=path, artifact_id=artifact_id, depth=depth,
+    )
 
 
 @mcp.tool()
@@ -1681,6 +1762,105 @@ def get_run_manifest_envelope(outputs_dir: str, run_id: str) -> dict[str, Any]:
     """
     envelope = run_manifest.build_run_manifest_envelope(outputs_dir, run_id)
     return research_evidence.envelope_to_dict(envelope)
+
+
+# Gap set C, "backup-export". ``bundle`` is imported inside each tool rather
+# than in the module-level import block above, so this addition does not
+# touch lines other in-flight changes to this file also edit.
+
+
+@mcp.tool()
+def export_outputs_bundle(
+    outputs_dir: str,
+    bundle_path: str = ".meridian-outputs-cache/bundles/meridian-outputs-bundle.json",
+) -> dict[str, Any]:
+    """Back up every Outputs ledger (provenance, fingerprint, run manifest,
+    artifact registry) plus index metadata to ONE checksummed JSON file
+    (gap set C).
+
+    Each member carries a sha256 over its canonical JSON; ``bundle_digest``
+    covers every member digest bound to its name. The file is written via a
+    temp file and an atomic replace. ``index.duckdb`` is NOT included (it is
+    rebuildable). Registry ``local_only_path`` values are stripped (set to
+    null). A ledger that exists but is empty or not valid JSON refuses the
+    export instead of being backed up as empty.
+
+    Args:
+      outputs_dir:  Absolute path to the outputs directory.
+      bundle_path:  Where to write, inside ``outputs_dir`` (relative paths
+                    are relative to it). Defaults to a file under
+                    ``.meridian-outputs-cache/bundles/``, which the index
+                    walk skips. May not name a live ledger or index file.
+
+    Returns:
+      ``{"exported": True, "bundle_path", "bundle_digest", "members",
+      "local_only_paths_stripped"}`` or ``{"exported": False, "error"}``.
+    """
+    from . import bundle
+
+    return bundle.export_bundle(outputs_dir, bundle_path)
+
+
+@mcp.tool()
+def verify_outputs_bundle(outputs_dir: str, bundle_path: str) -> dict[str, Any]:
+    """Recompute every checksum in an Outputs bundle and report what does
+    not match (gap set C). Read-only.
+
+    Checksums detect corruption and accidental edits, not deliberate
+    tampering by someone able to recompute them.
+
+    Args:
+      outputs_dir:  Absolute path to the outputs directory.
+      bundle_path:  The bundle file, inside ``outputs_dir``.
+
+    Returns:
+      ``{"verified", "format", "schema_version", "bundle_digest",
+      "bundle_digest_ok", "members", "mismatches", "missing", "unexpected",
+      "malformed", "errors"}``. ``verified`` is True only when everything
+      checks out.
+    """
+    from . import bundle
+
+    return bundle.verify_bundle(bundle_path, outputs_dir=outputs_dir)
+
+
+@mcp.tool()
+def import_outputs_bundle(
+    outputs_dir: str,
+    bundle_path: str,
+    dry_run: bool = True,
+    overwrite: bool = False,
+    accept_hash_algo_mismatch: bool = False,
+) -> dict[str, Any]:
+    """Verify an Outputs bundle and merge its ledgers into ``outputs_dir``
+    (gap set C). Dry run by default: pass ``dry_run=False`` to write.
+
+    Fail-closed: refuses (writing nothing) if verification fails, if the
+    bundle's hash-algorithm versions differ from this install's (unless
+    ``accept_hash_algo_mismatch=True``, which flags it), if a target ledger
+    exists but is unreadable, or if any key conflicts with a different
+    existing entry (unless ``overwrite=True``). Keys only in the target are
+    always kept; on overwrite a registry artifact keeps the target's own
+    local path sightings.
+
+    Args:
+      outputs_dir:                Absolute path to the outputs directory.
+      bundle_path:                The bundle file, inside ``outputs_dir``.
+      dry_run:                    Plan only (default True).
+      overwrite:                  Replace conflicting entries.
+      accept_hash_algo_mismatch:  Proceed, flagged, across a version
+                                  mismatch.
+
+    Returns:
+      ``{"imported", "dry_run", "refused", "reason", "verification",
+      "hash_algo", "members", "would_write", "written_members"}``.
+    """
+    from . import bundle
+
+    return bundle.import_bundle(
+        bundle_path, outputs_dir, dry_run=dry_run, overwrite=overwrite,
+        accept_hash_algo_mismatch=accept_hash_algo_mismatch,
+    )
 
 
 def main() -> None:

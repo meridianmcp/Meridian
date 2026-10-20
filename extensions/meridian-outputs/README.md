@@ -75,7 +75,8 @@ and reported a real parse error) — never a raised exception, never a hang.
 | `get_provenance_status` | Richer, ranked per-file provenance answer: exact / directory-fallback / unregistered / unknown / stale-by-script, plus staleness, archival identity, and index-convergence awareness |
 | `list_provenance` | List the latest `record_provenance` record for every path recorded under an outputs directory |
 | `resolve_figure_output` | Forward resolution: a document figure's file path → its generating source (exact match, then relocation-tolerant basename fallback) |
-| `find_outputs_by_source` | Reverse resolution: a script/data source path → the outputs it produced |
+| `find_outputs_by_source` | Reverse resolution: a script/data source path → the outputs it produced (one hop; `limit` ≤ 1000, `search_limit` ≤ 5000; a `truncated` block flags a saturated scan, a partial index, or capped outputs) |
+| `trace_forward_outputs` | Bounded transitive forward trace: a source → every output depending on it through other outputs (BFS, `max_depth` 3 / `max_nodes` 200 by default; caps set a `truncated` flag and reason, never an error; `max_depth=1` equals `find_outputs_by_source`) |
 | `bind_artifact_provenance` | Join a document's structural artifacts (figures/tables/equations) to authoritative per-file provenance, fail-closed |
 | `tag_output` | Fingerprint an output and record it in a persistent ledger stamped with its generating script's content hash |
 | `check_staleness` | Re-hash every ledger-tagged generating script and report which previously-tagged outputs are now stale |
@@ -159,6 +160,7 @@ always surfaced together, never silently narrowed to one.
 | `bind_artifact_source_edge` | Record a typed edge between a registered artifact and a source locator (idempotent) |
 | `get_artifact_sources` | Artifact → its bound sources |
 | `get_source_artifacts` | Source → the artifacts it produced |
+| `get_output_lineage` | Joined lineage for one output: the union of registry source edges, the `record_provenance` generating script and the `tag_output` script, each tagged with its origin, each in-tree source joined to its own provenance record (out-of-tree ones marked `not_recorded_outside_outputs_dir`), a script-hash `stale` flag, and the run's inputs (`scope: "run"`); `complete` is false whenever anything is unresolved; one hop |
 | `list_registered_artifacts` | All registered artifacts, optionally filtered by kind/lifecycle_state |
 | `reconcile_legacy_artifact_outputs` | Migration/reconciliation report for legacy outputs (defaults to the `record_provenance` ledger); dry-run preview or real registration; ambiguous/unanchored entries are never silently registered |
 
@@ -205,6 +207,26 @@ this package, with no second codec.
 | `get_run_manifest` | Look up the current run-manifest record for a `run_id`, whatever phase it's in |
 | `list_run_manifests` | List every run-manifest record started under an outputs directory |
 | `get_run_manifest_envelope` | Typed, lossless `RUN`-kind `ProvenanceEnvelope` for one run manifest |
+
+### Ledger backup / export bundle (gap set C)
+
+`meridian_outputs.bundle` writes the four ledgers above (provenance,
+fingerprint, run manifest, artifact registry) plus an `index_meta` record
+to ONE JSON file: `{"format": "meridian-outputs-bundle", "schema_version":
+1, "members": {name: {sha256, size, payload}}, "bundle_digest"}`. Each
+member's sha256 is over its canonical JSON; `bundle_digest` covers every
+member digest bound to its name, so two exports of identical state have the
+same digest. The file is written through a temp file and an atomic replace.
+`index.duckdb` is not included (it is rebuildable), and registry
+`local_only_path` values are stripped. Checksums detect corruption, not
+deliberate tampering. Bundle paths must lie inside `outputs_dir`; the default
+sits under `.meridian-outputs-cache/bundles/`, which the index walk skips.
+
+| Tool | Description |
+|------|-------------|
+| `export_outputs_bundle` | Write every ledger plus index metadata to one checksummed bundle; refuses if a ledger file is empty or not valid JSON rather than backing it up as empty |
+| `verify_outputs_bundle` | Recompute every member digest and the bundle digest; reports `mismatches`, `missing`, `unexpected`, `malformed`, `errors` (read-only) |
+| `import_outputs_bundle` | Verify, then merge a bundle into `outputs_dir`; dry run by default, refuses on any verification failure, hash-algorithm version mismatch (unless accepted), unreadable target ledger, or conflict (unless `overwrite`) |
 
 ### Derived-artifact cache & fast variant rendering (item 19917525)
 

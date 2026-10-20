@@ -68,8 +68,11 @@ resolved/ambiguous/unresolved/orphaned outcome and never a silent basename
 guess" -- callers that need a durable, portable identity (rather than a
 one-off per-write provenance check) should prefer
 ``artifact_registry.register_artifact``/``resolve_artifact`` over building
-one on top of this module's basename tier. The two modules do not import
-each other.
+one on top of this module's basename tier. ``artifact_registry`` never
+imports this module; the only dependency in the other direction is
+:func:`get_output_lineage` (gap set C), which reads the registry, the
+provenance and fingerprint ledgers, and the run-manifest ledger through
+deferred imports to join them into one lineage view.
 """
 from __future__ import annotations
 
@@ -81,8 +84,10 @@ from . import outputs_local, provenance_status
 __all__ = [
     "resolve_figure_output",
     "find_outputs_by_source",
+    "trace_forward_outputs",
     "classify_temp_output_ownership",
     "bind_artifact_provenance",
+    "get_output_lineage",
     "RESOLVED",
     "ORPHANED",
     "HASH_MISMATCH",
@@ -192,6 +197,149 @@ def resolve_figure_output(
     return best
 
 
+# Bounded forward trace (gap set C, "forward-trace-cap"). Hard ceilings on
+# the caller-supplied knobs: before this, ``limit``/``search_limit`` were
+# floored at 1 but never capped, so one call could ask the index for an
+# unbounded scan window. A value above its ceiling is clamped (never an
+# error) and the clamp is reported in the response's ``limits`` block.
+FORWARD_LIMIT_CEILING = 1000
+FORWARD_SEARCH_LIMIT_CEILING = 5000
+TRACE_MAX_DEPTH_CEILING = 25
+TRACE_MAX_NODES_CEILING = 5000
+
+# Truncation reasons reported by trace_forward_outputs, in the fixed order
+# ``truncation["reasons"]`` lists them (``truncation["reason"]`` is the first).
+TRUNCATION_REASONS = (
+    "max_nodes",
+    "max_depth",
+    "outputs_capped",
+    "scan_saturated",
+    "index_partial",
+)
+
+
+def _clamp_limit(value: Any, ceiling: int) -> tuple[int, bool]:
+    """Floor ``value`` at 1 and cap it at ``ceiling``; report whether capped."""
+    requested = int(value)
+    effective = min(max(requested, 1), ceiling)
+    return effective, requested > ceiling
+
+
+def _no_truncation() -> dict[str, bool]:
+    return {"scan_saturated": False, "index_partial": False, "outputs_capped": False}
+
+
+def _exact_path_keys(outputs_dir: str, path: Any) -> set[str]:
+    """Exact (non-basename) identity keys for one output/source path.
+
+    Used for hops 2+ of :func:`trace_forward_outputs`, where basename
+    matching over-matches (any ``results.csv`` anywhere would chain onward).
+    Two spellings of the same file compare equal: the path as given, its
+    real absolute form, and -- when it lies under ``outputs_dir`` -- its
+    ``outputs_dir``-relative form, so a ``generating_script`` recorded as
+    ``"sub/a.json"`` matches the indexed ``<outputs_dir>/sub/a.json`` row.
+    Every key goes through :func:`_path_key` (case/slash-insensitive).
+    """
+    raw = str(path or "").strip()
+    if not raw:
+        return set()
+    keys = {_path_key(os.path.normpath(raw))}
+    try:
+        root = os.path.realpath(os.path.abspath(outputs_dir))
+        candidate = raw if os.path.isabs(raw) else os.path.join(root, raw)
+        resolved = os.path.realpath(os.path.abspath(candidate))
+    except (OSError, ValueError):
+        return keys
+    keys.add(_path_key(resolved))
+    try:
+        if os.path.normcase(os.path.commonpath((root, resolved))) == os.path.normcase(root):
+            keys.add(_path_key(os.path.relpath(resolved, root)))
+    except ValueError:
+        pass  # different drive: no outputs_dir-relative spelling exists
+    return keys
+
+
+def _scan_outputs_by_source(
+    outputs_dir: str,
+    source_path: str,
+    *,
+    limit: int,
+    search_limit: int,
+    exact_only: bool,
+) -> dict[str, Any]:
+    """One-hop expander shared by find_outputs_by_source and the trace.
+
+    ``exact_only=False`` is the historical match rule (normalised exact
+    string OR basename). ``exact_only=True`` matches only exact normalised
+    paths (see :func:`_exact_path_keys`); the trace uses it beyond hop 1.
+    """
+    eff_limit, limit_clamped = _clamp_limit(limit, FORWARD_LIMIT_CEILING)
+    eff_search, search_clamped = _clamp_limit(search_limit, FORWARD_SEARCH_LIMIT_CEILING)
+    limits = {
+        "limit": eff_limit,
+        "search_limit": eff_search,
+        "limit_clamped": limit_clamped,
+        "search_limit_clamped": search_clamped,
+    }
+    empty: dict[str, Any] = {
+        "source_path": source_path,
+        "outputs": [],
+        "total": 0,
+        "truncated": _no_truncation(),
+        "limits": limits,
+    }
+    if not source_path or not str(source_path).strip():
+        return empty
+    if not os.path.isdir(outputs_dir):
+        return empty
+
+    target_path = _path_key(source_path)
+    target_base = _basename_key(source_path)
+    exact_keys = _exact_path_keys(outputs_dir, source_path) if exact_only else set()
+    query = os.path.basename(str(source_path).replace("\\", "/").rstrip("/")) or str(source_path)
+    result = outputs_local.search_outputs(
+        outputs_dir, query, limit=eff_search, include_archival=True,
+    )
+    hits = result.get("hits") or []
+
+    matches: list[dict[str, Any]] = []
+    seen_paths: set[str] = set()
+    for hit in hits:
+        gs = hit.get("generating_script")
+        if not gs:
+            continue
+        if exact_only:
+            if not (_exact_path_keys(outputs_dir, gs) & exact_keys):
+                continue
+        elif _path_key(gs) != target_path and _basename_key(gs) != target_base:
+            continue
+        p = hit.get("path")
+        if p in seen_paths:
+            continue
+        seen_paths.add(p)
+        clean = dict(hit)
+        clean.pop("score", None)
+        clean.pop("bm25", None)
+        matches.append(clean)
+
+    matches.sort(key=lambda h: (h.get("mtime") or 0), reverse=True)
+    trimmed = matches[:eff_limit]
+    truncated = {
+        # The search returned a full window: more cited rows may sit past it.
+        "scan_saturated": len(hits) >= eff_search,
+        # The index itself is mid-walk / FTS not built: hits under-report.
+        "index_partial": bool(result.get("partial") or result.get("fts_pending")),
+        "outputs_capped": len(matches) > len(trimmed),
+    }
+    return {
+        "source_path": source_path,
+        "outputs": trimmed,
+        "total": len(matches),
+        "truncated": truncated,
+        "limits": limits,
+    }
+
+
 def find_outputs_by_source(
     outputs_dir: str,
     source_path: str,
@@ -209,55 +357,205 @@ def find_outputs_by_source(
     catch a docx figure quietly citing STALE data: walk the source's outputs
     forward, newest first, and compare against what the docx actually shows.
 
+    One hop only. For transitive dependents (outputs of outputs) use
+    :func:`trace_forward_outputs`, which is bounded by depth and node caps.
+
     Args:
       outputs_dir:   Absolute path to the outputs directory.
       source_path:   The script or data file to trace forward from.
-      limit:         Max number of matched outputs to return.
+      limit:         Max number of matched outputs to return. Floored at 1,
+                     capped at ``FORWARD_LIMIT_CEILING`` (1000).
       search_limit:  How many search_outputs hits to scan before filtering
                      (generous, since only a subset will actually match).
+                     Floored at 1, capped at ``FORWARD_SEARCH_LIMIT_CEILING``
+                     (5000).
 
     Returns:
-      ``{source_path, outputs: [...], total}`` where each output row has the
-      same fields as a ``search_outputs`` hit (path, generating_script,
-      is_archival, canonical_path, kind, size, mtime, csv_columns,
-      json_keys), sorted newest-first by ``mtime``. ``total`` is the full
-      match count before ``limit`` truncation. ``outputs`` is empty (not an
-      error) when nothing in the tree cites this source.
+      ``{source_path, outputs: [...], total, truncated, limits}`` where each
+      output row has the same fields as a ``search_outputs`` hit (path,
+      generating_script, is_archival, canonical_path, kind, size, mtime,
+      csv_columns, json_keys), sorted newest-first by ``mtime``. ``total``
+      is the full match count before ``limit`` truncation. ``outputs`` is
+      empty (not an error) when nothing in the tree cites this source.
+
+      ``truncated`` says whether the answer may be incomplete, as flags
+      (never an error): ``scan_saturated`` -- the search filled its whole
+      ``search_limit`` window, so matches past it were never scanned;
+      ``index_partial`` -- the outputs index reported ``partial`` or
+      ``fts_pending`` (still walking/building), so hits under-report;
+      ``outputs_capped`` -- ``total`` exceeds the returned ``outputs``.
+      ``limits`` reports the effective ``limit``/``search_limit`` and
+      whether each was clamped to its ceiling.
     """
-    empty: dict[str, Any] = {"source_path": source_path, "outputs": [], "total": 0}
-    if not source_path or not str(source_path).strip():
-        return empty
-    if not os.path.isdir(outputs_dir):
-        return empty
-
-    target_path = _path_key(source_path)
-    target_base = _basename_key(source_path)
-    query = os.path.basename(str(source_path).replace("\\", "/").rstrip("/")) or str(source_path)
-    result = outputs_local.search_outputs(
-        outputs_dir, query, limit=max(int(search_limit), 1), include_archival=True,
+    return _scan_outputs_by_source(
+        outputs_dir, source_path, limit=limit, search_limit=search_limit,
+        exact_only=False,
     )
-    hits = result.get("hits") or []
 
-    matches: list[dict[str, Any]] = []
-    seen_paths: set[str] = set()
-    for hit in hits:
-        gs = hit.get("generating_script")
-        if not gs:
-            continue
-        if _path_key(gs) != target_path and _basename_key(gs) != target_base:
-            continue
-        p = hit.get("path")
-        if p in seen_paths:
-            continue
-        seen_paths.add(p)
-        clean = dict(hit)
-        clean.pop("score", None)
-        clean.pop("bm25", None)
-        matches.append(clean)
 
-    matches.sort(key=lambda h: (h.get("mtime") or 0), reverse=True)
-    trimmed = matches[: max(int(limit), 1)]
-    return {"source_path": source_path, "outputs": trimmed, "total": len(matches)}
+def trace_forward_outputs(
+    outputs_dir: str,
+    source_path: str,
+    *,
+    max_depth: int = 3,
+    max_nodes: int = 200,
+    limit: int = 25,
+    search_limit: int = 200,
+) -> dict[str, Any]:
+    """Bounded transitive forward trace: source -> outputs -> their outputs.
+
+    A breadth-first walk that uses the one-hop expander behind
+    :func:`find_outputs_by_source` once per node. Hop 1 keeps that
+    function's match rule (exact normalised string OR basename), so
+    ``max_depth=1`` returns exactly today's one-hop answer. Hops 2+ match
+    only exact normalised paths (an output's absolute or
+    ``outputs_dir``-relative spelling), because basename matching there
+    would chain through any unrelated file that shares a name.
+
+    A visited set keyed by :func:`_path_key` (seeded with the source itself)
+    makes every path appear at most once, so a cycle (A generates B, B
+    generates A) terminates.
+
+    Caps are flags, never errors. The walk stops at ``max_depth`` hops or
+    ``max_nodes`` nodes (the source is not counted), and the response says
+    so.
+
+    Args:
+      outputs_dir:   Absolute path to the outputs directory.
+      source_path:   The script or data file to trace forward from.
+      max_depth:     Max hops from the source (floored at 1, capped at
+                     ``TRACE_MAX_DEPTH_CEILING``).
+      max_nodes:     Max dependent outputs returned (floored at 1, capped at
+                     ``TRACE_MAX_NODES_CEILING``).
+      limit:         Per-hop ``limit`` forwarded to the one-hop expander.
+      search_limit:  Per-hop ``search_limit`` forwarded to the expander.
+
+    Returns:
+      ``{source_path, nodes, total, truncated, truncation, limits}``.
+      ``nodes`` is in BFS order; each node is the one-hop output row plus
+      ``depth`` (1 = cites the source directly) and ``parent`` (the path it
+      was reached from; the caller's ``source_path`` for depth 1).
+      ``truncated`` is a bool. ``truncation`` is ``{reason, reasons,
+      depth_reached, nodes_visited, scan_saturated, index_partial,
+      outputs_capped}``: ``reasons`` lists every cause in the fixed
+      ``TRUNCATION_REASONS`` order and ``reason`` is the first, or ``None``.
+      ``max_depth`` is reported when a node at the depth cap has an
+      unvisited dependent, or when the one extra probe hop that checks this
+      cannot rule one out (the probe's scan saturated or the index is
+      partial). ``scan_saturated``/``index_partial``/``outputs_capped`` are
+      the OR of those flags over every hop the answer includes. A missing
+      ``outputs_dir`` or empty ``source_path`` returns no nodes and
+      ``truncated=False``, matching find_outputs_by_source's empty answer.
+    """
+    eff_depth, depth_clamped = _clamp_limit(max_depth, TRACE_MAX_DEPTH_CEILING)
+    eff_nodes, nodes_clamped = _clamp_limit(max_nodes, TRACE_MAX_NODES_CEILING)
+    eff_limit, limit_clamped = _clamp_limit(limit, FORWARD_LIMIT_CEILING)
+    eff_search, search_clamped = _clamp_limit(search_limit, FORWARD_SEARCH_LIMIT_CEILING)
+    limits = {
+        "max_depth": eff_depth,
+        "max_nodes": eff_nodes,
+        "limit": eff_limit,
+        "search_limit": eff_search,
+        "max_depth_clamped": depth_clamped,
+        "max_nodes_clamped": nodes_clamped,
+        "limit_clamped": limit_clamped,
+        "search_limit_clamped": search_clamped,
+    }
+
+    nodes: list[dict[str, Any]] = []
+    flags = _no_truncation()
+    hit_max_nodes = False
+    hit_max_depth = False
+    depth_reached = 0
+
+    if source_path and str(source_path).strip() and os.path.isdir(outputs_dir):
+        visited: set[str] = set(_exact_path_keys(outputs_dir, source_path))
+        visited.add(_path_key(source_path))
+        frontier: list[tuple[str, int]] = [(source_path, 0)]
+
+        def _expand(node_path: str, depth: int) -> dict[str, Any]:
+            hop = _scan_outputs_by_source(
+                outputs_dir, node_path, limit=eff_limit, search_limit=eff_search,
+                exact_only=depth >= 1,
+            )
+            for key, value in hop["truncated"].items():
+                flags[key] = flags[key] or bool(value)
+            return hop
+
+        def _is_new(row: dict[str, Any]) -> bool:
+            path = row.get("path")
+            if not path:
+                return False
+            return not (_exact_path_keys(outputs_dir, path) | {_path_key(path)}) & visited
+
+        while frontier and not hit_max_nodes:
+            next_frontier: list[tuple[str, int]] = []
+            for node_path, depth in frontier:
+                if depth >= eff_depth:
+                    # Probe one hop past the cap so ``max_depth`` is reported
+                    # only when a dependent lies beyond it, or the probe
+                    # cannot rule one out (its own scan saturated, or the
+                    # index is partial). The probe's flags are NOT merged
+                    # into ``flags``: they describe a hop the answer does
+                    # not include.
+                    if not hit_max_depth:
+                        probe = _scan_outputs_by_source(
+                            outputs_dir, node_path, limit=eff_limit,
+                            search_limit=eff_search, exact_only=True,
+                        )
+                        probe_flags = probe["truncated"]
+                        if (
+                            any(_is_new(row) for row in probe["outputs"])
+                            or probe_flags["scan_saturated"]
+                            or probe_flags["index_partial"]
+                        ):
+                            hit_max_depth = True
+                    continue
+                hop = _expand(node_path, depth)
+                for row in hop["outputs"]:
+                    # Hop 1 keeps every row the one-hop expander returned
+                    # (it already dedupes by path), so max_depth=1 equals
+                    # find_outputs_by_source exactly; later hops skip
+                    # anything already visited, which is what ends cycles.
+                    if depth > 0 and not _is_new(row):
+                        continue
+                    if not row.get("path"):
+                        continue
+                    if len(nodes) >= eff_nodes:
+                        hit_max_nodes = True
+                        break
+                    path = row["path"]
+                    visited.update(_exact_path_keys(outputs_dir, path))
+                    visited.add(_path_key(path))
+                    nodes.append({**row, "depth": depth + 1, "parent": node_path})
+                    depth_reached = max(depth_reached, depth + 1)
+                    next_frontier.append((path, depth + 1))
+                if hit_max_nodes:
+                    break
+            frontier = next_frontier
+
+    active = {
+        "max_nodes": hit_max_nodes,
+        "max_depth": hit_max_depth,
+        "outputs_capped": flags["outputs_capped"],
+        "scan_saturated": flags["scan_saturated"],
+        "index_partial": flags["index_partial"],
+    }
+    reasons = [reason for reason in TRUNCATION_REASONS if active[reason]]
+    return {
+        "source_path": source_path,
+        "nodes": nodes,
+        "total": len(nodes),
+        "truncated": bool(reasons),
+        "truncation": {
+            "reason": reasons[0] if reasons else None,
+            "reasons": reasons,
+            "depth_reached": depth_reached,
+            "nodes_visited": len(nodes),
+            **flags,
+        },
+        "limits": limits,
+    }
 
 
 def classify_temp_output_ownership(outputs_dir: str, path: str) -> dict[str, Any]:
@@ -665,3 +963,525 @@ def bind_artifact_provenance(
         counts[binding["status"]] = counts.get(binding["status"], 0) + 1
     all_clear = counts[RESOLVED] == len(bindings)
     return {"bindings": bindings, "counts": counts, "all_clear": all_clear}
+
+
+# ---------------------------------------------------------------------------
+# Gap set C, "joined-lineage": output -> its generating sources -> their own
+# provenance records, as ONE view.
+#
+# Three stores each record an output -> source link, and nothing reconciled
+# them: the artifact registry's SourceEdges, the provenance ledger's
+# ``generating_script`` (record_provenance), and the fingerprint ledger's
+# ``generating_script``/``script_path`` (tag_output). get_output_lineage
+# unions all three, tags every source with the store it came from, and never
+# collapses two origins into one entry -- when the stores disagree, the
+# disagreement stays visible. The view is fail-closed: ``complete`` is True
+# only when at least one source is known and every source, the run manifest
+# (if the artifact names a run), and every store read resolved cleanly.
+#
+# The result is portable: every path is outputs_dir-relative or a relative
+# source reference, never a machine-local absolute path (the registry's
+# local_only_path values are stripped via strip_local_metadata).
+# ---------------------------------------------------------------------------
+
+LINEAGE_ORIGIN_REGISTRY = "artifact_registry"
+LINEAGE_ORIGIN_PROVENANCE = "provenance_record"
+LINEAGE_ORIGIN_FINGERPRINT = "fingerprint_ledger"
+_LINEAGE_ORIGIN_RANK = {
+    LINEAGE_ORIGIN_REGISTRY: 0,
+    LINEAGE_ORIGIN_PROVENANCE: 1,
+    LINEAGE_ORIGIN_FINGERPRINT: 2,
+}
+
+# Per-source resolution statuses. Only SOURCE_RECORDED counts as resolved.
+SOURCE_RECORDED = "recorded"
+SOURCE_NO_PROVENANCE_RECORD = "no_provenance_record"
+SOURCE_NOT_FOUND = "not_found"
+SOURCE_OUTSIDE_OUTPUTS_DIR = "not_recorded_outside_outputs_dir"
+
+
+def _portable_locator(outputs_dir: str, value: Any) -> str | None:
+    """A ledger locator safe to return: never a machine-local absolute path.
+
+    Relative values pass through (slashes normalised). An absolute value is
+    rewritten as a reference relative to ``outputs_dir``, or reduced to its
+    basename when it sits on a different volume (the same fallback
+    annotate/fingerprint use when they persist a generating script).
+    """
+    if not isinstance(value, str) or not value.strip():
+        return None
+    raw = value.strip()
+    if not os.path.isabs(raw):
+        return raw.replace("\\", "/")
+    from .path_security import relative_reference
+
+    return relative_reference(outputs_dir, raw) or os.path.basename(raw.replace("\\", "/"))
+
+
+def _relative_output(outputs_dir: str, path: Any) -> str | None:
+    from .path_security import relative_output_path
+
+    try:
+        return relative_output_path(outputs_dir, path)
+    except (TypeError, ValueError):
+        return _portable_locator(outputs_dir, path)
+
+
+def _portable_provenance_record(outputs_dir: str, record: dict[str, Any] | None) -> dict[str, Any] | None:
+    if record is None:
+        return None
+    clean = dict(record)
+    if "path" in clean:
+        clean["path"] = _relative_output(outputs_dir, clean.get("path"))
+    if "generating_script" in clean:
+        clean["generating_script"] = _portable_locator(outputs_dir, clean.get("generating_script"))
+    return clean
+
+
+def _portable_fingerprint_entry(outputs_dir: str, entry: dict[str, Any] | None) -> dict[str, Any] | None:
+    if entry is None:
+        return None
+    clean = dict(entry)
+    for key in ("path", "script_path", "generating_script"):
+        if key in clean:
+            clean[key] = _portable_locator(outputs_dir, clean.get(key))
+    return clean
+
+
+def _portable_artifact(outputs_dir: str, record: dict[str, Any] | None) -> dict[str, Any] | None:
+    if record is None:
+        return None
+    from . import artifact_registry
+
+    clean = artifact_registry.strip_local_metadata(record)
+    for key in ("generator", "source_locator"):
+        if key in clean:
+            clean[key] = _portable_locator(outputs_dir, clean.get(key))
+    return clean
+
+
+def _same_output(outputs_dir: str, ledger_path: Any, target_real: str) -> bool:
+    from .path_security import resolve_reference
+
+    if not isinstance(ledger_path, str) or not ledger_path.strip():
+        return False
+    try:
+        resolved = resolve_reference(outputs_dir, ledger_path)
+    except (OSError, TypeError, ValueError):
+        return False
+    return os.path.normcase(os.path.normpath(resolved)) == os.path.normcase(os.path.normpath(target_real))
+
+
+def _locate_source(outputs_dir: str, locator: str) -> tuple[str, str | None]:
+    """``("inside", <real path>)`` or ``("outside", None)``.
+
+    A relative locator is read relative to ``outputs_dir`` (the convention
+    every ledger in this package uses for stored references); the current
+    working directory is never consulted, so the answer does not depend on
+    where the server process happens to run.
+    """
+    from .path_security import _require_within
+
+    root = os.path.realpath(os.path.abspath(outputs_dir))
+    candidate = locator if os.path.isabs(locator) else os.path.join(root, locator)
+    try:
+        return "inside", _require_within(outputs_dir, candidate)
+    except ValueError:
+        return "outside", None
+
+
+def _resolve_lineage_source(
+    outputs_dir: str,
+    *,
+    origin: str,
+    locator: str,
+    relation: str,
+    location_hint: str | None = None,
+    edge_id: str | None = None,
+) -> dict[str, Any]:
+    """Classify one source and attach its own provenance record if it has one."""
+    from . import annotate
+
+    where, real = _locate_source(outputs_dir, location_hint or locator)
+    entry: dict[str, Any] = {
+        "origin": origin,
+        "locator": locator,
+        "relation": relation,
+        "scope": "output",
+        "location": "inside_outputs_dir" if where == "inside" else "outside_outputs_dir",
+        "path": None,
+        "status": SOURCE_OUTSIDE_OUTPUTS_DIR,
+        "resolved": False,
+        "provenance_record": None,
+        "stale": None,
+        "stale_reason": None,
+        "recorded_script_hash": None,
+        "current_script_hash": None,
+    }
+    if edge_id is not None:
+        entry["edge_id"] = edge_id
+    if where != "inside" or real is None:
+        return entry
+
+    entry["path"] = _relative_output(outputs_dir, real)
+    try:
+        record = annotate.get_provenance(outputs_dir, real)
+    except Exception as exc:  # noqa: BLE001 -- a store failure is reported, never raised
+        entry["status"] = SOURCE_NO_PROVENANCE_RECORD
+        entry["store_error"] = type(exc).__name__
+        return entry
+    if record is not None:
+        entry["status"] = SOURCE_RECORDED
+        entry["resolved"] = True
+        entry["provenance_record"] = _portable_provenance_record(outputs_dir, record)
+    elif os.path.exists(real):
+        entry["status"] = SOURCE_NO_PROVENANCE_RECORD
+    else:
+        entry["status"] = SOURCE_NOT_FOUND
+    return entry
+
+
+def _set_script_staleness(entry: dict[str, Any], recorded: str | None, current: str | None,
+                          *, script_known: bool) -> None:
+    """Fill the stale fields the way fingerprint.check_staleness reasons,
+    except that an absent recorded hash is reported as unknown (None)
+    rather than silently "not stale"."""
+    entry["recorded_script_hash"] = recorded
+    entry["current_script_hash"] = current
+    if not script_known:
+        entry["stale"] = None
+        entry["stale_reason"] = "no generating script was resolved when this link was recorded"
+    elif current is None:
+        entry["stale"] = True
+        entry["stale_reason"] = "generating script no longer readable/present"
+    elif recorded is None:
+        entry["stale"] = None
+        entry["stale_reason"] = "no script hash was recorded, so staleness cannot be confirmed"
+    elif current != recorded:
+        entry["stale"] = True
+        entry["stale_reason"] = "generating script content changed since it was recorded"
+    else:
+        entry["stale"] = False
+        entry["stale_reason"] = "generating script unchanged since it was recorded"
+
+
+def get_output_lineage(
+    outputs_dir: str,
+    *,
+    path: str | None = None,
+    artifact_id: str | None = None,
+    depth: int = 1,
+) -> dict[str, Any]:
+    """Joined lineage for one output: its sources from every store, each
+    source's own provenance record, and the run inputs, as ONE view.
+
+    Exactly how the stores are joined:
+
+      1. The output is located by ``path`` (validated to lie inside
+         ``outputs_dir``) and/or ``artifact_id``. A path is matched to a
+         registry artifact through ``artifact_registry.resolve_artifact``
+         (content hash, then exact prior path sighting -- never a basename
+         guess); an ``artifact_id`` without a ``path`` uses the artifact's
+         most recent local sighting inside ``outputs_dir``.
+      2. Sources are the UNION of the registry's SourceEdges for that
+         artifact, the provenance ledger's ``generating_script`` and the
+         fingerprint ledger's ``generating_script`` (or ``script_path``).
+         Every source carries ``origin`` naming its store; the same script
+         seen by two stores appears twice, once per origin, never merged.
+      3. Each source inside ``outputs_dir`` gets its own provenance record
+         attached (``status="recorded"``) or is marked
+         ``no_provenance_record``/``not_found``. A source outside
+         ``outputs_dir`` is marked ``not_recorded_outside_outputs_dir``.
+         Only ``recorded`` counts as resolved.
+      4. ``stale`` compares the script hash a store recorded with the
+         script's current hash: the fingerprint ledger's tag-time hash, and
+         the provenance record's ``script_content_hash`` when present.
+      5. When the artifact names a ``run_id`` with a run manifest, the run's
+         input hashes are attached under ``run.inputs`` with
+         ``scope="run"`` (they describe the whole run, not this output).
+
+    Args:
+      outputs_dir:  Absolute path to the outputs directory.
+      path:         The output file (inside ``outputs_dir``).
+      artifact_id:  A registered artifact id, instead of or with ``path``.
+      depth:        Hops to follow. Only 1 is accepted: deeper lineage is
+                    reserved (it needs a visited set) and any other value is
+                    an error rather than a silently shallower answer.
+
+    Returns:
+      ``{"error": ...}`` for invalid arguments (missing ``outputs_dir``, a
+      ``path`` outside it, neither ``path`` nor ``artifact_id``, or a
+      ``depth`` other than 1) -- never a traceback. Otherwise ``{output,
+      sources, run, complete, unresolved}``:
+
+        - ``output``: ``{path, artifact_id, artifact_evidence, artifact,
+          provenance_record, fingerprint, provenance_status}`` with every
+          path made portable.
+        - ``sources``: one dict per (origin, locator) -- ``{origin,
+          locator, relation, scope, location, path, status, resolved,
+          provenance_record, stale, stale_reason, recorded_script_hash,
+          current_script_hash}`` plus ``edge_id`` for registry edges --
+          sorted by origin (registry, provenance, fingerprint), then
+          locator.
+        - ``run``: ``None`` when no run is linked, else ``{run_id, found,
+          phase, manifest_hash, command, inputs}``.
+        - ``complete``: True only when ``sources`` is non-empty and
+          ``unresolved`` is empty (fail closed).
+        - ``unresolved``: one dict per gap: an unresolved source, an
+          ambiguous or unknown artifact, a missing run manifest, an
+          unreadable store, or no lineage recorded at all.
+    """
+    from . import annotate, artifact_registry, fingerprint
+    from . import run_manifest as run_manifest_mod
+    from .path_security import _require_within, resolve_reference
+
+    if not outputs_dir or not str(outputs_dir).strip():
+        return {"error": "outputs_dir is required"}
+    if not os.path.isdir(outputs_dir):
+        return {"error": "outputs_dir does not exist"}
+    if isinstance(depth, bool) or not isinstance(depth, int) or depth != 1:
+        return {
+            "error": "depth must be 1: deeper lineage is reserved and not implemented",
+        }
+    has_path = bool(path and str(path).strip())
+    has_id = bool(artifact_id and str(artifact_id).strip())
+    if not has_path and not has_id:
+        return {"error": "path or artifact_id is required"}
+
+    target_real: str | None = None
+    if has_path:
+        try:
+            target_real = _require_within(outputs_dir, str(path))
+        except ValueError as exc:
+            return {"error": str(exc)}
+
+    unresolved: list[dict[str, Any]] = []
+
+    # -- 1. the output and its registry artifact -----------------------------
+    artifact: dict[str, Any] | None = None
+    artifact_evidence: str | None = None
+    try:
+        if has_id:
+            artifact = artifact_registry.get_artifact(outputs_dir, str(artifact_id))
+            if artifact is None:
+                unresolved.append({
+                    "kind": "artifact", "artifact_id": artifact_id,
+                    "reason": "artifact_not_registered",
+                })
+            else:
+                artifact_evidence = "artifact_id"
+        elif target_real is not None:
+            hit = artifact_registry.resolve_artifact(outputs_dir, canonical_path=target_real)
+            if hit["status"] == artifact_registry.RESOLVED:
+                artifact = hit["record"]
+                artifact_evidence = hit["evidence"]
+            elif hit["status"] == artifact_registry.AMBIGUOUS:
+                unresolved.append({
+                    "kind": "artifact", "reason": "artifact_ambiguous",
+                    "candidates": list(hit["candidates"]),
+                })
+    except Exception as exc:  # noqa: BLE001 -- store failure is a gap, not a crash
+        unresolved.append({
+            "kind": "store", "store": LINEAGE_ORIGIN_REGISTRY,
+            "reason": "store_unreadable", "error_type": type(exc).__name__,
+        })
+
+    if target_real is None and artifact is not None:
+        sightings = sorted(
+            artifact.get("local_paths") or [],
+            key=lambda e: e.get("last_seen") or "", reverse=True,
+        )
+        for sighting in sightings:
+            candidate = sighting.get("local_only_path")
+            if not isinstance(candidate, str) or not candidate.strip():
+                continue
+            try:
+                target_real = _require_within(outputs_dir, candidate)
+                break
+            except ValueError:
+                continue
+        if target_real is None:
+            unresolved.append({
+                "kind": "output", "artifact_id": artifact.get("artifact_id"),
+                "reason": "output_path_unknown",
+            })
+
+    provenance_record: dict[str, Any] | None = None
+    fingerprint_entry: dict[str, Any] | None = None
+    status_summary: dict[str, Any] | None = None
+    if target_real is not None:
+        try:
+            provenance_record = annotate.get_provenance(outputs_dir, target_real)
+        except Exception as exc:  # noqa: BLE001
+            unresolved.append({
+                "kind": "store", "store": LINEAGE_ORIGIN_PROVENANCE,
+                "reason": "store_unreadable", "error_type": type(exc).__name__,
+            })
+        try:
+            ledger = fingerprint._read_ledger(outputs_dir)
+            for key in sorted(ledger):
+                entry = ledger[key]
+                if isinstance(entry, dict) and _same_output(
+                    outputs_dir, entry.get("path") or key, target_real,
+                ):
+                    fingerprint_entry = dict(entry)
+                    break
+        except Exception as exc:  # noqa: BLE001
+            unresolved.append({
+                "kind": "store", "store": LINEAGE_ORIGIN_FINGERPRINT,
+                "reason": "store_unreadable", "error_type": type(exc).__name__,
+            })
+        try:
+            status_row = provenance_status.get_provenance_status(outputs_dir, target_real)
+            staleness = status_row.get("staleness") or {}
+            # Summary fields only: the full row repeats the record and its
+            # free-text reasons can embed absolute paths (RELOCATED branch).
+            status_summary = {
+                "provenance_type": status_row.get("provenance_type"),
+                "stale": staleness.get("stale"),
+                "inconclusive": status_row.get("inconclusive"),
+            }
+        except Exception as exc:  # noqa: BLE001 -- output status is advisory
+            status_summary = {"error": type(exc).__name__}
+
+    # -- 2/3/4. sources from every store, never merged across origins -------
+    sources: list[dict[str, Any]] = []
+    if artifact is not None:
+        try:
+            edges = artifact_registry.get_artifact_sources(outputs_dir, artifact["artifact_id"])
+        except Exception as exc:  # noqa: BLE001
+            edges = []
+            unresolved.append({
+                "kind": "store", "store": LINEAGE_ORIGIN_REGISTRY,
+                "reason": "store_unreadable", "error_type": type(exc).__name__,
+            })
+        for edge in edges:
+            locator = _portable_locator(outputs_dir, edge.get("source_locator"))
+            if not locator:
+                continue
+            sources.append(_resolve_lineage_source(
+                outputs_dir, origin=LINEAGE_ORIGIN_REGISTRY, locator=locator,
+                relation=str(edge.get("relation") or "produced_by"),
+                edge_id=edge.get("edge_id"),
+            ))
+
+    if provenance_record is not None:
+        locator = _portable_locator(outputs_dir, provenance_record.get("generating_script"))
+        if locator:
+            entry = _resolve_lineage_source(
+                outputs_dir, origin=LINEAGE_ORIGIN_PROVENANCE, locator=locator,
+                relation="generating_script",
+            )
+            recorded = provenance_record.get("script_content_hash")
+            if recorded is not None:
+                # Resolve the script exactly as record_provenance did when it
+                # captured the hash, so the comparison is like for like.
+                script_file = fingerprint._resolve_script_path(
+                    provenance_record["generating_script"], search_root=outputs_dir,
+                )
+                current = fingerprint.script_content_hash(script_file) if script_file else None
+                _set_script_staleness(entry, recorded, current, script_known=True)
+            else:
+                entry["stale_reason"] = (
+                    "no script hash was recorded, so staleness cannot be confirmed"
+                )
+            sources.append(entry)
+
+    if fingerprint_entry is not None:
+        script_ref = fingerprint_entry.get("script_path")
+        locator = (
+            _portable_locator(outputs_dir, fingerprint_entry.get("generating_script"))
+            or _portable_locator(outputs_dir, script_ref)
+        )
+        if locator:
+            hint = _portable_locator(outputs_dir, script_ref)
+            entry = _resolve_lineage_source(
+                outputs_dir, origin=LINEAGE_ORIGIN_FINGERPRINT, locator=locator,
+                relation="generating_script", location_hint=hint,
+            )
+            recorded = (
+                fingerprint._digest_hex(fingerprint_entry.get("content_digest"))
+                or fingerprint_entry.get("script_hash")
+            )
+            current = (
+                fingerprint.script_content_hash(resolve_reference(outputs_dir, script_ref))
+                if isinstance(script_ref, str) and script_ref else None
+            )
+            _set_script_staleness(
+                entry, recorded, current,
+                script_known=isinstance(script_ref, str) and bool(script_ref),
+            )
+            sources.append(entry)
+
+    sources.sort(key=lambda s: (
+        _LINEAGE_ORIGIN_RANK.get(s["origin"], 99), s["locator"], s["relation"],
+        s.get("edge_id") or "",
+    ))
+    for src in sources:
+        if not src["resolved"]:
+            gap = {
+                "kind": "source", "origin": src["origin"], "locator": src["locator"],
+                "reason": src["status"],
+            }
+            if "store_error" in src:
+                gap["error_type"] = src["store_error"]
+            unresolved.append(gap)
+
+    # -- 5. run-scoped inputs ------------------------------------------------
+    run: dict[str, Any] | None = None
+    run_id = artifact.get("run_id") if artifact is not None else None
+    if isinstance(run_id, str) and run_id.strip():
+        try:
+            manifest = run_manifest_mod.get_run_manifest(outputs_dir, run_id)
+        except Exception as exc:  # noqa: BLE001
+            manifest = None
+            unresolved.append({
+                "kind": "store", "store": "run_manifest",
+                "reason": "store_unreadable", "error_type": type(exc).__name__,
+            })
+        if manifest is None:
+            run = {"run_id": run_id, "found": False, "phase": None,
+                   "manifest_hash": None, "command": None, "inputs": []}
+            unresolved.append({"kind": "run", "run_id": run_id, "reason": "run_manifest_not_found"})
+        else:
+            file_hashes = (manifest.get("input_identity") or {}).get("file_hashes") or {}
+            inputs = [
+                {
+                    "locator": _portable_locator(outputs_dir, raw) or "",
+                    "sha256": digest,
+                    "scope": "run",
+                    "origin": "run_manifest",
+                }
+                for raw, digest in file_hashes.items()
+            ]
+            inputs.sort(key=lambda item: item["locator"])
+            run = {
+                "run_id": run_id,
+                "found": True,
+                "phase": manifest.get("phase"),
+                "manifest_hash": manifest.get("manifest_hash"),
+                "command": (manifest.get("command_identity") or {}).get("tool_name"),
+                "inputs": inputs,
+            }
+
+    if not sources:
+        unresolved.append({"kind": "output", "reason": "no_source_recorded"})
+
+    output = {
+        "path": _relative_output(outputs_dir, target_real) if target_real else None,
+        "artifact_id": artifact.get("artifact_id") if artifact is not None else (
+            artifact_id if has_id else None
+        ),
+        "artifact_evidence": artifact_evidence,
+        "artifact": _portable_artifact(outputs_dir, artifact),
+        "provenance_record": _portable_provenance_record(outputs_dir, provenance_record),
+        "fingerprint": _portable_fingerprint_entry(outputs_dir, fingerprint_entry),
+        "provenance_status": status_summary,
+    }
+    return {
+        "output": output,
+        "sources": sources,
+        "run": run,
+        "complete": bool(sources) and not unresolved,
+        "unresolved": unresolved,
+    }
