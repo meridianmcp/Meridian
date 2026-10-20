@@ -1178,17 +1178,29 @@ def _reclaim_stale_lock_file(lock_path: str, snapshot: _LockSnapshot) -> bool:
 
 
 def _lock_file_is_ours(lock_path: str, token: str | None, handle: Any) -> bool:
-    """True when ``lock_path`` is still this holder's lock file: its lease
-    names ``token``. A file with no readable lease (this holder's own
-    best-effort lease write failed) counts as ours only when it is the very
-    file ``handle`` has open."""
-    lease = _read_lease_from_path(lock_path)
-    if lease is not None:
-        return token is not None and lease.get("token") == token
+    """True when ``lock_path`` is still this holder's lock file: the path
+    names the very file ``handle`` has open, and that file's lease names
+    ``token`` (or holds no readable lease, because this holder's own
+    best-effort lease write failed).
+
+    The lease is read through ``handle`` once the identity check passes.
+    Reopening the path instead costs several milliseconds per release on
+    Windows (on-access scanning of a just-written file), measured at about
+    10x the whole uncontended acquire/release cycle."""
     try:
-        return os.path.samestat(os.fstat(handle.fileno()), os.stat(lock_path))
+        if not os.path.samestat(os.fstat(handle.fileno()), os.stat(lock_path)):
+            return False  # removed and re-created: a successor's file
+        handle.seek(0)
+        text = handle.read()
     except (OSError, ValueError):
         return False
+    try:
+        lease = json.loads(text) if text.strip() else None
+    except ValueError:
+        lease = None
+    if not isinstance(lease, dict):
+        return True
+    return token is not None and lease.get("token") == token
 
 
 # Windows: every waiting acquirer reads the holder's lease
@@ -1443,8 +1455,8 @@ class IndexFileLock:
         try:
             if self._file_handle is not None:
                 lock_path = self._canonical + ".lock"
-                # Checked before the handle is closed: the identity fallback
-                # in _lock_file_is_ours needs the open handle.
+                # Checked before the handle is closed: _lock_file_is_ours
+                # compares the path with the open handle and reads through it.
                 owns_file = self._lock_mode == "atomic_create" and _lock_file_is_ours(
                     lock_path, self._token, self._file_handle,
                 )
