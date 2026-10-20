@@ -63,7 +63,8 @@ import hashlib
 import json
 import logging
 import os
-import tempfile
+import re
+import secrets
 import time
 from contextlib import contextmanager
 from typing import Any, Callable, Iterator, NoReturn
@@ -290,18 +291,68 @@ def _fsync_directory(directory: str) -> None:
         os.close(fd)
 
 
+# Random bytes in a temporary file's name: "<ledger basename>.<hex>.tmp".
+_TEMP_TOKEN_BYTES = 8
+# A temporary file is renamed or removed within moments of its creation; one
+# older than this is what a crash between create and os.replace left behind.
+_STALE_TEMP_SECONDS = 3600.0
+
+
+def _sweep_stale_temps(directory: str, basename: str) -> None:
+    """Remove ``basename``'s leftover temporary files in ``directory``.
+
+    Only names :func:`write_ledger_atomic` itself creates for this ledger
+    (``<basename>.<16 hex>.tmp``, compared case-insensitively where the
+    filesystem is) and only regular files whose mtime is older than
+    :data:`_STALE_TEMP_SECONDS`, so a temporary file another writer is still
+    filling is never touched. Best-effort: a file that cannot be listed,
+    stat-ed or removed is left for a later write, and nothing is raised."""
+    pattern = re.compile(
+        re.escape(os.path.normcase(basename))
+        + r"\.[0-9a-f]{%d}\.tmp" % (2 * _TEMP_TOKEN_BYTES)
+    )
+    cutoff = time.time() - _STALE_TEMP_SECONDS
+    try:
+        with os.scandir(directory) as entries:
+            stale = [
+                entry.path for entry in entries
+                if pattern.fullmatch(os.path.normcase(entry.name))
+                and entry.is_file(follow_symlinks=False)
+                and entry.stat(follow_symlinks=False).st_mtime < cutoff
+            ]
+    except OSError:
+        return
+    for leftover in stale:
+        try:
+            os.remove(leftover)
+        except OSError:
+            pass
+
+
 def write_ledger_atomic(path: str, data: dict[str, Any]) -> None:
     """Replace ``path`` with ``data`` as JSON, atomically and durably.
 
-    Writes a uniquely named temporary file in the same directory (so two
-    writers can never share one), flushes it, calls ``os.fsync`` on it, then
-    moves it over ``path`` with ``os.replace``. On any failure the temporary
-    file is removed and the previous ledger is untouched. ``TypeError`` from
-    a non-JSON-serialisable value is raised before anything is renamed.
+    Writes a uniquely named temporary file (``<ledger>.<16 hex>.tmp``) in the
+    same directory, created exclusively (``O_EXCL``) so two writers can never
+    share one, flushes it, calls ``os.fsync`` on it, then moves it over
+    ``path`` with ``os.replace``. The file is created with mode ``0o666``
+    and the process umask applied, as ``open(path, "w")`` would, so the
+    ledger stays readable to the other accounts or containers the umask
+    allows (``tempfile.mkstemp`` would force ``0o600``). On any failure the
+    temporary file is removed and the previous ledger is untouched.
+    ``TypeError`` from a non-JSON-serialisable value is raised before
+    anything is renamed. A crash between create and replace still leaves the
+    temporary file behind, so each write first removes this ledger's
+    temporary files older than an hour (:func:`_sweep_stale_temps`).
     """
     directory = os.path.dirname(os.path.abspath(path)) or "."
-    fd, tmp = tempfile.mkstemp(
-        prefix=os.path.basename(path) + ".", suffix=".tmp", dir=directory,
+    basename = os.path.basename(path)
+    _sweep_stale_temps(directory, basename)
+    tmp = os.path.join(
+        directory, f"{basename}.{secrets.token_hex(_TEMP_TOKEN_BYTES)}.tmp",
+    )
+    fd = os.open(
+        tmp, os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_BINARY", 0), 0o666,
     )
     try:
         with os.fdopen(fd, "w", encoding="utf-8") as fh:

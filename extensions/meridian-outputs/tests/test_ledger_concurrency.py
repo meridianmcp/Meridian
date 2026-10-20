@@ -23,7 +23,9 @@ import hashlib
 import json
 import logging
 import os
+import re
 import socket
+import stat
 import subprocess
 import sys
 import threading
@@ -34,9 +36,11 @@ import pytest
 
 sys.path.insert(0, str(Path(__file__).parent.parent))
 from meridian_outputs import annotate as AN
+from meridian_outputs import artifact_registry as AR
 from meridian_outputs import fingerprint as FP
 from meridian_outputs import ledger_io as LIO
 from meridian_outputs import outputs_local as OL
+from meridian_outputs import run_manifest as RM
 
 _EXT_ROOT = str(Path(__file__).parent.parent)
 _LOCK_TIMEOUT_ENV = "MERIDIAN_OUTPUTS_LOCK_TIMEOUT_SECONDS"
@@ -162,6 +166,193 @@ class TestCrossProcessWriters:
             assert rec["params"] == {"worker": worker, "i": int(index)}
         leftovers = [n for n in _cache_files(outputs) if n.endswith((".tmp", ".lock"))]
         assert leftovers == []
+
+
+# The run-manifest ledger and the artifact registry (F6): their writers held
+# only an in-process lock, so a write from another process between one
+# writer's read and its replace was silently dropped.
+
+_REGISTRY_RUN_WRITER_SCRIPT = r"""
+import os, sys, time
+ext_dir, outputs_dir, worker_id, count, ready_path, gate_path = sys.argv[1:7]
+count = int(count)
+sys.path.insert(0, ext_dir)
+from meridian_outputs import artifact_registry, run_manifest
+
+# The convergence snapshot opens the outputs index; it is not under test.
+run_manifest._safe_convergence = lambda outputs_dir: None
+
+with open(ready_path, "w", encoding="utf-8") as fh:
+    fh.write(str(os.getpid()))
+deadline = time.monotonic() + 120.0
+while not os.path.exists(gate_path):
+    if time.monotonic() > deadline:
+        sys.exit(3)
+    time.sleep(0.005)
+
+for i in range(count):
+    name = "w%s_%02d" % (worker_id, i)
+    art = artifact_registry.register_artifact(outputs_dir, "output", generator=name + ".py")
+    run_manifest.start_run_manifest(outputs_dir, run_id=name, command_name="build")
+    run_manifest.finalize_run_manifest(
+        outputs_dir, name, artifact_ids=[art["artifact_id"]], status="complete",
+    )
+"""
+
+# One writer (the holder) has read the ledger and stops just before its
+# write; the other (the racer) runs its whole write meanwhile. Without a
+# cross-process lock the racer's write lands inside that window and the
+# holder's write then drops it. Under the lock the racer waits for the
+# holder's write, so the holder only waits ``grace`` seconds for a racer that
+# never finishes first.
+_PAUSED_WRITER_SCRIPT = r"""
+import os, sys, time
+ext_dir, outputs_dir, op, name, held_path, ready_path, done_path, grace = sys.argv[1:9]
+sys.path.insert(0, ext_dir)
+from meridian_outputs import artifact_registry, ledger_io, run_manifest
+
+run_manifest._safe_convergence = lambda outputs_dir: None
+
+
+def _touch(path):
+    with open(path, "w", encoding="utf-8") as fh:
+        fh.write(str(os.getpid()))
+
+
+def _wait(path, seconds):
+    deadline = time.monotonic() + seconds
+    while not os.path.exists(path) and time.monotonic() < deadline:
+        time.sleep(0.01)
+
+
+holder = held_path != "-"
+if holder:
+    real_write = ledger_io.write_ledger_atomic
+
+    def _held_write(path, data):
+        _touch(held_path)
+        _wait(ready_path, 120.0)
+        _wait(done_path, float(grace))
+        real_write(path, data)
+
+    ledger_io.write_ledger_atomic = _held_write
+else:
+    _touch(ready_path)
+
+if op == "start":
+    run_manifest.start_run_manifest(outputs_dir, run_id=name, command_name="build")
+elif op == "finalize":
+    run_manifest.finalize_run_manifest(outputs_dir, name, status="complete")
+else:
+    artifact_registry.register_artifact(outputs_dir, "output", generator=name)
+
+if not holder:
+    _touch(done_path)
+"""
+
+
+def _finish(procs: list[subprocess.Popen]) -> None:
+    for proc in procs:
+        _, err = proc.communicate(timeout=240)
+        assert proc.returncode == 0, err.decode("utf-8", "replace")
+
+
+class TestRegistryAndRunManifestCrossProcess:
+    def test_four_processes_register_start_and_finalize_lose_nothing(
+        self, tmp_path: Path,
+    ) -> None:
+        outputs = _outputs(tmp_path)
+        gate = tmp_path / "gate"
+        workers, per_worker = 4, 8
+        env = dict(os.environ)
+        env[_LOCK_TIMEOUT_ENV] = "120"  # contention must wait, never time out
+        procs: list[subprocess.Popen] = []
+        try:
+            ready_paths = []
+            for w in range(workers):
+                ready = tmp_path / f"ready_{w}"
+                ready_paths.append(ready)
+                procs.append(subprocess.Popen(
+                    [
+                        sys.executable, "-c", _REGISTRY_RUN_WRITER_SCRIPT, _EXT_ROOT,
+                        str(outputs), str(w), str(per_worker), str(ready), str(gate),
+                    ],
+                    env=env, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                ))
+            for ready in ready_paths:
+                _wait_for_file(str(ready), timeout=120.0)
+            gate.write_text("go", encoding="utf-8")  # all four start together
+            _finish(procs)
+        finally:
+            for proc in procs:
+                if proc.poll() is None:
+                    proc.kill()
+
+        od = str(outputs)
+        expected = {f"w{w}_{i:02d}" for w in range(workers) for i in range(per_worker)}
+        artifacts = AR._read_registry_strict(od)["artifacts"]
+        ids_by_generator = {rec["generator"]: aid for aid, rec in artifacts.items()}
+        assert set(ids_by_generator) == {name + ".py" for name in expected}
+        runs = RM._read_ledger_strict(od)
+        assert set(runs) == expected
+        for name, run in runs.items():
+            # A finalize lost to a concurrent start would still read in_progress.
+            assert run["phase"] == "complete", (name, run["phase"], run["status_reason"])
+            assert run["artifact_ids"] == [ids_by_generator[name + ".py"]]
+        leftovers = [n for n in _cache_files(outputs) if n.endswith((".tmp", ".lock"))]
+        assert leftovers == []
+
+    @pytest.mark.parametrize(
+        "holder, racer",
+        [
+            (("start", "r1"), ("finalize", "r0")),  # a finalize lost to a start
+            (("finalize", "r0"), ("start", "r1")),  # a start lost to a finalize
+            (("register", "a.py"), ("register", "b.py")),
+        ],
+        ids=["start-holds-finalize-races", "finalize-holds-start-races", "two-registrations"],
+    )
+    def test_write_between_another_process_read_and_write_survives(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+        holder: tuple[str, str], racer: tuple[str, str],
+    ) -> None:
+        outputs = _outputs(tmp_path)
+        od = str(outputs)
+        monkeypatch.setattr(RM, "_safe_convergence", lambda outputs_dir: None)
+        if holder[0] != "register":
+            RM.start_run_manifest(od, run_id="r0", command_name="build")
+        held, ready, done = (tmp_path / n for n in ("held", "ready", "done"))
+        env = dict(os.environ)
+        env[_LOCK_TIMEOUT_ENV] = "120"
+
+        def _spawn(op: str, name: str, held_path: str) -> subprocess.Popen:
+            return subprocess.Popen(
+                [
+                    sys.executable, "-c", _PAUSED_WRITER_SCRIPT, _EXT_ROOT, od, op, name,
+                    held_path, str(ready), str(done), "4",
+                ],
+                env=env, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+            )
+
+        procs: list[subprocess.Popen] = []
+        try:
+            procs.append(_spawn(*holder, str(held)))
+            _wait_for_file(str(held), timeout=120.0)  # read done, write pending
+            procs.append(_spawn(*racer, "-"))
+            _finish(procs)
+        finally:
+            for proc in procs:
+                if proc.poll() is None:
+                    proc.kill()
+
+        if holder[0] == "register":
+            generators = {r["generator"] for r in AR._read_registry_strict(od)["artifacts"].values()}
+            assert generators == {"a.py", "b.py"}
+        else:
+            runs = RM._read_ledger_strict(od)
+            assert set(runs) == {"r0", "r1"}
+            assert runs["r0"]["phase"] == "complete"
+            assert runs["r1"]["phase"] == "in_progress"
+        assert [n for n in _cache_files(outputs) if n.endswith((".tmp", ".lock"))] == []
 
 
 # ---------------------------------------------------------------------------
@@ -299,6 +490,129 @@ class TestAtomicWrite:
             LIO._fsync_directory(str(tmp_path))  # must not raise
         assert opened == [str(tmp_path)]
         LIO._fsync_directory(str(tmp_path))  # real platform: never raises
+
+
+# ---------------------------------------------------------------------------
+# Temporary files: default mode (F7)
+# ---------------------------------------------------------------------------
+
+class TestLedgerTempFileMode:
+    """F7: the temporary file came from tempfile.mkstemp, which creates it
+    0600 whatever the umask, and os.replace keeps that mode on the ledger.
+    Another account or container reading a bind-mounted outputs directory
+    then got PermissionError, and the lenient readers reported empty."""
+
+    def test_temp_file_is_created_exclusively_with_mode_0666(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        ledger = tmp_path / "ledger.json"
+        real_open = os.open
+        calls: list[tuple[str, int, int]] = []
+
+        def _spy(path, flags, mode=0o777, *args, **kwargs):
+            if str(path).endswith(".tmp"):
+                calls.append((os.path.basename(path), flags, mode))
+            return real_open(path, flags, mode, *args, **kwargs)
+
+        with monkeypatch.context() as m:
+            m.setattr(os, "open", _spy)
+            LIO.write_ledger_atomic(str(ledger), {"k": [1, 2]})
+
+        assert len(calls) == 1, calls
+        name, flags, mode = calls[0]
+        assert mode == 0o666  # the umask applies, as for open(path, "w")
+        assert flags & os.O_CREAT and flags & os.O_EXCL
+        binary = getattr(os, "O_BINARY", 0)
+        assert flags & binary == binary
+        assert re.fullmatch(r"ledger\.json\.[0-9a-f]{16}\.tmp", name), name
+        raw = ledger.read_bytes()
+        assert b"\r\r\n" not in raw  # no CRT text-mode translation on Windows
+        assert json.loads(raw.decode("utf-8")) == {"k": [1, 2]}
+        assert sorted(os.listdir(tmp_path)) == ["ledger.json"]
+
+    @pytest.mark.skipif(os.name != "posix", reason="POSIX permission bits")
+    @pytest.mark.parametrize("umask", [0o022, 0o002])
+    def test_ledger_mode_follows_the_umask_like_a_plain_open(
+        self, tmp_path: Path, umask: int,
+    ) -> None:
+        ledger = tmp_path / "ledger.json"
+        reference = tmp_path / "reference.json"
+        previous = os.umask(umask)
+        try:
+            LIO.write_ledger_atomic(str(ledger), {"k": 1})
+            with open(reference, "w", encoding="utf-8") as fh:
+                fh.write("{}")
+        finally:
+            os.umask(previous)
+        mode = stat.S_IMODE(os.stat(ledger).st_mode)
+        assert mode == 0o666 & ~umask
+        assert mode == stat.S_IMODE(os.stat(reference).st_mode)
+
+
+# ---------------------------------------------------------------------------
+# Temporary files: leftovers from a crash are swept (F8)
+# ---------------------------------------------------------------------------
+
+def _aged(path: Path, seconds: float) -> Path:
+    path.write_bytes(b'{"leftover": "' + b"x" * 4096 + b'"}')
+    when = time.time() - seconds
+    os.utime(path, (when, when))
+    return path
+
+
+class TestLedgerTempFileSweep:
+    """F8: a crash between creating the temporary file and os.replace left a
+    full-size copy of the ledger in the cache, and nothing ever removed it."""
+
+    def test_next_write_removes_this_ledgers_temp_files_older_than_an_hour(
+        self, tmp_path: Path,
+    ) -> None:
+        ledger = tmp_path / "ledger.json"
+        stale = _aged(tmp_path / f"ledger.json.{'a' * 16}.tmp", 2 * 3600)
+        fresh = _aged(tmp_path / f"ledger.json.{'b' * 16}.tmp", 60)
+        # Old, but not this ledger's temporary files: never touched.
+        others = [
+            _aged(tmp_path / f"other.json.{'c' * 16}.tmp", 2 * 3600),
+            _aged(tmp_path / "ledger.json.corrupt-0123456789abcdef", 2 * 3600),
+            _aged(tmp_path / "ledger.json.lock", 2 * 3600),
+            _aged(tmp_path / "ledger.json.notatoken.tmp", 2 * 3600),
+        ]
+
+        LIO.write_ledger_atomic(str(ledger), {"k": 1})
+
+        assert not stale.exists()
+        assert fresh.exists()
+        assert all(p.exists() for p in others)
+        assert json.loads(ledger.read_text(encoding="utf-8")) == {"k": 1}
+
+    def test_a_writer_sweeps_through_its_ledger_transaction(self, tmp_path: Path) -> None:
+        outputs = _outputs(tmp_path)
+        a = _write(outputs / "a.csv", "x\n1\n")
+        assert "error" not in AN.record_provenance(str(outputs), str(a))
+        cache = outputs / ".meridian-outputs-cache"
+        stale = _aged(cache / f"provenance_ledger.json.{'d' * 16}.tmp", 2 * 3600)
+        b = _write(outputs / "b.csv", "x\n2\n")
+        assert "error" not in AN.record_provenance(str(outputs), str(b))
+        assert not stale.exists()
+        assert [n for n in _cache_files(outputs) if n.endswith(".tmp")] == []
+
+    def test_a_temp_file_that_cannot_be_removed_does_not_block_the_write(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        ledger = tmp_path / "ledger.json"
+        stale = _aged(tmp_path / f"ledger.json.{'e' * 16}.tmp", 2 * 3600)
+        real_remove = os.remove
+
+        def _held_open(path: str) -> None:
+            if os.path.basename(path) == stale.name:
+                raise PermissionError("sharing violation")
+            real_remove(path)
+
+        with monkeypatch.context() as m:
+            m.setattr(os, "remove", _held_open)
+            LIO.write_ledger_atomic(str(ledger), {"k": 2})
+        assert stale.exists()
+        assert json.loads(ledger.read_text(encoding="utf-8")) == {"k": 2}
 
 
 # ---------------------------------------------------------------------------
