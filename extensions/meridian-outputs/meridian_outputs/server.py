@@ -687,7 +687,11 @@ def get_provenance_status_envelope(
       ``partial`` is ``True`` whenever ANY contained record is itself
       partial (e.g. a path that was never discovered, or is indexed but has
       no provenance record yet) -- never silently reported as fully
-      authoritative just because SOME paths resolved cleanly.
+      authoritative just because SOME paths resolved cleanly. A path whose
+      lookup hits an unreadable provenance store (a corrupt ledger) gets an
+      ``ambiguous``, confidence-0.0, partial record with
+      ``attributes.store_error="ledger_unreadable"`` instead of failing the
+      whole call.
 
     Raises:
       Nothing caught here escapes: an empty/missing ``outputs_dir`` or a
@@ -987,7 +991,10 @@ def bind_artifact_provenance(
       :func:`meridian_outputs.provenance.bind_artifact_provenance` for the
       full per-binding shape and status semantics (``resolved``/
       ``hash_mismatch``/``orphaned``/``unresolved``). ``all_clear`` is
-      ``True`` only when every artifact is ``resolved``.
+      ``True`` only when every artifact is ``resolved``. An artifact whose
+      lookup hits an unreadable provenance store is ``unresolved`` with
+      ``evidence="ledger_unreadable"``; the other artifacts still get their
+      own verdicts.
     """
     return provenance.bind_artifact_provenance(
         outputs_dir, artifacts, fuzzy_limit=fuzzy_limit,

@@ -1326,6 +1326,37 @@ class TestBuildProvenanceEnvelope:
         restored = RE.parse_provenance_envelope(payload, format="xml")
         assert restored == env
 
+    @duckdb_required
+    def test_corrupt_provenance_ledger_is_mapped_into_the_envelope(
+        self, tmp_path: Path,
+    ) -> None:
+        """An unreadable provenance ledger makes every path's lookup fail;
+        each still gets its own non-authoritative, partial record and the
+        envelope tool returns instead of raising."""
+        pytest.importorskip("mcp")
+        from meridian_outputs import server
+
+        a = tmp_path / "a.csv"
+        a.write_text("a\n1\n", encoding="utf-8")
+        AN.record_provenance(str(tmp_path), str(a))
+        Path(AN._ledger_path(str(tmp_path))).write_bytes(b"{not json")
+        paths = [str(a), str(tmp_path / "b.csv")]
+
+        env = PS.build_provenance_envelope(str(tmp_path), paths)
+        assert [r.identity.id for r in env.records] == paths
+        for record in env.records:
+            assert record.resolver.status is RE.ResolverStatus.AMBIGUOUS
+            assert not record.resolver.is_authoritative
+            assert record.partial is True
+            assert record.attributes["store_error"] == "ledger_unreadable"
+            assert "provenance_ledger.json" in record.partial_reason
+            assert str(tmp_path) not in record.partial_reason
+        assert env.partial is True
+
+        payload = server.get_provenance_status_envelope(str(tmp_path), paths)
+        assert len(payload["records"]) == 2
+        assert payload["partial"] is True
+
 
 # ---------------------------------------------------------------------------
 # db63385b (W31-B): a REAL get_provenance_status RELOCATED/AMBIGUOUS result

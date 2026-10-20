@@ -1345,6 +1345,39 @@ def evidence_record_from_provenance_status(
     )
 
 
+def _store_unreadable_evidence_record(
+    path: str, exc: BaseException,
+) -> "research_evidence.EvidenceRecord":
+    """OUTPUT record for a path whose provenance lookup hit a store that
+    cannot be read: ``AMBIGUOUS`` at confidence 0.0 (provenance unknown,
+    not confirmed either way -- never ``VERIFIED``, and not ``UNAVAILABLE``,
+    which this module reserves for confirmed absence) and ``partial``."""
+    detail = _store_error_detail(exc)
+    reason = (
+        f"a provenance store could not be read ({detail}) -- this path's "
+        "provenance is unknown"
+    )
+    now = _now_iso()
+    return research_evidence.EvidenceRecord(
+        identity=research_evidence.EvidenceIdentity(
+            id=path, kind=research_evidence.EvidenceKind.OUTPUT, locator=path,
+        ),
+        timestamps=research_evidence.EvidenceTimestamps(observed_at=now, updated_at=now),
+        resolver=research_evidence.ResolverState(
+            status=research_evidence.ResolverStatus.AMBIGUOUS,
+            confidence=0.0,
+            reason=reason,
+        ),
+        partial=True,
+        partial_reason=reason,
+        attributes={
+            "provenance_type": None,
+            "store_error": "ledger_unreadable",
+            "error": detail,
+        },
+    )
+
+
 def build_provenance_envelope(
     outputs_dir: str,
     paths: "list[str]",
@@ -1382,6 +1415,13 @@ def build_provenance_envelope(
       containing even one known-incomplete record is never reported as a
       fully-authoritative whole.
 
+      A path whose lookup hits a provenance store that cannot be read (a
+      corrupt ledger or an ``OSError``) still gets its own record: an
+      ``AMBIGUOUS``, confidence-0.0, ``partial`` record whose
+      ``attributes["store_error"]`` is ``"ledger_unreadable"`` (see
+      :func:`_store_unreadable_evidence_record`) -- the store failure is
+      reported in the envelope, never raised and never shown as verified.
+
     Raises:
       research_evidence.EnvelopeValidationError: ``outputs_dir`` is missing,
       or any individual ``path`` lookup itself errors (e.g. an empty-string
@@ -1393,7 +1433,11 @@ def build_provenance_envelope(
 
     records: "list[research_evidence.EvidenceRecord]" = []
     for path in paths:
-        status = get_provenance_status(outputs_dir, path)
+        try:
+            status = get_provenance_status(outputs_dir, path)
+        except (ledger_io.LedgerCorruptError, OSError) as exc:
+            records.append(_store_unreadable_evidence_record(path, exc))
+            continue
         if "error" in status:
             raise research_evidence.EnvelopeValidationError(
                 f"cannot build provenance envelope: {status['error']} "

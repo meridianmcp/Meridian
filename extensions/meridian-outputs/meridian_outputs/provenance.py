@@ -79,7 +79,7 @@ from __future__ import annotations
 import os
 from typing import Any
 
-from . import outputs_local, provenance_status
+from . import ledger_io, outputs_local, provenance_status
 
 __all__ = [
     "resolve_figure_output",
@@ -871,6 +871,28 @@ def _bind_one_artifact(
     }
 
 
+def _ledger_unreadable_binding(artifact: dict[str, Any], exc: BaseException) -> dict[str, Any]:
+    """UNRESOLVED binding for an artifact whose lookup hit a store that
+    cannot be read. A ``LedgerCorruptError`` names only the ledger's
+    basename; any other error is reduced to its type name, since an
+    ``OSError``'s text can carry a machine-local absolute path."""
+    detail = str(exc) if isinstance(exc, ledger_io.LedgerCorruptError) else type(exc).__name__
+    return {
+        "artifact_id": artifact.get("artifact_id"),
+        "kind": artifact.get("kind"),
+        "canonical_path": artifact.get("canonical_path"),
+        "generating_script": None,
+        "status": UNRESOLVED,
+        "match_type": None,
+        "evidence": "ledger_unreadable",
+        "resolved_sha256": None,
+        "reason": (
+            f"a meridian-outputs provenance store could not be read ({detail}) "
+            "-- this artifact's provenance cannot be confirmed either way"
+        ),
+    }
+
+
 def bind_artifact_provenance(
     outputs_dir: str,
     artifacts: "list[dict[str, Any]]",
@@ -930,7 +952,10 @@ def bind_artifact_provenance(
           walking ``outputs_dir`` yet -- fail-closed: incomplete evidence is
           never promoted to the confident ``"orphaned"`` verdict, since the
           artifact's real output may simply not have been indexed yet on a
-          large/cold tree.
+          large/cold tree, OR (``evidence="ledger_unreadable"``) a
+          provenance store this artifact's lookup needed could not be read
+          (a corrupt ledger or an ``OSError``) -- that artifact gets its own
+          unresolved binding and every other artifact is still classified.
 
       ``counts`` tallies each status across ``bindings`` (always all four
       keys, zero-filled). ``all_clear`` is ``True`` only when every artifact
@@ -954,10 +979,15 @@ def bind_artifact_provenance(
       applies to the rest of that tier's evidence), never proof the exact
       DOCX media file came from that generator.
     """
-    bindings = [
-        _bind_one_artifact(outputs_dir, artifact, fuzzy_limit=fuzzy_limit)
-        for artifact in (artifacts or [])
-    ]
+    bindings: list[dict[str, Any]] = []
+    for artifact in (artifacts or []):
+        # One unreadable store must not cost the other artifacts their
+        # verdicts: it becomes this artifact's own UNRESOLVED binding.
+        try:
+            binding = _bind_one_artifact(outputs_dir, artifact, fuzzy_limit=fuzzy_limit)
+        except (ledger_io.LedgerCorruptError, OSError) as exc:
+            binding = _ledger_unreadable_binding(artifact, exc)
+        bindings.append(binding)
     counts = {status: 0 for status in ARTIFACT_STATUSES}
     for binding in bindings:
         counts[binding["status"]] = counts.get(binding["status"], 0) + 1
