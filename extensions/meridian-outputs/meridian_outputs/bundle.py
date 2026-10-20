@@ -1079,8 +1079,11 @@ def import_bundle(
                 result["written_members"].append(name)
                 if step["module"] is annotate:
                     _invalidate_annotate_cache(step["path"])
+        except ledger_io.LedgerCorruptError:
+            # Only the re-check read raises this: the ledger the plan read
+            # cleanly no longer parses, so it changed under the import.
+            return _concurrent_modification_result(result)
         except (OSError, TimeoutError, TypeError, ValueError, outputs_local.IndexLockAcquireError):
-            result["reason"] = "write_failed"
-            return result
+            return _refuse("write_failed")
     result["imported"] = True
     return result

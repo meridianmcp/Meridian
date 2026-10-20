@@ -1046,6 +1046,61 @@ class TestImport:
         assert result["reason"] == "write_failed"
         assert result["written_members"] == []
 
+    def test_second_ledger_write_failure_is_a_refusal(self, populated, monkeypatch) -> None:
+        """S-R4-8: a write that failed part-way returned reason write_failed
+        with refused=False, unlike every other stop."""
+        _export(populated["outputs"])
+        target = _empty_target(populated["root"])
+        _copy_bundle(populated["outputs"], "backup/bundle.json", target)
+        real_write = B._atomic_write_json
+        writes = {"n": 0}
+
+        def _second_fails(path, obj, *, indent):
+            writes["n"] += 1
+            if writes["n"] == 2:
+                raise OSError("read-only volume")
+            real_write(path, obj, indent=indent)
+
+        monkeypatch.setattr(B, "_atomic_write_json", _second_fails)
+        result = B.import_bundle("incoming.json", str(target), dry_run=False)
+        assert result["refused"] is True
+        assert result["imported"] is False
+        assert result["reason"] == "write_failed"
+        assert result["written_members"] == ["artifact_registry"]
+        assert _ledger_path(target, "artifact_registry").exists()
+        assert not _ledger_path(target, "fingerprint_ledger").exists()
+
+    def test_ledger_corrupted_after_the_plan_is_a_concurrent_modification(
+        self, tmp_path, monkeypatch,
+    ) -> None:
+        """S-R4-8: a target ledger that was valid when planned but corrupt at
+        the pre-write re-check raised LedgerCorruptError (a ValueError) there,
+        which was reported as write_failed with refused=False. The ledger
+        changed under the import, so it is a concurrent_modification refusal,
+        and the corrupt file is left as it is."""
+        target, _gen = _fingerprint_import_setup(tmp_path)
+        ledger = _ledger_path(target, "fingerprint_ledger")
+        garbage = b'{"b.csv": {"script_path": "trunc'
+        monkeypatch.setattr(B, "_file_signature", lambda path: (1, 1))
+        real_read = fingerprint._read_ledger
+        calls = {"n": 0}
+
+        def _read_then_corrupt(outputs_dir):
+            calls["n"] += 1
+            data = real_read(outputs_dir)
+            if calls["n"] == 1:  # the plan's read; the file is damaged after it
+                ledger.write_bytes(garbage)
+            return data
+
+        monkeypatch.setattr(fingerprint, "_read_ledger", _read_then_corrupt)
+        result = B.import_bundle("incoming.json", str(target), dry_run=False)
+        assert calls["n"] == 2  # the re-check read the corrupt file
+        assert result["refused"] is True
+        assert result["imported"] is False
+        assert result["reason"] == "concurrent_modification"
+        assert result["written_members"] == []
+        assert ledger.read_bytes() == garbage
+
     def test_import_replace_failure_leaves_no_temp_file(self, populated, monkeypatch) -> None:
         _export(populated["outputs"])
         target = _empty_target(populated["root"])
