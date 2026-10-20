@@ -25,7 +25,8 @@ What IS new here: one more atomic-JSON ledger --
 ``<outputs_dir>/.meridian-outputs-cache/run_manifest_ledger.json`` -- keyed
 by ``run_id``, following the exact same convention ``annotate.py``/
 ``fingerprint.py``/``artifact_registry.py`` already established (same cache
-dir, same ``os.replace`` atomic write, same in-process ``RLock``, same
+dir, same ``os.replace`` atomic write, same cross-process
+``ledger_io.ledger_transaction`` around every read-modify-write, same
 "never raises on I/O, degrade instead" discipline). This is deliberately
 the ONLY new piece of durable state this module owns -- every other field
 in a run-manifest record is either a caller-supplied identity input or a
@@ -70,8 +71,9 @@ import logging
 import os
 import subprocess
 import threading
+from contextlib import contextmanager
 from datetime import datetime, timezone
-from typing import Any, Callable
+from typing import Any, Callable, Iterator
 
 from . import artifact_registry, environment, fingerprint, ledger_io, outputs_local, research_evidence
 from .path_security import relative_reference
@@ -97,12 +99,12 @@ _CACHE_DIRNAME = ".meridian-outputs-cache"
 _LEDGER_FILENAME = "run_manifest_ledger.json"
 _SCHEMA_VERSION = 1
 
-# In-process only (not cross-process) -- see module docstring: this ledger
-# follows the SAME lower-stakes, mostly-single-writer sidecar convention
-# annotate.py/fingerprint.py already established. RLock (not Lock): several
-# functions below do their own read-modify-write and may be called reentrantly
-# from within a caller already holding this lock via a wrapping helper --
-# mirrors annotate.py's own fa600e42 fix for the identical hazard.
+# In-process lock, taken INSIDE the cross-process ledger transaction by every
+# writer (_ledger_write_transaction) and by bundle.import_bundle, in that
+# order, so neither can hold it while waiting for the transaction. The
+# transaction alone already serialises writers in every process (its own
+# per-path thread lock included); this lock is kept because bundle's import
+# takes it. Never take a ledger transaction for this ledger while holding it.
 _write_lock = threading.RLock()
 
 _VALID_START_PHASE = "in_progress"
@@ -191,16 +193,16 @@ def _parse_ledger_strict(path: str, raw: "bytes | None") -> dict[str, dict[str, 
 
 
 def _read_ledger_for_write(outputs_dir: str) -> dict[str, dict[str, Any]]:
-    """The writers' read, taken under ``_write_lock``. Strict: a corrupt
-    ledger is quarantined and ``ledger_io.LedgerCorruptError`` raised
-    (``ledger_io.raise_quarantined``), so it is never read as ``{}`` and
-    replaced by an entry-only ledger. Continuing from empty (as the
-    provenance ledger's writer does) would also drop the per-run
-    immutability check :func:`start_run_manifest` makes against the existing
-    record. Any other read ``OSError`` propagates; nothing is written. The
-    file is read once and the quarantine copies exactly the bytes that
-    failed: ``_write_lock`` is in-process only, so another process may
-    replace the file meanwhile."""
+    """The writers' read, taken inside :func:`_ledger_write_transaction`.
+    Strict: a corrupt ledger is quarantined and
+    ``ledger_io.LedgerCorruptError`` raised (``ledger_io.raise_quarantined``),
+    so it is never read as ``{}`` and replaced by an entry-only ledger.
+    Continuing from empty (as the provenance ledger's writer does) would also
+    drop the per-run immutability check :func:`start_run_manifest` makes
+    against the existing record. Any other read ``OSError`` propagates;
+    nothing is written. The file is read once and the quarantine copies
+    exactly the bytes that failed. Takes no lock itself: the transaction's
+    lock is not reentrant."""
     path = _ledger_path(outputs_dir, create=False)
     raw = ledger_io._read_bytes(path)
     try:
@@ -209,17 +211,22 @@ def _read_ledger_for_write(outputs_dir: str) -> dict[str, dict[str, Any]]:
         ledger_io.raise_quarantined(exc, raw)
 
 
-def _write_ledger_entry(outputs_dir: str, key: str, record: dict[str, Any]) -> None:
-    """Read-modify-write one run row. The write is a unique temp file, fsync,
-    then ``os.replace`` (``ledger_io.write_ledger_atomic``): a crash can never
-    leave a zero-length or truncated ledger, which the strict read would
-    refuse for good, and a failed write leaves the previous ledger and no temp
-    file behind."""
-    path = _ledger_path(outputs_dir)
-    with _write_lock:
-        ledger = _read_ledger_for_write(outputs_dir)
-        ledger[key] = record
-        ledger_io.write_ledger_atomic(path, ledger)
+@contextmanager
+def _ledger_write_transaction(outputs_dir: str) -> Iterator[ledger_io.LedgerTransaction]:
+    """Hold the run-manifest ledger for one read-modify-write.
+
+    ``ledger_io.ledger_transaction`` on the path the readers use (lock file
+    ``run_manifest_ledger.json.lock``), so a writer in another process can
+    no longer commit between this writer's read and its replace and have
+    its row dropped; then ``_write_lock`` inside it, the order
+    ``bundle.import_bundle`` takes the two in. Read with
+    :func:`_read_ledger_for_write` and write with ``txn.commit`` (unique temp
+    file, fsync, ``os.replace``). Not reentrant: never open a second one, or
+    any other transaction on this ledger, inside it. Raises
+    ``outputs_local.IndexLockAcquireError`` when another process holds the
+    ledger past the lock timeout; nothing is written then."""
+    with ledger_io.ledger_transaction(_ledger_path(outputs_dir)) as txn, _write_lock:
+        yield txn
 
 
 def _utcnow_iso() -> str:
@@ -614,6 +621,8 @@ def start_run_manifest(
       ledger_io.LedgerCorruptError: the run-manifest ledger exists but cannot
       be parsed. Its bytes are quarantined (``quarantine_path``) and nothing
       is written: a damaged ledger is never replaced by this one record.
+      outputs_local.IndexLockAcquireError: another process held the ledger's
+      cross-process lock past its timeout; nothing is written.
     """
     if not outputs_dir or not str(outputs_dir).strip():
         raise RunManifestError("outputs_dir is required")
@@ -695,7 +704,9 @@ def start_run_manifest(
     manifest["updated_at"] = now
 
     key = manifest["run_id"]
-    with _write_lock:
+    # One transaction for the read, the immutability check and the write:
+    # a concurrent writer in any process cannot commit in between.
+    with _ledger_write_transaction(outputs_dir) as txn:
         ledger = _read_ledger_for_write(outputs_dir)
         existing = ledger.get(key)
         ok, reason = check_run_manifest_immutable(existing, manifest)
@@ -703,7 +714,8 @@ def start_run_manifest(
             raise RunManifestError(reason)
         if existing is not None and existing.get("manifest_hash") == manifest["manifest_hash"]:
             return dict(existing)
-        _write_ledger_entry(outputs_dir, key, manifest)
+        ledger[key] = manifest
+        txn.commit(ledger)
     return dict(manifest)
 
 
@@ -764,6 +776,8 @@ def finalize_run_manifest(
       not quarantined here).
       OSError: ``artifact_ids`` is non-empty and the artifact registry cannot
       be read; nothing is written.
+      outputs_local.IndexLockAcquireError: another process held the ledger's
+      cross-process lock past its timeout; nothing is written.
     """
     if not outputs_dir or not str(outputs_dir).strip():
         raise RunManifestError("outputs_dir is required")
@@ -775,7 +789,22 @@ def finalize_run_manifest(
             f"status must be one of {_VALID_FINAL_STATUSES}, got {status!r}"
         )
 
-    with _write_lock:
+    # Hashing the outputs and the convergence snapshot read no ledger, so
+    # they run before the cross-process lock: hashing large outputs while
+    # holding it would stall every other process's run-manifest writer.
+    output_hashes = _hash_paths(output_paths)
+    missing = sorted(p for p, h in output_hashes.items() if h is None)
+    output_identity = {
+        "file_hashes": dict(sorted(output_hashes.items())),
+        "file_set_hash": _file_set_hash(output_hashes),
+        "missing_or_unreadable": missing,
+    }
+    convergence_at_finish = _safe_convergence(outputs_dir)
+
+    # The registry is read inside this transaction without a lock of its own
+    # (a strict, lock-free read of a different ledger path), so no second
+    # transaction is ever nested here.
+    with _ledger_write_transaction(outputs_dir) as txn:
         ledger = _read_ledger_for_write(outputs_dir)
         existing = ledger.get(key)
         if existing is None:
@@ -784,14 +813,6 @@ def finalize_run_manifest(
                 f"{outputs_dir!r} -- call start_run_manifest first (finalize "
                 "never creates a fresh identity)"
             )
-
-        output_hashes = _hash_paths(output_paths)
-        missing = sorted(p for p, h in output_hashes.items() if h is None)
-        output_identity = {
-            "file_hashes": dict(sorted(output_hashes.items())),
-            "file_set_hash": _file_set_hash(output_hashes),
-            "missing_or_unreadable": missing,
-        }
 
         resolved_artifact_ids: list[str] = []
         unknown_artifact_ids: list[str] = []
@@ -833,11 +854,12 @@ def finalize_run_manifest(
         updated["artifact_ids"] = sorted(set(resolved_artifact_ids))
         updated["unknown_artifact_ids"] = sorted(set(unknown_artifact_ids))
         updated["status_reason"] = status_reason
-        updated["convergence_at_finish"] = _safe_convergence(outputs_dir)
+        updated["convergence_at_finish"] = convergence_at_finish
         updated["updated_at"] = _utcnow_iso()
         # manifest_hash is an IDENTITY hash fixed at start_run_manifest time
         # -- deliberately untouched here (see _HASH_EXCLUDED_KEYS).
-        _write_ledger_entry(outputs_dir, key, updated)
+        ledger[key] = updated
+        txn.commit(ledger)
     return dict(updated)
 
 

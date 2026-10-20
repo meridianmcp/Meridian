@@ -79,9 +79,10 @@ import platform
 import threading
 import time
 import uuid
+from contextlib import contextmanager
 from dataclasses import asdict, dataclass, field
 from datetime import datetime, timezone
-from typing import Any
+from typing import Any, Iterator
 
 from . import annotate, fingerprint, ledger_io, outputs_local
 
@@ -122,10 +123,12 @@ _REGISTRY_FILENAME = "artifact_registry.json"
 # artifact_id, so it is a constant, not configuration.
 _ARTIFACT_ID_NAMESPACE = uuid.UUID("6f1d6b6a-6d3a-4b1a-9a9b-e1c979e36d57")
 
-# In-process only, matching annotate.py's own reasoning: this is a
-# lower-stakes, mostly-single-writer sidecar ledger, not the shared FTS
-# index -- cross-process portalocker exclusivity is not warranted here
-# either.
+# In-process lock, taken INSIDE the cross-process registry transaction by
+# every writer (_registry_write_transaction) and by bundle.import_bundle, in
+# that order, so neither can hold it while waiting for the transaction. The
+# transaction alone already serialises writers in every process (its own
+# per-path thread lock included); this lock is kept because bundle's import
+# takes it. Never take a ledger transaction for the registry while holding it.
 _write_lock = threading.Lock()
 
 RESOLVED = "resolved"
@@ -222,14 +225,14 @@ def _read_registry_strict(outputs_dir: str) -> dict[str, Any]:
 
 
 def _read_registry_for_write(outputs_dir: str) -> dict[str, Any]:
-    """The writers' read, taken under ``_write_lock``. A corrupt registry is
-    quarantined and ``ledger_io.LedgerCorruptError`` raised
-    (``ledger_io.raise_quarantined``), so it is never read as empty and
-    replaced by a one-artifact registry. Continuing from empty would also
+    """The writers' read, taken inside :func:`_registry_write_transaction`. A
+    corrupt registry is quarantined and ``ledger_io.LedgerCorruptError``
+    raised (``ledger_io.raise_quarantined``), so it is never read as empty
+    and replaced by a one-artifact registry. Continuing from empty would also
     drop the content-hash conflict check :func:`register_artifact` makes
     against the existing record. Nothing is written. The file is read once
-    and the quarantine copies exactly the bytes that failed: ``_write_lock``
-    is in-process only, so another process may replace the file meanwhile."""
+    and the quarantine copies exactly the bytes that failed. Takes no lock
+    itself: the transaction's lock is not reentrant."""
     path = _registry_path(outputs_dir, create=False)
     raw = ledger_io._read_bytes(path)
     try:
@@ -242,8 +245,28 @@ def _write_registry(outputs_dir: str, registry: dict[str, Any]) -> None:
     """Unique temp file, fsync, then ``os.replace``
     (``ledger_io.write_ledger_atomic``): a crash can never leave a zero-length
     or truncated registry, which the strict read would refuse for good, and a
-    failed write leaves the previous registry and no temp file behind."""
+    failed write leaves the previous registry and no temp file behind. Takes
+    no lock: the writers below read-modify-write inside
+    :func:`_registry_write_transaction` and commit through it instead."""
     ledger_io.write_ledger_atomic(_registry_path(outputs_dir), registry)
+
+
+@contextmanager
+def _registry_write_transaction(outputs_dir: str) -> Iterator[ledger_io.LedgerTransaction]:
+    """Hold the registry for one read-modify-write.
+
+    ``ledger_io.ledger_transaction`` on the path the readers use (lock file
+    ``artifact_registry.json.lock``), so a writer in another process can no
+    longer commit between this writer's read and its replace and have its
+    artifact or edge dropped; then ``_write_lock`` inside it, the order
+    ``bundle.import_bundle`` takes the two in. Read with
+    :func:`_read_registry_for_write` and write with ``txn.commit`` (unique
+    temp file, fsync, ``os.replace``). Not reentrant: never open a second
+    one, or any other transaction on the registry, inside it. Raises
+    ``outputs_local.IndexLockAcquireError`` when another process holds the
+    registry past the lock timeout; nothing is written then."""
+    with ledger_io.ledger_transaction(_registry_path(outputs_dir)) as txn, _write_lock:
+        yield txn
 
 
 def _utcnow_iso() -> str:
@@ -453,6 +476,10 @@ def register_artifact(
         parsed. Its bytes are quarantined (``quarantine_path``) and nothing
         is written. :func:`set_lifecycle_state` and :func:`bind_source_edge`
         refuse the same way.
+      outputs_local.IndexLockAcquireError: another process held the
+        registry's cross-process lock past its timeout; nothing is written.
+        :func:`set_lifecycle_state` and :func:`bind_source_edge` raise it
+        the same way.
     """
     if not outputs_dir or not str(outputs_dir).strip():
         raise RegistryError("register_artifact: outputs_dir is required")
@@ -481,7 +508,7 @@ def register_artifact(
         source_locator=source_locator,
     )
 
-    with _write_lock:
+    with _registry_write_transaction(outputs_dir) as txn:
         registry = _read_registry_for_write(outputs_dir)
         existing = registry["artifacts"].get(artifact_id)
         now = _utcnow_iso()
@@ -546,7 +573,7 @@ def register_artifact(
                 })
 
         registry["artifacts"][artifact_id] = record
-        _write_registry(outputs_dir, registry)
+        txn.commit(registry)
 
     return {**record, "created": existing is None}
 
@@ -820,7 +847,7 @@ def set_lifecycle_state(
             f"set_lifecycle_state: lifecycle_state must be one of "
             f"{LIFECYCLE_STATES}, got {lifecycle_state!r}"
         )
-    with _write_lock:
+    with _registry_write_transaction(outputs_dir) as txn:
         registry = _read_registry_for_write(outputs_dir)
         record = registry["artifacts"].get(artifact_id)
         if record is None:
@@ -835,7 +862,7 @@ def set_lifecycle_state(
             "from": previous, "to": lifecycle_state, "at": now, "reason": reason,
         })
         registry["artifacts"][artifact_id] = record
-        _write_registry(outputs_dir, registry)
+        txn.commit(registry)
     return dict(record)
 
 
@@ -867,7 +894,7 @@ def bind_source_edge(
     if not isinstance(relation, str) or not relation.strip():
         raise RegistryError("bind_source_edge: relation must be a non-empty string")
 
-    with _write_lock:
+    with _registry_write_transaction(outputs_dir) as txn:
         registry = _read_registry_for_write(outputs_dir)
         if artifact_id not in registry["artifacts"]:
             raise RegistryError(
@@ -883,7 +910,7 @@ def bind_source_edge(
                     merged = dict(edge.get("metadata") or {})
                     merged.update(metadata)
                     edge["metadata"] = merged
-                _write_registry(outputs_dir, registry)
+                txn.commit(registry)
                 return dict(edge)
 
         edge = SourceEdge(
@@ -895,7 +922,7 @@ def bind_source_edge(
             metadata=dict(metadata or {}),
         ).to_dict()
         registry["edges"].append(edge)
-        _write_registry(outputs_dir, registry)
+        txn.commit(registry)
     return edge
 
 
