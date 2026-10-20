@@ -129,13 +129,17 @@ import contextlib
 import copy
 import hashlib
 import json
+import logging
 import os
+import stat
 import tempfile
 from datetime import datetime, timezone
 from typing import Any, Iterator
 
 from . import annotate, artifact_registry, fingerprint, ledger_io, outputs_local, run_manifest
 from .path_security import _require_within, relative_output_path
+
+_log = logging.getLogger(__name__)
 
 __all__ = [
     "BUNDLE_FORMAT",
@@ -346,9 +350,10 @@ def _publish_create_only(tmp: str, path: str) -> None:
     then unlinked. Where hard links are unavailable (no ``os.link``, or a
     filesystem that refuses them), ``path`` is reserved with ``O_CREAT |
     O_EXCL`` (FileExistsError if it exists) and ``tmp`` is renamed over that
-    empty reservation; a failed rename removes the reservation again. A
-    writer passing ``overwrite=True`` may still replace the file, which is
-    what overwrite means.
+    empty reservation; any failure after the reservation, its ``fstat``
+    included, removes it again (:func:`_remove_reservation`) before the
+    error propagates. A writer passing ``overwrite=True`` may still replace
+    the file, which is what overwrite means.
     """
     link = getattr(os, "link", None)
     if link is not None:
@@ -363,18 +368,57 @@ def _publish_create_only(tmp: str, path: str) -> None:
                 os.unlink(tmp)
             return
     fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o666)
+    reserved: os.stat_result | None = None
     try:
-        reserved = os.fstat(fd)
-    finally:
-        os.close(fd)
-    try:
+        try:
+            reserved = os.fstat(fd)
+        finally:
+            os.close(fd)
         ledger_io._retry_sharing(lambda: os.replace(tmp, path))
     except BaseException:
-        with contextlib.suppress(OSError):
-            current = os.stat(path)
-            if (current.st_dev, current.st_ino) == (reserved.st_dev, reserved.st_ino):
-                os.unlink(path)
+        _remove_reservation(path, reserved)
         raise
+
+
+def _remove_reservation(path: str, reserved: os.stat_result | None) -> None:
+    """Remove the empty O_EXCL reservation :func:`_publish_create_only` made
+    at ``path`` if ``path`` is still that file. Never raises an OSError.
+
+    ``reserved`` is the reservation's ``fstat``, compared by ``(st_dev,
+    st_ino)``. When that ``fstat`` itself failed it is None, and only an
+    empty regular file is removed: that is what the reservation is, O_EXCL
+    proved the name was free, nothing in this package removes another
+    writer's reservation, and a published bundle is never empty.
+
+    The unlink retries a Windows sharing violation the way the rename does,
+    since the reader whose open handle made the rename fail usually makes
+    the first unlink fail too. A reservation that still cannot be removed is
+    logged as a leftover with its path before the caller's error
+    propagates: every later create-only export to that path is refused as
+    "already exists" until it is removed, and it is an empty file, which
+    :func:`verify_bundle` never accepts as a bundle.
+    """
+    def _unlink_if_reserved() -> None:
+        try:
+            current = os.stat(path)
+            if reserved is not None:
+                if (current.st_dev, current.st_ino) != (reserved.st_dev, reserved.st_ino):
+                    return
+            elif not (stat.S_ISREG(current.st_mode) and current.st_size == 0):
+                return
+            os.unlink(path)
+        except FileNotFoundError:
+            return
+
+    try:
+        ledger_io._retry_sharing(_unlink_if_reserved)
+    except OSError as exc:
+        _log.warning(
+            "%s: failed create-only bundle publish left its empty reservation "
+            "as a leftover (%s); later create-only exports to that path are "
+            "refused until it is removed",
+            path, type(exc).__name__,
+        )
 
 
 def _atomic_write_json(

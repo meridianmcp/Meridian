@@ -6,6 +6,7 @@ metadata: export, verify, and a fail-closed import.
 from __future__ import annotations
 
 import json
+import logging
 import os
 import shutil
 import sys
@@ -614,6 +615,117 @@ class TestExport:
         assert list((populated["outputs"] / "backup").iterdir()) == []
         monkeypatch.undo()
         assert B.export_bundle(str(populated["outputs"]), "backup/x.json")["exported"] is True
+
+    @staticmethod
+    def _reader_holds_reservation(monkeypatch, *, unlinks_refused: int | None) -> dict[str, int]:
+        """No hard links, and a reader holding the empty reservation open:
+        every rename onto it fails with a sharing violation, and so do the
+        first ``unlinks_refused`` unlinks of it (all of them when None)."""
+        monkeypatch.delattr(B.os, "link")
+        monkeypatch.setattr(ledger_io, "_SHARING_RETRY_SLEEP_SECONDS", 0.0)
+        real_unlink = os.unlink
+        refused = {"unlinks": 0}
+
+        def _replace(_src, _dst):
+            raise PermissionError("sharing violation")
+
+        def _unlink(path, *args, **kwargs):
+            if os.path.basename(os.fspath(path)) == "x.json" and (
+                unlinks_refused is None or refused["unlinks"] < unlinks_refused
+            ):
+                refused["unlinks"] += 1
+                raise PermissionError("sharing violation")
+            return real_unlink(path, *args, **kwargs)
+
+        monkeypatch.setattr(B.os, "replace", _replace)
+        monkeypatch.setattr(B.os, "unlink", _unlink)
+        return refused
+
+    def test_cleanup_unlink_retries_a_sharing_violation(self, populated, monkeypatch) -> None:
+        """S-R4-11: the reader that made the rename fail also made the one
+        cleanup unlink fail; its error was suppressed and the empty
+        reservation stayed, so every later create-only export was refused as
+        "already exists". The cleanup now retries the sharing violation the
+        way the rename does, and the reservation is gone before the export
+        reports its failure."""
+        refused = self._reader_holds_reservation(monkeypatch, unlinks_refused=3)
+        result = B.export_bundle(str(populated["outputs"]), "backup/x.json")
+        assert result == {"exported": False, "error": "failed to write bundle (PermissionError)"}
+        assert refused["unlinks"] == 3
+        assert list((populated["outputs"] / "backup").iterdir()) == []
+        monkeypatch.undo()
+        assert B.export_bundle(str(populated["outputs"]), "backup/x.json")["exported"] is True
+
+    def test_reservation_that_outlives_the_retries_is_logged_as_a_leftover(
+        self, populated, monkeypatch, caplog,
+    ) -> None:
+        """S-R4-11: a reservation still held after every retry is logged as a
+        leftover naming its path before the export reports failure. It stays
+        an empty file: a later create-only export refuses it as an existing
+        file, and verify_bundle never takes it for a finished bundle."""
+        od = str(populated["outputs"])
+        target = populated["outputs"] / "backup" / "x.json"
+        refused = self._reader_holds_reservation(monkeypatch, unlinks_refused=None)
+        with caplog.at_level(logging.WARNING, logger=B.__name__):
+            result = B.export_bundle(od, "backup/x.json")
+        assert result == {"exported": False, "error": "failed to write bundle (PermissionError)"}
+        assert refused["unlinks"] == ledger_io._SHARING_RETRIES
+        warnings = [r for r in caplog.records if r.name == B.__name__]
+        assert len(warnings) == 1
+        assert "leftover" in warnings[0].getMessage()
+        assert os.path.samefile(warnings[0].args[0], target)
+        assert [p.name for p in target.parent.iterdir()] == ["x.json"]  # no temp file
+        assert target.stat().st_size == 0
+        monkeypatch.undo()
+        assert B.export_bundle(od, "backup/x.json") == {"exported": False, "error": B._EXISTS_ERROR}
+        report = B.verify_bundle(str(target))
+        assert report["verified"] is False
+        assert report["errors"] == ["bundle is not valid JSON (JSONDecodeError)"]
+        assert target.stat().st_size == 0
+
+    def test_fstat_failure_after_the_reservation_removes_it(self, populated, monkeypatch) -> None:
+        """S-R4-12: the fstat of the fresh O_EXCL reservation ran outside the
+        try that removes it, so an fstat failure left the empty reservation
+        behind and every later create-only export was refused as "already
+        exists". It now leaves no reservation and no temp file."""
+        monkeypatch.delattr(B.os, "link")
+        od = str(populated["outputs"])
+        real_open, real_fstat = os.open, os.fstat
+        reservations: list[int] = []
+
+        def _open(path, flags, *args, **kwargs):
+            fd = real_open(path, flags, *args, **kwargs)
+            if flags & os.O_EXCL and os.path.basename(os.fspath(path)) == "x.json":
+                reservations.append(fd)
+            return fd
+
+        def _fstat(fd):
+            if fd in reservations:
+                reservations.remove(fd)  # the fd number may be reused later
+                raise OSError(5, "I/O error")
+            return real_fstat(fd)
+
+        monkeypatch.setattr(B.os, "open", _open)
+        monkeypatch.setattr(B.os, "fstat", _fstat)
+        result = B.export_bundle(od, "backup/x.json")
+        assert result == {"exported": False, "error": "failed to write bundle (OSError)"}
+        assert reservations == []  # the reservation was made and its fstat failed
+        assert list((populated["outputs"] / "backup").iterdir()) == []
+        monkeypatch.undo()
+        assert B.export_bundle(od, "backup/x.json")["exported"] is True
+
+    def test_cleanup_without_an_fstat_never_removes_a_non_empty_file(
+        self, tmp_path, monkeypatch,
+    ) -> None:
+        """S-R4-12: with no fstat to compare identity against, the cleanup
+        removes only what the reservation is, an empty regular file."""
+        target = tmp_path / "bundle.json"
+        target.write_text('{"published": 1}', encoding="utf-8")
+        B._remove_reservation(str(target), None)
+        assert target.read_text(encoding="utf-8") == '{"published": 1}'
+        target.write_bytes(b"")
+        B._remove_reservation(str(target), None)
+        assert not target.exists()
 
 
 class TestVerify:

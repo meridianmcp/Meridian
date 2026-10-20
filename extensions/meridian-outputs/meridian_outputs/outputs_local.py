@@ -2096,8 +2096,14 @@ _ZIP_CENTRAL_LEN = 46
 # zipfile reads the whole central directory into memory and splits each
 # record's extra field by repeated slicing, which is quadratic in the extra
 # length; 256 records with 64 KiB extras is about 16 MiB of directory and
-# far more work. numpy's directory for 256 members is about 15 KB.
-_NPZ_MAX_CENTRAL_DIRECTORY_BYTES = 1 << 20
+# far more work. numpy's directory for 256 members is about 15 KB, but a
+# valid archive at the member cap with long member names (4 KiB each) is
+# just over 1 MiB, so a 1 MiB cap refused it and lost its array names,
+# shapes and dtypes. At 4 MiB the cost stays bounded: at most about 64
+# records with full 64 KiB extra fields fit, which zipfile parses in about
+# 2.5 s (measured on CPython 3.12; budget up to ~5 s on slower machines),
+# and the record walk still stops at _NPZ_MAX_MEMBERS + 1 records.
+_NPZ_MAX_CENTRAL_DIRECTORY_BYTES = 4 << 20
 
 
 def _zip_end_record(fh: Any) -> tuple[int, bytes] | None:
