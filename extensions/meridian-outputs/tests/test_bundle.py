@@ -569,6 +569,50 @@ class TestExport:
         monkeypatch.undo()
         assert B.export_bundle(str(populated["outputs"]), "backup/x.json")["exported"] is True
 
+    def test_fstat_failure_after_the_reservation_removes_it(self, populated, monkeypatch) -> None:
+        """S-R4-12: the fstat of the fresh O_EXCL reservation ran outside the
+        try that removes it, so an fstat failure left the empty reservation
+        behind and every later create-only export was refused as "already
+        exists". It now leaves no reservation and no temp file."""
+        monkeypatch.delattr(B.os, "link")
+        od = str(populated["outputs"])
+        real_open, real_fstat = os.open, os.fstat
+        reservations: list[int] = []
+
+        def _open(path, flags, *args, **kwargs):
+            fd = real_open(path, flags, *args, **kwargs)
+            if flags & os.O_EXCL and os.path.basename(os.fspath(path)) == "x.json":
+                reservations.append(fd)
+            return fd
+
+        def _fstat(fd):
+            if fd in reservations:
+                reservations.remove(fd)  # the fd number may be reused later
+                raise OSError(5, "I/O error")
+            return real_fstat(fd)
+
+        monkeypatch.setattr(B.os, "open", _open)
+        monkeypatch.setattr(B.os, "fstat", _fstat)
+        result = B.export_bundle(od, "backup/x.json")
+        assert result == {"exported": False, "error": "failed to write bundle (OSError)"}
+        assert reservations == []  # the reservation was made and its fstat failed
+        assert list((populated["outputs"] / "backup").iterdir()) == []
+        monkeypatch.undo()
+        assert B.export_bundle(od, "backup/x.json")["exported"] is True
+
+    def test_cleanup_without_an_fstat_never_removes_a_non_empty_file(
+        self, tmp_path, monkeypatch,
+    ) -> None:
+        """S-R4-12: with no fstat to compare identity against, the cleanup
+        removes only what the reservation is, an empty regular file."""
+        target = tmp_path / "bundle.json"
+        target.write_text('{"published": 1}', encoding="utf-8")
+        B._remove_reservation(str(target), None)
+        assert target.read_text(encoding="utf-8") == '{"published": 1}'
+        target.write_bytes(b"")
+        B._remove_reservation(str(target), None)
+        assert not target.exists()
+
 
 class TestVerify:
     def test_fresh_bundle_verifies(self, populated) -> None:
