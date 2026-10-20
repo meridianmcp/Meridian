@@ -292,11 +292,43 @@ class TestSourceResolution:
         def _boom(*_a, **_k):
             raise RuntimeError("run ledger unreadable")
 
-        monkeypatch.setattr(run_manifest, "get_run_manifest", _boom)
+        monkeypatch.setattr(run_manifest, "_read_ledger_strict", _boom)
         result = PV.get_output_lineage(outputs, path=str(layout["out"]))
         assert {"kind": "store", "store": "run_manifest",
                 "reason": "store_unreadable", "error_type": "RuntimeError"} in result["unresolved"]
-        assert result["run"]["found"] is False
+        # Unknown, not "not found": the ledger could not be read.
+        assert result["run"]["found"] is None
+        assert all(g.get("reason") != "run_manifest_not_found" for g in result["unresolved"])
+
+    @pytest.mark.parametrize("content", [b"", b'{"run-1": {"run_id": "run-1"', b'{"run-1": null}'])
+    def test_corrupt_run_ledger_is_store_unreadable_not_run_missing(
+        self, layout, content,
+    ) -> None:
+        """S-F7b: the run block read the run ledger leniently, so a damaged
+        ledger reported run_manifest_not_found instead of a store gap."""
+        outputs = str(layout["outputs"])
+        upstream = layout["outputs"] / "upstream.csv"
+        upstream.write_text("u\n1\n", encoding="utf-8")
+        annotate.record_provenance(outputs, str(upstream), generating_script="fetch.py")
+        annotate.record_provenance(outputs, str(layout["out"]), generating_script="upstream.csv")
+        run_manifest.start_run_manifest(outputs, run_id="run-1", command_name="gen")
+        artifact_registry.register_artifact(
+            outputs, "output", canonical_path=str(layout["out"]), generator="gen.py",
+            run_id="run-1",
+        )
+        healthy = PV.get_output_lineage(outputs, path=str(layout["out"]))
+        assert healthy["run"]["found"] is True
+        assert healthy["complete"] is True
+
+        ledger = layout["outputs"] / ".meridian-outputs-cache" / "run_manifest_ledger.json"
+        ledger.write_bytes(content)
+        result = PV.get_output_lineage(outputs, path=str(layout["out"]))
+        assert {"kind": "store", "store": "run_manifest",
+                "reason": "store_unreadable", "error_type": "LedgerCorruptError"} in result["unresolved"]
+        assert all(g.get("reason") != "run_manifest_not_found" for g in result["unresolved"])
+        assert result["run"]["found"] is None
+        assert result["complete"] is False
+        _assert_no_absolute_path(result, layout["root"])
 
 
 class TestStaleness:
