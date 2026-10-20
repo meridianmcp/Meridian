@@ -126,11 +126,15 @@ def _normalize_path(path: str) -> str:
     return os.path.normcase(os.path.normpath(s)).replace("\\", "/")
 
 
-def _cache_dir(outputs_dir: str) -> str:
+def _cache_dir(outputs_dir: str, *, create: bool = True) -> str:
     """``<outputs_dir>/.meridian-outputs-cache`` -- created + gitignored on
-    first use. Never raises; falls back to the (uncreated) path on failure so
-    callers degrade to a no-op read/write rather than crashing."""
+    first write. Never raises; falls back to the (uncreated) path on failure
+    so callers degrade to a no-op read/write rather than crashing.
+    ``create=False`` (every read path) only computes the path: a read never
+    creates the directory or edits a ``.gitignore``."""
     cache_dir = os.path.join(outputs_dir, _CACHE_DIRNAME)
+    if not create:
+        return cache_dir
     try:
         os.makedirs(cache_dir, exist_ok=True)
         outputs_local.ensure_gitignored(cache_dir)
@@ -139,8 +143,8 @@ def _cache_dir(outputs_dir: str) -> str:
     return cache_dir
 
 
-def _ledger_path(outputs_dir: str) -> str:
-    return os.path.join(_cache_dir(outputs_dir), _LEDGER_FILENAME)
+def _ledger_path(outputs_dir: str, *, create: bool = True) -> str:
+    return os.path.join(_cache_dir(outputs_dir, create=create), _LEDGER_FILENAME)
 
 
 # fa600e42 -- path -> (stat signature, parsed ledger dict). Avoids re-reading
@@ -199,7 +203,8 @@ def _load_ledger_unlocked(path: str) -> dict[str, dict[str, Any]]:
 
 
 def _read_ledger(outputs_dir: str) -> dict[str, dict[str, Any]]:
-    return _load_ledger_unlocked(_ledger_path(outputs_dir))
+    # A missing cache directory reads as a missing ledger ({}), never created.
+    return _load_ledger_unlocked(_ledger_path(outputs_dir, create=False))
 
 
 def _history_parts(entry: dict[str, Any]) -> tuple[list[dict[str, Any]], int]:

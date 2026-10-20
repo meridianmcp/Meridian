@@ -71,7 +71,7 @@ import threading
 from datetime import datetime, timezone
 from typing import Any, Callable
 
-from . import artifact_registry, environment, fingerprint, outputs_local, research_evidence
+from . import artifact_registry, environment, fingerprint, ledger_io, outputs_local, research_evidence
 from .path_security import relative_reference
 
 _log = logging.getLogger(__name__)
@@ -136,8 +136,13 @@ class RunManifestError(ValueError):
 # Ledger location + atomic read/write (same convention as annotate.py)
 # ---------------------------------------------------------------------------
 
-def _cache_dir(outputs_dir: str) -> str:
+def _cache_dir(outputs_dir: str, *, create: bool = True) -> str:
+    """``<outputs_dir>/.meridian-outputs-cache``, created + gitignored on a
+    write. ``create=False`` (every read path) only computes the path: a read
+    never creates the directory or edits a ``.gitignore``."""
     cache_dir = os.path.join(outputs_dir, _CACHE_DIRNAME)
+    if not create:
+        return cache_dir
     try:
         os.makedirs(cache_dir, exist_ok=True)
         outputs_local.ensure_gitignored(cache_dir)
@@ -146,18 +151,34 @@ def _cache_dir(outputs_dir: str) -> str:
     return cache_dir
 
 
-def _ledger_path(outputs_dir: str) -> str:
-    return os.path.join(_cache_dir(outputs_dir), _LEDGER_FILENAME)
+def _ledger_path(outputs_dir: str, *, create: bool = True) -> str:
+    return os.path.join(_cache_dir(outputs_dir, create=create), _LEDGER_FILENAME)
 
 
 def _read_ledger(outputs_dir: str) -> dict[str, dict[str, Any]]:
-    path = _ledger_path(outputs_dir)
+    path = _ledger_path(outputs_dir, create=False)
     try:
         with open(path, "r", encoding="utf-8") as fh:
             data = json.load(fh)
     except (OSError, ValueError):
         return {}
     return data if isinstance(data, dict) else {}
+
+
+def _read_ledger_strict(outputs_dir: str) -> dict[str, dict[str, Any]]:
+    """Strict read for staleness lookups (:func:`check_input_staleness`,
+    :func:`run_ids_for_output`): ``{}`` only for a missing ledger. Bytes that
+    are not a JSON object, or a run row that is not an object, raise
+    ``ledger_io.LedgerCorruptError`` -- an unreadable ledger is never read
+    as "no run covers this output". :func:`_read_ledger` keeps its lenient
+    behaviour for the writers and plain listings."""
+    path = _ledger_path(outputs_dir, create=False)
+    ledger = ledger_io.read_ledger_strict(path)
+    for record in ledger.values():
+        if not isinstance(record, dict):
+            kind = "null" if record is None else type(record).__name__
+            raise ledger_io.LedgerCorruptError(path, f"a run row is {kind}, not an object")
+    return ledger
 
 
 def _write_ledger_entry(outputs_dir: str, key: str, record: dict[str, Any]) -> None:
@@ -295,14 +316,18 @@ def _snapshot_inputs(
 ) -> "tuple[dict[str, str | None], dict[str, dict[str, Any]]]":
     """``(file_hashes, input_stat)`` for ``input_paths``.
 
-    ``file_hashes`` is exactly what ``_hash_paths`` always produced (keyed by
-    the path as given, hashed as given), so ``manifest_hash`` is unchanged by
-    this feature. ``input_stat`` maps each input's normalised key to
-    ``{exists, size, mtime_ns, sha256}``. Each file is stat-ed BEFORE it is
-    hashed: if it changes in between, a later check sees a stat mismatch and
-    re-hashes, so a change during capture can cost one extra hash but can
-    never be missed. An input given by absolute path (or relative to a
-    working directory that is ``outputs_dir``) is hashed once for both maps.
+    Every input is resolved ONCE, by :func:`_resolve_ref` (a relative path
+    against ``outputs_dir``, never the working directory -- the same
+    resolver :func:`check_input_staleness` uses), and that one file is both
+    stat-ed and hashed. ``file_hashes`` stays keyed by the path as given
+    (the stored identity keys are unchanged); ``input_stat`` maps each
+    input's normalised key to ``{exists, size, mtime_ns, sha256}``. For an
+    absolute input, or a relative one from a run started with the working
+    directory at ``outputs_dir``, ``file_hashes`` is exactly what
+    ``_hash_paths`` produced, so ``manifest_hash`` is unchanged there. Each
+    file is stat-ed BEFORE it is hashed: if it changes in between, a later
+    check sees a stat mismatch and re-hashes, so a change during capture can
+    cost one extra hash but can never be missed.
     """
     file_hashes: "dict[str, str | None]" = {}
     input_stat: dict[str, dict[str, Any]] = {}
@@ -310,12 +335,11 @@ def _snapshot_inputs(
         given = str(raw)
         resolved = _resolve_ref(outputs_dir, given)
         st = _stat_or_none(resolved)
-        file_hashes[given] = fingerprint.script_content_hash(given)
-        same_file = os.path.realpath(os.path.abspath(given)) == resolved
+        sha = fingerprint.script_content_hash(resolved) if st is not None else None
+        file_hashes[given] = sha
         if st is None:
             entry: dict[str, Any] = {"exists": False, "size": None, "mtime_ns": None, "sha256": None}
         else:
-            sha = file_hashes[given] if same_file else fingerprint.script_content_hash(resolved)
             entry = {"exists": True, "size": st.st_size, "mtime_ns": st.st_mtime_ns, "sha256": sha}
         input_stat[_input_key(outputs_dir, resolved)] = entry
     return file_hashes, dict(sorted(input_stat.items()))
@@ -507,7 +531,8 @@ def start_run_manifest(
     ``repo_dir``), package/tool version (``meridian_outputs.__version__``,
     the interpreter version, platform), command identity (``command_name``
     + ``command_args``), input hashes (:func:`fingerprint.script_content_hash`
-    over ``input_paths``), the bounds actually in effect
+    over ``input_paths``, a relative path resolved against ``outputs_dir``,
+    never the working directory), the bounds actually in effect
     (:func:`_snapshot_bounds`), the on-disk location of every ledger this
     run can reference (this module's own, plus the provenance/fingerprint/
     artifact-registry ledgers this package already maintains), and a
@@ -822,7 +847,11 @@ def check_input_staleness(
     ``outputs_dir`` (absolute when on another volume); a relative input path
     is resolved against ``outputs_dir``. A manifest written before
     ``input_stat`` existed has no stat baseline, so every input is re-hashed
-    against ``input_identity.file_hashes`` (``baseline="legacy_hash_only"``).
+    against ``input_identity.file_hashes`` (``baseline="legacy_hash_only"``),
+    each resolved by the same resolver :func:`start_run_manifest` hashes
+    with. (A manifest started before that resolver was shared may hold a
+    working-directory hash for a relative input; such an input can report
+    ``changed``/``appeared`` -- fail closed, never missed.)
 
     Returns ``{run_id, strict, baseline, stale, reason, inputs, stale_inputs,
     stale_outputs, hashed_count}``. ``stale_outputs`` lists the run's
@@ -832,10 +861,13 @@ def check_input_staleness(
     Raises:
       RunManifestError: missing ``outputs_dir``/``run_id``, or no manifest
       was ever started for ``run_id``.
+      ledger_io.LedgerCorruptError: the run-manifest ledger exists but
+      cannot be parsed (strict read) -- never reported as "no manifest".
     """
     if not outputs_dir or not str(outputs_dir).strip():
         raise RunManifestError("outputs_dir is required")
-    manifest = get_run_manifest(outputs_dir, run_id)
+    key = str(run_id).strip() if run_id else ""
+    manifest = _read_ledger_strict(outputs_dir).get(key) if key else None
     if manifest is None:
         raise RunManifestError(f"no run manifest found for run_id={run_id!r}")
 
@@ -890,12 +922,15 @@ def run_ids_for_output(
     """Run ids whose manifest covers output ``path``: every run whose
     finalized ``output_identity`` lists it (relative paths resolved against
     ``outputs_dir``), plus ``record_run_id`` (a provenance record's
-    ``run_id``) when that run exists. Sorted; one ledger read."""
+    ``run_id``) when that run exists. Sorted; one strict ledger read:
+    raises ``ledger_io.LedgerCorruptError`` for an unreadable ledger rather
+    than returning ``[]`` ("no run covers it")."""
     if not path or not str(path).strip():
         return []
     target = os.path.normcase(_resolve_ref(outputs_dir, str(path)))
     found: set[str] = set()
-    for manifest in list_run_manifests(outputs_dir):
+    ledger = _read_ledger_strict(outputs_dir)
+    for manifest in (ledger[k] for k in sorted(ledger)):
         rid = manifest.get("run_id")
         if not isinstance(rid, str):
             continue

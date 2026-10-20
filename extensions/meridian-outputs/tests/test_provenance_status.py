@@ -815,6 +815,64 @@ class TestStaleByScript:
         assert status["staleness"]["stale"] is True
         assert status["script_staleness"] is None  # never fingerprint-tagged
 
+    @duckdb_required
+    @pytest.mark.parametrize("garbage", [b"", b"{not json", b"[1, 2]"])
+    def test_corrupt_fingerprint_ledger_keeps_exact_with_unknown_script_staleness(
+        self, tmp_path: Path, garbage: bytes,
+    ) -> None:
+        """An unreadable fingerprint ledger must not break an exact lookup:
+        the record is kept, script staleness is reported unknown (never
+        "not stale"), and the typed bridge never calls it VERIFIED."""
+        script = tmp_path / "train.py"
+        script.write_text("print('v1')\n", encoding="utf-8")
+        output = tmp_path / "result.csv"
+        output.write_text("a,b\n1,2\n", encoding="utf-8")
+        AN.record_provenance(str(tmp_path), str(output), generating_script=str(script))
+        FP.tag_output(str(output), str(tmp_path), script_path=str(script))
+        Path(FP._ledger_path(str(tmp_path))).write_bytes(garbage)
+
+        status = PS.get_provenance_status(str(tmp_path), str(output))
+        assert status["provenance_type"] == PS.EXACT
+        assert status["record"] is not None
+        assert status["staleness"]["stale"] is False  # the output itself is unchanged
+        script_staleness = status["script_staleness"]
+        assert script_staleness["is_stale"] is None
+        assert script_staleness["error"] == "ledger_unreadable"
+        assert "fingerprint_ledger.json" in script_staleness["reason"]
+        assert str(tmp_path) not in script_staleness["reason"]
+
+        resolver = PS.evidence_record_from_provenance_status(status).resolver
+        assert resolver.status is RE.ResolverStatus.AMBIGUOUS
+        assert not resolver.is_authoritative
+
+        backed = PS.get_manifest_backed_provenance_status(str(tmp_path), str(output), None)
+        assert backed["provenance_type"] == PS.EXACT
+        assert backed["script_staleness"]["is_stale"] is None
+
+    @duckdb_required
+    @pytest.mark.parametrize("row", ["null", "3", '"x"', "[1]"])
+    def test_non_object_fingerprint_row_is_corruption_not_attribute_error(
+        self, tmp_path: Path, row: str,
+    ) -> None:
+        """A valid-JSON ledger with a non-object row passes the top-level
+        parse; the strict read must still reject it as corrupt."""
+        from meridian_outputs import ledger_io as LIO
+
+        output = tmp_path / "result.csv"
+        output.write_text("a,b\n1,2\n", encoding="utf-8")
+        AN.record_provenance(str(tmp_path), str(output))
+        Path(FP._ledger_path(str(tmp_path))).write_text(
+            '{"result.csv": ' + row + "}", encoding="utf-8",
+        )
+
+        with pytest.raises(LIO.LedgerCorruptError, match="not an object"):
+            FP.check_staleness(str(tmp_path))
+        with pytest.raises(LIO.LedgerCorruptError):
+            FP.find_stale_by_script(str(tmp_path), str(tmp_path / "train.py"))
+        status = PS.get_provenance_status(str(tmp_path), str(output))
+        assert status["provenance_type"] == PS.EXACT
+        assert status["script_staleness"]["is_stale"] is None
+
 
 # ---------------------------------------------------------------------------
 # Canonical/archival identity (item d3374b0e)
@@ -1291,6 +1349,37 @@ class TestBuildProvenanceEnvelope:
         payload = RE.serialize_provenance_envelope(env, format="xml")
         restored = RE.parse_provenance_envelope(payload, format="xml")
         assert restored == env
+
+    @duckdb_required
+    def test_corrupt_provenance_ledger_is_mapped_into_the_envelope(
+        self, tmp_path: Path,
+    ) -> None:
+        """An unreadable provenance ledger makes every path's lookup fail;
+        each still gets its own non-authoritative, partial record and the
+        envelope tool returns instead of raising."""
+        pytest.importorskip("mcp")
+        from meridian_outputs import server
+
+        a = tmp_path / "a.csv"
+        a.write_text("a\n1\n", encoding="utf-8")
+        AN.record_provenance(str(tmp_path), str(a))
+        Path(AN._ledger_path(str(tmp_path))).write_bytes(b"{not json")
+        paths = [str(a), str(tmp_path / "b.csv")]
+
+        env = PS.build_provenance_envelope(str(tmp_path), paths)
+        assert [r.identity.id for r in env.records] == paths
+        for record in env.records:
+            assert record.resolver.status is RE.ResolverStatus.AMBIGUOUS
+            assert not record.resolver.is_authoritative
+            assert record.partial is True
+            assert record.attributes["store_error"] == "ledger_unreadable"
+            assert "provenance_ledger.json" in record.partial_reason
+            assert str(tmp_path) not in record.partial_reason
+        assert env.partial is True
+
+        payload = server.get_provenance_status_envelope(str(tmp_path), paths)
+        assert len(payload["records"]) == 2
+        assert payload["partial"] is True
 
 
 # ---------------------------------------------------------------------------

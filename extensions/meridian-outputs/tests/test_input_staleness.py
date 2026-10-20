@@ -128,6 +128,51 @@ class TestCheckInputStaleness:
         for run_id in ("rel", "abs", "both"):
             assert RM.check_input_staleness(str(outputs), run_id)["stale_inputs"] == ["data/in.csv"]
 
+    def test_relative_input_is_stat_ed_and_hashed_as_one_file(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """A relative input used to be stat-ed under outputs_dir but hashed
+        against the working directory. Both now use one resolver."""
+        outputs = tmp_path / "outputs"
+        inp = _write(outputs / "data" / "in.csv", "a\n1\n")
+        _write(tmp_path / "cwd" / "data" / "in.csv", "same name, different file\n")
+        monkeypatch.chdir(tmp_path / "cwd")
+
+        rec = _start(outputs, "r1", ["data/in.csv"])
+        expected = RM.fingerprint.script_content_hash(str(inp))
+        assert rec["input_identity"]["file_hashes"] == {"data/in.csv": expected}
+        assert rec["input_stat"]["data/in.csv"]["sha256"] == expected
+        assert RM.check_input_staleness(str(outputs), "r1")["stale"] is False
+
+        # The identity no longer depends on the working directory.
+        monkeypatch.chdir(outputs)
+        assert _start(outputs, "r1", ["data/in.csv"])["manifest_hash"] == rec["manifest_hash"]
+
+        inp.write_text("a\n1\n2\n", encoding="utf-8")
+        result = RM.check_input_staleness(str(outputs), "r1")
+        assert result["stale"] is True
+        assert _by_input(result) == {"data/in.csv": "changed"}
+
+    def test_legacy_baseline_of_relative_input_uses_the_same_resolver(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        outputs = tmp_path / "outputs"
+        inp = _write(outputs / "data" / "in.csv", "a\n1\n")
+        elsewhere = tmp_path / "elsewhere"
+        elsewhere.mkdir()
+        monkeypatch.chdir(elsewhere)
+        _start(outputs, "r1", ["data/in.csv"])
+        ledger_file = outputs / ".meridian-outputs-cache" / "run_manifest_ledger.json"
+        ledger = json.loads(ledger_file.read_text(encoding="utf-8"))
+        del ledger["r1"]["input_stat"]
+        ledger_file.write_text(json.dumps(ledger), encoding="utf-8")
+
+        unchanged = RM.check_input_staleness(str(outputs), "r1")
+        assert unchanged["baseline"] == "legacy_hash_only"
+        assert unchanged["stale"] is False
+        inp.write_text("a\n2\n", encoding="utf-8")
+        assert _by_input(RM.check_input_staleness(str(outputs), "r1")) == {"data/in.csv": "changed"}
+
     def test_strict_catches_same_size_same_mtime_edit_default_misses_it(
         self, tmp_path: Path,
     ) -> None:
@@ -296,6 +341,71 @@ class TestProvenanceStatusInputStaleness:
         assert status["input_staleness"]["stale"] is True  # reported, shape untouched
 
         assert "input_staleness" not in PS.get_provenance_status(str(tmp_path), "")
+
+    def _covered_output(self, tmp_path: Path) -> Path:
+        inp = _write(tmp_path / "in.csv", "a\n1\n")
+        out = _write(tmp_path / "out.csv", "r\n1\n")
+        _start(tmp_path, "r1", [str(inp)])
+        RM.finalize_run_manifest(str(tmp_path), "r1", output_paths=[str(out)])
+        AN.record_provenance(str(tmp_path), str(out), run_id="r1")
+        return out
+
+    @pytest.mark.parametrize("garbage", [b"", b"{not json", b'{"r1": null}'])
+    def test_corrupt_run_manifest_ledger_is_unknown_not_fresh(
+        self, tmp_path: Path, garbage: bytes,
+    ) -> None:
+        pytest.importorskip("duckdb")
+        from meridian_outputs import ledger_io as LIO
+        from meridian_outputs import provenance_status as PS
+        from meridian_outputs import research_evidence as RE
+
+        out = self._covered_output(tmp_path)
+        before = PS.get_provenance_status(str(tmp_path), str(out))
+        assert before["input_staleness"]["stale"] is False
+        assert PS.evidence_record_from_provenance_status(before).resolver.status is (
+            RE.ResolverStatus.VERIFIED
+        )
+
+        ledger = tmp_path / ".meridian-outputs-cache" / "run_manifest_ledger.json"
+        ledger.write_bytes(garbage)
+        status = PS.get_provenance_status(str(tmp_path), str(out))
+        assert status["provenance_type"] == PS.EXACT
+        assert status["input_staleness"]["stale"] is None
+        assert status["input_staleness"]["error"] == "LedgerCorruptError"
+        assert "run_manifest_ledger.json" in status["input_staleness"]["reason"]
+        assert str(tmp_path) not in status["input_staleness"]["reason"]
+        assert status["staleness"]["stale"] is None
+        assert "input staleness unknown" in status["staleness"]["reason"]
+        assert PS.evidence_record_from_provenance_status(status).resolver.status is (
+            RE.ResolverStatus.AMBIGUOUS
+        )
+        with pytest.raises(LIO.LedgerCorruptError):
+            RM.run_ids_for_output(str(tmp_path), str(out))
+        with pytest.raises(LIO.LedgerCorruptError):
+            RM.check_input_staleness(str(tmp_path), "r1")
+
+    def test_failed_run_check_is_unknown_not_fresh(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        pytest.importorskip("duckdb")
+        from meridian_outputs import provenance_status as PS
+        from meridian_outputs import research_evidence as RE
+
+        out = self._covered_output(tmp_path)
+
+        def _boom(*_a, **_k):
+            raise OSError("input volume went away")
+
+        monkeypatch.setattr(RM, "check_input_staleness", _boom)
+        status = PS.get_provenance_status(str(tmp_path), str(out))
+        assert status["input_staleness"]["stale"] is None
+        assert status["input_staleness"]["runs"] == [
+            {"run_id": "r1", "stale": None, "error": "input volume went away"},
+        ]
+        assert status["staleness"]["stale"] is None
+        assert PS.evidence_record_from_provenance_status(status).resolver.status is (
+            RE.ResolverStatus.AMBIGUOUS
+        )
 
 
 class TestServerWrapper:

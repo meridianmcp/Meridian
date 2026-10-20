@@ -513,6 +513,42 @@ class TestIncompleteEvidenceFailsClosed:
 
 
 # ---------------------------------------------------------------------------
+# An unreadable provenance store is a per-artifact verdict, never a crash
+# ---------------------------------------------------------------------------
+
+class TestUnreadableStoreFailsClosed:
+    def test_corrupt_provenance_ledger_keeps_every_binding(self, tmp_path: Path) -> None:
+        """Each unindexed artifact falls through to get_provenance_status,
+        whose strict ledger read raises on a corrupt ledger. That must not
+        abort the batch: every artifact gets its own UNRESOLVED binding."""
+        cache = tmp_path / ".meridian-outputs-cache"
+        cache.mkdir()
+        (cache / "provenance_ledger.json").write_bytes(b"")  # zero bytes: corrupt
+        artifacts = [
+            {
+                "artifact_id": f"fig-{i}", "kind": "figure",
+                "canonical_path": str(tmp_path / f"missing_{i}.png"),
+            }
+            for i in range(10)
+        ]
+
+        result = PV.bind_artifact_provenance(str(tmp_path), artifacts)
+        assert [b["artifact_id"] for b in result["bindings"]] == [
+            f"fig-{i}" for i in range(10)
+        ]
+        assert result["counts"] == {
+            PV.RESOLVED: 0, PV.ORPHANED: 0, PV.HASH_MISMATCH: 0, PV.UNRESOLVED: 10,
+        }
+        assert result["all_clear"] is False
+        for binding in result["bindings"]:
+            assert binding["status"] == PV.UNRESOLVED
+            assert binding["evidence"] == "ledger_unreadable"
+            assert binding["kind"] == "figure"
+            assert "provenance_ledger.json" in binding["reason"]
+            assert str(tmp_path) not in binding["reason"]
+
+
+# ---------------------------------------------------------------------------
 # Aggregate counts / all_clear across a mixed manifest
 # ---------------------------------------------------------------------------
 

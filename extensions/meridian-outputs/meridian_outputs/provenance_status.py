@@ -172,12 +172,15 @@ The ``provenance_type`` -> :class:`~research_evidence.ResolverStatus` mapping
   - :data:`EXACT` -> ``VERIFIED`` when the output's own content hash still
     matches what was recorded, ``STALE`` when it does not, or ``AMBIGUOUS``
     when there simply isn't enough hash data to say either way (e.g. no
-    content hash was ever captured) -- never silently reported as verified
-    just because an exact record exists.
+    content hash was ever captured, or the fingerprint ledger could not be
+    read so script staleness is unknown, or input staleness is unknown
+    because the run-manifest ledger or a run's check failed) -- never
+    silently reported as verified just because an exact record exists.
   - :data:`RELOCATED` -> ``VERIFIED`` (confidence 0.75, lower than a
     same-path :data:`EXACT` match's 0.95) -- content identity IS confirmed
     by hash, just at a different path than originally recorded; the reason
-    string names the matched prior path.
+    string names the matched prior path. ``AMBIGUOUS`` instead while input
+    staleness is unknown.
   - :data:`AMBIGUOUS` (this module's ``provenance_type``, not to be confused
     with the identically-named :class:`~research_evidence.ResolverStatus`
     member several OTHER branches below also map to) -> ``AMBIGUOUS``, low
@@ -271,7 +274,7 @@ import os
 from datetime import datetime, timezone
 from typing import Any
 
-from . import annotate, fingerprint, outputs_local, research_evidence
+from . import annotate, fingerprint, ledger_io, outputs_local, research_evidence
 
 _log = logging.getLogger(__name__)
 
@@ -405,14 +408,46 @@ def _stale_by_script_result(outputs_dir: str, path: str) -> dict[str, Any] | Non
     compare) -- this is NOT the same as "not stale"; callers must check for
     ``None`` before reading ``is_stale``. Otherwise the matching
     :class:`fingerprint.StalenessResult`, as a dict.
+
+    When the fingerprint ledger exists but cannot be read
+    (``ledger_io.LedgerCorruptError`` or an ``OSError``), whether ``path``
+    was tagged and whether its script changed are both unknown: the result
+    is a dict of the same shape with ``is_stale`` ``None``, a ``reason``
+    saying why, and ``error="ledger_unreadable"`` -- never ``None`` ("never
+    tagged") and never an exception that would lose the exact record.
     """
     target = annotate._normalize_path(path)
     if not target:
         return None
-    for result in fingerprint.check_staleness(outputs_dir):
+    try:
+        results = fingerprint.check_staleness(outputs_dir)
+    except (ledger_io.LedgerCorruptError, OSError) as exc:
+        return {
+            "path": path,
+            "script_path": None,
+            "tagged_script_hash": None,
+            "current_script_hash": None,
+            "is_stale": None,
+            "reason": (
+                f"fingerprint ledger could not be read ({_store_error_detail(exc)}) "
+                "-- script staleness cannot be confirmed either way"
+            ),
+            "error": "ledger_unreadable",
+        }
+    for result in results:
         if annotate._normalize_path(result.path) == target:
             return result.to_dict()
     return None
+
+
+def _store_error_detail(exc: BaseException) -> str:
+    """Short, portable description of a store read failure. A
+    ``LedgerCorruptError`` names only the ledger's basename; any other error
+    is reduced to its type name, since an ``OSError``'s text can carry a
+    machine-local absolute path."""
+    if isinstance(exc, ledger_io.LedgerCorruptError):
+        return str(exc)
+    return type(exc).__name__
 
 
 def _directory_fallback(outputs_dir: str, path: str) -> dict[str, Any] | None:
@@ -571,10 +606,16 @@ def _input_staleness(
 ) -> dict[str, Any] | None:
     """Input-change staleness for ``path`` from the run manifests that cover
     it: runs whose finalized outputs list ``path``, plus the exact record's
-    own ``run_id``. ``None`` when no run manifest covers ``path``. A run
-    whose check fails is reported with ``error`` and never counted stale
-    (staleness cannot be confirmed either way). Run manifests only: tag_output
-    and artifact source edges record no input hashes."""
+    own ``run_id``. ``None`` when no run manifest covers ``path``.
+
+    ``stale`` is ``True`` when any covering run's inputs changed, ``False``
+    when every covering run was checked and none changed, and ``None``
+    (unknown) when the run-manifest ledger could not be read or a run's
+    check failed and no other run is stale -- staleness cannot be confirmed
+    either way, so it is never reported as ``False``. An unreadable ledger
+    gives ``{"stale": None, "runs": [], "reason": ..., "error": ...}``; a
+    failed run is listed with ``stale: None`` and ``error``. Run manifests
+    only: tag_output and artifact source edges record no input hashes."""
     from . import run_manifest  # noqa: PLC0415 -- lazy: keep module import order unchanged
 
     record = status.get("record")
@@ -585,9 +626,17 @@ def _input_staleness(
     )
     try:
         run_ids = run_manifest.run_ids_for_output(outputs_dir, path, record_run_id=record_run_id)
-    except Exception:  # noqa: BLE001 -- additive signal, never breaks the status call
+    except Exception as exc:  # noqa: BLE001 -- additive signal, never breaks the status call
         _log.debug("get_provenance_status: run lookup failed for %r", path, exc_info=True)
-        return None
+        return {
+            "stale": None,
+            "runs": [],
+            "reason": (
+                f"run manifest ledger could not be read ({_store_error_detail(exc)}) "
+                "-- input staleness cannot be confirmed either way"
+            ),
+            "error": type(exc).__name__,
+        }
     if not run_ids:
         return None
     runs: list[dict[str, Any]] = []
@@ -595,7 +644,7 @@ def _input_staleness(
         try:
             result = run_manifest.check_input_staleness(outputs_dir, run_id)
         except Exception as exc:  # noqa: BLE001
-            runs.append({"run_id": run_id, "stale": False, "error": str(exc)})
+            runs.append({"run_id": run_id, "stale": None, "error": str(exc)})
             continue
         runs.append({
             "run_id": run_id,
@@ -603,19 +652,39 @@ def _input_staleness(
             "stale_inputs": result["stale_inputs"],
             "reason": result["reason"],
         })
-    stale_runs = [r for r in runs if r["stale"]]
-    reason = (
-        "; ".join(f"run {r['run_id']}: {r['reason']}" for r in stale_runs)
-        if stale_runs else "no input of a covering run changed since that run started"
-    )
-    return {"stale": bool(stale_runs), "runs": runs, "reason": reason}
+    stale_runs = [r for r in runs if r["stale"] is True]
+    unknown_runs = [r for r in runs if r["stale"] is None]
+    if stale_runs:
+        return {
+            "stale": True,
+            "runs": runs,
+            "reason": "; ".join(f"run {r['run_id']}: {r['reason']}" for r in stale_runs),
+        }
+    if unknown_runs:
+        return {
+            "stale": None,
+            "runs": runs,
+            "reason": (
+                "input staleness check failed for "
+                + ", ".join(f"run {r['run_id']}" for r in unknown_runs)
+                + " -- cannot be confirmed either way"
+            ),
+        }
+    return {
+        "stale": False,
+        "runs": runs,
+        "reason": "no input of a covering run changed since that run started",
+    }
 
 
 def _with_input_staleness(fn: Any) -> Any:
     """Adds the ``input_staleness`` key to every non-error answer and, when
     an input of a covering run changed, sets ``staleness["stale"]`` and
     appends the reason -- only on branches that carry a ``staleness`` dict
-    (EXACT, STALE_BY_SCRIPT, RELOCATED). Every existing key is unchanged."""
+    (EXACT, STALE_BY_SCRIPT, RELOCATED). When input staleness is unknown
+    (``stale`` ``None``), a ``staleness["stale"]`` that is not already
+    ``True`` becomes ``None`` with the reason appended: it is never left
+    reading as a clean ``False``. Every existing key is unchanged."""
     @functools.wraps(fn)
     def wrapper(outputs_dir: str, path: str) -> dict[str, Any]:
         status = fn(outputs_dir, path)
@@ -624,10 +693,20 @@ def _with_input_staleness(fn: Any) -> Any:
         input_staleness = _input_staleness(outputs_dir, path, status)
         status["input_staleness"] = input_staleness
         staleness = status.get("staleness")
-        if input_staleness and input_staleness["stale"] and isinstance(staleness, dict):
-            staleness["stale"] = True
-            note = f"an input changed since its run started ({input_staleness['reason']})"
-            staleness["reason"] = f"{staleness['reason']}; {note}" if staleness.get("reason") else note
+        if input_staleness and isinstance(staleness, dict):
+            if input_staleness["stale"] is True:
+                staleness["stale"] = True
+                note = f"an input changed since its run started ({input_staleness['reason']})"
+            elif input_staleness["stale"] is None:
+                if staleness.get("stale") is not True:
+                    staleness["stale"] = None
+                note = f"input staleness unknown ({input_staleness['reason']})"
+            else:
+                note = None
+            if note:
+                staleness["reason"] = (
+                    f"{staleness['reason']}; {note}" if staleness.get("reason") else note
+                )
         return status
 
     return wrapper
@@ -660,8 +739,10 @@ def get_provenance_status(outputs_dir: str, path: str) -> dict[str, Any]:
           stronger, more specific staleness signal (item d3374b0e).
         - :data:`EXACT` -- ``record`` is the exact ``annotate.get_provenance``
           record; ``staleness`` is populated (see :func:`_staleness`).
-          ``script_staleness`` is ``None`` (never fingerprint-tagged) or
-          not stale.
+          ``script_staleness`` is ``None`` (never fingerprint-tagged), not
+          stale, or unknown (``is_stale`` ``None`` with
+          ``error="ledger_unreadable"`` when the fingerprint ledger cannot
+          be read -- the exact record is still returned).
         - :data:`RELOCATED` -- no exact record for THIS path, but either (a)
           exactly one OTHER recorded path's ``content_hash`` matches this
           file's current content (fa600e42; ``record`` is that matching
@@ -709,7 +790,9 @@ def get_provenance_status(outputs_dir: str, path: str) -> dict[str, Any]:
       ``run_id``). When it is stale and the branch has a ``staleness`` dict,
       ``staleness["stale"]`` is set and the reason appended, for this path
       only -- other outputs are affected only if their own runs' inputs
-      changed.
+      changed. When the run-manifest ledger cannot be read or a run's check
+      fails, ``input_staleness["stale"]`` is ``None`` (unknown) and a
+      ``staleness["stale"]`` that was not ``True`` becomes ``None`` too.
     """
     if not outputs_dir or not str(outputs_dir).strip():
         return {"error": "outputs_dir is required"}
@@ -1028,6 +1111,22 @@ def _resolver_state_for_provenance_status(
     staleness = status.get("staleness") or {}
     script_staleness = status.get("script_staleness") or {}
     inconclusive = bool(status.get("inconclusive"))
+    # Input staleness that could not be checked (run-manifest ledger
+    # unreadable, or a run's check failed): EXACT/RELOCATED must not be
+    # reported VERIFIED while it is unknown.
+    input_staleness = status.get("input_staleness")
+    input_unknown = (
+        research_evidence.ResolverState(
+            status=research_evidence.ResolverStatus.AMBIGUOUS,
+            confidence=0.5,
+            reason=(
+                input_staleness.get("reason")
+                or "input staleness could not be confirmed either way"
+            ),
+        )
+        if isinstance(input_staleness, dict) and input_staleness.get("stale") is None
+        else None
+    )
 
     if ptype == STALE_BY_SCRIPT:
         return research_evidence.ResolverState(
@@ -1048,6 +1147,19 @@ def _resolver_state_for_provenance_status(
                     or "content changed since provenance was recorded"
                 ),
             )
+        if script_staleness and script_staleness.get("is_stale") is None:
+            # The fingerprint ledger could not be read, so whether the
+            # generating script changed is unknown: never VERIFIED.
+            return research_evidence.ResolverState(
+                status=research_evidence.ResolverStatus.AMBIGUOUS,
+                confidence=0.5,
+                reason=(
+                    script_staleness.get("reason")
+                    or "script staleness could not be confirmed either way"
+                ),
+            )
+        if input_unknown is not None:
+            return input_unknown
         if (
             staleness.get("recorded_content_hash") is None
             or staleness.get("current_content_hash") is None
@@ -1069,6 +1181,8 @@ def _resolver_state_for_provenance_status(
             ),
         )
     if ptype == RELOCATED:
+        if input_unknown is not None:
+            return input_unknown
         record = status.get("record") or {}
         return research_evidence.ResolverState(
             status=research_evidence.ResolverStatus.VERIFIED,
@@ -1299,6 +1413,39 @@ def evidence_record_from_provenance_status(
     )
 
 
+def _store_unreadable_evidence_record(
+    path: str, exc: BaseException,
+) -> "research_evidence.EvidenceRecord":
+    """OUTPUT record for a path whose provenance lookup hit a store that
+    cannot be read: ``AMBIGUOUS`` at confidence 0.0 (provenance unknown,
+    not confirmed either way -- never ``VERIFIED``, and not ``UNAVAILABLE``,
+    which this module reserves for confirmed absence) and ``partial``."""
+    detail = _store_error_detail(exc)
+    reason = (
+        f"a provenance store could not be read ({detail}) -- this path's "
+        "provenance is unknown"
+    )
+    now = _now_iso()
+    return research_evidence.EvidenceRecord(
+        identity=research_evidence.EvidenceIdentity(
+            id=path, kind=research_evidence.EvidenceKind.OUTPUT, locator=path,
+        ),
+        timestamps=research_evidence.EvidenceTimestamps(observed_at=now, updated_at=now),
+        resolver=research_evidence.ResolverState(
+            status=research_evidence.ResolverStatus.AMBIGUOUS,
+            confidence=0.0,
+            reason=reason,
+        ),
+        partial=True,
+        partial_reason=reason,
+        attributes={
+            "provenance_type": None,
+            "store_error": "ledger_unreadable",
+            "error": detail,
+        },
+    )
+
+
 def build_provenance_envelope(
     outputs_dir: str,
     paths: "list[str]",
@@ -1336,6 +1483,13 @@ def build_provenance_envelope(
       containing even one known-incomplete record is never reported as a
       fully-authoritative whole.
 
+      A path whose lookup hits a provenance store that cannot be read (a
+      corrupt ledger or an ``OSError``) still gets its own record: an
+      ``AMBIGUOUS``, confidence-0.0, ``partial`` record whose
+      ``attributes["store_error"]`` is ``"ledger_unreadable"`` (see
+      :func:`_store_unreadable_evidence_record`) -- the store failure is
+      reported in the envelope, never raised and never shown as verified.
+
     Raises:
       research_evidence.EnvelopeValidationError: ``outputs_dir`` is missing,
       or any individual ``path`` lookup itself errors (e.g. an empty-string
@@ -1347,7 +1501,11 @@ def build_provenance_envelope(
 
     records: "list[research_evidence.EvidenceRecord]" = []
     for path in paths:
-        status = get_provenance_status(outputs_dir, path)
+        try:
+            status = get_provenance_status(outputs_dir, path)
+        except (ledger_io.LedgerCorruptError, OSError) as exc:
+            records.append(_store_unreadable_evidence_record(path, exc))
+            continue
         if "error" in status:
             raise research_evidence.EnvelopeValidationError(
                 f"cannot build provenance envelope: {status['error']} "

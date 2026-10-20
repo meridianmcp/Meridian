@@ -65,11 +65,15 @@ _CACHE_DIRNAME = ".meridian-outputs-cache"
 # Ledger location (reuses the existing .meridian-outputs-cache convention)
 # ---------------------------------------------------------------------------
 
-def _cache_dir(outputs_dir: str) -> str:
+def _cache_dir(outputs_dir: str, *, create: bool = True) -> str:
     """The same ``.meridian-outputs-cache`` directory outputs_local's FTS
-    index already lives under -- created + gitignored on first use so the
-    ledger never needs its own separate cache-safety story."""
+    index already lives under -- created + gitignored on first write so the
+    ledger never needs its own separate cache-safety story. ``create=False``
+    (every read path) only computes the path: a read never creates the
+    directory or edits a ``.gitignore``."""
     cache_dir = os.path.join(outputs_dir, _CACHE_DIRNAME)
+    if not create:
+        return cache_dir
     try:
         os.makedirs(cache_dir, exist_ok=True)
         outputs_local.ensure_gitignored(cache_dir)
@@ -81,8 +85,8 @@ def _cache_dir(outputs_dir: str) -> str:
     return cache_dir
 
 
-def _ledger_path(outputs_dir: str) -> str:
-    return os.path.join(_cache_dir(outputs_dir), _LEDGER_FILENAME)
+def _ledger_path(outputs_dir: str, *, create: bool = True) -> str:
+    return os.path.join(_cache_dir(outputs_dir, create=create), _LEDGER_FILENAME)
 
 
 # ---------------------------------------------------------------------------
@@ -298,8 +302,16 @@ def _read_ledger(outputs_dir: str) -> dict[str, dict[str, Any]]:
     """Strict read: ``{}`` only for a missing ledger. A corrupt ledger raises
     ``ledger_io.LedgerCorruptError`` instead of reading as empty, so
     :func:`check_staleness` and :func:`find_stale_by_script` can never report
-    "nothing stale" for a ledger they could not parse."""
-    return ledger_io.read_ledger_strict(_ledger_path(outputs_dir))
+    "nothing stale" for a ledger they could not parse. A row that is not a
+    JSON object (e.g. ``{"a.csv": null}``) is corruption too: it raises
+    ``LedgerCorruptError`` here rather than ``AttributeError`` in a caller."""
+    path = _ledger_path(outputs_dir, create=False)  # a read never creates the cache dir
+    ledger = ledger_io.read_ledger_strict(path)
+    for entry in ledger.values():
+        if not isinstance(entry, dict):
+            kind = "null" if entry is None else type(entry).__name__
+            raise ledger_io.LedgerCorruptError(path, f"a row is {kind}, not an object")
+    return ledger
 
 
 def _write_ledger_entry(outputs_dir: str, tagged: ScriptTaggedFingerprint) -> str | None:

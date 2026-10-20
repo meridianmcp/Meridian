@@ -533,3 +533,45 @@ class TestTraceForwardOutputs:
         names = [(os.path.basename(n["path"]), n["depth"]) for n in result["nodes"]]
         assert ("stage1.json", 1) in names
         assert ("stage2.json", 2) in names
+
+
+# ---------------------------------------------------------------------------
+# Read paths never create the cache directory or edit .gitignore
+# ---------------------------------------------------------------------------
+
+class TestReadsLeaveAFreshOutputsDirUntouched:
+    def test_reading_ledgers_and_registry_creates_no_cache_dir(self, tmp_path: Path) -> None:
+        """A dry-run bundle import reads every ledger through these readers;
+        a read must not create .meridian-outputs-cache or write a
+        .gitignore beside it. Only a write may do that."""
+        from meridian_outputs import annotate, artifact_registry, bundle, fingerprint, run_manifest
+
+        outputs = tmp_path / "outputs"
+        outputs.mkdir()
+        fig = outputs / "fig.csv"
+        fig.write_text("a\n1\n", encoding="utf-8")
+        d = str(outputs)
+
+        assert annotate.get_provenance(d, str(fig)) is None
+        assert annotate.get_provenance_history(d, str(fig)) is None
+        assert annotate.list_provenance(d) == []
+        assert fingerprint.check_staleness(d) == []
+        assert fingerprint.find_stale_by_script(d, str(outputs / "gen.py")) == []
+        assert artifact_registry.get_artifact(d, "no-such-id") is None
+        assert artifact_registry.list_artifacts(d) == []
+        assert artifact_registry.resolve_artifact(d, canonical_path=str(fig))["status"] == (
+            artifact_registry.UNRESOLVED
+        )
+        assert artifact_registry.get_artifact_sources(d, "no-such-id") == []
+        assert run_manifest.get_run_manifest(d, "r1") is None
+        assert run_manifest.list_run_manifests(d) == []
+        for module, reader, _filename in bundle._LEDGER_MEMBERS.values():
+            getattr(module, reader)(d)
+
+        assert sorted(p.name for p in outputs.iterdir()) == ["fig.csv"]
+        assert not (tmp_path / ".gitignore").exists()
+
+        # A write still creates and gitignores the cache directory.
+        annotate.record_provenance(d, str(fig))
+        assert (outputs / ".meridian-outputs-cache").is_dir()
+        assert (outputs / ".gitignore").is_file()

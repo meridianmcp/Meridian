@@ -79,7 +79,7 @@ from __future__ import annotations
 import os
 from typing import Any
 
-from . import outputs_local, provenance_status
+from . import ledger_io, outputs_local, provenance_status
 
 __all__ = [
     "resolve_figure_output",
@@ -871,6 +871,28 @@ def _bind_one_artifact(
     }
 
 
+def _ledger_unreadable_binding(artifact: dict[str, Any], exc: BaseException) -> dict[str, Any]:
+    """UNRESOLVED binding for an artifact whose lookup hit a store that
+    cannot be read. A ``LedgerCorruptError`` names only the ledger's
+    basename; any other error is reduced to its type name, since an
+    ``OSError``'s text can carry a machine-local absolute path."""
+    detail = str(exc) if isinstance(exc, ledger_io.LedgerCorruptError) else type(exc).__name__
+    return {
+        "artifact_id": artifact.get("artifact_id"),
+        "kind": artifact.get("kind"),
+        "canonical_path": artifact.get("canonical_path"),
+        "generating_script": None,
+        "status": UNRESOLVED,
+        "match_type": None,
+        "evidence": "ledger_unreadable",
+        "resolved_sha256": None,
+        "reason": (
+            f"a meridian-outputs provenance store could not be read ({detail}) "
+            "-- this artifact's provenance cannot be confirmed either way"
+        ),
+    }
+
+
 def bind_artifact_provenance(
     outputs_dir: str,
     artifacts: "list[dict[str, Any]]",
@@ -930,7 +952,10 @@ def bind_artifact_provenance(
           walking ``outputs_dir`` yet -- fail-closed: incomplete evidence is
           never promoted to the confident ``"orphaned"`` verdict, since the
           artifact's real output may simply not have been indexed yet on a
-          large/cold tree.
+          large/cold tree, OR (``evidence="ledger_unreadable"``) a
+          provenance store this artifact's lookup needed could not be read
+          (a corrupt ledger or an ``OSError``) -- that artifact gets its own
+          unresolved binding and every other artifact is still classified.
 
       ``counts`` tallies each status across ``bindings`` (always all four
       keys, zero-filled). ``all_clear`` is ``True`` only when every artifact
@@ -954,10 +979,15 @@ def bind_artifact_provenance(
       applies to the rest of that tier's evidence), never proof the exact
       DOCX media file came from that generator.
     """
-    bindings = [
-        _bind_one_artifact(outputs_dir, artifact, fuzzy_limit=fuzzy_limit)
-        for artifact in (artifacts or [])
-    ]
+    bindings: list[dict[str, Any]] = []
+    for artifact in (artifacts or []):
+        # One unreadable store must not cost the other artifacts their
+        # verdicts: it becomes this artifact's own UNRESOLVED binding.
+        try:
+            binding = _bind_one_artifact(outputs_dir, artifact, fuzzy_limit=fuzzy_limit)
+        except (ledger_io.LedgerCorruptError, OSError) as exc:
+            binding = _ledger_unreadable_binding(artifact, exc)
+        bindings.append(binding)
     counts = {status: 0 for status in ARTIFACT_STATUSES}
     for binding in bindings:
         counts[binding["status"]] = counts.get(binding["status"], 0) + 1
@@ -998,6 +1028,10 @@ SOURCE_RECORDED = "recorded"
 SOURCE_NO_PROVENANCE_RECORD = "no_provenance_record"
 SOURCE_NOT_FOUND = "not_found"
 SOURCE_OUTSIDE_OUTPUTS_DIR = "not_recorded_outside_outputs_dir"
+# Only a bare file name was stored for a generating script (the basename
+# fallback for a script on another volume) and no file of that name exists
+# under outputs_dir or the working directory: its location is unknown.
+SOURCE_LOCATION_UNRECORDED = "script_location_unrecorded"
 
 
 def _portable_locator(outputs_dir: str, value: Any) -> str | None:
@@ -1141,6 +1175,36 @@ def _resolve_lineage_source(
     return entry
 
 
+def _is_bare_name(value: Any) -> bool:
+    """True for a stored script reference with no directory part
+    (``"gen.py"``), which is all a cross-volume script leaves behind."""
+    return (
+        isinstance(value, str) and bool(value.strip()) and not os.path.isabs(value)
+        and "/" not in value and "\\" not in value
+    )
+
+
+def _check_registry_readable(outputs_dir: str) -> None:
+    """Strict read of the artifact registry for :func:`get_output_lineage`.
+
+    ``artifact_registry``'s reader returns an empty registry for a file it
+    cannot parse, so without this check a damaged registry looks like "no
+    artifact registered" and the lineage can still report ``complete``. A
+    missing registry is fine (nothing was registered). Raises
+    ``ledger_io.LedgerCorruptError`` when the file exists but is not a JSON
+    object whose ``artifacts`` is an object and ``edges`` a list; other
+    ``OSError`` read failures propagate.
+    """
+    from . import artifact_registry
+
+    path = artifact_registry._registry_path(outputs_dir, create=False)
+    data = ledger_io.read_ledger_strict(path)
+    if not isinstance(data.get("artifacts", {}), dict) or not isinstance(data.get("edges", []), list):
+        raise ledger_io.LedgerCorruptError(
+            path, "artifacts is not an object or edges is not a list",
+        )
+
+
 def _set_script_staleness(entry: dict[str, Any], recorded: str | None, current: str | None,
                           *, script_known: bool) -> None:
     """Fill the stale fields the way fingerprint.check_staleness reasons,
@@ -1182,7 +1246,9 @@ def get_output_lineage(
          registry artifact through ``artifact_registry.resolve_artifact``
          (content hash, then exact prior path sighting -- never a basename
          guess); an ``artifact_id`` without a ``path`` uses the artifact's
-         most recent local sighting inside ``outputs_dir``.
+         most recent local sighting inside ``outputs_dir``. The registry is
+         read strictly first: a registry file that exists but cannot be
+         parsed is a ``store_unreadable`` gap, never read as empty.
       2. Sources are the UNION of the registry's SourceEdges for that
          artifact, the provenance ledger's ``generating_script`` and the
          fingerprint ledger's ``generating_script`` (or ``script_path``).
@@ -1192,7 +1258,10 @@ def get_output_lineage(
          attached (``status="recorded"``) or is marked
          ``no_provenance_record``/``not_found``. A source outside
          ``outputs_dir`` is marked ``not_recorded_outside_outputs_dir``.
-         Only ``recorded`` counts as resolved.
+         A provenance record whose generating script was stored as a bare
+         file name (the cross-volume basename fallback) that is found
+         nowhere is marked ``script_location_unrecorded`` with ``stale``
+         ``None``. Only ``recorded`` counts as resolved.
       4. ``stale`` compares the script hash a store recorded with the
          script's current hash: the fingerprint ledger's tag-time hash, and
          the provenance record's ``script_content_hash`` when present.
@@ -1261,6 +1330,9 @@ def get_output_lineage(
     artifact: dict[str, Any] | None = None
     artifact_evidence: str | None = None
     try:
+        # artifact_registry's own reader turns a damaged registry into an
+        # empty one; read it strictly first so damage is a store gap here.
+        _check_registry_readable(outputs_dir)
         if has_id:
             artifact = artifact_registry.get_artifact(outputs_dir, str(artifact_id))
             if artifact is None:
@@ -1373,12 +1445,25 @@ def get_output_lineage(
                 relation="generating_script",
             )
             recorded = provenance_record.get("script_content_hash")
-            if recorded is not None:
-                # Resolve the script exactly as record_provenance did when it
-                # captured the hash, so the comparison is like for like.
-                script_file = fingerprint._resolve_script_path(
-                    provenance_record["generating_script"], search_root=outputs_dir,
+            # Resolve the script exactly as record_provenance did when it
+            # captured the hash, so the comparison is like for like.
+            stored_script = provenance_record["generating_script"]
+            script_file = fingerprint._resolve_script_path(stored_script, search_root=outputs_dir)
+            if script_file is None and _is_bare_name(stored_script):
+                # Only a file name was stored (record_provenance keeps just
+                # the basename of a script on another volume) and nothing of
+                # that name is found: the script's location was never
+                # recorded, so neither "not found" nor "stale" follows.
+                if entry["status"] == SOURCE_NOT_FOUND:
+                    entry["status"] = SOURCE_LOCATION_UNRECORDED
+                entry["recorded_script_hash"] = recorded
+                entry["stale"] = None
+                entry["stale_reason"] = (
+                    "only the generating script's file name was recorded and no "
+                    "file of that name was found, so its location and staleness "
+                    "are unknown"
                 )
+            elif recorded is not None:
                 current = fingerprint.script_content_hash(script_file) if script_file else None
                 _set_script_staleness(entry, recorded, current, script_known=True)
             else:
