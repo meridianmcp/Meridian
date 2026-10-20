@@ -348,37 +348,52 @@ class TestExport:
         assert "run_manifest_ledger: reader failed (RuntimeError)" in result["errors"]
 
     def test_failed_replace_leaves_no_temp_file_and_no_bundle(self, populated, monkeypatch) -> None:
+        # overwrite=True: os.replace is the overwrite publish; a create-only
+        # export links instead (see the create-only tests below).
         def _fail(_src, _dst):
             raise OSError("disk full")
 
         monkeypatch.setattr(B.os, "replace", _fail)
-        result = B.export_bundle(str(populated["outputs"]), "backup/x.json")
+        result = B.export_bundle(str(populated["outputs"]), "backup/x.json", overwrite=True)
         assert result == {"exported": False, "error": "failed to write bundle (OSError)"}
         leftovers = list((populated["outputs"] / "backup").iterdir())
         assert leftovers == []
 
-    def test_write_is_fsynced_before_replace(self, populated, monkeypatch) -> None:
-        calls: list[str] = []
-        real_fsync, real_replace = os.fsync, os.replace
-        monkeypatch.setattr(B.os, "fsync", lambda fd: (calls.append("fsync"), real_fsync(fd))[1])
-        monkeypatch.setattr(B.os, "replace", lambda s, d: (calls.append("replace"), real_replace(s, d))[1])
-        _export(populated["outputs"])
-        # The file fsync precedes the rename; on POSIX the directory fsync
-        # after it adds a second fsync.
-        assert calls[:2] == ["fsync", "replace"]
-        assert calls.count("replace") == 1
+    @staticmethod
+    def _spy_publish(monkeypatch, record) -> None:
+        """Record os.link and os.replace (the two publish steps) as "publish"."""
+        real_link, real_replace = os.link, os.replace
+        monkeypatch.setattr(B.os, "link", lambda s, d: (record("publish"), real_link(s, d))[1])
+        monkeypatch.setattr(B.os, "replace", lambda s, d: (record("publish"), real_replace(s, d))[1])
 
-    def test_directory_is_fsynced_after_replace(self, populated, monkeypatch) -> None:
+    @pytest.mark.parametrize("overwrite", [False, True])
+    def test_write_is_fsynced_before_replace(self, populated, monkeypatch, overwrite) -> None:
+        calls: list[str] = []
+        real_fsync = os.fsync
+        monkeypatch.setattr(B.os, "fsync", lambda fd: (calls.append("fsync"), real_fsync(fd))[1])
+        self._spy_publish(monkeypatch, calls.append)
+        result = B.export_bundle(str(populated["outputs"]), "backup/bundle.json", overwrite=overwrite)
+        assert result["exported"] is True, result
+        # The file fsync precedes the publish (a link without overwrite, a
+        # rename with it); on POSIX the directory fsync after it adds a
+        # second fsync.
+        assert calls[:2] == ["fsync", "publish"]
+        assert calls.count("publish") == 1
+
+    @pytest.mark.parametrize("overwrite", [False, True])
+    def test_directory_is_fsynced_after_replace(self, populated, monkeypatch, overwrite) -> None:
         events: list[str] = []
-        real_replace = os.replace
-        monkeypatch.setattr(B.os, "replace", lambda s, d: (events.append("replace"), real_replace(s, d))[1])
+        self._spy_publish(monkeypatch, events.append)
         monkeypatch.setattr(ledger_io, "_fsync_directory", lambda d: events.append(f"dir:{d}"))
-        _export(populated["outputs"])
-        assert len(events) == 2 and events[0] == "replace"
+        result = B.export_bundle(str(populated["outputs"]), "backup/bundle.json", overwrite=overwrite)
+        assert result["exported"] is True, result
+        assert len(events) == 2 and events[0] == "publish"
         assert events[1].startswith("dir:")
         assert os.path.samefile(events[1][len("dir:"):], populated["outputs"] / "backup")
 
     def test_transient_sharing_violation_on_replace_is_retried(self, populated, monkeypatch) -> None:
+        # overwrite=True: the replace is where a lock-free reader holding
+        # the target open causes a sharing violation.
         real_replace = os.replace
         failures = {"left": 2}
 
@@ -390,10 +405,77 @@ class TestExport:
 
         monkeypatch.setattr(ledger_io, "_SHARING_RETRY_SLEEP_SECONDS", 0.0)
         monkeypatch.setattr(B.os, "replace", _flaky)
-        _export(populated["outputs"])
+        result = B.export_bundle(str(populated["outputs"]), "backup/bundle.json", overwrite=True)
+        assert result["exported"] is True, result
         assert failures["left"] == 0
         assert B.verify_bundle(str(populated["outputs"] / "backup" / "bundle.json"))["verified"] is True
         assert [p.name for p in (populated["outputs"] / "backup").iterdir()] == ["bundle.json"]
+
+    def test_concurrent_create_only_exports_cannot_both_succeed(self, populated, monkeypatch) -> None:
+        """B-F12: overwrite=False was a check then os.replace. An export that
+        passed the check replaced a bundle another export published while it
+        read the ledgers, and both returned exported=True."""
+        od = str(populated["outputs"])
+        target = populated["outputs"] / "backup" / "bundle.json"
+        real_problem = B._ledger_file_problem
+        racer: dict[str, Any] = {}
+
+        def _another_export_publishes_first(path):
+            if not racer:  # once, after this export's existence check passed
+                racer["started"] = True
+                racer["result"] = B.export_bundle(od, "backup/bundle.json")
+                racer["bytes"] = target.read_bytes()
+            return real_problem(path)
+
+        monkeypatch.setattr(B, "_ledger_file_problem", _another_export_publishes_first)
+        result = B.export_bundle(od, "backup/bundle.json")
+        assert racer["result"]["exported"] is True
+        assert result["exported"] is False, "the second export replaced the first"
+        assert target.read_bytes() == racer["bytes"]
+        assert result == {"exported": False, "error": B._EXISTS_ERROR}
+        assert [p.name for p in target.parent.iterdir()] == ["bundle.json"]
+
+    @pytest.mark.parametrize("hard_links", ["available", "missing", "refused"])
+    def test_create_only_publish_refuses_an_existing_target(
+        self, tmp_path, monkeypatch, hard_links,
+    ) -> None:
+        """B-F12: a second create-only publish to the same target raises
+        FileExistsError and the first file's bytes survive, whether the
+        name is claimed by os.link or, without hard links, by an O_EXCL
+        reservation."""
+        if hard_links == "missing":
+            monkeypatch.delattr(B.os, "link")
+        elif hard_links == "refused":
+            def _no_hard_links(_src, _dst):
+                raise PermissionError(1, "hard links are not supported here")
+
+            monkeypatch.setattr(B.os, "link", _no_hard_links)
+        target = tmp_path / "bundles" / "bundle.json"
+        B._atomic_write_json(str(target), {"first": 1}, indent=None, create_only=True)
+        first = target.read_bytes()
+        assert json.loads(first) == {"first": 1}
+        with pytest.raises(FileExistsError):
+            B._atomic_write_json(str(target), {"second": 2}, indent=None, create_only=True)
+        assert target.read_bytes() == first
+        assert [p.name for p in target.parent.iterdir()] == ["bundle.json"]
+
+    def test_failed_create_only_publish_leaves_no_reservation_or_temp_file(
+        self, populated, monkeypatch,
+    ) -> None:
+        """Without hard links the name is reserved first; a rename that then
+        fails removes the empty reservation, so a retry is not refused as
+        "already exists"."""
+        monkeypatch.delattr(B.os, "link")
+
+        def _fail(_src, _dst):
+            raise OSError("disk full")
+
+        monkeypatch.setattr(B.os, "replace", _fail)
+        result = B.export_bundle(str(populated["outputs"]), "backup/x.json")
+        assert result == {"exported": False, "error": "failed to write bundle (OSError)"}
+        assert list((populated["outputs"] / "backup").iterdir()) == []
+        monkeypatch.undo()
+        assert B.export_bundle(str(populated["outputs"]), "backup/x.json")["exported"] is True
 
 
 class TestVerify:
