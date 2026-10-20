@@ -750,14 +750,14 @@ class TestExport:
         B._remove_reservation(str(target), None)
         assert not target.exists()
 
-    def test_cleanup_with_no_inode_number_never_removes_the_file(
+    def test_cleanup_with_no_inode_number_never_removes_a_non_empty_file(
         self, tmp_path, monkeypatch, caplog,
     ) -> None:
         """F9: on a volume that reports st_ino 0 for every file, the
         (st_dev, st_ino) identity check matched whatever was at the path, so
         the cleanup could remove another writer's file. An st_ino of 0 is now
-        an unknown identity: nothing is removed and the path is logged as a
-        leftover."""
+        an unknown identity: a non-empty file is never removed and the path
+        is logged (R6-E: only an empty one, the reservation, is removed)."""
         target = tmp_path / "bundle.json"
         target.write_text('{"published": 1}', encoding="utf-8")
         real_stat = os.stat
@@ -783,9 +783,65 @@ class TestExport:
         assert target.read_text(encoding="utf-8") == '{"published": 1}'
         warnings = [r for r in caplog.records if r.name == B.__name__]
         assert len(warnings) == 1
-        assert "leftover" in warnings[0].getMessage()
+        assert "left it untouched" in warnings[0].getMessage()
         assert "identity unknown" in warnings[0].getMessage()
         assert warnings[0].args[0] == str(target)
+
+    def test_cleanup_with_no_inode_number_removes_the_empty_reservation(
+        self, populated, monkeypatch, caplog,
+    ) -> None:
+        """R6-E: with st_ino 0 the cleanup removed nothing, so a failed
+        publish on such a volume left its empty reservation behind and every
+        later create-only export to that path was refused as "already
+        exists". An unknown identity now gets the empty-regular-file test the
+        missing-fstat case uses: the empty reservation is removed, nothing
+        is logged, and a retry succeeds."""
+        monkeypatch.delattr(B.os, "link")
+        od = str(populated["outputs"])
+        real_open, real_fstat, real_stat = os.open, os.fstat, os.stat
+        reservations: list[int] = []
+
+        def _without_inode(st: os.stat_result) -> os.stat_result:
+            return os.stat_result((
+                st.st_mode, 0, st.st_dev, st.st_nlink, st.st_uid, st.st_gid,
+                st.st_size, int(st.st_atime), int(st.st_mtime), int(st.st_ctime),
+            ))
+
+        def _is_target(path: Any) -> bool:
+            return not isinstance(path, int) and os.path.basename(os.fspath(path)) == "x.json"
+
+        def _open(path, flags, *args, **kwargs):
+            fd = real_open(path, flags, *args, **kwargs)
+            if flags & os.O_EXCL and _is_target(path):
+                reservations.append(fd)
+            return fd
+
+        def _fstat(fd):
+            st = real_fstat(fd)
+            if fd in reservations:
+                reservations.remove(fd)  # the fd number may be reused later
+                return _without_inode(st)
+            return st
+
+        def _stat(path, *args, **kwargs):
+            st = real_stat(path, *args, **kwargs)
+            return _without_inode(st) if _is_target(path) else st
+
+        def _fail(_src, _dst):
+            raise OSError("disk full")
+
+        monkeypatch.setattr(B.os, "open", _open)
+        monkeypatch.setattr(B.os, "fstat", _fstat)
+        monkeypatch.setattr(B.os, "stat", _stat)
+        monkeypatch.setattr(B.os, "replace", _fail)
+        with caplog.at_level(logging.WARNING, logger=B.__name__):
+            result = B.export_bundle(od, "backup/x.json")
+        assert result == {"exported": False, "error": "failed to write bundle (OSError)"}
+        assert reservations == []  # the reservation was made with st_ino 0
+        assert list((populated["outputs"] / "backup").iterdir()) == []
+        assert [r for r in caplog.records if r.name == B.__name__] == []
+        monkeypatch.undo()
+        assert B.export_bundle(od, "backup/x.json")["exported"] is True
 
 
 class TestVerify:

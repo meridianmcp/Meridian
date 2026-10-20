@@ -385,13 +385,13 @@ def _remove_reservation(path: str, reserved: os.stat_result | None) -> None:
     at ``path`` if ``path`` is still that file. Never raises an OSError.
 
     ``reserved`` is the reservation's ``fstat``, compared by ``(st_dev,
-    st_ino)``. When that ``fstat`` itself failed it is None, and only an
+    st_ino)``. When that ``fstat`` itself failed it is None, and when its
+    ``st_ino`` is 0 the volume reports no file identity (FAT, some network
+    shares) and every file there would match it. In both cases only an
     empty regular file is removed: that is what the reservation is, O_EXCL
     proved the name was free, nothing in this package removes another
-    writer's reservation, and a published bundle is never empty. When
-    ``st_ino`` is 0 the volume reports no file identity (FAT, some network
-    shares) and every file there would match it, so the file at ``path`` is
-    never removed: it is logged as a leftover instead.
+    writer's reservation, and a published bundle is never empty. A
+    non-empty file found there with ``st_ino`` 0 is left alone and logged.
 
     The unlink retries a Windows sharing violation the way the rename does,
     since the reader whose open handle made the rename fail usually makes
@@ -401,7 +401,10 @@ def _remove_reservation(path: str, reserved: os.stat_result | None) -> None:
     "already exists" until it is removed, and it is an empty file, which
     :func:`verify_bundle` never accepts as a bundle.
     """
-    def _unlink_if_reserved() -> None:
+    identity_unknown = reserved is not None and reserved.st_ino == 0
+
+    def _unlink_if_reserved() -> bool:
+        """False when the file at ``path`` is not the reservation."""
         # The identity check (stat) and the unlink are two separate calls:
         # a file another writer puts at ``path`` between them is removed.
         # That window is accepted. It is microseconds wide and only an
@@ -409,29 +412,33 @@ def _remove_reservation(path: str, reserved: os.stat_result | None) -> None:
         # proved was free a moment before.
         try:
             current = os.stat(path)
-            if reserved is not None:
+            if reserved is not None and not identity_unknown:
                 if (current.st_dev, current.st_ino) != (reserved.st_dev, reserved.st_ino):
-                    return
+                    return False
             elif not (stat.S_ISREG(current.st_mode) and current.st_size == 0):
-                return
+                return False
             os.unlink(path)
         except FileNotFoundError:
-            return
+            pass
+        return True
 
-    if reserved is not None and reserved.st_ino == 0:
-        cause = "file identity unknown: the volume reports no inode number"
-    else:
-        try:
-            ledger_io._retry_sharing(_unlink_if_reserved)
-            return
-        except OSError as exc:
-            cause = type(exc).__name__
-    _log.warning(
-        "%s: failed create-only bundle publish left its empty reservation "
-        "as a leftover (%s); later create-only exports to that path are "
-        "refused until it is removed",
-        path, cause,
-    )
+    try:
+        removed = ledger_io._retry_sharing(_unlink_if_reserved)
+    except OSError as exc:
+        _log.warning(
+            "%s: failed create-only bundle publish left its empty reservation "
+            "as a leftover (%s); later create-only exports to that path are "
+            "refused until it is removed",
+            path, type(exc).__name__,
+        )
+        return
+    if not removed and identity_unknown:
+        _log.warning(
+            "%s: failed create-only bundle publish found a non-empty file "
+            "where its reservation was and left it untouched (file identity "
+            "unknown: the volume reports no inode number)",
+            path,
+        )
 
 
 def _atomic_write_json(
