@@ -172,8 +172,9 @@ The ``provenance_type`` -> :class:`~research_evidence.ResolverStatus` mapping
   - :data:`EXACT` -> ``VERIFIED`` when the output's own content hash still
     matches what was recorded, ``STALE`` when it does not, or ``AMBIGUOUS``
     when there simply isn't enough hash data to say either way (e.g. no
-    content hash was ever captured) -- never silently reported as verified
-    just because an exact record exists.
+    content hash was ever captured, or the fingerprint ledger could not be
+    read so script staleness is unknown) -- never silently reported as
+    verified just because an exact record exists.
   - :data:`RELOCATED` -> ``VERIFIED`` (confidence 0.75, lower than a
     same-path :data:`EXACT` match's 0.95) -- content identity IS confirmed
     by hash, just at a different path than originally recorded; the reason
@@ -271,7 +272,7 @@ import os
 from datetime import datetime, timezone
 from typing import Any
 
-from . import annotate, fingerprint, outputs_local, research_evidence
+from . import annotate, fingerprint, ledger_io, outputs_local, research_evidence
 
 _log = logging.getLogger(__name__)
 
@@ -405,14 +406,46 @@ def _stale_by_script_result(outputs_dir: str, path: str) -> dict[str, Any] | Non
     compare) -- this is NOT the same as "not stale"; callers must check for
     ``None`` before reading ``is_stale``. Otherwise the matching
     :class:`fingerprint.StalenessResult`, as a dict.
+
+    When the fingerprint ledger exists but cannot be read
+    (``ledger_io.LedgerCorruptError`` or an ``OSError``), whether ``path``
+    was tagged and whether its script changed are both unknown: the result
+    is a dict of the same shape with ``is_stale`` ``None``, a ``reason``
+    saying why, and ``error="ledger_unreadable"`` -- never ``None`` ("never
+    tagged") and never an exception that would lose the exact record.
     """
     target = annotate._normalize_path(path)
     if not target:
         return None
-    for result in fingerprint.check_staleness(outputs_dir):
+    try:
+        results = fingerprint.check_staleness(outputs_dir)
+    except (ledger_io.LedgerCorruptError, OSError) as exc:
+        return {
+            "path": path,
+            "script_path": None,
+            "tagged_script_hash": None,
+            "current_script_hash": None,
+            "is_stale": None,
+            "reason": (
+                f"fingerprint ledger could not be read ({_store_error_detail(exc)}) "
+                "-- script staleness cannot be confirmed either way"
+            ),
+            "error": "ledger_unreadable",
+        }
+    for result in results:
         if annotate._normalize_path(result.path) == target:
             return result.to_dict()
     return None
+
+
+def _store_error_detail(exc: BaseException) -> str:
+    """Short, portable description of a store read failure. A
+    ``LedgerCorruptError`` names only the ledger's basename; any other error
+    is reduced to its type name, since an ``OSError``'s text can carry a
+    machine-local absolute path."""
+    if isinstance(exc, ledger_io.LedgerCorruptError):
+        return str(exc)
+    return type(exc).__name__
 
 
 def _directory_fallback(outputs_dir: str, path: str) -> dict[str, Any] | None:
@@ -660,8 +693,10 @@ def get_provenance_status(outputs_dir: str, path: str) -> dict[str, Any]:
           stronger, more specific staleness signal (item d3374b0e).
         - :data:`EXACT` -- ``record`` is the exact ``annotate.get_provenance``
           record; ``staleness`` is populated (see :func:`_staleness`).
-          ``script_staleness`` is ``None`` (never fingerprint-tagged) or
-          not stale.
+          ``script_staleness`` is ``None`` (never fingerprint-tagged), not
+          stale, or unknown (``is_stale`` ``None`` with
+          ``error="ledger_unreadable"`` when the fingerprint ledger cannot
+          be read -- the exact record is still returned).
         - :data:`RELOCATED` -- no exact record for THIS path, but either (a)
           exactly one OTHER recorded path's ``content_hash`` matches this
           file's current content (fa600e42; ``record`` is that matching
@@ -1046,6 +1081,17 @@ def _resolver_state_for_provenance_status(
                 reason=(
                     staleness.get("reason")
                     or "content changed since provenance was recorded"
+                ),
+            )
+        if script_staleness and script_staleness.get("is_stale") is None:
+            # The fingerprint ledger could not be read, so whether the
+            # generating script changed is unknown: never VERIFIED.
+            return research_evidence.ResolverState(
+                status=research_evidence.ResolverStatus.AMBIGUOUS,
+                confidence=0.5,
+                reason=(
+                    script_staleness.get("reason")
+                    or "script staleness could not be confirmed either way"
                 ),
             )
         if (

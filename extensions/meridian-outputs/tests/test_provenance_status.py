@@ -815,6 +815,40 @@ class TestStaleByScript:
         assert status["staleness"]["stale"] is True
         assert status["script_staleness"] is None  # never fingerprint-tagged
 
+    @duckdb_required
+    @pytest.mark.parametrize("garbage", [b"", b"{not json", b"[1, 2]"])
+    def test_corrupt_fingerprint_ledger_keeps_exact_with_unknown_script_staleness(
+        self, tmp_path: Path, garbage: bytes,
+    ) -> None:
+        """An unreadable fingerprint ledger must not break an exact lookup:
+        the record is kept, script staleness is reported unknown (never
+        "not stale"), and the typed bridge never calls it VERIFIED."""
+        script = tmp_path / "train.py"
+        script.write_text("print('v1')\n", encoding="utf-8")
+        output = tmp_path / "result.csv"
+        output.write_text("a,b\n1,2\n", encoding="utf-8")
+        AN.record_provenance(str(tmp_path), str(output), generating_script=str(script))
+        FP.tag_output(str(output), str(tmp_path), script_path=str(script))
+        Path(FP._ledger_path(str(tmp_path))).write_bytes(garbage)
+
+        status = PS.get_provenance_status(str(tmp_path), str(output))
+        assert status["provenance_type"] == PS.EXACT
+        assert status["record"] is not None
+        assert status["staleness"]["stale"] is False  # the output itself is unchanged
+        script_staleness = status["script_staleness"]
+        assert script_staleness["is_stale"] is None
+        assert script_staleness["error"] == "ledger_unreadable"
+        assert "fingerprint_ledger.json" in script_staleness["reason"]
+        assert str(tmp_path) not in script_staleness["reason"]
+
+        resolver = PS.evidence_record_from_provenance_status(status).resolver
+        assert resolver.status is RE.ResolverStatus.AMBIGUOUS
+        assert not resolver.is_authoritative
+
+        backed = PS.get_manifest_backed_provenance_status(str(tmp_path), str(output), None)
+        assert backed["provenance_type"] == PS.EXACT
+        assert backed["script_staleness"]["is_stale"] is None
+
 
 # ---------------------------------------------------------------------------
 # Canonical/archival identity (item d3374b0e)
