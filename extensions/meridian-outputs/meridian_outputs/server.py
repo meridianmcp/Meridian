@@ -66,8 +66,8 @@ Security notes:
   - The local index cache directory is auto-added to .gitignore on first use
     (via outputs_local.ensure_gitignored, called by the search tool when it
     creates a persistent DB).
-  - All index writes are serialised through IndexFileLock (threading + optional
-    cross-process portalocker) to prevent cache corruption.
+  - All index writes are serialised through IndexFileLock (threading + a
+    cross-process atomic-create lease file) to prevent cache corruption.
 """
 from __future__ import annotations
 

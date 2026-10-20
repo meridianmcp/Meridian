@@ -663,7 +663,7 @@ class TestReadIndexLockOwner:
             assert owner.pid_alive is True
             assert owner.is_stale is False
             assert owner.stale_reason is None
-            assert owner.lock_mode in ("atomic_create", "portalocker")
+            assert owner.lock_mode == "atomic_create"
         finally:
             lock.release()
 
@@ -739,22 +739,27 @@ class TestIndexFileLockCorrectnessFix:
     """a52216e2's core correctness fix: a genuine acquisition failure must
     raise, never be silently swallowed and treated as 'acquired'."""
 
-    def test_unexpected_portalocker_failure_raises_not_silently_succeeds(
+    def test_unexpected_create_failure_raises_not_silently_succeeds(
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
     ) -> None:
         """Regression test for the pre-a52216e2 bug: ANY exception during
-        portalocker acquisition (not just ImportError) used to be caught at
-        DEBUG level and treated as success, letting the caller believe it
-        held exclusive access when it did not."""
-        fake_portalocker = MagicMock()
-        fake_portalocker.LOCK_EX = 2
-        fake_portalocker.lock.side_effect = OSError("simulated permission denied")
-        monkeypatch.setitem(sys.modules, "portalocker", fake_portalocker)
-
+        cross-process acquisition used to be caught at DEBUG level and
+        treated as success, letting the caller believe it held exclusive
+        access when it did not. An unexpected error creating the lock file
+        must raise instead."""
         db_path = str(tmp_path / "index.duckdb")
+        real_open = os.open
+
+        def _read_only(path, flags, *a, **k):  # noqa: ANN001, ANN002, ANN003
+            if str(path).endswith(".lock"):
+                raise OSError("simulated read-only filesystem")
+            return real_open(path, flags, *a, **k)
+
         lock = OL.IndexFileLock(db_path)
-        with pytest.raises(OL.IndexLockAcquireError):
-            lock.acquire()
+        with monkeypatch.context() as m:
+            m.setattr(os, "open", _read_only)
+            with pytest.raises(OL.IndexLockAcquireError):
+                lock.acquire()
         # The in-process thread lock must be released on failure too, so a
         # later legitimate acquire in this same process isn't wedged forever.
         acquired = lock._thread_lock.acquire(blocking=False)
@@ -764,9 +769,8 @@ class TestIndexFileLockCorrectnessFix:
     def test_import_error_is_not_an_error_uses_atomic_fallback(
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
     ) -> None:
-        """portalocker simply being ABSENT is the documented, supported
-        degrade path -- it must never raise, and must still provide real
-        exclusivity via the atomic-create fallback."""
+        """portalocker being ABSENT (the default install) must never raise,
+        and the atomic-create lease file provides real exclusivity."""
         monkeypatch.setitem(sys.modules, "portalocker", None)
         db_path = str(tmp_path / "index.duckdb")
         lock = OL.IndexFileLock(db_path)
@@ -779,43 +783,87 @@ class TestIndexFileLockCorrectnessFix:
         assert not os.path.exists(db_path + ".lock")
 
 
-class _BlockingFakePortalocker:
-    """Stand-in for portalocker (not installed in every test env) covering
-    the calls IndexFileLock makes: one exclusive lock that blocks a second
-    caller (or raises for LOCK_NB), and an event set once a caller waits."""
+class _RecordingFakePortalocker:
+    """Stand-in for an importable portalocker (not installed in every test
+    env). IndexFileLock must never call it; it records every call and, like
+    the real OS lock, grants one exclusive holder. A contended call raises
+    instead of blocking, so a regression fails rather than hangs."""
 
     LOCK_EX = 2
     LOCK_NB = 4
 
     def __init__(self) -> None:
-        self._lock = threading.Lock()
-        self.contended = threading.Event()
+        self.calls: list[str] = []
+        self._held = False
 
     def lock(self, fh: Any, flags: int) -> None:  # noqa: ARG002
-        if self._lock.acquire(blocking=False):
-            return
-        if flags & self.LOCK_NB:
+        self.calls.append("lock")
+        if self._held:
             raise OSError("simulated: lock is held")
-        self.contended.set()
-        self._lock.acquire()
+        self._held = True
 
     def unlock(self, fh: Any) -> None:  # noqa: ARG002
-        self._lock.release()
+        self.calls.append("unlock")
+        self._held = False
 
 
-class TestIndexFileLockPortalockerLease:
-    """portalocker mode: waiting for the OS lock must never touch the live
-    holder's lease."""
+class TestIndexFileLockIgnoresPortalocker:
+    """Every IndexFileLock acquirer uses the same O_EXCL lease file, whether
+    or not portalocker is importable. A process that took portalocker's OS
+    lock never saw an atomic-create holder's lease file, and an atomic-create
+    process never saw that OS lock, so in an install where only some
+    processes could import portalocker both entered the critical section and
+    a ledger update was lost."""
 
-    def test_blocked_contender_leaves_the_holders_lease_intact(
+    @pytest.mark.parametrize(
+        ("holder_sees_portalocker", "contender_sees_portalocker"),
+        [(False, True), (True, False), (True, True)],
+    )
+    def test_acquirers_exclude_each_other_whatever_is_importable(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+        holder_sees_portalocker: bool, contender_sees_portalocker: bool,
+    ) -> None:
+        fake = _RecordingFakePortalocker()
+        db_path = str(tmp_path / "index.duckdb")
+        lock_path = Path(db_path + ".lock")
+
+        monkeypatch.setitem(
+            sys.modules, "portalocker", fake if holder_sees_portalocker else None,
+        )
+        holder = OL.IndexFileLock(db_path, session_id="holder")
+        holder.acquire()
+        try:
+            holder_lease = lock_path.read_bytes()
+            assert json.loads(holder_lease)["lock_mode"] == "atomic_create"
+
+            monkeypatch.setitem(
+                sys.modules, "portalocker",
+                fake if contender_sees_portalocker else None,
+            )
+            contender = OL.IndexFileLock(db_path, session_id="contender", timeout=0.3)
+            # Stands in for a second process: in one process the per-path
+            # thread lock would serialise the two before the file is reached.
+            contender._thread_lock = threading.Lock()
+            with pytest.raises(OL.IndexLockAcquireError) as exc_info:
+                contender.acquire()
+            assert exc_info.value.owner is not None
+            assert exc_info.value.owner.session_id == "holder"
+            assert lock_path.read_bytes() == holder_lease
+            owner = OL.read_index_lock_owner(db_path)
+            assert owner.held is True
+            assert owner.session_id == "holder"
+            assert owner.is_stale is False
+        finally:
+            holder.release()
+        assert not lock_path.exists()
+        assert fake.calls == []
+
+    def test_waiting_contender_leaves_the_holders_lease_intact(
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
     ) -> None:
-        """A contender used to open the lock file in "w" mode before
-        blocking on the OS lock, truncating the holder's lease to zero bytes
-        for as long as it waited: diagnostics lost the owner, and an
-        atomic-create process could judge the lease-less file stale and
-        reclaim it while the holder still ran."""
-        fake = _BlockingFakePortalocker()
+        """A contender waiting for the lock never touches the live holder's
+        lease, and takes the lock once the holder releases it."""
+        fake = _RecordingFakePortalocker()
         monkeypatch.setitem(sys.modules, "portalocker", fake)
         db_path = str(tmp_path / "index.duckdb")
         lock_path = Path(db_path + ".lock")
@@ -825,9 +873,18 @@ class TestIndexFileLockPortalockerLease:
         holder_lease = lock_path.read_bytes()
         assert json.loads(holder_lease)["session_id"] == "holder"
 
-        contender = OL.IndexFileLock(db_path, session_id="contender")
-        # Stands in for a second process: in one process the per-path thread
-        # lock would serialise the two before the contender opened the file.
+        # The contender inspects the holder's lease each time its create
+        # finds the lock file present, i.e. once it is waiting.
+        waiting = threading.Event()
+        real_inspect = OL._inspect_index_lock
+
+        def _inspect(*args: Any, **kwargs: Any) -> Any:
+            waiting.set()
+            return real_inspect(*args, **kwargs)
+
+        monkeypatch.setattr(OL, "_inspect_index_lock", _inspect)
+        contender = OL.IndexFileLock(db_path, session_id="contender", timeout=10.0)
+        # Stands in for a second process (see the test above).
         contender._thread_lock = threading.Lock()
         errors: list[BaseException] = []
 
@@ -840,35 +897,40 @@ class TestIndexFileLockPortalockerLease:
         waiter = threading.Thread(target=_contend, daemon=True)
         waiter.start()
         try:
-            assert fake.contended.wait(10.0), "contender never blocked on the lock"
+            assert waiting.wait(10.0), "contender never waited on the held lock"
             assert lock_path.read_bytes() == holder_lease
             owner = OL.read_index_lock_owner(db_path)
             assert owner.session_id == "holder"
             assert owner.is_stale is False
         finally:
             holder.release()
-            waiter.join(10.0)
+            waiter.join(15.0)
         assert not waiter.is_alive(), "contender never acquired after release"
         assert errors == []
         try:
             lease = json.loads(lock_path.read_text(encoding="utf-8"))
             assert lease["session_id"] == "contender"
             assert lease["token"] == contender._token
+            assert lease["lock_mode"] == "atomic_create"
         finally:
             contender.release()
+        assert not lock_path.exists()
+        assert fake.calls == []
 
     def test_lease_write_failure_leaves_no_predecessor_lease(
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
     ) -> None:
-        """Once the lock is held the previous holder's lease is cleared, so a
-        failed lease write cannot leave a predecessor named as the owner."""
-        monkeypatch.setitem(sys.modules, "portalocker", _BlockingFakePortalocker())
+        """A stale predecessor's lock file is removed, not reused, so a
+        failed lease write leaves an empty file of this holder's own rather
+        than a predecessor named as the owner."""
+        fake = _RecordingFakePortalocker()
+        monkeypatch.setitem(sys.modules, "portalocker", fake)
         db_path = str(tmp_path / "index.duckdb")
         lock_path = Path(db_path + ".lock")
         lock_path.write_text(json.dumps({
             "pid": 4, "hostname": "some-other-host-entirely",
             "session_id": "predecessor", "started_at": time.time() - 10_000,
-            "heartbeat_at": time.time() - 10_000, "lock_mode": "portalocker",
+            "heartbeat_at": time.time() - 10_000, "lock_mode": "atomic_create",
             "token": "predecessor-token",
         }), encoding="utf-8")
 
@@ -876,13 +938,36 @@ class TestIndexFileLockPortalockerLease:
             raise OSError("disk full")
 
         monkeypatch.setattr(OL, "_write_lease_to_handle", _disk_full)
-        lock = OL.IndexFileLock(db_path)
+        lock = OL.IndexFileLock(db_path, timeout=5.0)
         lock.acquire()
         try:
-            assert lock._lock_mode == "portalocker"
+            assert lock._lock_mode == "atomic_create"
             assert lock_path.read_bytes() == b""
+            owner = OL.read_index_lock_owner(db_path)
+            assert owner.held is True
+            assert owner.session_id is None and owner.pid is None
         finally:
             lock.release()
+        assert not lock_path.exists()
+        assert fake.calls == []
+
+    def test_reading_the_owner_never_creates_a_lock_file(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """Diagnostics with portalocker importable used to create an empty
+        lock file to probe, which every atomic-create acquirer then waited on
+        as a live owner until it went stale."""
+        fake = _RecordingFakePortalocker()
+        monkeypatch.setitem(sys.modules, "portalocker", fake)
+        db_path = str(tmp_path / "index.duckdb")
+
+        owner = OL.read_index_lock_owner(db_path)
+        assert owner.held is False
+        assert not os.path.exists(db_path + ".lock")
+        lock = OL.IndexFileLock(db_path, timeout=0.3)
+        lock.acquire()
+        lock.release()
+        assert fake.calls == []
 
 
 class TestIndexFileLockAtomicFallback:

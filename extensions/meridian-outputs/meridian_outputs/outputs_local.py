@@ -12,8 +12,8 @@ Security requirements (non-negotiable, tested):
      FTS index.  The filter is applied in :func:`_iter_safe_output_files` which
      replaces the plain os.walk used in the original.
   2. File locking -- :class:`IndexFileLock` provides an exclusive write lock
-     (threading.Lock + optional portalocker for cross-process safety) so
-     concurrent index writes can never corrupt the cache.
+     (threading.Lock + an atomic-create lease file for cross-process safety)
+     so concurrent index writes can never corrupt the cache.
   3. Deterministic output -- path lists are always sorted (stable sort over
      absolute paths); dict/set iteration is avoided in any place where result
      ordering is observable.
@@ -708,33 +708,37 @@ def ensure_gitignored(path: str) -> None:
 #
 # a52216e2 -- "Wave 10D found no confirmed orphan to kill: the lock was held
 # by one of several live concurrent server processes." Investigating that
-# incident surfaced the REAL bug: this environment does not have `portalocker`
-# installed (it is an optional, lazily-imported dependency -- see the
-# original docstring below), so on a real deployment without it, the
-# cross-process branch below used to be a complete no-op: `except ImportError:
-# pass`. Two separate Meridian server processes each running IndexFileLock
-# against the SAME on-disk db_path therefore had ZERO real mutual exclusion --
-# only the in-process threading.Lock protected against contention WITHIN one
-# process. Worse, a genuine (non-ImportError) acquisition failure was caught
-# and silently logged at DEBUG, then treated as "acquired" -- so ANY failure
-# to acquire the cross-process lock, for ANY reason, silently left ownership
+# incident surfaced the REAL bug: the cross-process layer used to rely on the
+# optional, never-declared `portalocker` package, and without it that branch
+# was a complete no-op: `except ImportError: pass`. Two separate Meridian
+# server processes each running IndexFileLock against the SAME on-disk
+# db_path therefore had ZERO real mutual exclusion -- only the in-process
+# threading.Lock protected against contention WITHIN one process. Worse, a
+# genuine (non-ImportError) acquisition failure was caught and silently
+# logged at DEBUG, then treated as "acquired" -- so ANY failure to acquire
+# the cross-process lock, for ANY reason, silently left ownership
 # non-deterministic. Neither gap was ever surfaced anywhere a caller could see.
 #
 # This section closes both gaps:
-#   1. A dependency-free, deterministic fallback lock (`os.O_CREAT |
-#      os.O_EXCL` -- atomic file creation, same guarantee on POSIX and
-#      Windows) is used automatically whenever portalocker is unavailable, so
-#      REAL cross-process exclusivity now always exists, with or without the
-#      optional dependency.
+#   1. Cross-process exclusivity is ONE primitive in EVERY process: an
+#      `os.O_CREAT | os.O_EXCL` lease file (atomic file creation, same
+#      guarantee on POSIX and Windows). No optional dependency changes that;
+#      portalocker is never used, even when it is importable. An earlier
+#      revision kept portalocker's OS-level lock whenever it imported and
+#      used the lease file only without it, but that OS lock and the lease
+#      file never see each other: in an install where only some processes
+#      could import it, a portalocker holder and a lease-file holder both
+#      entered the critical section and a ledger update was lost. One
+#      primitive for every acquirer rules that out.
 #   2. A genuine acquisition failure now RAISES IndexLockAcquireError instead
 #      of being silently swallowed -- see that class's docstring.
-#   3. Because the fallback lock's FILE (unlike portalocker's OS-level lock)
-#      is not auto-removed if its owner process crashes, every lock now
-#      carries a small lease (owner pid/hostname/session_id/started_at/
-#      heartbeat_at) written into the lock file, and read_index_lock_owner()
-#      lets any caller distinguish a lock held by a live, active owner from
-#      one left behind by a dead one -- WITHOUT ever touching the recorded
-#      process. Reclaiming a stale LOCK FILE and killing the process that
+#   3. Because the lease FILE (unlike an OS-level lock) is not auto-removed
+#      if its owner process crashes, every lock now carries a small lease
+#      (owner pid/hostname/session_id/started_at/heartbeat_at/token) written
+#      into the lock file, and read_index_lock_owner() lets any caller
+#      distinguish a lock held by a live, active owner from one left behind
+#      by a dead one -- WITHOUT ever touching the recorded process.
+#      Reclaiming a stale LOCK FILE and killing the process that
 #      (legitimately or not) still holds it are two entirely different
 #      things; this module only ever does the former.
 
@@ -757,12 +761,9 @@ def _get_thread_lock(canonical: str) -> threading.Lock:
 _LOCK_STALE_SECONDS_DEFAULT = 120.0
 _LOCK_STALE_SECONDS_ENV_VAR = "MERIDIAN_OUTPUTS_LOCK_STALE_SECONDS"
 
-# How long the atomic-create fallback lock waits on a confirmed-ACTIVE (not
-# stale) owner before giving up and raising IndexLockAcquireError. Only
-# applies to the fallback mechanism -- the optional portalocker path keeps
-# its historical indefinite-block-by-default behaviour unless a caller
-# explicitly passes a timeout, so an environment where portalocker IS
-# installed sees no behaviour change from this item.
+# How long IndexFileLock waits on a confirmed-ACTIVE (not stale) owner before
+# giving up and raising IndexLockAcquireError, unless a caller passes its own
+# timeout.
 _LOCK_TIMEOUT_SECONDS_DEFAULT = 60.0
 _LOCK_TIMEOUT_SECONDS_ENV_VAR = "MERIDIAN_OUTPUTS_LOCK_TIMEOUT_SECONDS"
 
@@ -794,7 +795,7 @@ def _resolve_lock_timeout_seconds() -> float | None:
         return _LOCK_TIMEOUT_SECONDS_DEFAULT
     stripped = raw.strip()
     if stripped.lower() in ("0", "none", "unbounded", "infinite"):
-        return None  # explicit opt-in to block indefinitely, like portalocker
+        return None  # explicit opt-in to block indefinitely
     try:
         value = float(stripped)
     except ValueError:
@@ -924,9 +925,8 @@ class IndexLockOwner:
     pid on this host, or a silent heartbeat past the configured threshold when
     liveness can't be checked directly) -- i.e. the lock FILE may be safely
     reclaimed. It is never a signal to kill anything: a stale reading only
-    ever justifies deleting the leftover lock file, exactly like a crashed
-    process's OS-level lock would already have been released automatically
-    had portalocker's lock been in use instead.
+    ever justifies deleting the leftover lock file, which its crashed owner
+    could not remove itself.
     """
 
     db_path: str
@@ -959,7 +959,7 @@ def _write_lease_to_handle(
 
     Deliberately does NOT ``os.fsync`` -- the lease is diagnostics-only
     (read_index_lock_owner never trusts it for the actual exclusivity
-    guarantee, only the atomic-create/portalocker primitive does that), and
+    guarantee, only the atomic create does that), and
     on the SAME live machine a plain ``flush()`` is already immediately
     visible to any other process reading the file through the shared OS page
     cache. ``fsync`` would only buy durability across a hard crash/power-loss
@@ -1000,42 +1000,6 @@ def _read_lease_from_path(path: str) -> dict[str, Any] | None:
     except Exception:  # noqa: BLE001
         return None
     return obj if isinstance(obj, dict) else None
-
-
-def _probe_portalocker_held(lock_path: str, portalocker_module: Any) -> bool | None:
-    """Best-effort, side-effect-minimal check: is ``lock_path`` CURRENTLY
-    locked via portalocker by ANY process (including this one, via a
-    different handle)? A non-blocking probe lock/unlock cycle on a fresh
-    handle is the standard technique for this -- if the probe itself
-    succeeds, nobody holds the real lock right now (the probe never keeps
-    it). Returns ``None`` on any I/O error -- genuinely indeterminate, never
-    guessed."""
-    try:
-        # Ensure the file exists so the probe targets the same path a real
-        # acquirer would -- mirrors the acquire() path, which creates the lock
-        # file when missing (without truncating it) on every attempt.
-        with open(lock_path, "a", encoding="utf-8"):
-            pass
-        probe = open(lock_path, "r+", encoding="utf-8")
-    except OSError:
-        return None
-    try:
-        try:
-            portalocker_module.lock(
-                probe, portalocker_module.LOCK_EX | portalocker_module.LOCK_NB,
-            )
-        except Exception:  # noqa: BLE001 -- LockException or a platform OSError
-            return True
-        try:
-            portalocker_module.unlock(probe)
-        except Exception:  # noqa: BLE001
-            pass
-        return False
-    finally:
-        try:
-            probe.close()
-        except Exception:  # noqa: BLE001
-            pass
 
 
 def read_index_lock_owner(
@@ -1091,12 +1055,9 @@ def _inspect_index_lock(
     threshold = stale_seconds if stale_seconds is not None else _resolve_lock_stale_seconds()
     now = time.time()
 
-    try:
-        import portalocker  # noqa: PLC0415 -- optional
-    except ImportError:
-        held: bool | None = os.path.exists(lock_path)
-    else:
-        held = _probe_portalocker_held(lock_path, portalocker)
+    # The lock file's existence IS the lock: every IndexFileLock acquirer
+    # creates it with O_EXCL and removes it on release. Never created here.
+    held = os.path.exists(lock_path)
 
     if meta is None:
         # No lease content -- either never used, cleanly released (atomic
@@ -1120,7 +1081,7 @@ def _inspect_index_lock(
                 ),
             ), (None, signature)
         return IndexLockOwner(
-            db_path=db_path, lock_path=lock_path, held=bool(held) if held is not None else False,
+            db_path=db_path, lock_path=lock_path, held=held,
         ), (None, signature)
 
     pid = meta.get("pid")
@@ -1139,9 +1100,8 @@ def _inspect_index_lock(
     is_stale = False
     stale_reason: str | None = None
     if held is False:
-        # OS/atomic-file-confirmed: nobody holds it right now. Leftover
-        # metadata here is purely historical (portalocker mode leaves the
-        # file in place after a clean release) -- nothing to reclaim.
+        # The lock file went away after its lease was read (a release or a
+        # reclaim in between): nobody holds it now -- nothing to reclaim.
         is_stale = False
     elif pid_alive is False:
         is_stale = True
@@ -1151,8 +1111,7 @@ def _inspect_index_lock(
         stale_reason = f"heartbeat is {age:.1f}s old (> {threshold:.0f}s threshold)"
 
     return IndexLockOwner(
-        db_path=db_path, lock_path=lock_path,
-        held=bool(held) if held is not None else True,
+        db_path=db_path, lock_path=lock_path, held=held,
         pid=pid, hostname=hostname, session_id=session_id,
         started_at=started_at, heartbeat_at=heartbeat_at, age_seconds=age,
         lock_mode=meta.get("lock_mode"), pid_alive=pid_alive,
@@ -1256,24 +1215,22 @@ def _remove_released_lock_file(lock_path: str) -> None:
 class IndexFileLock:
     """Exclusive write lock for one index DB file.
 
-    Uses a per-path threading.Lock for in-process safety (always) PLUS one of
-    two real cross-process mechanisms for a persistent (non-``:memory:``)
-    path:
+    Uses a per-path threading.Lock for in-process safety (always) PLUS, for a
+    persistent (non-``:memory:``) path, one cross-process mechanism shared by
+    every acquirer in every process: an atomic-create lease file
+    (``os.O_CREAT | os.O_EXCL``, a52216e2) -- a real, deterministic,
+    dependency-free mutual-exclusion primitive on both POSIX and Windows. No
+    optional dependency changes it: ``portalocker`` is never used, even when
+    importable, because its OS-level lock and this lease file never see each
+    other, so mixing the two let two holders in at once.
+    Bounded by ``timeout`` (default :func:`_resolve_lock_timeout_seconds`)
+    against a confirmed-ACTIVE owner; a confirmed-STALE owner's lock file is
+    reclaimed automatically (never its process -- see
+    :func:`read_index_lock_owner`).
 
-    * ``portalocker`` (when importable) -- an OS-level advisory lock, kernel-
-      released automatically if the owning process dies. Unchanged from the
-      historical behaviour: blocks indefinitely by default.
-    * An atomic-create fallback (``os.O_CREAT | os.O_EXCL``) used whenever
-      portalocker is unavailable (a52216e2) -- a real, deterministic,
-      dependency-free mutual-exclusion primitive on both POSIX and Windows.
-      Bounded by ``timeout`` (default :func:`_resolve_lock_timeout_seconds`)
-      against a confirmed-ACTIVE owner; a confirmed-STALE owner's lock file is
-      reclaimed automatically (never its process -- see
-      :func:`read_index_lock_owner`).
-
-    Both mechanisms write a small lease (owner pid/hostname/session_id/
-    started_at/heartbeat_at) into the lock file once acquired, readable via
-    :func:`read_index_lock_owner` without holding the lock.
+    The holder writes a small lease (owner pid/hostname/session_id/
+    started_at/heartbeat_at/token) into the lock file once acquired, readable
+    via :func:`read_index_lock_owner` without holding the lock.
 
     A genuine acquisition failure now raises :class:`IndexLockAcquireError`
     instead of being silently treated as success (a52216e2) -- callers that
@@ -1316,15 +1273,7 @@ class IndexFileLock:
             return
         lock_path = self._canonical + ".lock"
         try:
-            import portalocker  # noqa: PLC0415 -- optional
-        except ImportError:
-            portalocker = None  # type: ignore[assignment]
-
-        try:
-            if portalocker is not None:
-                self._acquire_portalocker(portalocker, lock_path)
-            else:
-                self._acquire_atomic(lock_path, timeout)
+            self._acquire_atomic(lock_path, timeout)
         except BaseException:
             self._thread_lock.release()
             raise
@@ -1333,39 +1282,6 @@ class IndexFileLock:
         self._started_at = now
         self._token = os.urandom(16).hex()
         self._write_lease(now)
-
-    def _acquire_portalocker(self, portalocker: Any, lock_path: str) -> None:
-        try:
-            # Opened without truncation: this open happens BEFORE the
-            # blocking lock, and "w" mode used to wipe a live holder's lease
-            # for as long as this process waited, leaving a lease-less file
-            # an atomic-create process can judge stale and reclaim.
-            fd = os.open(lock_path, os.O_RDWR | os.O_CREAT)
-            self._file_handle = os.fdopen(fd, "r+", encoding="utf-8")
-            portalocker.lock(self._file_handle, portalocker.LOCK_EX)
-        except Exception as exc:  # noqa: BLE001 -- a52216e2: no longer swallowed
-            if self._file_handle is not None:
-                try:
-                    self._file_handle.close()
-                except Exception:  # noqa: BLE001
-                    pass
-                self._file_handle = None
-            _log.warning(
-                "IndexFileLock: portalocker acquire failed for %r -- refusing "
-                "to proceed without a real cross-process lock (a52216e2)",
-                lock_path, exc_info=True,
-            )
-            raise IndexLockAcquireError(
-                f"failed to acquire the cross-process lock at {lock_path!r}: {exc}"
-            ) from exc
-        # Only now that the lock is held: drop the previous holder's lease,
-        # so a failed lease write in acquire() leaves no lease rather than a
-        # predecessor's. Best-effort, like the lease write itself.
-        try:
-            self._file_handle.truncate(0)
-        except Exception:  # noqa: BLE001 -- diagnostics-only, never fatal
-            _log.debug("IndexFileLock: failed to clear the previous lease", exc_info=True)
-        self._lock_mode = "portalocker"
 
     def _acquire_atomic(self, lock_path: str, timeout: float | None) -> None:
         effective_timeout = (
@@ -1488,19 +1404,13 @@ class IndexFileLock:
                 owns_file = self._lock_mode == "atomic_create" and _lock_file_is_ours(
                     lock_path, self._token, self._file_handle,
                 )
-                if self._lock_mode == "portalocker":
-                    try:
-                        import portalocker  # noqa: PLC0415
-                        portalocker.unlock(self._file_handle)
-                    except Exception:  # noqa: BLE001
-                        pass
                 try:
                     self._file_handle.close()
                 except Exception:  # noqa: BLE001
                     pass
                 if self._lock_mode == "atomic_create":
-                    # a52216e2 -- unlike portalocker's OS-level lock, this is
-                    # a plain file: it is NOT released just by closing the
+                    # a52216e2 -- unlike an OS-level lock, the lease file is
+                    # an ordinary file: it is NOT released just by closing the
                     # handle, so a clean release must remove it explicitly to
                     # make the path available to the next acquirer. Only when
                     # the on-disk lease still names this holder's token: if

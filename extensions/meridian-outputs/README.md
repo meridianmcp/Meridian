@@ -289,7 +289,8 @@ self-consistent, not merely present.
   `*credential*`, `config.*`, `*.pem`, and many others).
 - The local index cache is auto-added to `.gitignore` on first use.
 - Concurrent index writes are serialised through `IndexFileLock`
-  (threading + optional cross-process portalocker).
+  (threading + a cross-process atomic-create lease file, the same in every
+  process whatever optional packages are installed).
 - Provenance and fingerprint ledger writes hold the same cross-process
   `IndexFileLock` on the ledger file (`meridian_outputs.ledger_io`), write a
   unique fsynced temporary file, and replace the ledger atomically. A

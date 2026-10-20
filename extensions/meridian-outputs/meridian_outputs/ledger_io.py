@@ -22,10 +22,10 @@ primitive rather than adding a new one:
 * :func:`ledger_transaction` holds :class:`outputs_local.IndexFileLock` on the
   ledger path (lock file ``<ledger>.lock`` beside it, inside the gitignored
   cache directory) for the whole read-modify-write. Contention fails closed:
-  :class:`outputs_local.IndexLockAcquireError` propagates when the atomic
-  fallback lock does not become free within its timeout. With the optional
-  ``portalocker`` installed, ``IndexFileLock`` keeps its historical
-  block-until-free behaviour; the OS releases that lock if its owner dies.
+  :class:`outputs_local.IndexLockAcquireError` propagates when the lock does
+  not become free within its timeout. Every process takes the same
+  atomic-create lease file whatever is installed; a lease left by a dead
+  owner is reclaimed as stale.
 * :func:`read_ledger_strict` returns ``{}`` only for a missing ledger. Bytes
   that are not a JSON object raise :class:`LedgerCorruptError`; they are never
   read as empty.
