@@ -83,7 +83,7 @@ from dataclasses import asdict, dataclass, field
 from datetime import datetime, timezone
 from typing import Any
 
-from . import annotate, fingerprint, outputs_local
+from . import annotate, fingerprint, ledger_io, outputs_local
 
 __all__ = [
     "RegistryError",
@@ -195,6 +195,30 @@ def _read_registry(outputs_dir: str) -> dict[str, Any]:
     if not isinstance(data["edges"], list):
         data["edges"] = []
     return data
+
+
+def _read_registry_strict(outputs_dir: str) -> dict[str, Any]:
+    """Strict read: an empty registry only for a missing file. Bytes that are
+    not a JSON object raise ``ledger_io.LedgerCorruptError`` instead of
+    reading as empty the way :func:`_read_registry` does. Takes no lock."""
+    path = _registry_path(outputs_dir, create=False)
+    data = ledger_io.read_ledger_strict(path)
+    data.setdefault("artifacts", {})
+    data.setdefault("edges", [])
+    return data
+
+
+def _read_registry_for_write(outputs_dir: str) -> dict[str, Any]:
+    """The writers' read, taken under ``_write_lock``. A corrupt registry is
+    quarantined and ``ledger_io.LedgerCorruptError`` raised
+    (``ledger_io.raise_quarantined``), so it is never read as empty and
+    replaced by a one-artifact registry. Continuing from empty would also
+    drop the content-hash conflict check :func:`register_artifact` makes
+    against the existing record. Nothing is written."""
+    try:
+        return _read_registry_strict(outputs_dir)
+    except ledger_io.LedgerCorruptError as exc:
+        ledger_io.raise_quarantined(exc)
 
 
 def _write_registry(outputs_dir: str, registry: dict[str, Any]) -> None:
@@ -408,6 +432,10 @@ def register_artifact(
           already on file for this id from a prior registration. Either way
           the write is refused rather than silently accepted or silently
           overwriting a conflicting prior hash.
+      ledger_io.LedgerCorruptError: the registry file exists but cannot be
+        parsed. Its bytes are quarantined (``quarantine_path``) and nothing
+        is written. :func:`set_lifecycle_state` and :func:`bind_source_edge`
+        refuse the same way.
     """
     if not outputs_dir or not str(outputs_dir).strip():
         raise RegistryError("register_artifact: outputs_dir is required")
@@ -437,7 +465,7 @@ def register_artifact(
     )
 
     with _write_lock:
-        registry = _read_registry(outputs_dir)
+        registry = _read_registry_for_write(outputs_dir)
         existing = registry["artifacts"].get(artifact_id)
         now = _utcnow_iso()
 
@@ -776,7 +804,7 @@ def set_lifecycle_state(
             f"{LIFECYCLE_STATES}, got {lifecycle_state!r}"
         )
     with _write_lock:
-        registry = _read_registry(outputs_dir)
+        registry = _read_registry_for_write(outputs_dir)
         record = registry["artifacts"].get(artifact_id)
         if record is None:
             raise RegistryError(
@@ -821,7 +849,7 @@ def bind_source_edge(
         raise RegistryError("bind_source_edge: relation is required")
 
     with _write_lock:
-        registry = _read_registry(outputs_dir)
+        registry = _read_registry_for_write(outputs_dir)
         if artifact_id not in registry["artifacts"]:
             raise RegistryError(
                 f"bind_source_edge: cannot bind an edge to unregistered "

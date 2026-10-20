@@ -167,11 +167,12 @@ def _read_ledger(outputs_dir: str) -> dict[str, dict[str, Any]]:
 
 def _read_ledger_strict(outputs_dir: str) -> dict[str, dict[str, Any]]:
     """Strict read for staleness lookups (:func:`check_input_staleness`,
-    :func:`run_ids_for_output`): ``{}`` only for a missing ledger. Bytes that
+    :func:`run_ids_for_output`) and the writers
+    (:func:`_read_ledger_for_write`): ``{}`` only for a missing ledger. Bytes that
     are not a JSON object, or a run row that is not an object, raise
     ``ledger_io.LedgerCorruptError`` -- an unreadable ledger is never read
     as "no run covers this output". :func:`_read_ledger` keeps its lenient
-    behaviour for the writers and plain listings."""
+    behaviour for plain listings."""
     path = _ledger_path(outputs_dir, create=False)
     ledger = ledger_io.read_ledger_strict(path)
     for record in ledger.values():
@@ -181,10 +182,24 @@ def _read_ledger_strict(outputs_dir: str) -> dict[str, dict[str, Any]]:
     return ledger
 
 
+def _read_ledger_for_write(outputs_dir: str) -> dict[str, dict[str, Any]]:
+    """The writers' read, taken under ``_write_lock``. Strict: a corrupt
+    ledger is quarantined and ``ledger_io.LedgerCorruptError`` raised
+    (``ledger_io.raise_quarantined``), so it is never read as ``{}`` and
+    replaced by an entry-only ledger. Continuing from empty (as the
+    provenance ledger's writer does) would also drop the per-run
+    immutability check :func:`start_run_manifest` makes against the existing
+    record. Any other read ``OSError`` propagates; nothing is written."""
+    try:
+        return _read_ledger_strict(outputs_dir)
+    except ledger_io.LedgerCorruptError as exc:
+        ledger_io.raise_quarantined(exc)
+
+
 def _write_ledger_entry(outputs_dir: str, key: str, record: dict[str, Any]) -> None:
     path = _ledger_path(outputs_dir)
     with _write_lock:
-        ledger = _read_ledger(outputs_dir)
+        ledger = _read_ledger_for_write(outputs_dir)
         ledger[key] = record
         tmp = path + ".tmp"
         with open(tmp, "w", encoding="utf-8") as fh:
@@ -553,6 +568,9 @@ def start_run_manifest(
       manifest already exists for this ``run_id`` with a DIFFERENT identity
       hash (see :func:`check_run_manifest_immutable`) -- fails closed rather
       than silently overwriting a different run's identity.
+      ledger_io.LedgerCorruptError: the run-manifest ledger exists but cannot
+      be parsed. Its bytes are quarantined (``quarantine_path``) and nothing
+      is written: a damaged ledger is never replaced by this one record.
     """
     if not outputs_dir or not str(outputs_dir).strip():
         raise RunManifestError("outputs_dir is required")
@@ -635,7 +653,7 @@ def start_run_manifest(
 
     key = manifest["run_id"]
     with _write_lock:
-        ledger = _read_ledger(outputs_dir)
+        ledger = _read_ledger_for_write(outputs_dir)
         existing = ledger.get(key)
         ok, reason = check_run_manifest_immutable(existing, manifest)
         if not ok:
@@ -694,6 +712,8 @@ def finalize_run_manifest(
       RunManifestError: ``outputs_dir``/``run_id`` missing, ``status`` not
       one of the valid values, or no manifest was ever started for this
       ``run_id`` -- finalize never creates a fresh identity on its own.
+      ledger_io.LedgerCorruptError: the run-manifest ledger exists but cannot
+      be parsed (quarantined, nothing written; see :func:`start_run_manifest`).
     """
     if not outputs_dir or not str(outputs_dir).strip():
         raise RunManifestError("outputs_dir is required")
@@ -706,7 +726,7 @@ def finalize_run_manifest(
         )
 
     with _write_lock:
-        ledger = _read_ledger(outputs_dir)
+        ledger = _read_ledger_for_write(outputs_dir)
         existing = ledger.get(key)
         if existing is None:
             raise RunManifestError(

@@ -23,7 +23,7 @@ import pytest
 
 sys.path.insert(0, str(Path(__file__).parent.parent))
 from meridian_outputs import artifact_registry as AR
-from meridian_outputs import annotate
+from meridian_outputs import annotate, ledger_io
 
 
 def _write(path: Path, content: str = "hello") -> str:
@@ -484,3 +484,42 @@ class TestStripLocalMetadata:
         )
         AR.strip_local_metadata(rec)
         assert "local_only_path" in rec["local_paths"][0]
+
+
+# ---------------------------------------------------------------------------
+# Writers on a corrupt registry (S-F3): refuse, quarantine, write nothing
+# ---------------------------------------------------------------------------
+
+class TestCorruptRegistryWriters:
+    @staticmethod
+    def _truncated_registry(tmp_path: Path) -> tuple[Path, bytes, str]:
+        """A real two-artifact registry cut off mid-file."""
+        od = str(tmp_path)
+        first = AR.register_artifact(od, "figure", generator="a.py")
+        AR.register_artifact(od, "figure", generator="b.py")
+        registry = tmp_path / ".meridian-outputs-cache" / "artifact_registry.json"
+        raw = registry.read_bytes()
+        truncated = raw[: len(raw) // 2]
+        registry.write_bytes(truncated)
+        return registry, truncated, first["artifact_id"]
+
+    @pytest.mark.parametrize("writer", ["register", "lifecycle", "edge"])
+    def test_writer_on_truncated_registry_raises_and_keeps_its_bytes(
+        self, tmp_path: Path, writer: str,
+    ) -> None:
+        registry, truncated, aid = self._truncated_registry(tmp_path)
+        od = str(tmp_path)
+        with pytest.raises(ledger_io.LedgerCorruptError) as info:
+            if writer == "register":
+                AR.register_artifact(od, "figure", generator="c.py")
+            elif writer == "lifecycle":
+                AR.set_lifecycle_state(od, aid, AR.DEPRECATED)
+            else:
+                AR.bind_source_edge(od, aid, "data/src.csv")
+        # Never replaced by a registry holding only this write.
+        assert registry.read_bytes() == truncated
+        quarantined = info.value.quarantine_path
+        assert quarantined is not None
+        assert Path(quarantined).name.startswith("artifact_registry.json.corrupt-")
+        assert Path(quarantined).read_bytes() == truncated
+        assert str(tmp_path) not in str(info.value)  # basename only in the message
