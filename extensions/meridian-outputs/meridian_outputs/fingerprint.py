@@ -362,17 +362,48 @@ def _write_ledger_entry(outputs_dir: str, tagged: ScriptTaggedFingerprint) -> st
 @dataclass
 class StalenessResult:
     """Whether one previously-tagged output is stale relative to its
-    generating script's CURRENT on-disk content."""
+    generating script's CURRENT on-disk content. ``is_stale`` is ``None``
+    (unknown, never "not stale") when the row cannot be checked: no
+    generating script was resolved at tag time, or no script hash was
+    recorded at tag time."""
 
     path: str
     script_path: str | None
     tagged_script_hash: str | None
     current_script_hash: str | None
-    is_stale: bool
+    is_stale: bool | None
     reason: str
 
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)
+
+
+_NO_SCRIPT_REASON = (
+    "no generating script resolved at tag time -- staleness cannot be "
+    "confirmed either way"
+)
+
+
+def _script_staleness(
+    tagged_hash: str | None, current_hash: str | None,
+) -> tuple[bool | None, str]:
+    """``(is_stale, reason)`` for one ledger row whose script path is known.
+
+    The single rule :func:`check_staleness` and :func:`find_stale_by_script`
+    both apply, so the two readers can never disagree about the same row. A
+    script that can no longer be read is stale; a row with no recorded hash
+    is unknown (``None``), since there is nothing to compare the current
+    content against."""
+    if current_hash is None:
+        return True, "generating script no longer readable/present"
+    if tagged_hash is None:
+        return None, (
+            "no script hash was recorded at tag time -- staleness cannot be "
+            "confirmed either way"
+        )
+    if current_hash != tagged_hash:
+        return True, "generating script content changed since tagging"
+    return False, "generating script unchanged since tagging"
 
 
 def check_staleness(outputs_dir: str) -> list[StalenessResult]:
@@ -386,6 +417,11 @@ def check_staleness(outputs_dir: str) -> list[StalenessResult]:
     file itself never changed and looks perfectly valid/cached. It is also
     flagged stale if the generating script can no longer be read at all
     (deleted/moved -- provenance can no longer be confirmed either way).
+
+    A row that cannot be checked -- no generating script was resolved at
+    tag time, or no script hash was recorded then -- gets ``is_stale``
+    ``None`` with a reason saying so. It is never reported as ``False``
+    ("unchanged"), since nothing was compared.
 
     Returns results in stable sorted order (by output path). Raises
     ``ledger_io.LedgerCorruptError`` for a corrupt ledger rather than
@@ -405,35 +441,20 @@ def check_staleness(outputs_dir: str) -> list[StalenessResult]:
         if not script_path:
             results.append(StalenessResult(
                 path=output_path, script_path=None, tagged_script_hash=tagged_hash,
-                current_script_hash=None, is_stale=False,
-                reason="no generating script resolved at tag time",
+                current_script_hash=None, is_stale=None,
+                reason=_NO_SCRIPT_REASON,
             ))
             continue
         resolved_script = resolve_reference(outputs_dir, script_path)
         if resolved_script not in script_hash_cache:
             script_hash_cache[resolved_script] = script_content_hash(resolved_script)
         current_hash = script_hash_cache[resolved_script]
-        if current_hash is None:
-            results.append(StalenessResult(
-                path=output_path, script_path=resolved_script,
-                tagged_script_hash=tagged_hash, current_script_hash=None,
-                is_stale=True,
-                reason="generating script no longer readable/present",
-            ))
-        elif tagged_hash is not None and current_hash != tagged_hash:
-            results.append(StalenessResult(
-                path=output_path, script_path=resolved_script,
-                tagged_script_hash=tagged_hash, current_script_hash=current_hash,
-                is_stale=True,
-                reason="generating script content changed since tagging",
-            ))
-        else:
-            results.append(StalenessResult(
-                path=output_path, script_path=resolved_script,
-                tagged_script_hash=tagged_hash, current_script_hash=current_hash,
-                is_stale=False,
-                reason="generating script unchanged since tagging",
-            ))
+        is_stale, reason = _script_staleness(tagged_hash, current_hash)
+        results.append(StalenessResult(
+            path=output_path, script_path=resolved_script,
+            tagged_script_hash=tagged_hash, current_script_hash=current_hash,
+            is_stale=is_stale, reason=reason,
+        ))
     return results
 
 
@@ -447,6 +468,13 @@ def find_stale_by_script(outputs_dir: str, script_path: str) -> list[str]:
     script whose recorded ``script_hash`` doesn't match the script's CURRENT
     hash was generated by a script content-state that no longer exists on
     disk -- i.e. potentially the just-fixed bug.
+
+    A row is listed exactly when :func:`check_staleness` reports it
+    ``is_stale`` ``True`` (both apply :func:`_script_staleness`): a script
+    that can no longer be read lists every row tagged against it, and a row
+    with no recorded script hash is NOT listed, because its staleness is
+    unknown rather than confirmed -- :func:`check_staleness` reports such a
+    row with ``is_stale`` ``None``.
 
     Returns paths in stable sorted order. Raises
     ``ledger_io.LedgerCorruptError`` for a corrupt ledger.
@@ -470,6 +498,6 @@ def find_stale_by_script(outputs_dir: str, script_path: str) -> list[str]:
         # this item) would let a NEW-style row that somehow lacks
         # script_hash disagree with check_staleness about the same data.
         tagged_hash = _digest_hex(entry.get("content_digest")) or entry.get("script_hash")
-        if tagged_hash != current_hash:
+        if _script_staleness(tagged_hash, current_hash)[0] is True:
             stale.append(resolve_reference(outputs_dir, path))
     return stale

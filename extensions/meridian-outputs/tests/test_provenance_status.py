@@ -873,6 +873,62 @@ class TestStaleByScript:
         assert status["provenance_type"] == PS.EXACT
         assert status["script_staleness"]["is_stale"] is None
 
+    @duckdb_required
+    def test_tagged_row_without_resolvable_script_is_unknown_never_verified(
+        self, tmp_path: Path,
+    ) -> None:
+        """A fingerprint-tagged output whose script was never resolved can
+        not have its script staleness checked. It used to read as "not
+        stale", so the bridge called the exact record VERIFIED at 0.95."""
+        output = tmp_path / "result.csv"
+        output.write_text("a,b\n1,2\n", encoding="utf-8")
+        AN.record_provenance(str(tmp_path), str(output))
+        assert FP.tag_output(str(output), str(tmp_path)).script_path is None
+
+        status = PS.get_provenance_status(str(tmp_path), str(output))
+        assert status["provenance_type"] == PS.EXACT
+        assert status["staleness"]["stale"] is False  # the output itself is unchanged
+        assert status["staleness"]["recorded_content_hash"] is not None
+        script_staleness = status["script_staleness"]
+        assert script_staleness["is_stale"] is None
+        assert "no generating script resolved at tag time" in script_staleness["reason"]
+        assert "error" not in script_staleness
+
+        resolver = PS.evidence_record_from_provenance_status(status).resolver
+        assert resolver.status is not RE.ResolverStatus.VERIFIED
+        assert resolver.status is RE.ResolverStatus.AMBIGUOUS
+        assert resolver.confidence != 0.95
+        assert not resolver.is_authoritative
+
+    def test_relocated_with_unknown_script_staleness_is_never_verified(self) -> None:
+        status = {
+            "path": "/out/moved.csv",
+            "provenance_type": PS.RELOCATED,
+            "record": {"path": "/out/original.csv"},
+            "directory_note": None,
+            "staleness": {
+                "exists_on_disk": True, "recorded_content_hash": "ab" * 32,
+                "current_content_hash": "ab" * 32, "stale": False,
+                "reason": "content hash matches a provenance record for a different path",
+            },
+            "script_staleness": {
+                "is_stale": None,
+                "reason": "no generating script resolved at tag time -- staleness "
+                          "cannot be confirmed either way",
+            },
+            "input_staleness": None,
+            "inconclusive": False,
+        }
+        resolver = PS._resolver_state_for_provenance_status(status)
+        assert resolver.status is RE.ResolverStatus.AMBIGUOUS
+        assert "no generating script resolved" in resolver.reason
+
+        status["script_staleness"]["is_stale"] = False
+        assert (
+            PS._resolver_state_for_provenance_status(status).status
+            is RE.ResolverStatus.VERIFIED
+        )
+
 
 # ---------------------------------------------------------------------------
 # Canonical/archival identity (item d3374b0e)
