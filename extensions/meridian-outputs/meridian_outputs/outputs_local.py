@@ -1212,6 +1212,50 @@ def _remove_released_lock_file(lock_path: str) -> None:
     )
 
 
+# How often OutputsFtsIndex's long Tantivy loops (the delta commit in
+# _rebuild_fts and the one-time DuckDB-to-Tantivy migration) refresh the write
+# lock's lease while they run: after this many rows or this many seconds,
+# whichever comes first, plus once before and once after each commit. Both
+# loops run inside rebuild()'s write-lock section, which used to heartbeat only
+# once, before them: a delta or migration longer than the stale threshold
+# (_LOCK_STALE_SECONDS_DEFAULT) left a live holder with an old heartbeat, which
+# another process judges stale and reclaims, so both entered the critical
+# section. Both values sit far below that threshold; IndexFileLock.heartbeat's
+# own _HEARTBEAT_MIN_INTERVAL_SECONDS still caps the actual lease writes.
+_FTS_HEARTBEAT_EVERY_ROWS = 1000
+_FTS_HEARTBEAT_EVERY_SECONDS = 5.0
+
+
+class _LeaseHeartbeatPacer:
+    """Calls ``heartbeat`` from a long per-row loop at a bounded interval
+    (:data:`_FTS_HEARTBEAT_EVERY_ROWS` rows or
+    :data:`_FTS_HEARTBEAT_EVERY_SECONDS`, whichever comes first) instead of on
+    every row. ``heartbeat`` is :meth:`IndexFileLock.heartbeat`, which is
+    best-effort, never raises, and is a no-op when the lock is not held."""
+
+    __slots__ = ("_heartbeat", "_rows", "_last")
+
+    def __init__(self, heartbeat: Callable[[], None]) -> None:
+        self._heartbeat = heartbeat
+        self._rows = 0
+        self._last = time.monotonic()
+
+    def beat(self) -> None:
+        """Heartbeat now, e.g. right before and right after a commit."""
+        self._heartbeat()
+        self._rows = 0
+        self._last = time.monotonic()
+
+    def tick(self) -> None:
+        """Count one row; heartbeat once either interval has been reached."""
+        self._rows += 1
+        if (
+            self._rows >= _FTS_HEARTBEAT_EVERY_ROWS
+            or time.monotonic() - self._last >= _FTS_HEARTBEAT_EVERY_SECONDS
+        ):
+            self.beat()
+
+
 class IndexFileLock:
     """Exclusive write lock for one index DB file.
 
@@ -1350,8 +1394,11 @@ class IndexFileLock:
                 return
 
     # a52216e2 -- heartbeat() is called from inside rebuild()'s write-lock
-    # section on every Phase 2 pass that reaches the Tantivy commit step, so
-    # it must be cheap on the common (fast, uncontended) call -- a full lease
+    # section on every Phase 2 pass that reaches the Tantivy commit step, and
+    # again from inside that step's long loops (the delta commit and the
+    # one-time DuckDB-to-Tantivy migration, paced by _LeaseHeartbeatPacer)
+    # so a hold longer than the stale threshold keeps a fresh lease. It
+    # must be cheap on the common (fast, uncontended) call -- a full lease
     # rewrite on every single call measurably ate into tight rebuild budgets
     # (see the investigation notes on _write_lease_to_handle re: fsync).
     # Skipping a redundant rewrite when the lease is already fresh keeps the
@@ -5476,11 +5523,18 @@ class OutputsFtsIndex:
             duckdb_count, tantivy_count,
         )
         import tantivy  # noqa: PLC0415
+        # Runs inside rebuild()'s write-lock section and can take far longer
+        # than the lease's stale threshold on a large legacy table: keep the
+        # lease fresh while it runs (a no-op when the lock is not held).
+        pacer = _LeaseHeartbeatPacer(self._write_lock.heartbeat)
         relation = con.execute("SELECT path, content FROM outputs_index")
         for path, content in relation.fetchall():
             writer.delete_documents("path", path)
             writer.add_document(tantivy.Document(path=path, content=content or ""))
+            pacer.tick()
+        pacer.beat()
         writer.commit()
+        pacer.beat()
         index.reload()
 
     def _ensure_schema(self, con: Any) -> None:
@@ -7313,7 +7367,9 @@ class OutputsFtsIndex:
                         # below, so a sibling process's staleness check never
                         # mistakes a genuinely-still-working writer for an
                         # abandoned one just because the DB write above alone
-                        # took a while.
+                        # took a while. _rebuild_fts() keeps it fresh from
+                        # there (_LeaseHeartbeatPacer) through the delta and
+                        # the one-time migration, however long they run.
                         self._write_lock.heartbeat()
                         fts_started = time.monotonic()
                         self._rebuild_fts(con)
@@ -7734,13 +7790,21 @@ class OutputsFtsIndex:
         deletes, self._pending_tantivy_deletes = self._pending_tantivy_deletes, set()
         upserts, self._pending_tantivy_upserts = self._pending_tantivy_upserts, {}
         if deletes or upserts:
+            # A large (or long-deferred) delta can outlast the lease's stale
+            # threshold: keep the write lock's lease fresh while it runs
+            # (a no-op when the lock is not held, e.g. search()'s lazy build).
+            pacer = _LeaseHeartbeatPacer(self._write_lock.heartbeat)
             for p in deletes:
                 writer.delete_documents("path", p)
+                pacer.tick()
             for row in upserts.values():
                 writer.add_document(
                     tantivy.Document(path=row.path, content=row.content or "")
                 )
+                pacer.tick()
+            pacer.beat()
             writer.commit()
+            pacer.beat()
             index.reload()
         if not self._tantivy_migration_checked:
             self._tantivy_migration_checked = True

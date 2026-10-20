@@ -7156,6 +7156,173 @@ class TestTantivyMigration:
             pass
 
 
+class _SlowTantivyWriter:
+    """Delegates to a real Tantivy writer but sleeps before every
+    ``add_document``, so the loop around it outlasts a shrunken stale
+    threshold without needing a huge corpus."""
+
+    def __init__(self, inner: Any, delay: float) -> None:
+        self._inner = inner
+        self._delay = delay
+
+    def add_document(self, doc: Any) -> Any:
+        time.sleep(self._delay)
+        return self._inner.add_document(doc)
+
+    def __getattr__(self, name: str) -> Any:
+        return getattr(self._inner, name)
+
+
+class TestFtsLeaseHeartbeat:
+    """rebuild() holds the index write lock through _rebuild_fts(), whose
+    Tantivy delta commit and one-time DuckDB-to-Tantivy migration used to
+    run with no heartbeat at all (rebuild() refreshed the lease once, just
+    before them). One that outlasted the stale threshold left a LIVE holder
+    with an old heartbeat, which a second process judges stale and reclaims,
+    so both ran the critical section. These tests shrink the stale threshold
+    and the heartbeat pacing, run each loop for well over the threshold, and
+    play the second process's acquire loop from a thread: inspect the lock,
+    and reclaim it when judged stale, exactly as _acquire_atomic does."""
+
+    _STALE_SECONDS = 0.75
+    _ROWS = 100
+    _ROW_DELAY = 0.02  # ~2-3 s per loop, several times the stale threshold
+
+    @pytest.fixture(autouse=True)
+    def _fast_lease_clock(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.setenv(
+            "MERIDIAN_OUTPUTS_LOCK_STALE_SECONDS", str(self._STALE_SECONDS),
+        )
+        monkeypatch.setattr(OL, "_FTS_HEARTBEAT_EVERY_SECONDS", 0.1)
+        monkeypatch.setattr(OL.IndexFileLock, "_HEARTBEAT_MIN_INTERVAL_SECONDS", 0.05)
+
+    @staticmethod
+    def _second_acquirer(
+        db_path: str, stop: threading.Event, verdicts: list[str],
+    ) -> None:
+        lock_path = os.path.abspath(db_path) + ".lock"
+        while not stop.is_set():
+            owner, snapshot = OL._inspect_index_lock(db_path)
+            if owner.is_stale:
+                verdicts.append(str(owner.stale_reason))
+                OL._reclaim_stale_lock_file(lock_path, snapshot)
+            time.sleep(0.02)
+
+    def _run_held(self, idx: OL.OutputsFtsIndex, work: Any, what: str) -> None:
+        """Run ``work()`` holding idx's write lock while the simulated second
+        acquirer watches. Asserts it never judged the live holder stale, the
+        lock file still belongs to this holder, and its heartbeat moved on."""
+        verdicts: list[str] = []
+        stop = threading.Event()
+        lock = idx._write_lock
+        lock.acquire()
+        try:
+            started = time.monotonic()
+            watcher = threading.Thread(
+                target=self._second_acquirer, args=(idx._db_path, stop, verdicts),
+                daemon=True,
+            )
+            watcher.start()
+            try:
+                work()
+            finally:
+                stop.set()
+                watcher.join(10.0)
+            elapsed = time.monotonic() - started
+            assert elapsed > 2 * self._STALE_SECONDS, (
+                f"test setup invariant: the loop ran only {elapsed:.2f}s, not "
+                f"longer than the {self._STALE_SECONDS}s stale threshold"
+            )
+            assert verdicts == [], (
+                "a second acquirer judged the lock of a live holder stale "
+                f"(and so tried to reclaim it) during the {what}: {verdicts[:3]}"
+            )
+            lock_path = os.path.abspath(idx._db_path) + ".lock"
+            assert OL._lock_file_is_ours(lock_path, lock._token, lock._file_handle), (
+                "the lock file was reclaimed out from under a live holder"
+            )
+            lease = json.loads(Path(lock_path).read_text(encoding="utf-8"))
+            assert lease["heartbeat_at"] - lease["started_at"] > self._STALE_SECONDS
+        finally:
+            lock.release()
+
+    def test_migration_keeps_lease_fresh_past_stale_threshold(
+        self, tmp_path: Path,
+    ) -> None:
+        db_path = OL._resolve_index_db_path(str(tmp_path))
+        idx = OL.OutputsFtsIndex(str(tmp_path), db_path=db_path)
+        try:
+            con = idx._connect()
+            idx._ensure_schema(con)
+            for i in range(self._ROWS):
+                con.execute(
+                    "INSERT INTO outputs_index VALUES "
+                    "(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                    [
+                        str(tmp_path / f"legacy_{i}.csv"), f"legacyrow{i} content",
+                        time.time(), f"{i:08x}", 10, None, "csv", False, None,
+                        None, None,
+                    ],
+                )
+            index, writer = idx._connect_tantivy()
+            assert index.searcher().num_docs == 0, "test setup: migration must run"
+            slow = _SlowTantivyWriter(writer, self._ROW_DELAY)
+
+            self._run_held(
+                idx,
+                lambda: idx._migrate_duckdb_rows_to_tantivy_if_needed(con, index, slow),
+                "one-time DuckDB-to-Tantivy migration",
+            )
+            assert index.searcher().num_docs == self._ROWS
+        finally:
+            idx.close()
+
+    def test_delta_commit_keeps_lease_fresh_past_stale_threshold(
+        self, tmp_path: Path,
+    ) -> None:
+        from types import SimpleNamespace  # noqa: PLC0415
+
+        db_path = OL._resolve_index_db_path(str(tmp_path))
+        idx = OL.OutputsFtsIndex(str(tmp_path), db_path=db_path)
+        try:
+            con = idx._connect()
+            idx._ensure_schema(con)
+            index, writer = idx._connect_tantivy()
+            idx._tantivy_writer = _SlowTantivyWriter(writer, self._ROW_DELAY)
+            idx._tantivy_migration_checked = True  # delta path only
+            for i in range(self._ROWS):
+                path = str(tmp_path / f"delta_{i}.csv")
+                idx._pending_tantivy_upserts[path] = SimpleNamespace(
+                    path=path, content=f"deltarow{i} content",
+                )
+
+            self._run_held(
+                idx, lambda: idx._rebuild_fts(con), "Tantivy delta commit",
+            )
+            assert index.searcher().num_docs == self._ROWS
+        finally:
+            idx.close()
+
+    def test_pacer_heartbeats_by_row_count_not_every_row(
+        self, monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """The loops must stay cheap: one heartbeat per
+        _FTS_HEARTBEAT_EVERY_ROWS rows (time trigger disabled here), never
+        one per row, plus one per explicit beat() around a commit."""
+        monkeypatch.setattr(OL, "_FTS_HEARTBEAT_EVERY_SECONDS", 3600.0)
+        monkeypatch.setattr(OL, "_FTS_HEARTBEAT_EVERY_ROWS", 1000)
+        calls: list[float] = []
+        pacer = OL._LeaseHeartbeatPacer(lambda: calls.append(time.monotonic()))
+        for _ in range(2500):
+            pacer.tick()
+        assert len(calls) == 2
+        pacer.beat()
+        assert len(calls) == 3
+        for _ in range(999):
+            pacer.tick()
+        assert len(calls) == 3, "beat() must restart the row interval"
+
+
 class TestTantivyDependency:
     """279448b4 -- the real PyPI package is "tantivy" (quickwit-oss/tantivy-py's
     official bindings), NOT "tantivy-py" (a different, unrelated, essentially
