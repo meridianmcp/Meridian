@@ -14,7 +14,7 @@ from pathlib import Path
 import pytest
 
 sys.path.insert(0, str(Path(__file__).parent.parent))
-from meridian_outputs import annotate, artifact_registry, fingerprint, outputs_local, run_manifest
+from meridian_outputs import annotate, artifact_registry, fingerprint, ledger_io, outputs_local, run_manifest
 from meridian_outputs import bundle as B
 
 _READERS = {
@@ -245,7 +245,37 @@ class TestExport:
         monkeypatch.setattr(B.os, "fsync", lambda fd: (calls.append("fsync"), real_fsync(fd))[1])
         monkeypatch.setattr(B.os, "replace", lambda s, d: (calls.append("replace"), real_replace(s, d))[1])
         _export(populated["outputs"])
-        assert calls == ["fsync", "replace"]
+        # The file fsync precedes the rename; on POSIX the directory fsync
+        # after it adds a second fsync.
+        assert calls[:2] == ["fsync", "replace"]
+        assert calls.count("replace") == 1
+
+    def test_directory_is_fsynced_after_replace(self, populated, monkeypatch) -> None:
+        events: list[str] = []
+        real_replace = os.replace
+        monkeypatch.setattr(B.os, "replace", lambda s, d: (events.append("replace"), real_replace(s, d))[1])
+        monkeypatch.setattr(ledger_io, "_fsync_directory", lambda d: events.append(f"dir:{d}"))
+        _export(populated["outputs"])
+        assert len(events) == 2 and events[0] == "replace"
+        assert events[1].startswith("dir:")
+        assert os.path.samefile(events[1][len("dir:"):], populated["outputs"] / "backup")
+
+    def test_transient_sharing_violation_on_replace_is_retried(self, populated, monkeypatch) -> None:
+        real_replace = os.replace
+        failures = {"left": 2}
+
+        def _flaky(src, dst):
+            if failures["left"]:
+                failures["left"] -= 1
+                raise PermissionError("sharing violation")
+            real_replace(src, dst)
+
+        monkeypatch.setattr(ledger_io, "_SHARING_RETRY_SLEEP_SECONDS", 0.0)
+        monkeypatch.setattr(B.os, "replace", _flaky)
+        _export(populated["outputs"])
+        assert failures["left"] == 0
+        assert B.verify_bundle(str(populated["outputs"] / "backup" / "bundle.json"))["verified"] is True
+        assert [p.name for p in (populated["outputs"] / "backup").iterdir()] == ["bundle.json"]
 
 
 class TestVerify:
@@ -593,6 +623,23 @@ class TestImport:
         assert result["imported"] is False
         assert result["reason"] == "write_failed"
         assert result["written_members"] == []
+
+    def test_import_replace_failure_leaves_no_temp_file(self, populated, monkeypatch) -> None:
+        _export(populated["outputs"])
+        target = _empty_target(populated["root"])
+        _copy_bundle(populated["outputs"], "backup/bundle.json", target)
+
+        def _fail(_src, _dst):
+            raise OSError("disk full")
+
+        monkeypatch.setattr(B.os, "replace", _fail)
+        result = B.import_bundle("incoming.json", str(target), dry_run=False)
+        assert result["imported"] is False
+        assert result["reason"] == "write_failed"
+        assert result["written_members"] == []
+        cache = target / ".meridian-outputs-cache"
+        assert [p.name for p in cache.iterdir() if p.name.endswith(".tmp")] == []
+        assert _snapshot(target) == {name: None for name in _LEDGER_FILES}
 
     def test_busy_ledger_lock_is_a_write_failure_not_a_hang(self, populated, monkeypatch) -> None:
         _export(populated["outputs"])

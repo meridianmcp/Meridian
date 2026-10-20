@@ -116,7 +116,7 @@ import tempfile
 from datetime import datetime, timezone
 from typing import Any, Iterator
 
-from . import annotate, artifact_registry, fingerprint, outputs_local, run_manifest
+from . import annotate, artifact_registry, fingerprint, ledger_io, outputs_local, run_manifest
 from .path_security import _require_within, relative_output_path
 
 __all__ = [
@@ -259,8 +259,11 @@ def _file_signature(path: str) -> tuple[int, int] | None:
 
 
 def _atomic_write_json(path: str, obj: Any, *, indent: int | None) -> None:
-    """Temp file in the same directory, fsync, ``os.replace``; the temp file
-    is removed on any failure so nothing half-written is left behind."""
+    """Temp file in the same directory, fsync, ``os.replace``, directory
+    fsync; the temp file is removed on any failure so nothing half-written
+    is left behind. The replace retries a transient Windows sharing
+    violation (a lock-free reader holding the target open) the same way
+    ``ledger_io.write_ledger_atomic`` does."""
     directory = os.path.dirname(path)
     os.makedirs(directory, exist_ok=True)
     fd, tmp = tempfile.mkstemp(dir=directory, prefix=".bundle-", suffix=".tmp")
@@ -269,11 +272,12 @@ def _atomic_write_json(path: str, obj: Any, *, indent: int | None) -> None:
             json.dump(obj, fh, indent=indent, sort_keys=True)
             fh.flush()
             os.fsync(fh.fileno())
-        os.replace(tmp, path)
+        ledger_io._retry_sharing(lambda: os.replace(tmp, path))
     except BaseException:
         with contextlib.suppress(OSError):
             os.unlink(tmp)
         raise
+    ledger_io._fsync_directory(directory)
 
 
 def _ensure_cache_dir(outputs_dir: str) -> None:
@@ -710,6 +714,12 @@ def import_bundle(
       4. The per-key merge plan must have no conflicts, unless
          ``overwrite=True``.
       5. Nothing is written when ``dry_run`` is True (the default).
+
+    A real import replaces each changed ledger file atomically, one after
+    another; it is NOT atomic across the ledgers. If a later ledger's write
+    fails or stops (``"write_failed"``, ``"concurrent_modification"``), the
+    ledgers already replaced stay replaced: ``written_members`` lists exactly
+    those, in write order, and the rest are untouched.
 
     Args:
       bundle_path:                The bundle file, inside ``outputs_dir``.
