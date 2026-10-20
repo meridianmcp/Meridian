@@ -1064,6 +1064,18 @@ def _lock_file_signature(path: str) -> tuple[int, int] | None:
     return st.st_mtime_ns, st.st_size
 
 
+def _lock_file_is_gone(path: str) -> bool:
+    """True only when ``path`` does not exist. Any other stat failure (e.g. a
+    Windows delete-pending file) is not proof the path is free."""
+    try:
+        os.stat(path)
+    except FileNotFoundError:
+        return True
+    except OSError:
+        return False
+    return False
+
+
 def _inspect_index_lock(
     db_path: str, *, stale_seconds: float | None = None,
 ) -> tuple[IndexLockOwner, _LockSnapshot]:
@@ -1164,10 +1176,14 @@ def _reclaim_stale_lock_file(lock_path: str, snapshot: _LockSnapshot) -> bool:
     Closing it on POSIX needs a rename-then-verify reclaim.
     """
     lease, signature = snapshot
-    if _read_lease_from_path(lock_path) != lease:
-        return False
-    if lease is None and _lock_file_signature(lock_path) != signature:
-        return False
+    if _read_lease_from_path(lock_path) != lease or (
+        lease is None and _lock_file_signature(lock_path) != signature
+    ):
+        # Changed since the verdict -- or already gone (another waiter
+        # reclaimed it, or its holder released it), which reads as a change
+        # too but leaves the path free: report that so the caller retries the
+        # create at once instead of sleeping, or failing at its deadline.
+        return _lock_file_is_gone(lock_path)
     try:
         os.remove(lock_path)
     except FileNotFoundError:

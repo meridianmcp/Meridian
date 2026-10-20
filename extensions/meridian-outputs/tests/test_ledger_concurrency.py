@@ -712,6 +712,58 @@ class TestIndexFileLockStaleReclaim:
             lock.acquire()
         assert json.loads(Path(lock_path).read_text(encoding="utf-8")) == successor
 
+    @pytest.mark.parametrize("with_lease", [True, False])
+    def test_reclaim_of_an_already_removed_stale_lock_reports_free(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, with_lease: bool,
+    ) -> None:
+        """A stale lock file that is gone by the time of the reclaim (another
+        waiter removed it) leaves the path free, which the reclaim reports."""
+        monkeypatch.setitem(sys.modules, "portalocker", None)
+        db_path = str(tmp_path / "ledger.json")
+        lock_path = Path(db_path + ".lock")
+        if with_lease:
+            _write_lease_file(str(lock_path))
+        else:
+            lock_path.write_bytes(b"")
+            old = time.time() - 10_000
+            os.utime(lock_path, (old, old))
+        owner, snapshot = OL._inspect_index_lock(db_path)
+        assert owner.is_stale is True
+        lock_path.unlink()
+        assert OL._reclaim_stale_lock_file(str(lock_path), snapshot) is True
+
+    def test_acquire_retries_at_once_when_the_stale_lock_is_already_gone(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """Another waiter removes the stale lock file between this waiter's
+        stale verdict and its reclaim. The path is free, so the create must
+        be retried at once: with a zero timeout, any trip through the poll
+        branch instead raises IndexLockAcquireError naming a stale owner."""
+        monkeypatch.setitem(sys.modules, "portalocker", None)
+        db_path = str(tmp_path / "ledger.json")
+        lock_path = db_path + ".lock"
+        _write_lease_file(lock_path)
+        real_inspect = OL._inspect_index_lock
+        calls = {"n": 0}
+
+        def _reclaimed_by_another_waiter(*args: object, **kwargs: object):
+            calls["n"] += 1
+            verdict = real_inspect(*args, **kwargs)
+            if calls["n"] == 1:
+                os.remove(lock_path)
+            return verdict
+
+        monkeypatch.setattr(OL, "_inspect_index_lock", _reclaimed_by_another_waiter)
+        lock = OL.IndexFileLock(db_path, session_id="next", timeout=0.0)
+        lock.acquire()
+        try:
+            assert calls["n"] == 1
+            lease = json.loads(Path(lock_path).read_text(encoding="utf-8"))
+            assert lease["session_id"] == "next"
+        finally:
+            lock.release()
+        assert not os.path.exists(lock_path)
+
     def test_release_keeps_a_lock_file_that_names_another_token(
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
     ) -> None:
