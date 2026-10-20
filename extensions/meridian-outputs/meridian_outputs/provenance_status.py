@@ -181,9 +181,10 @@ The ``provenance_type`` -> :class:`~research_evidence.ResolverStatus` mapping
     same-path :data:`EXACT` match's 0.95) -- content identity IS confirmed
     by hash, just at a different path than originally recorded; the reason
     string names the matched prior path. ``STALE`` (as for
-    :data:`STALE_BY_SCRIPT`) when ``script_staleness`` shows the tagged
-    generating script changed, and ``AMBIGUOUS`` while script or input
-    staleness is unknown.
+    :data:`STALE_BY_SCRIPT`) when ``script_staleness`` shows the matched
+    record's tagged generating script changed or ``input_staleness`` shows
+    an input of the matched record's run changed, and ``AMBIGUOUS`` while
+    script or input staleness is unknown.
   - :data:`AMBIGUOUS` (this module's ``provenance_type``, not to be confused
     with the identically-named :class:`~research_evidence.ResolverStatus`
     member several OTHER branches below also map to) -> ``AMBIGUOUS``, low
@@ -626,8 +627,10 @@ def _input_staleness(
     outputs_dir: str, path: str, status: dict[str, Any],
 ) -> dict[str, Any] | None:
     """Input-change staleness for ``path`` from the run manifests that cover
-    it: runs whose finalized outputs list ``path``, plus the exact record's
-    own ``run_id``. ``None`` when no run manifest covers ``path``.
+    it: runs whose finalized outputs list ``path``, plus the ``run_id`` of
+    the exact record or, for :data:`RELOCATED`, of the matched record (the
+    run that produced it before it moved). ``None`` when no run manifest
+    covers ``path``.
 
     ``stale`` is ``True`` when any covering run's inputs changed, ``False``
     when every covering run was checked and none changed, and ``None``
@@ -642,7 +645,8 @@ def _input_staleness(
     record = status.get("record")
     record_run_id = (
         record.get("run_id")
-        if isinstance(record, dict) and status.get("provenance_type") in (EXACT, STALE_BY_SCRIPT)
+        if isinstance(record, dict)
+        and status.get("provenance_type") in (EXACT, STALE_BY_SCRIPT, RELOCATED)
         else None
     )
     try:
@@ -778,6 +782,8 @@ def get_provenance_status(outputs_dir: str, path: str) -> dict[str, Any]:
           ``record`` is that resolved row, ``staleness`` notes the weaker,
           basename-only evidence). ``relocation_evidence`` (additive) is
           ``"content_hash"`` or ``"basename"`` so a caller can tell which.
+          ``script_staleness`` is looked up at ``record["path"]`` (the
+          matched record's generator), never at this moved path.
         - :data:`AMBIGUOUS` -- same as :data:`RELOCATED`, but MORE THAN ONE
           candidate matches -- either by content hash (fa600e42; ``record``
           is ``None``, the matches are listed verbatim under a new
@@ -810,8 +816,9 @@ def get_provenance_status(outputs_dir: str, path: str) -> dict[str, Any]:
       ``input_staleness`` (additive, every branch): ``None`` when no run
       manifest covers ``path``; else ``{stale, runs, reason}`` from
       :func:`run_manifest.check_input_staleness` for each covering run (a run
-      whose finalized outputs list ``path``, or the exact record's
-      ``run_id``). When it is stale and the branch has a ``staleness`` dict,
+      whose finalized outputs list ``path``, or the ``run_id`` of the exact
+      record or of a :data:`RELOCATED` result's matched record). When it is
+      stale and the branch has a ``staleness`` dict,
       ``staleness["stale"]`` is set and the reason appended, for this path
       only -- other outputs are affected only if their own runs' inputs
       changed. When the run-manifest ledger cannot be read or a run's check
@@ -882,7 +889,10 @@ def get_provenance_status(outputs_dir: str, path: str) -> dict[str, Any]:
                     "appears to have been relocated/renamed"
                 ),
             },
-            "script_staleness": _stale_by_script_result(outputs_dir, path),
+            # The matched record's generator, looked up at the path that
+            # record was matched by -- never at this moved path, whose own
+            # fingerprint row (if any) describes some other file.
+            "script_staleness": _stale_by_script_result(outputs_dir, match.get("path")),
             "archival": indexed["archival"],
             "convergence": indexed["convergence"],
             "relocation_evidence": "content_hash",
@@ -953,7 +963,7 @@ def get_provenance_status(outputs_dir: str, path: str) -> dict[str, Any]:
                     "are left unknown rather than guessed"
                 ),
             },
-            "script_staleness": _stale_by_script_result(outputs_dir, path),
+            "script_staleness": _stale_by_script_result(outputs_dir, basename_hit.get("path")),
             "archival": indexed["archival"],
             "convergence": indexed["convergence"],
             "relocation_evidence": "basename",
@@ -1237,6 +1247,18 @@ def _resolver_state_for_provenance_status(
             ),
         )
     if ptype == RELOCATED:
+        # An input of the matched record's run changed since that run
+        # started: stale, the same verdict a changed script gets here.
+        if isinstance(input_staleness, dict) and input_staleness.get("stale") is True:
+            return research_evidence.ResolverState(
+                status=research_evidence.ResolverStatus.STALE,
+                confidence=0.3,
+                reason=(
+                    staleness.get("reason")
+                    or "an input changed since its run started "
+                    f"({input_staleness.get('reason')})"
+                ),
+            )
         if script_unknown is not None:
             return script_unknown
         if input_unknown is not None:

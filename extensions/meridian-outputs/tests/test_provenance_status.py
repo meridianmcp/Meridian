@@ -42,6 +42,7 @@ from meridian_outputs import outputs_local as OL
 from meridian_outputs import provenance as PV
 from meridian_outputs import provenance_status as PS
 from meridian_outputs import research_evidence as RE
+from meridian_outputs import run_manifest as RM
 
 # db63385b (W31-B): tools/meridian_fallbacks/figure_invariant_gate.py lives
 # under the repo root, not this extension -- add the repo root explicitly
@@ -443,22 +444,28 @@ class TestRelocated:
         """S-R4-4: the RELOCATED resolver branch checked unknown script and
         input staleness but not a confirmed script change, so a relocated
         file whose tagged generating script changed was VERIFIED at 0.75. It
-        must map to STALE, as STALE_BY_SCRIPT does for an exact record."""
+        must map to STALE, as STALE_BY_SCRIPT does for an exact record.
+
+        F4 (round five): the normal flow tags the ORIGINAL path, then the
+        file moves. Script staleness used to be read at the moved path, which
+        has no fingerprint row, so the matched record's changed generator was
+        never seen and the copy stayed VERIFIED."""
         script = tmp_path / "train.py"
         script.write_text("print('v1')\n", encoding="utf-8")
         old = tmp_path / "run_3" / "metrics.csv"
         old.parent.mkdir()
         old.write_text("epoch,accuracy\n1,0.9\n", encoding="utf-8")
         AN.record_provenance(str(tmp_path), str(old), generating_script=str(script))
+        FP.tag_output(str(old), str(tmp_path), script_path=str(script))
         new = tmp_path / "run_3_moved" / "metrics.csv"
         new.parent.mkdir()
-        new.write_text("epoch,accuracy\n1,0.9\n", encoding="utf-8")
-        FP.tag_output(str(new), str(tmp_path), script_path=str(script))
-        old.unlink()
+        os.replace(old, new)  # moved: same bytes, original path gone
         script.write_text("print('v2 -- changed')\n", encoding="utf-8")
 
         status = PS.get_provenance_status(str(tmp_path), str(new))
         assert status["provenance_type"] == PS.RELOCATED
+        assert status["record"]["path"] == str(old)
+        assert status["script_staleness"] is not None
         assert status["script_staleness"]["is_stale"] is True
         resolver = PS.evidence_record_from_provenance_status(status).resolver
         assert resolver.status is not RE.ResolverStatus.VERIFIED
@@ -472,6 +479,114 @@ class TestRelocated:
             PS._resolver_state_for_provenance_status(status).status
             is RE.ResolverStatus.STALE
         )
+
+    @duckdb_required
+    def test_unrelated_row_at_moved_path_does_not_flip_healthy_relocation(
+        self, tmp_path: Path,
+    ) -> None:
+        """F4 (round five): the moved path's own fingerprint row describes
+        whatever file was tagged there before, not the relocated record. A
+        changed script on that row made a relocated record whose own
+        generator is unchanged read STALE."""
+        script = tmp_path / "train.py"
+        script.write_text("print('stable')\n", encoding="utf-8")
+        other_script = tmp_path / "other.py"
+        other_script.write_text("print('v1')\n", encoding="utf-8")
+        old = tmp_path / "run_4" / "metrics.csv"
+        old.parent.mkdir()
+        old.write_text("epoch,accuracy\n1,0.9\n", encoding="utf-8")
+        AN.record_provenance(str(tmp_path), str(old), generating_script=str(script))
+        FP.tag_output(str(old), str(tmp_path), script_path=str(script))
+        new = tmp_path / "run_4_moved" / "metrics.csv"
+        new.parent.mkdir()
+        new.write_text("unrelated,earlier\n0,0\n", encoding="utf-8")
+        FP.tag_output(str(new), str(tmp_path), script_path=str(other_script))
+        os.replace(old, new)  # the relocated file lands on the tagged path
+        other_script.write_text("print('v2 -- changed')\n", encoding="utf-8")
+
+        status = PS.get_provenance_status(str(tmp_path), str(new))
+        assert status["provenance_type"] == PS.RELOCATED
+        assert status["record"]["path"] == str(old)
+        script_staleness = status["script_staleness"]
+        assert script_staleness["is_stale"] is False
+        assert os.path.normcase(script_staleness["script_path"]) == os.path.normcase(
+            os.path.realpath(script)
+        )
+        resolver = PS.evidence_record_from_provenance_status(status).resolver
+        assert resolver.status is RE.ResolverStatus.VERIFIED
+        assert resolver.confidence == 0.75
+
+    @staticmethod
+    def _relocated_run_output(outputs: Path) -> tuple[Path, Path, Path]:
+        """``(input, original, moved)``: run ``r1`` reads ``input`` and
+        produces ``original`` (recorded with ``run_id="r1"``), which then
+        moves to ``moved`` with the same bytes."""
+        inp = outputs / "data" / "in.csv"
+        inp.parent.mkdir()
+        inp.write_text("a\n1\n", encoding="utf-8")
+        RM.start_run_manifest(
+            str(outputs), run_id="r1", command_name="build",
+            input_paths=[str(inp)], _git_runner=lambda argv: None,
+        )
+        old = outputs / "run_5" / "metrics.csv"
+        old.parent.mkdir()
+        old.write_text("epoch,accuracy\n1,0.9\n", encoding="utf-8")
+        RM.finalize_run_manifest(str(outputs), "r1", output_paths=[str(old)])
+        AN.record_provenance(str(outputs), str(old), run_id="r1")
+        new = outputs / "run_5_moved" / "metrics.csv"
+        new.parent.mkdir()
+        os.replace(old, new)
+        return inp, old, new
+
+    @duckdb_required
+    def test_relocated_record_whose_run_input_changed_is_stale(
+        self, tmp_path: Path,
+    ) -> None:
+        """F5 (round five): the matched record's run_id was dropped for a
+        RELOCATED result, so input staleness was looked up for the moved
+        path alone, found no run, and a changed input of the run that
+        produced the record still read VERIFIED."""
+        inp, old, new = self._relocated_run_output(tmp_path)
+
+        healthy = PS.get_provenance_status(str(tmp_path), str(new))
+        assert healthy["provenance_type"] == PS.RELOCATED
+        assert healthy["record"]["path"] == str(old)
+        assert healthy["input_staleness"] is not None
+        assert healthy["input_staleness"]["stale"] is False
+        assert [r["run_id"] for r in healthy["input_staleness"]["runs"]] == ["r1"]
+        resolver = PS.evidence_record_from_provenance_status(healthy).resolver
+        assert resolver.status is RE.ResolverStatus.VERIFIED
+        assert resolver.confidence == 0.75
+
+        inp.write_text("a\n1\n2\n", encoding="utf-8")
+        status = PS.get_provenance_status(str(tmp_path), str(new))
+        assert status["provenance_type"] == PS.RELOCATED  # type is unchanged
+        assert status["input_staleness"]["stale"] is True
+        assert status["staleness"]["stale"] is True
+        resolver = PS.evidence_record_from_provenance_status(status).resolver
+        assert resolver.status is RE.ResolverStatus.STALE
+        assert resolver.confidence == 0.3
+        assert not resolver.is_authoritative
+        assert "an input changed since its run started" in resolver.reason
+
+    @duckdb_required
+    def test_relocated_record_whose_run_check_failed_is_unknown(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """F5: an input staleness of None for the matched record's run is
+        unknown, never verified."""
+        _, _, new = self._relocated_run_output(tmp_path)
+
+        def _boom(*_a, **_k):
+            raise OSError("input volume went away")
+
+        monkeypatch.setattr(RM, "check_input_staleness", _boom)
+        status = PS.get_provenance_status(str(tmp_path), str(new))
+        assert status["provenance_type"] == PS.RELOCATED
+        assert status["input_staleness"]["stale"] is None
+        resolver = PS.evidence_record_from_provenance_status(status).resolver
+        assert resolver.status is RE.ResolverStatus.AMBIGUOUS
+        assert not resolver.is_authoritative
 
 
 # ---------------------------------------------------------------------------
@@ -543,6 +658,37 @@ class TestBasenameRelocationFallback:
         rec = PS.evidence_record_from_provenance_status(status)
         assert rec.resolver.status is RE.ResolverStatus.VERIFIED
         assert rec.attributes["relocation_evidence"] == "basename"
+
+    @duckdb_required
+    def test_basename_relocation_reads_script_staleness_of_matched_row(
+        self, tmp_path: Path,
+    ) -> None:
+        """F4 (round five): a basename-relocated copy (here outside
+        outputs_dir, where no fingerprint row can exist) must take the
+        matched indexed row's script staleness, so a changed generator of
+        that row is not read as VERIFIED."""
+        outputs_dir = tmp_path / "outputs"
+        outputs_dir.mkdir()
+        script = tmp_path / "train.py"
+        script.write_text("print('v1')\n", encoding="utf-8")
+        original = outputs_dir / "meridian_reloc_gap_scr5.csv"
+        original.write_text("a,b\n1,2\n", encoding="utf-8")
+        OL.register_priority_path(str(outputs_dir), str(original))
+        FP.tag_output(str(original), str(outputs_dir), script_path=str(script))
+
+        relocated = tmp_path / "elsewhere" / "meridian_reloc_gap_scr5.csv"
+        relocated.parent.mkdir()
+        relocated.write_text("a,b\n1,2\n", encoding="utf-8")
+        script.write_text("print('v2 -- changed')\n", encoding="utf-8")
+
+        status = PS.get_provenance_status(str(outputs_dir), str(relocated))
+        assert status["provenance_type"] == PS.RELOCATED
+        assert status["relocation_evidence"] == "basename"
+        assert status["record"]["path"] == str(original)
+        assert status["script_staleness"]["is_stale"] is True
+        resolver = PS.evidence_record_from_provenance_status(status).resolver
+        assert resolver.status is RE.ResolverStatus.STALE
+        assert resolver.confidence == 0.3
 
     @duckdb_required
     def test_multiple_basename_candidates_is_ambiguous(
