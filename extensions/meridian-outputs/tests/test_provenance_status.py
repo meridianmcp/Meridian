@@ -1005,6 +1005,33 @@ class TestNonObjectProvenanceRow:
         assert sorted(r["note"] for r in AN.list_provenance(str(tmp_path))) == ["keep", "new"]
 
 
+@duckdb_required
+def test_documented_raise_matches_behaviour(tmp_path: Path) -> None:
+    """get_provenance_status raises LedgerCorruptError for an unreadable
+    provenance ledger; its docstring and the MCP tool's used to say it
+    always returns a status dict."""
+    from meridian_outputs import ledger_io as LIO
+
+    output = tmp_path / "result.csv"
+    output.write_text("a,b\n1,2\n", encoding="utf-8")
+    Path(AN._ledger_path(str(tmp_path))).write_bytes(b"{not json")
+    with pytest.raises(LIO.LedgerCorruptError):
+        PS.get_provenance_status(str(tmp_path), str(output))
+
+    docs = [PS.get_provenance_status.__doc__, PS.get_manifest_backed_provenance_status.__doc__]
+    try:
+        from meridian_outputs import server
+    except ImportError:  # mcp not installed: the tool docstring is not reachable
+        pass
+    else:
+        docs.append(server.get_provenance_status.__doc__)
+    for doc in docs:
+        assert "LedgerCorruptError" in doc
+        assert "Never raises" not in doc
+    assert "Raises:" in PS.get_provenance_status.__doc__
+    assert "ledger_unreadable" in PS.get_provenance_status.__doc__
+
+
 # ---------------------------------------------------------------------------
 # Canonical/archival identity (item d3374b0e)
 # ---------------------------------------------------------------------------

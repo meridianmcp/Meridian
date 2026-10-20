@@ -728,9 +728,10 @@ def get_provenance_status(outputs_dir: str, path: str) -> dict[str, Any]:
       path:         The output file to look up.
 
     Returns:
-      ``{"error": ...}`` if ``outputs_dir``/``path`` are missing. Otherwise
-      always ``{"path": path, "provenance_type": ..., "record": ...,
-      "directory_note": ..., "staleness": ..., "script_staleness": ...,
+      ``{"error": ...}`` if ``outputs_dir``/``path`` are missing. Otherwise,
+      unless it raises (see Raises), ``{"path": path, "provenance_type":
+      ..., "record": ..., "directory_note": ..., "staleness": ...,
+      "script_staleness": ...,
       "archival": ..., "convergence": ..., "inconclusive": ...}`` where
       exactly one of ``record``/``directory_note`` is non-``None`` (or
       neither, for ``"unregistered"``/``"unknown"``) and ``provenance_type``
@@ -800,6 +801,23 @@ def get_provenance_status(outputs_dir: str, path: str) -> dict[str, Any]:
       changed. When the run-manifest ledger cannot be read or a run's check
       fails, ``input_staleness["stale"]`` is ``None`` (unknown) and a
       ``staleness["stale"]`` that was not ``True`` becomes ``None`` too.
+
+    Raises:
+      ledger_io.LedgerCorruptError: the provenance ledger
+      (``provenance_ledger.json``, read by ``annotate.get_provenance``/
+      ``list_provenance``) exists but is not a JSON object, or holds a row
+      that is not an object. Unreadable provenance is never reported as
+      ``UNREGISTERED``/``UNKNOWN``.
+      OSError: the provenance ledger exists but cannot be read.
+
+      A corrupt or unreadable fingerprint ledger or run-manifest ledger
+      does NOT raise: it is reported as unknown ``script_staleness``/
+      ``input_staleness`` (see above). Callers that must not raise map the
+      provenance-ledger errors themselves: :func:`build_provenance_envelope`
+      turns them into an ``AMBIGUOUS``, confidence-0.0, partial record with
+      ``attributes["store_error"] == "ledger_unreadable"``, and
+      ``provenance.bind_artifact_provenance`` into an ``"unresolved"``
+      binding with ``evidence="ledger_unreadable"``.
     """
     if not outputs_dir or not str(outputs_dir).strip():
         return {"error": "outputs_dir is required"}
@@ -1004,7 +1022,10 @@ def get_manifest_backed_provenance_status(
     package already uses elsewhere, never a new hash scheme) matches the
     recorded one. Fail-closed on every other combination (missing/not-ok
     aggregation, path not recorded, unreadable file, hash mismatch) — never
-    silently treats "we could not check" as "verified". Never raises.
+    silently treats "we could not check" as "verified". Raises only what
+    :func:`get_provenance_status` raises (``ledger_io.LedgerCorruptError``
+    or ``OSError`` for an unreadable provenance ledger); the manifest check
+    itself never raises.
     """
     base = get_provenance_status(outputs_dir, path)
     if "error" in base:

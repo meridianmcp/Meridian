@@ -637,6 +637,18 @@ def get_provenance_status(outputs_dir: str, path: str) -> dict[str, Any]:
       ``record``/``directory_note``/``staleness`` are ``None`` whenever not
       applicable to the returned ``provenance_type`` -- always branch on
       ``provenance_type``, never infer status from field presence alone.
+
+    Raises:
+      ``ledger_io.LedgerCorruptError`` when the provenance ledger
+      (``provenance_ledger.json``) exists but is not a JSON object or holds
+      a row that is not an object, and ``OSError`` when it cannot be read --
+      unreadable provenance is never reported as "unregistered"/"unknown".
+      A corrupt fingerprint or run-manifest ledger does not raise; it shows
+      as unknown ``script_staleness``/``input_staleness``. For a batch that
+      must not fail, use ``get_provenance_status_envelope`` (maps the error
+      to an ``ambiguous`` record with ``store_error="ledger_unreadable"``)
+      or ``bind_artifact_provenance`` (an ``unresolved`` binding with
+      ``evidence="ledger_unreadable"``).
     """
     return provenance_status.get_provenance_status(outputs_dir, path)
 
