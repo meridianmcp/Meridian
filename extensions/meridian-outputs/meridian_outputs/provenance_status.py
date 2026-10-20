@@ -778,6 +778,8 @@ def get_provenance_status(outputs_dir: str, path: str) -> dict[str, Any]:
           ``record`` is that resolved row, ``staleness`` notes the weaker,
           basename-only evidence). ``relocation_evidence`` (additive) is
           ``"content_hash"`` or ``"basename"`` so a caller can tell which.
+          ``script_staleness`` is looked up at ``record["path"]`` (the
+          matched record's generator), never at this moved path.
         - :data:`AMBIGUOUS` -- same as :data:`RELOCATED`, but MORE THAN ONE
           candidate matches -- either by content hash (fa600e42; ``record``
           is ``None``, the matches are listed verbatim under a new
@@ -882,7 +884,10 @@ def get_provenance_status(outputs_dir: str, path: str) -> dict[str, Any]:
                     "appears to have been relocated/renamed"
                 ),
             },
-            "script_staleness": _stale_by_script_result(outputs_dir, path),
+            # The matched record's generator, looked up at the path that
+            # record was matched by -- never at this moved path, whose own
+            # fingerprint row (if any) describes some other file.
+            "script_staleness": _stale_by_script_result(outputs_dir, match.get("path")),
             "archival": indexed["archival"],
             "convergence": indexed["convergence"],
             "relocation_evidence": "content_hash",
@@ -953,7 +958,7 @@ def get_provenance_status(outputs_dir: str, path: str) -> dict[str, Any]:
                     "are left unknown rather than guessed"
                 ),
             },
-            "script_staleness": _stale_by_script_result(outputs_dir, path),
+            "script_staleness": _stale_by_script_result(outputs_dir, basename_hit.get("path")),
             "archival": indexed["archival"],
             "convergence": indexed["convergence"],
             "relocation_evidence": "basename",
