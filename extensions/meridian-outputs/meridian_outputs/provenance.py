@@ -1028,6 +1028,10 @@ SOURCE_RECORDED = "recorded"
 SOURCE_NO_PROVENANCE_RECORD = "no_provenance_record"
 SOURCE_NOT_FOUND = "not_found"
 SOURCE_OUTSIDE_OUTPUTS_DIR = "not_recorded_outside_outputs_dir"
+# Only a bare file name was stored for a generating script (the basename
+# fallback for a script on another volume) and no file of that name exists
+# under outputs_dir or the working directory: its location is unknown.
+SOURCE_LOCATION_UNRECORDED = "script_location_unrecorded"
 
 
 def _portable_locator(outputs_dir: str, value: Any) -> str | None:
@@ -1171,6 +1175,15 @@ def _resolve_lineage_source(
     return entry
 
 
+def _is_bare_name(value: Any) -> bool:
+    """True for a stored script reference with no directory part
+    (``"gen.py"``), which is all a cross-volume script leaves behind."""
+    return (
+        isinstance(value, str) and bool(value.strip()) and not os.path.isabs(value)
+        and "/" not in value and "\\" not in value
+    )
+
+
 def _check_registry_readable(outputs_dir: str) -> None:
     """Strict read of the artifact registry for :func:`get_output_lineage`.
 
@@ -1245,7 +1258,10 @@ def get_output_lineage(
          attached (``status="recorded"``) or is marked
          ``no_provenance_record``/``not_found``. A source outside
          ``outputs_dir`` is marked ``not_recorded_outside_outputs_dir``.
-         Only ``recorded`` counts as resolved.
+         A provenance record whose generating script was stored as a bare
+         file name (the cross-volume basename fallback) that is found
+         nowhere is marked ``script_location_unrecorded`` with ``stale``
+         ``None``. Only ``recorded`` counts as resolved.
       4. ``stale`` compares the script hash a store recorded with the
          script's current hash: the fingerprint ledger's tag-time hash, and
          the provenance record's ``script_content_hash`` when present.
@@ -1429,12 +1445,25 @@ def get_output_lineage(
                 relation="generating_script",
             )
             recorded = provenance_record.get("script_content_hash")
-            if recorded is not None:
-                # Resolve the script exactly as record_provenance did when it
-                # captured the hash, so the comparison is like for like.
-                script_file = fingerprint._resolve_script_path(
-                    provenance_record["generating_script"], search_root=outputs_dir,
+            # Resolve the script exactly as record_provenance did when it
+            # captured the hash, so the comparison is like for like.
+            stored_script = provenance_record["generating_script"]
+            script_file = fingerprint._resolve_script_path(stored_script, search_root=outputs_dir)
+            if script_file is None and _is_bare_name(stored_script):
+                # Only a file name was stored (record_provenance keeps just
+                # the basename of a script on another volume) and nothing of
+                # that name is found: the script's location was never
+                # recorded, so neither "not found" nor "stale" follows.
+                if entry["status"] == SOURCE_NOT_FOUND:
+                    entry["status"] = SOURCE_LOCATION_UNRECORDED
+                entry["recorded_script_hash"] = recorded
+                entry["stale"] = None
+                entry["stale_reason"] = (
+                    "only the generating script's file name was recorded and no "
+                    "file of that name was found, so its location and staleness "
+                    "are unknown"
                 )
+            elif recorded is not None:
                 current = fingerprint.script_content_hash(script_file) if script_file else None
                 _set_script_staleness(entry, recorded, current, script_known=True)
             else:

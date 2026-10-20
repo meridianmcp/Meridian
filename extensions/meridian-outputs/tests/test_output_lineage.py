@@ -332,6 +332,38 @@ class TestStaleness:
         assert src["origin"] == "provenance_record"
         assert src["stale"] is True
 
+    def test_basename_only_script_not_found_is_unknown_not_stale(
+        self, layout, monkeypatch,
+    ) -> None:
+        """For a script on another volume record_provenance can store only
+        its basename. When no file of that name is found, lineage must say
+        the location was not recorded and staleness is unknown -- not
+        not_found + stale=True, an answer that depends on the cwd."""
+        outputs = str(layout["outputs"])
+        # relative_reference returns None across volumes; simulate that.
+        monkeypatch.setattr(annotate, "relative_reference", lambda *_a, **_k: None)
+        annotate.record_provenance(outputs, str(layout["out"]), generating_script=str(layout["gen"]))
+        monkeypatch.undo()
+        record = annotate.get_provenance(outputs, str(layout["out"]))
+        assert record["generating_script"] == "gen.py"
+        assert record["script_content_hash"] is not None
+        monkeypatch.chdir(layout["root"])  # no gen.py here either
+
+        result = PV.get_output_lineage(outputs, path=str(layout["out"]))
+        (src,) = result["sources"]
+        assert src["origin"] == "provenance_record"
+        assert src["locator"] == "gen.py"
+        assert src["stale"] is None
+        assert src["status"] == "script_location_unrecorded"
+        assert src["status"] == PV.SOURCE_LOCATION_UNRECORDED
+        assert src["resolved"] is False
+        assert src["recorded_script_hash"] == record["script_content_hash"]
+        assert src["current_script_hash"] is None
+        assert {"kind": "source", "origin": "provenance_record", "locator": "gen.py",
+                "reason": "script_location_unrecorded"} in result["unresolved"]
+        assert result["complete"] is False
+        _assert_no_absolute_path(result, layout["root"])
+
     def test_legacy_tag_without_recorded_hash_reports_unknown_staleness(self, layout) -> None:
         outputs = str(layout["outputs"])
         fingerprint.tag_output(str(layout["out"]), outputs, script_path=str(layout["gen"]))
