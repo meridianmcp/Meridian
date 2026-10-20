@@ -354,6 +354,34 @@ class TestCheckInputStaleness:
         assert _by_input(result) == {"in.csv": "unreadable"}
         assert result["stale"] is True
 
+    @pytest.mark.parametrize("realpath_rejects", [False, True])
+    def test_input_path_with_nul_byte_records_none(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, realpath_rejects: bool,
+    ) -> None:
+        """S-R4-17: os.stat raises ValueError (not OSError) for an embedded
+        NUL byte, which escaped _stat_or_none and failed start_run_manifest.
+        Such a path names no file: it is recorded absent with a None hash,
+        as dev did. ``realpath_rejects`` reproduces POSIX, where realpath
+        (inside _resolve_ref) raises the same ValueError first."""
+        if realpath_rejects:
+            real_resolve = RM._resolve_ref
+
+            def _posix_like(outputs_dir: str, raw: str) -> str:
+                if "\x00" in raw:
+                    raise ValueError("lstat: embedded null character in path")
+                return real_resolve(outputs_dir, raw)
+
+            monkeypatch.setattr(RM, "_resolve_ref", _posix_like)
+        assert RM._stat_or_none(str(tmp_path / "bad\x00name.csv")) is None
+        rec = _start(tmp_path, "r1", ["bad\x00name.csv"])
+        assert rec["input_identity"]["file_hashes"] == {"bad\x00name.csv": None}
+        assert rec["input_stat"] == {
+            "bad\x00name.csv": {"exists": False, "size": None, "mtime_ns": None, "sha256": None},
+        }
+        result = RM.check_input_staleness(str(tmp_path), "r1")
+        assert result["stale"] is False
+        assert _by_input(result) == {"bad\x00name.csv": "absent"}
+
     def test_run_without_inputs_and_unknown_runs(self, tmp_path: Path) -> None:
         _start(tmp_path, "r1", [])
         result = RM.check_input_staleness(str(tmp_path), "r1")

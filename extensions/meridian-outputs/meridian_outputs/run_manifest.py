@@ -319,9 +319,12 @@ def _key_path(outputs_dir: str, key: str) -> str:
 
 
 def _stat_or_none(path: str) -> "os.stat_result | None":
+    """``os.stat`` of a regular file, else ``None``. A path ``os.stat``
+    rejects outright (ValueError, e.g. an embedded NUL byte) names no file
+    either: ``None``, as the hash of such a path already is."""
     try:
         st = os.stat(path)
-    except OSError:
+    except (OSError, ValueError):
         return None
     return st if os.path.isfile(path) else None
 
@@ -350,12 +353,26 @@ def _snapshot_inputs(
     twice. Each file is stat-ed BEFORE it is hashed: if it changes in
     between, a later check sees a stat mismatch and re-hashes, so a change
     during capture can cost one extra hash but can never be missed.
+
+    A path the OS rejects outright (an embedded NUL byte raises ValueError,
+    from ``os.stat`` and, on POSIX, already from ``realpath``) names no
+    file: it is recorded absent under its normalised given spelling, and
+    its identity hash is ``None`` -- never an exception out of
+    :func:`start_run_manifest`.
     """
     file_hashes: "dict[str, str | None]" = {}
     input_stat: dict[str, dict[str, Any]] = {}
     for raw in input_paths or []:
         given = str(raw)
-        resolved = _resolve_ref(outputs_dir, given)
+        try:
+            resolved = _resolve_ref(outputs_dir, given)
+            key = _input_key(outputs_dir, resolved)
+        except ValueError:
+            file_hashes[given] = fingerprint.script_content_hash(given)
+            input_stat[os.path.normcase(os.path.normpath(given)).replace("\\", "/")] = {
+                "exists": False, "size": None, "mtime_ns": None, "sha256": None,
+            }
+            continue
         st = _stat_or_none(resolved)
         sha = fingerprint.script_content_hash(resolved) if st is not None else None
         same_file = st is not None and os.path.realpath(os.path.abspath(given)) == resolved
@@ -364,7 +381,7 @@ def _snapshot_inputs(
             entry: dict[str, Any] = {"exists": False, "size": None, "mtime_ns": None, "sha256": None}
         else:
             entry = {"exists": True, "size": st.st_size, "mtime_ns": st.st_mtime_ns, "sha256": sha}
-        input_stat[_input_key(outputs_dir, resolved)] = entry
+        input_stat[key] = entry
     return file_hashes, dict(sorted(input_stat.items()))
 
 
