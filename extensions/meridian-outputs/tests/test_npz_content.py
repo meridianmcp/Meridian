@@ -265,17 +265,72 @@ class TestNpzParser:
             {"name": "nested/grid", "shape": [4, 4], "dtype": "float64"},
         ]
 
-    def test_unreadable_member_is_listed_without_header(self, tmp_path: Path) -> None:
-        """A member whose compression method is unsupported (for example an
-        AES-encrypted entry) keeps its name and loses only shape/dtype."""
+    def test_unknown_compression_method_is_filename_only(self, tmp_path: Path) -> None:
+        """A member whose compression method is neither stored nor deflated
+        (here 99, as an AES-encrypted entry declares) makes the whole file
+        filename-only. Before B4 the member was opened and listed without a
+        header; only stored and deflated reads are bounded, so no other
+        method is opened at all now."""
         data = bytearray(_npz_bytes({"weights": _npy_bytes("<f8", (2,))}))
         cd = data.find(b"PK\x01\x02")
         struct.pack_into("<H", data, cd + 10, 99)  # unknown compression method
         f = tmp_path / "odd.npz"
         f.write_bytes(bytes(data))
-        assert OL._npz_array_summary(str(f)) == [
-            {"name": "weights", "shape": None, "dtype": None},
-        ]
+        assert OL._npz_array_summary(str(f)) is None
+
+    @pytest.mark.parametrize("method, expect_parsed", [
+        (zipfile.ZIP_STORED, True),
+        (zipfile.ZIP_DEFLATED, True),
+        (zipfile.ZIP_BZIP2, False),
+        (zipfile.ZIP_LZMA, False),
+    ])
+    def test_only_stored_and_deflated_members_are_opened(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+        caplog: pytest.LogCaptureFixture, method: int, expect_parsed: bool,
+    ) -> None:
+        """B4: zipfile inflates a whole BZIP2/LZMA block on one read, so the
+        64 KiB header read did not bound those members. They are refused
+        before any member is opened; stored and deflated still parse."""
+        buf = io.BytesIO()
+        with zipfile.ZipFile(buf, "w", compression=method) as zf:
+            zf.writestr("weights.npy", _npy_bytes("<f8", (100, 3), payload=b"\0" * 4096))
+        f = tmp_path / "model.npz"
+        f.write_bytes(buf.getvalue())
+
+        opened: list[str] = []
+        real_open = zipfile.ZipFile.open
+
+        def _spy_open(self, name, *args, **kwargs):
+            opened.append(getattr(name, "filename", name))
+            return real_open(self, name, *args, **kwargs)
+
+        monkeypatch.setattr(zipfile.ZipFile, "open", _spy_open)
+        monkeypatch.setattr(OL, "_NPZ_UNREADABLE_LOGGED", False)
+        caplog.set_level(logging.INFO, logger=OL._log.name)
+        arrays = OL._npz_array_summary(str(f))
+        if expect_parsed:
+            assert arrays == [{"name": "weights", "shape": [100, 3], "dtype": "float64"}]
+            assert opened == ["weights.npy"]
+        else:
+            assert arrays is None
+            assert opened == []
+            logged = [r.getMessage() for r in caplog.records if ".npz archive" in r.getMessage()]
+            assert len(logged) == 1
+            assert f"compression method {method} is not stored or deflated" in logged[0]
+
+    def test_one_bzip2_member_refuses_the_whole_archive_unread(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        buf = io.BytesIO()
+        with zipfile.ZipFile(buf, "w") as zf:
+            zf.writestr("a.npy", _npy_bytes("<f8", (2,)), compress_type=zipfile.ZIP_STORED)
+            zf.writestr("b.npy", _npy_bytes("<f8", (3,)), compress_type=zipfile.ZIP_BZIP2)
+        f = tmp_path / "mixed.npz"
+        f.write_bytes(buf.getvalue())
+        opened: list[object] = []
+        monkeypatch.setattr(zipfile.ZipFile, "open", lambda self, name, *a, **k: opened.append(name))
+        assert OL._npz_array_summary(str(f)) is None
+        assert opened == []
 
 
 # ---------------------------------------------------------------------------

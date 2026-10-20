@@ -1448,6 +1448,7 @@ _PDF_TIMEOUT_SECONDS = 5.0
 _NPZ_SUFFIXES: frozenset[str] = frozenset({".npz"})
 _NPZ_MAX_MEMBERS = 256
 _NPZ_MAX_HEADER_BYTES = 64 * 1024
+_NPZ_READABLE_COMPRESSION: frozenset[int] = frozenset({zipfile.ZIP_STORED, zipfile.ZIP_DEFLATED})
 _NPY_MAGIC = b"\x93NUMPY"
 
 # Version of the content the FTS index extracts per kind. Bump it whenever
@@ -2053,6 +2054,18 @@ def _npz_members(fh: Any, path: str) -> list[dict[str, Any]] | None:
                 path, f"{len(infos)} members exceeds the cap of {_NPZ_MAX_MEMBERS}",
             )
             return None
+        # The bounded read below only bounds STORED and DEFLATED members:
+        # zipfile decompresses a whole BZIP2 or LZMA block per read, so a few
+        # KB of such a member can inflate to gigabytes. numpy writes only
+        # these two methods; any other one refuses the file before a single
+        # member is opened.
+        for info in infos:
+            if info.compress_type not in _NPZ_READABLE_COMPRESSION:
+                _log_npz_unreadable_once(
+                    path, f"member compression method {info.compress_type} "
+                          "is not stored or deflated",
+                )
+                return None
         arrays: list[dict[str, Any]] = []
         for info in infos:
             name = info.filename
