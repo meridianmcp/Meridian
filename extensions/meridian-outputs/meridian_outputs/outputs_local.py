@@ -1596,7 +1596,10 @@ _PDF_TIMEOUT_SECONDS = 5.0
 # (zipfile plus ast.literal_eval on the .npy header dict); no numpy, and
 # nothing is ever unpickled. Bounded on two axes: at most _NPZ_MAX_MEMBERS
 # members, counted by walking the central directory before zipfile parses
-# it (more, ZIP64, or an unreadable archive means filename-only), and at
+# it (more, a malformed or inconsistent directory, or an unreadable archive
+# means filename-only; a well-formed ZIP64 archive, as numpy writes past
+# 2 GiB, is walked like any other) in a directory of at most
+# _NPZ_MAX_CENTRAL_DIRECTORY_BYTES, and at
 # most _NPZ_MAX_HEADER_BYTES decompressed bytes read from each member, which
 # must be stored or deflated. .npy stays filename-only
 # (_METADATA_ONLY_SUFFIXES).
@@ -2175,8 +2178,16 @@ _ZIP_END_SIG = b"PK\x05\x06"
 _ZIP_END_LEN = 22
 _ZIP64_LOCATOR_SIG = b"PK\x06\x07"
 _ZIP64_LOCATOR_LEN = 20
+_ZIP64_END_SIG = b"PK\x06\x06"
+_ZIP64_END_LEN = 56
+_ZIP64_EXTRA_ID = 0x0001
 _ZIP_CENTRAL_SIG = b"PK\x01\x02"
 _ZIP_CENTRAL_LEN = 46
+# zipfile reads the whole central directory into memory and splits each
+# record's extra field by repeated slicing, which is quadratic in the extra
+# length; 256 records with 64 KiB extras is about 16 MiB of directory and
+# far more work. numpy's directory for 256 members is about 15 KB.
+_NPZ_MAX_CENTRAL_DIRECTORY_BYTES = 1 << 20
 
 
 def _zip_end_record(fh: Any) -> tuple[int, bytes] | None:
@@ -2200,6 +2211,54 @@ def _zip_end_record(fh: Any) -> tuple[int, bytes] | None:
     return start + pos, tail[pos:pos + _ZIP_END_LEN]
 
 
+def _zip64_end_record(fh: Any, end_pos: int) -> tuple[int, int, int, int] | str | None:
+    """``(record_offset, entries, cd_size, cd_offset)`` from the ZIP64 end
+    record named by a ZIP64 locator directly before the end record at
+    ``end_pos``, located and checked the way ``zipfile`` reads it (the
+    locator's offset, any extensible data filling the gap up to the
+    locator). None when there is no locator; a reason string when the
+    locator or the record is malformed or inconsistent."""
+    locator_pos = end_pos - _ZIP64_LOCATOR_LEN
+    if locator_pos < 0:
+        return None
+    fh.seek(locator_pos)
+    locator = fh.read(_ZIP64_LOCATOR_LEN)
+    if len(locator) != _ZIP64_LOCATOR_LEN or locator[:4] != _ZIP64_LOCATOR_SIG:
+        return None
+    _sig, locator_disk, record_pos, disks = struct.unpack("<4sLQL", locator)
+    if locator_disk or disks > 1 or record_pos > locator_pos - _ZIP64_END_LEN:
+        return "inconsistent ZIP64 end-of-central-directory locator"
+    fh.seek(record_pos)
+    record = fh.read(_ZIP64_END_LEN)
+    if len(record) != _ZIP64_END_LEN or record[:4] != _ZIP64_END_SIG:
+        return "ZIP64 end-of-central-directory record not found"
+    (_sig, record_size, _made_by, _needed, disk, cd_disk,
+     disk_entries, total_entries, cd_size, cd_offset) = struct.unpack("<4sQ2H2L4Q", record)
+    # record_size counts everything after its first 12 bytes, extensible
+    # data included, so the record must end exactly at the locator.
+    if (record_size + 12 != locator_pos - record_pos or disk or cd_disk
+            or disk_entries != total_entries):
+        return "inconsistent ZIP64 end-of-central-directory record"
+    return record_pos, total_entries, cd_size, cd_offset
+
+
+def _zip64_extra_values(extra: bytes) -> list[int] | None:
+    """The 8-byte values of the first ZIP64 extended-information field (id 1)
+    in a central record's extra data, or None when there is none or a field
+    before it overruns the extra data. Walks by offset, never by slicing,
+    so it is linear in the extra length."""
+    pos = 0
+    while len(extra) - pos >= 4:
+        field_id, field_len = struct.unpack_from("<2H", extra, pos)
+        pos += 4
+        if pos + field_len > len(extra):
+            return None
+        if field_id == _ZIP64_EXTRA_ID:
+            return list(struct.unpack_from(f"<{field_len // 8}Q", extra, pos))
+        pos += field_len
+    return None
+
+
 def _zip_central_directory_problem(fh: Any) -> str | None:
     """Why ``fh`` must not be handed to :class:`zipfile.ZipFile`, or None.
 
@@ -2207,9 +2266,18 @@ def _zip_central_directory_problem(fh: Any) -> str | None:
     can run, and it walks the directory by its byte size, ignoring the end
     record's entry count (which an attacker sets freely). So the directory
     is walked here first, record by record, reading only each record's
-    fixed 46-byte header, and the walk stops at record
-    ``_NPZ_MAX_MEMBERS + 1``. ZIP64 structures and offsets that do not line
-    up are refused rather than interpreted; numpy writes neither.
+    fixed 46-byte header (plus, for a record with a saturated 32-bit size
+    or offset, its extra field), and the walk stops at record
+    ``_NPZ_MAX_MEMBERS + 1``. A directory larger than
+    ``_NPZ_MAX_CENTRAL_DIRECTORY_BYTES`` is refused before the walk, since
+    ``zipfile`` would read all of it and parse every record's extra field.
+
+    ZIP64 is read the way ``zipfile`` reads it: numpy archives past 2 GiB
+    carry a ZIP64 end record and locator, and ZIP64 extra fields holding
+    the real sizes and offsets of large or late members. Saturated fields
+    with nothing to resolve them, a ZIP64 end record that disagrees with
+    the end record, and offsets that do not line up are refused rather than
+    interpreted.
     """
     found = _zip_end_record(fh)
     if found is None:
@@ -2217,18 +2285,38 @@ def _zip_central_directory_problem(fh: Any) -> str | None:
     end_pos, end = found
     (_sig, disk, cd_disk, disk_entries, total_entries,
      cd_size, cd_offset, _comment_len) = struct.unpack("<4s4H2LH", end)
-    if end_pos >= _ZIP64_LOCATOR_LEN:
-        fh.seek(end_pos - _ZIP64_LOCATOR_LEN)
-        if fh.read(4) == _ZIP64_LOCATOR_SIG:
-            return "ZIP64 archive"
-    if 0xFFFF in (disk_entries, total_entries) or 0xFFFFFFFF in (cd_size, cd_offset):
-        return "ZIP64 archive"
-    if disk or cd_disk or disk_entries != total_entries or cd_offset + cd_size != end_pos:
+    cd_end = end_pos
+    zip64 = _zip64_end_record(fh, end_pos)
+    if isinstance(zip64, str):
+        return zip64
+    if zip64 is not None:
+        cd_end, entries64, size64, offset64 = zip64
+        # zipfile uses only the ZIP64 values. Each 32-bit field must be
+        # saturated or equal to its ZIP64 value (zipfile writes
+        # min(value, saturated)), so no reader can see another directory.
+        narrow_fields = (
+            (disk, 0, 0xFFFF), (cd_disk, 0, 0xFFFF),
+            (disk_entries, entries64, 0xFFFF), (total_entries, entries64, 0xFFFF),
+            (cd_size, size64, 0xFFFFFFFF), (cd_offset, offset64, 0xFFFFFFFF),
+        )
+        if any(value not in (wide, saturated) for value, wide, saturated in narrow_fields):
+            return "end-of-central-directory record disagrees with the ZIP64 end record"
+        disk = cd_disk = 0
+        disk_entries = total_entries = entries64
+        cd_size, cd_offset = size64, offset64
+    elif 0xFFFF in (disk_entries, total_entries) or 0xFFFFFFFF in (cd_size, cd_offset):
+        return "ZIP64 marker without a ZIP64 end record"
+    if disk or cd_disk or disk_entries != total_entries or cd_offset + cd_size != cd_end:
         return "inconsistent end-of-central-directory offsets"
+    if cd_size > _NPZ_MAX_CENTRAL_DIRECTORY_BYTES:
+        return (
+            f"central directory of {cd_size} bytes exceeds the cap of "
+            f"{_NPZ_MAX_CENTRAL_DIRECTORY_BYTES} bytes"
+        )
     count = 0
     pos = cd_offset
-    while pos < end_pos:
-        if end_pos - pos < _ZIP_CENTRAL_LEN:
+    while pos < cd_end:
+        if cd_end - pos < _ZIP_CENTRAL_LEN:
             return "truncated central directory"
         fh.seek(pos)
         header = fh.read(_ZIP_CENTRAL_LEN)
@@ -2240,13 +2328,22 @@ def _zip_central_directory_problem(fh: Any) -> str | None:
         compress_size, file_size = struct.unpack_from("<2L", header, 20)
         name_len, extra_len, comment_len = struct.unpack_from("<3H", header, 28)
         local_offset = struct.unpack_from("<L", header, 42)[0]
-        if 0xFFFFFFFF in (compress_size, file_size, local_offset):
-            return "ZIP64 archive"
+        record_end = pos + _ZIP_CENTRAL_LEN + name_len + extra_len + comment_len
+        if record_end > cd_end:
+            return "inconsistent central directory size"
+        # zipfile resolves saturated fields from the ZIP64 extra in this
+        # order: uncompressed size, compressed size, local header offset.
+        saturated = (file_size, compress_size, local_offset).count(0xFFFFFFFF)
+        if saturated:
+            fh.seek(pos + _ZIP_CENTRAL_LEN + name_len)
+            values = _zip64_extra_values(fh.read(extra_len))
+            if values is None or len(values) < saturated:
+                return "ZIP64 field without a matching ZIP64 extra field"
+            if local_offset == 0xFFFFFFFF:
+                local_offset = values[saturated - 1]
         if local_offset >= cd_offset:
             return "inconsistent member offset"
-        pos += _ZIP_CENTRAL_LEN + name_len + extra_len + comment_len
-    if pos != end_pos:
-        return "inconsistent central directory size"
+        pos = record_end
     if count != total_entries:
         return f"end record declares {total_entries} entries but the directory holds {count}"
     return None

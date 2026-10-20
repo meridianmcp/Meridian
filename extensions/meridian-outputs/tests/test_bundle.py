@@ -216,6 +216,26 @@ class TestExport:
         assert (populated["outputs"] / ".meridian-outputs-cache" / "bundles"
                 / "meridian-outputs-bundle.json").is_file()
 
+    def test_export_into_a_fresh_cache_gitignores_it(self, tmp_path) -> None:
+        """B-F13: the ledger readers no longer create the cache dir, so an
+        export to the default path created .meridian-outputs-cache/bundles
+        with no .gitignore entry, leaving the bundle (and the cache) for
+        git to pick up."""
+        fresh = tmp_path / "fresh_outputs"
+        fresh.mkdir()
+        result = B.export_bundle(str(fresh))
+        assert result["exported"] is True, result
+        gitignore = fresh / ".gitignore"
+        assert gitignore.is_file()
+        assert "/.meridian-outputs-cache/" in gitignore.read_text(encoding="utf-8").splitlines()
+
+    def test_export_outside_the_cache_does_not_create_it(self, tmp_path) -> None:
+        fresh = tmp_path / "fresh_outputs"
+        fresh.mkdir()
+        assert B.export_bundle(str(fresh), "backup/bundle.json")["exported"] is True
+        assert not (fresh / ".meridian-outputs-cache").exists()
+        assert not (fresh / ".gitignore").exists()
+
     def test_empty_outputs_dir_exports_empty_members(self, tmp_path) -> None:
         result = _export(tmp_path)
         assert result["members"]["provenance_ledger"]["entries"] == 0
@@ -308,15 +328,21 @@ class TestExport:
         assert "already exists" in again["error"]
         assert B.export_bundle(od, overwrite=True)["exported"] is True
 
-    @pytest.mark.parametrize("rel", [
+    _STREAM_NAMES = [
         "results.csv:hidden",
         "backup.json:evil",
         ".meridian-outputs-cache/bundles/b.json::$DATA",
         "sub/name:stream:$DATA",
-    ])
-    def test_stream_suffixed_name_is_refused(self, populated, rel) -> None:
+    ]
+    _POSIX_COLON_NAME = ".meridian-outputs-cache/bundles/bundle-2026-10-20T10:00:00Z.json"
+
+    @pytest.mark.parametrize("rel", _STREAM_NAMES)
+    def test_stream_suffixed_name_is_refused(self, populated, rel, monkeypatch) -> None:
         """B1: on Windows ``name:stream`` writes an alternate data stream of
-        an existing file, so a ':' outside the drive letter is refused."""
+        an existing file, so a ':' outside the drive letter is refused there.
+        The Windows check is forced on so this runs on every host (B-F11
+        made the refusal Windows-only)."""
+        monkeypatch.setattr(B, "_IS_WINDOWS", True)
         results = populated["outputs"] / "results.csv"
         results.write_text("x,y\n1,2\n", encoding="utf-8")
         result = B.export_bundle(str(populated["outputs"]), rel, overwrite=True)
@@ -327,6 +353,33 @@ class TestExport:
         assert results.read_text(encoding="utf-8") == "x,y\n1,2\n"
         assert not (populated["outputs"] / "backup.json").exists()
         assert not (populated["outputs"] / "sub").exists()
+
+    @pytest.mark.parametrize("rel", [*_STREAM_NAMES, _POSIX_COLON_NAME])
+    def test_colon_is_an_ordinary_character_off_windows(self, rel, monkeypatch) -> None:
+        """B-F11: ':' was refused on every platform, although only Windows
+        reads it as a stream separator."""
+        monkeypatch.setattr(B, "_IS_WINDOWS", False, raising=False)
+        assert B._stream_separator_error(rel) is None
+        monkeypatch.setattr(B, "_IS_WINDOWS", True)
+        assert B._stream_separator_error(rel) == (
+            "bundle_path rejected: ':' is only allowed in a drive letter"
+        )
+
+    def test_posix_colon_name_is_refused_on_windows_only(self, populated) -> None:
+        """B-F11, on the real platform: a timestamped name with colons is
+        refused on Windows and exported (and verifies) everywhere else."""
+        od = str(populated["outputs"])
+        result = B.export_bundle(od, self._POSIX_COLON_NAME)
+        if os.name == "nt":
+            assert result == {
+                "exported": False,
+                "error": "bundle_path rejected: ':' is only allowed in a drive letter",
+            }
+            assert not (populated["outputs"] / ".meridian-outputs-cache" / "bundles").exists()
+        else:
+            assert result["exported"] is True, result
+            assert result["bundle_path"] == self._POSIX_COLON_NAME
+            assert B.verify_bundle(self._POSIX_COLON_NAME, outputs_dir=od)["verified"] is True
 
     def test_drive_qualified_absolute_path_inside_outputs_is_allowed(self, populated) -> None:
         target = populated["outputs"] / "abs_bundle.json"
@@ -387,37 +440,52 @@ class TestExport:
         assert not (populated["outputs"] / "x.json").exists()
 
     def test_failed_replace_leaves_no_temp_file_and_no_bundle(self, populated, monkeypatch) -> None:
+        # overwrite=True: os.replace is the overwrite publish; a create-only
+        # export links instead (see the create-only tests below).
         def _fail(_src, _dst):
             raise OSError("disk full")
 
         monkeypatch.setattr(B.os, "replace", _fail)
-        result = B.export_bundle(str(populated["outputs"]), "backup/x.json")
+        result = B.export_bundle(str(populated["outputs"]), "backup/x.json", overwrite=True)
         assert result == {"exported": False, "error": "failed to write bundle (OSError)"}
         leftovers = list((populated["outputs"] / "backup").iterdir())
         assert leftovers == []
 
-    def test_write_is_fsynced_before_replace(self, populated, monkeypatch) -> None:
-        calls: list[str] = []
-        real_fsync, real_replace = os.fsync, os.replace
-        monkeypatch.setattr(B.os, "fsync", lambda fd: (calls.append("fsync"), real_fsync(fd))[1])
-        monkeypatch.setattr(B.os, "replace", lambda s, d: (calls.append("replace"), real_replace(s, d))[1])
-        _export(populated["outputs"])
-        # The file fsync precedes the rename; on POSIX the directory fsync
-        # after it adds a second fsync.
-        assert calls[:2] == ["fsync", "replace"]
-        assert calls.count("replace") == 1
+    @staticmethod
+    def _spy_publish(monkeypatch, record) -> None:
+        """Record os.link and os.replace (the two publish steps) as "publish"."""
+        real_link, real_replace = os.link, os.replace
+        monkeypatch.setattr(B.os, "link", lambda s, d: (record("publish"), real_link(s, d))[1])
+        monkeypatch.setattr(B.os, "replace", lambda s, d: (record("publish"), real_replace(s, d))[1])
 
-    def test_directory_is_fsynced_after_replace(self, populated, monkeypatch) -> None:
+    @pytest.mark.parametrize("overwrite", [False, True])
+    def test_write_is_fsynced_before_replace(self, populated, monkeypatch, overwrite) -> None:
+        calls: list[str] = []
+        real_fsync = os.fsync
+        monkeypatch.setattr(B.os, "fsync", lambda fd: (calls.append("fsync"), real_fsync(fd))[1])
+        self._spy_publish(monkeypatch, calls.append)
+        result = B.export_bundle(str(populated["outputs"]), "backup/bundle.json", overwrite=overwrite)
+        assert result["exported"] is True, result
+        # The file fsync precedes the publish (a link without overwrite, a
+        # rename with it); on POSIX the directory fsync after it adds a
+        # second fsync.
+        assert calls[:2] == ["fsync", "publish"]
+        assert calls.count("publish") == 1
+
+    @pytest.mark.parametrize("overwrite", [False, True])
+    def test_directory_is_fsynced_after_replace(self, populated, monkeypatch, overwrite) -> None:
         events: list[str] = []
-        real_replace = os.replace
-        monkeypatch.setattr(B.os, "replace", lambda s, d: (events.append("replace"), real_replace(s, d))[1])
+        self._spy_publish(monkeypatch, events.append)
         monkeypatch.setattr(ledger_io, "_fsync_directory", lambda d: events.append(f"dir:{d}"))
-        _export(populated["outputs"])
-        assert len(events) == 2 and events[0] == "replace"
+        result = B.export_bundle(str(populated["outputs"]), "backup/bundle.json", overwrite=overwrite)
+        assert result["exported"] is True, result
+        assert len(events) == 2 and events[0] == "publish"
         assert events[1].startswith("dir:")
         assert os.path.samefile(events[1][len("dir:"):], populated["outputs"] / "backup")
 
     def test_transient_sharing_violation_on_replace_is_retried(self, populated, monkeypatch) -> None:
+        # overwrite=True: the replace is where a lock-free reader holding
+        # the target open causes a sharing violation.
         real_replace = os.replace
         failures = {"left": 2}
 
@@ -429,10 +497,77 @@ class TestExport:
 
         monkeypatch.setattr(ledger_io, "_SHARING_RETRY_SLEEP_SECONDS", 0.0)
         monkeypatch.setattr(B.os, "replace", _flaky)
-        _export(populated["outputs"])
+        result = B.export_bundle(str(populated["outputs"]), "backup/bundle.json", overwrite=True)
+        assert result["exported"] is True, result
         assert failures["left"] == 0
         assert B.verify_bundle(str(populated["outputs"] / "backup" / "bundle.json"))["verified"] is True
         assert [p.name for p in (populated["outputs"] / "backup").iterdir()] == ["bundle.json"]
+
+    def test_concurrent_create_only_exports_cannot_both_succeed(self, populated, monkeypatch) -> None:
+        """B-F12: overwrite=False was a check then os.replace. An export that
+        passed the check replaced a bundle another export published while it
+        read the ledgers, and both returned exported=True."""
+        od = str(populated["outputs"])
+        target = populated["outputs"] / "backup" / "bundle.json"
+        real_problem = B._ledger_file_problem
+        racer: dict[str, Any] = {}
+
+        def _another_export_publishes_first(path):
+            if not racer:  # once, after this export's existence check passed
+                racer["started"] = True
+                racer["result"] = B.export_bundle(od, "backup/bundle.json")
+                racer["bytes"] = target.read_bytes()
+            return real_problem(path)
+
+        monkeypatch.setattr(B, "_ledger_file_problem", _another_export_publishes_first)
+        result = B.export_bundle(od, "backup/bundle.json")
+        assert racer["result"]["exported"] is True
+        assert result["exported"] is False, "the second export replaced the first"
+        assert target.read_bytes() == racer["bytes"]
+        assert result == {"exported": False, "error": B._EXISTS_ERROR}
+        assert [p.name for p in target.parent.iterdir()] == ["bundle.json"]
+
+    @pytest.mark.parametrize("hard_links", ["available", "missing", "refused"])
+    def test_create_only_publish_refuses_an_existing_target(
+        self, tmp_path, monkeypatch, hard_links,
+    ) -> None:
+        """B-F12: a second create-only publish to the same target raises
+        FileExistsError and the first file's bytes survive, whether the
+        name is claimed by os.link or, without hard links, by an O_EXCL
+        reservation."""
+        if hard_links == "missing":
+            monkeypatch.delattr(B.os, "link")
+        elif hard_links == "refused":
+            def _no_hard_links(_src, _dst):
+                raise PermissionError(1, "hard links are not supported here")
+
+            monkeypatch.setattr(B.os, "link", _no_hard_links)
+        target = tmp_path / "bundles" / "bundle.json"
+        B._atomic_write_json(str(target), {"first": 1}, indent=None, create_only=True)
+        first = target.read_bytes()
+        assert json.loads(first) == {"first": 1}
+        with pytest.raises(FileExistsError):
+            B._atomic_write_json(str(target), {"second": 2}, indent=None, create_only=True)
+        assert target.read_bytes() == first
+        assert [p.name for p in target.parent.iterdir()] == ["bundle.json"]
+
+    def test_failed_create_only_publish_leaves_no_reservation_or_temp_file(
+        self, populated, monkeypatch,
+    ) -> None:
+        """Without hard links the name is reserved first; a rename that then
+        fails removes the empty reservation, so a retry is not refused as
+        "already exists"."""
+        monkeypatch.delattr(B.os, "link")
+
+        def _fail(_src, _dst):
+            raise OSError("disk full")
+
+        monkeypatch.setattr(B.os, "replace", _fail)
+        result = B.export_bundle(str(populated["outputs"]), "backup/x.json")
+        assert result == {"exported": False, "error": "failed to write bundle (OSError)"}
+        assert list((populated["outputs"] / "backup").iterdir()) == []
+        monkeypatch.undo()
+        assert B.export_bundle(str(populated["outputs"]), "backup/x.json")["exported"] is True
 
 
 class TestVerify:
@@ -1033,6 +1168,29 @@ class TestImport:
         assert summary["conflicts"] == ["a", "b"]
         assert summary["conflict_count"] == 3
         assert summary["conflicts_truncated"] is True
+
+
+class TestSourceEdgeFields:
+    @pytest.mark.parametrize("field, value", [
+        ("source_locator", 5),
+        ("source_locator", ["../scripts/gen.py"]),
+        ("relation", 5),
+    ])
+    def test_non_string_edge_field_is_refused_and_export_keeps_working(
+        self, populated, field, value,
+    ) -> None:
+        """B-F10: bind_source_edge stored a non-string source_locator or
+        relation, and every later export then refused the registry, whose
+        edge fields must be strings."""
+        od = str(populated["outputs"])
+        before = _snapshot(populated["outputs"])["artifact_registry"]
+        fields: dict[str, Any] = {"source_locator": "data/raw.csv", "relation": "produced_by"}
+        fields[field] = value
+        with pytest.raises(ValueError, match=f"{field} must be a non-empty string"):
+            artifact_registry.bind_source_edge(od, populated["artifact_id"], **fields)
+        assert _snapshot(populated["outputs"])["artifact_registry"] == before
+        assert len(artifact_registry._read_registry(od)["edges"]) == 1
+        assert B.export_bundle(od, "x.json")["exported"] is True
 
 
 class TestWiring:

@@ -33,7 +33,9 @@ What this module adds
   ``exported_at``/``package_version`` are informational and are NOT covered
   by the digest, so two exports of identical state have the same
   ``bundle_digest``. The file is written to a temp file in the target
-  directory, flushed, fsynced, then ``os.replace``d into place.
+  directory, flushed and fsynced, then published: hard-linked into place
+  (create-only, so a concurrent export cannot be clobbered) by default, or
+  ``os.replace``d into place with ``overwrite=True``.
 
 * :func:`verify_bundle` -- recomputes every digest and reports
   ``verified``, ``mismatches``, ``missing``, ``unexpected``, ``malformed``
@@ -107,12 +109,16 @@ Paths
 ``.meridian-outputs-cache`` only the ``bundles/`` subdirectory may hold a
 bundle: everything else there is live state (the ledgers, ``index.duckdb``,
 the ``*.lock`` files the index and ledger writers hold, the derived cache).
-A ``:`` anywhere but a drive letter is refused, since on Windows it names an
-alternate data stream of another file. Export also refuses to replace an
+On Windows a ``:`` anywhere but a drive letter is refused, since there it
+names an alternate data stream of another file; on other platforms ``:`` is
+an ordinary file-name character (``bundle-2026-10-20T10:00:00Z.json``) and is
+accepted. Export also refuses to replace an
 existing file unless ``overwrite=True``. A relative ``bundle_path`` is
 relative to ``outputs_dir``. The default, ``.meridian-outputs-cache/bundles/
 meridian-outputs-bundle.json``, sits in a dot-directory, which the outputs
-walk skips, so the bundle is never indexed as an output itself. Results
+walk skips, so the bundle is never indexed as an output itself; an export
+into the cache creates the cache directory and its ``.gitignore`` entry
+first, as every other cache writer does. Results
 report the bundle path relative to ``outputs_dir``, never absolute.
 
 NO hosted call is made anywhere in this module.
@@ -150,8 +156,12 @@ INDEX_META = "index_meta"
 
 _CACHE_DIRNAME = ".meridian-outputs-cache"
 _BUNDLES_SUBDIR = "bundles"  # the only part of the cache a bundle may live in
+_IS_WINDOWS = os.name == "nt"  # ':' names an alternate data stream only here
 _LOCK_TIMEOUT_SECONDS = 30.0
 _CONFLICT_LIST_CAP = 500
+_EXISTS_ERROR = (
+    "bundle_path rejected: a file already exists there (pass overwrite=True to replace it)"
+)
 
 # member name -> (module, reader attribute, on-disk filename). The reader is
 # looked up by NAME at call time, so a reader replaced on another branch (or
@@ -243,8 +253,12 @@ def _inside(path: str, root: str) -> bool:
 
 
 def _stream_separator_error(bundle_path: Any) -> str | None:
-    """Refuse a ``:`` outside the drive letter: on Windows ``name:stream``
-    writes an alternate data stream of ``name``, an existing file."""
+    """On Windows, refuse a ``:`` outside the drive letter: there
+    ``name:stream`` writes an alternate data stream of ``name``, an existing
+    file. Elsewhere ``:`` is an ordinary file-name character, so a name such
+    as ``bundle-2026-10-20T10:00:00Z.json`` is accepted."""
+    if not _IS_WINDOWS:
+        return None
     if not isinstance(bundle_path, (str, os.PathLike)):
         return None  # _require_within reports the type problem
     raw = os.fsdecode(os.fspath(bundle_path))
@@ -318,12 +332,56 @@ def _file_signature(path: str) -> tuple[int, int] | None:
     return st.st_mtime_ns, st.st_size
 
 
-def _atomic_write_json(path: str, obj: Any, *, indent: int | None) -> None:
-    """Temp file in the same directory, fsync, ``os.replace``, directory
-    fsync; the temp file is removed on any failure so nothing half-written
-    is left behind. The replace retries a transient Windows sharing
-    violation (a lock-free reader holding the target open) the same way
-    ``ledger_io.write_ledger_atomic`` does."""
+def _publish_create_only(tmp: str, path: str) -> None:
+    """Move the finished temp file ``tmp`` to ``path`` only if nothing is
+    there, as one atomic step, so two concurrent create-only writers can
+    never both succeed.
+
+    ``os.link`` fails with FileExistsError when ``path`` exists; ``tmp`` is
+    then unlinked. Where hard links are unavailable (no ``os.link``, or a
+    filesystem that refuses them), ``path`` is reserved with ``O_CREAT |
+    O_EXCL`` (FileExistsError if it exists) and ``tmp`` is renamed over that
+    empty reservation; a failed rename removes the reservation again. A
+    writer passing ``overwrite=True`` may still replace the file, which is
+    what overwrite means.
+    """
+    link = getattr(os, "link", None)
+    if link is not None:
+        try:
+            link(tmp, path)
+        except FileExistsError:
+            raise
+        except OSError:
+            pass  # no hard links on this filesystem: reserve the name instead
+        else:
+            with contextlib.suppress(OSError):
+                os.unlink(tmp)
+            return
+    fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o666)
+    try:
+        reserved = os.fstat(fd)
+    finally:
+        os.close(fd)
+    try:
+        ledger_io._retry_sharing(lambda: os.replace(tmp, path))
+    except BaseException:
+        with contextlib.suppress(OSError):
+            current = os.stat(path)
+            if (current.st_dev, current.st_ino) == (reserved.st_dev, reserved.st_ino):
+                os.unlink(path)
+        raise
+
+
+def _atomic_write_json(
+    path: str, obj: Any, *, indent: int | None, create_only: bool = False,
+) -> None:
+    """Temp file in the same directory, fsync, publish, directory fsync; the
+    temp file is removed on any failure so nothing half-written is left
+    behind. The publish is ``os.replace``, retrying a transient Windows
+    sharing violation (a lock-free reader holding the target open) the same
+    way ``ledger_io.write_ledger_atomic`` does; with ``create_only`` it is
+    :func:`_publish_create_only`, which raises FileExistsError and leaves
+    the existing file untouched when ``path`` already exists."""
     directory = os.path.dirname(path)
     os.makedirs(directory, exist_ok=True)
     fd, tmp = tempfile.mkstemp(dir=directory, prefix=".bundle-", suffix=".tmp")
@@ -332,7 +390,10 @@ def _atomic_write_json(path: str, obj: Any, *, indent: int | None) -> None:
             json.dump(obj, fh, indent=indent, sort_keys=True)
             fh.flush()
             os.fsync(fh.fileno())
-        ledger_io._retry_sharing(lambda: os.replace(tmp, path))
+        if create_only:
+            _publish_create_only(tmp, path)
+        else:
+            ledger_io._retry_sharing(lambda: os.replace(tmp, path))
     except BaseException:
         with contextlib.suppress(OSError):
             os.unlink(tmp)
@@ -513,7 +574,8 @@ def export_bundle(
                     subdirectory is allowed.
       overwrite:    Replace a file that already exists at ``bundle_path``.
                     Off by default, so an export never silently replaces a
-                    user's file or an earlier bundle.
+                    user's file or an earlier bundle, including one a
+                    concurrent export published while this one ran.
 
     Returns:
       ``{"exported": True, "bundle_path", "bundle_digest", "members":
@@ -529,11 +591,7 @@ def export_bundle(
     if target is None:
         return {"exported": False, "error": error}
     if not overwrite and os.path.lexists(target):
-        return {
-            "exported": False,
-            "error": "bundle_path rejected: a file already exists there "
-                     "(pass overwrite=True to replace it)",
-        }
+        return {"exported": False, "error": _EXISTS_ERROR}
 
     payloads: dict[str, Any] = {}
     errors: list[str] = []
@@ -583,9 +641,20 @@ def export_bundle(
         "bundle_digest": bundle_digest,
     }
     try:
-        # The ledger readers above already created and gitignored the cache
-        # dir; _atomic_write_json creates any bundle subdirectory itself.
-        _atomic_write_json(target, envelope, indent=None)
+        # The ledger readers never create the cache dir, so a bundle bound
+        # for it (the default path) first creates and gitignores it;
+        # _atomic_write_json creates any bundle subdirectory itself.
+        cache_real = os.path.realpath(os.path.join(os.path.realpath(outputs_dir), _CACHE_DIRNAME))
+        if _inside(target, cache_real):
+            _ensure_cache_dir(outputs_dir)
+        # Without overwrite the publish is create-only: the check above ran
+        # before the ledgers were read, and another export may have
+        # published to the same path since.
+        _atomic_write_json(target, envelope, indent=None, create_only=not overwrite)
+    except FileExistsError as exc:
+        if not overwrite and os.path.lexists(target):
+            return {"exported": False, "error": _EXISTS_ERROR}
+        return {"exported": False, "error": f"failed to write bundle ({type(exc).__name__})"}
     except OSError as exc:
         return {"exported": False, "error": f"failed to write bundle ({type(exc).__name__})"}
 

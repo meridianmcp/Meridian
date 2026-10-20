@@ -125,6 +125,63 @@ def _with_declared_count(data: bytes, count: int) -> bytes:
     return _patch_end(_patch_end(data, 8, "<H", count), 10, "<H", count)
 
 
+def _patch_record(data: bytes, sig: bytes, offset: int, fmt: str, value: int, *, nth: int = 0) -> bytes:
+    """Overwrite one field of the ``nth`` record that starts with ``sig``."""
+    pos = -1
+    for _ in range(nth + 1):
+        pos = data.find(sig, pos + 1)
+    out = bytearray(data)
+    struct.pack_into(fmt, out, pos + offset, value)
+    return bytes(out)
+
+
+def _zip64_npz_bytes(*, compressed: bool = False) -> bytes:
+    """The model archive laid out the way zipfile writes an archive past
+    2 GiB, without writing 2 GiB: with ZIP64_LIMIT lowered to 0 every
+    central record gets a ZIP64 extra field (both sizes, and the offset of
+    the second member; the first sits at offset 0) and the archive gets a
+    ZIP64 end record and locator. The 32-bit end-record fields keep their
+    real values, as zipfile writes them below 4 GiB."""
+    buf = io.BytesIO()
+    method = zipfile.ZIP_DEFLATED if compressed else zipfile.ZIP_STORED
+    with patch.object(zipfile, "ZIP64_LIMIT", 0):
+        with zipfile.ZipFile(buf, "w", compression=method) as zf:
+            zf.writestr("weights.npy", _npy_bytes("<f8", (100, 3), payload=b"\0" * 64))
+            zf.writestr("labels.npy", _npy_bytes("<i8", (100,), payload=b"\0" * 32))
+    return buf.getvalue()
+
+
+def _saturate_end_record(data: bytes) -> bytes:
+    """Saturate every 32-bit end-record field, as an archive past 4 GiB (or
+    a writer that always saturates under ZIP64) has them."""
+    data = _with_declared_count(data, 0xFFFF)
+    return _patch_end(_patch_end(data, 12, "<L", 0xFFFFFFFF), 16, "<L", 0xFFFFFFFF)
+
+
+def _with_zip64_extensible_data(data: bytes, size: int) -> bytes:
+    """Add ``size`` bytes of ZIP64 extensible data after the ZIP64 end
+    record (before the locator) and count them in its record size."""
+    pos = data.rfind(b"PK\x06\x07")
+    data = data[:pos] + b"\0" * size + data[pos:]
+    record = data.find(b"PK\x06\x06")
+    return _patch_record(data, b"PK\x06\x06", 4, "<Q",
+                         struct.unpack_from("<Q", data, record + 4)[0] + size)
+
+
+def _zip64_declared_count(data: bytes, count: int) -> bytes:
+    """Rewrite the ZIP64 end record's (this-disk and total) entry counts."""
+    data = _patch_record(data, b"PK\x06\x06", 24, "<Q", count)
+    return _patch_record(data, b"PK\x06\x06", 32, "<Q", count)
+
+
+# Field positions in the ZIP64 fixture: the second central record holds
+# "labels.npy" (10 bytes), then its ZIP64 extra field: id, length, then
+# uncompressed size, compressed size and local header offset.
+_SECOND_EXTRA = 46 + len("labels.npy")
+_SECOND_EXTRA_LEN = _SECOND_EXTRA + 2
+_SECOND_EXTRA_OFFSET = _SECOND_EXTRA + 4 + 16
+
+
 class _CountingBytesIO(io.BytesIO):
     """Counts reads of 46-byte central-directory record headers."""
 
@@ -465,6 +522,42 @@ class TestNpzDegradesToFilenameOnly:
         assert OL._npz_array_summary("many.npz", data) is None
         assert calls == []
 
+    def test_central_directory_over_the_byte_cap_is_refused_unparsed(
+        self, monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """B-F15: the walk bounded the record count but not the directory's
+        bytes. 17 records (far under the member cap) whose extra fields hold
+        16,000 empty subfields each make a 1.09 MB directory, and zipfile's
+        per-record extra parsing is quadratic in the extra length. The
+        archive is refused before a record is read or zipfile is built."""
+        extra = struct.pack("<2H", 0xCAFE, 0) * 16_000
+        buf = io.BytesIO()
+        with zipfile.ZipFile(buf, "w") as zf:
+            for i in range(17):
+                info = zipfile.ZipInfo(f"a{i:02d}.npy")
+                info.extra = extra
+                zf.writestr(info, _npy_bytes("<f8", (1,)))
+        data = buf.getvalue()
+        cd_size = struct.unpack_from("<L", data, data.rfind(b"PK\x05\x06") + 12)[0]
+        assert cd_size > 1 << 20
+        fh = _CountingBytesIO(data)
+        calls = _forbid_zipfile(monkeypatch)
+        assert OL._zip_central_directory_problem(fh) == (
+            f"central directory of {cd_size} bytes exceeds the cap of {1 << 20} bytes"
+        )
+        assert OL._NPZ_MAX_CENTRAL_DIRECTORY_BYTES == 1 << 20
+        assert fh.central_headers_read == 0
+        assert OL._npz_array_summary("padded.npz", data) is None
+        assert calls == []
+
+    def test_numpy_sized_directory_is_far_under_the_byte_cap(self) -> None:
+        """256 members named like numpy's (``arr_0.npy`` ...) make a
+        directory of a few KB, nowhere near the byte cap."""
+        data = _npz_bytes({f"arr_{i}": b"" for i in range(OL._NPZ_MAX_MEMBERS)})
+        cd_size = struct.unpack_from("<L", data, data.rfind(b"PK\x05\x06") + 12)[0]
+        assert cd_size * 50 < OL._NPZ_MAX_CENTRAL_DIRECTORY_BYTES
+        assert OL._zip_central_directory_problem(io.BytesIO(data)) is None
+
     def test_under_declared_count_below_the_cap_is_refused(
         self, monkeypatch: pytest.MonkeyPatch,
     ) -> None:
@@ -477,11 +570,20 @@ class TestNpzDegradesToFilenameOnly:
         assert calls == []
 
     @pytest.mark.parametrize("mutate, reason", [
-        (lambda d: _patch_end(d, 10, "<H", 0xFFFF), "ZIP64 archive"),
-        (lambda d: _patch_end(d, 16, "<L", 0xFFFFFFFF), "ZIP64 archive"),
-        (lambda d: _insert_before_end(d, b"PK\x06\x07" + b"\0" * 16), "ZIP64 archive"),
-        (lambda d: _patch_central(d, 42, "<L", 0xFFFFFFFF), "ZIP64 archive"),
-        (lambda d: _patch_central(d, 20, "<L", 0xFFFFFFFF), "ZIP64 archive"),
+        # B-F14: these five used to be refused as "ZIP64 archive". Each is a
+        # ZIP64 marker with nothing behind it -- a saturated end-record
+        # field with no ZIP64 end record, a locator naming no ZIP64 end
+        # record, a saturated central-record field with no ZIP64 extra --
+        # so they stay refused, with a reason naming the defect. Well-formed
+        # ZIP64 archives are accepted (test_valid_zip64_archive_...).
+        (lambda d: _patch_end(d, 10, "<H", 0xFFFF), "ZIP64 marker without a ZIP64 end record"),
+        (lambda d: _patch_end(d, 16, "<L", 0xFFFFFFFF), "ZIP64 marker without a ZIP64 end record"),
+        (lambda d: _insert_before_end(d, b"PK\x06\x07" + b"\0" * 16),
+         "ZIP64 end-of-central-directory record not found"),
+        (lambda d: _patch_central(d, 42, "<L", 0xFFFFFFFF),
+         "ZIP64 field without a matching ZIP64 extra field"),
+        (lambda d: _patch_central(d, 20, "<L", 0xFFFFFFFF),
+         "ZIP64 field without a matching ZIP64 extra field"),
         (lambda d: _patch_end(d, 16, "<L", 1), "inconsistent end-of-central-directory offsets"),
         (lambda d: _patch_end(d, 12, "<L", 10), "inconsistent end-of-central-directory offsets"),
         (lambda d: _patch_end(d, 4, "<H", 1), "inconsistent end-of-central-directory offsets"),
@@ -494,6 +596,88 @@ class TestNpzDegradesToFilenameOnly:
         self, monkeypatch: pytest.MonkeyPatch, mutate, reason: str,
     ) -> None:
         data = mutate(_model_npz())
+        calls = _forbid_zipfile(monkeypatch)
+        assert OL._zip_central_directory_problem(io.BytesIO(data)) == reason
+        assert OL._npz_array_summary("odd.npz", data) is None
+        assert calls == []
+
+    @pytest.mark.parametrize("compressed, saturated_end, extensible", [
+        (False, False, 0), (True, False, 0), (False, True, 0), (False, False, 16),
+    ])
+    def test_valid_zip64_archive_still_parses_member_headers(
+        self, compressed: bool, saturated_end: bool, extensible: int,
+    ) -> None:
+        """B-F14: the walk refused every ZIP64 archive, so a numpy .npz past
+        2 GiB -- ZIP64 extra fields on its central records, a ZIP64 end
+        record and a locator -- was indexed by filename only, where before
+        the walk existed its member headers were parsed."""
+        data = _zip64_npz_bytes(compressed=compressed)
+        # Premise: the layout zipfile writes past 2 GiB.
+        assert data.count(b"PK\x06\x06") == 1 and data.count(b"PK\x06\x07") == 1
+        first = data.find(b"PK\x01\x02")
+        second = data.find(b"PK\x01\x02", first + 4)
+        assert struct.unpack_from("<2L", data, first + 20) == (0xFFFFFFFF, 0xFFFFFFFF)
+        assert struct.unpack_from("<L", data, second + 42)[0] == 0xFFFFFFFF
+        assert struct.unpack_from("<H", data, second + _SECOND_EXTRA)[0] == 1
+        if saturated_end:
+            data = _saturate_end_record(data)
+        if extensible:
+            data = _with_zip64_extensible_data(data, extensible)
+        assert OL._zip_central_directory_problem(io.BytesIO(data)) is None
+        assert OL._npz_array_summary("big.npz", data) == _MODEL_ARRAYS
+
+    def test_zip64_archive_still_honours_the_member_cap(
+        self, monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        monkeypatch.setattr(OL, "_NPZ_MAX_MEMBERS", 1)
+        data = _zip64_npz_bytes()
+        calls = _forbid_zipfile(monkeypatch)
+        assert OL._zip_central_directory_problem(io.BytesIO(data)) == (
+            "more than 1 members exceeds the cap"
+        )
+        assert OL._npz_array_summary("big.npz", data) is None
+        assert calls == []
+
+    @pytest.mark.parametrize("mutate, reason", [
+        (lambda d: _patch_record(d, b"PK\x06\x07", 8, "<Q", d.find(b"PK\x06\x06") - 1),
+         "ZIP64 end-of-central-directory record not found"),
+        (lambda d: _patch_record(d, b"PK\x06\x07", 8, "<Q", d.find(b"PK\x06\x06") + 1),
+         "inconsistent ZIP64 end-of-central-directory locator"),
+        (lambda d: _patch_record(d, b"PK\x06\x07", 16, "<L", 2),
+         "inconsistent ZIP64 end-of-central-directory locator"),
+        (lambda d: _patch_record(d, b"PK\x06\x07", 4, "<L", 1),
+         "inconsistent ZIP64 end-of-central-directory locator"),
+        (lambda d: _patch_record(d, b"PK\x06\x06", 4, "<Q", 45),
+         "inconsistent ZIP64 end-of-central-directory record"),
+        (lambda d: _patch_record(d, b"PK\x06\x06", 24, "<Q", 3),
+         "inconsistent ZIP64 end-of-central-directory record"),
+        (lambda d: _patch_record(d, b"PK\x06\x06", 16, "<L", 1),
+         "inconsistent ZIP64 end-of-central-directory record"),
+        (lambda d: _patch_record(d, b"PK\x06\x06", 48, "<Q", d.find(b"PK\x01\x02") + 1),
+         "end-of-central-directory record disagrees with the ZIP64 end record"),
+        (lambda d: _with_declared_count(d, 3),
+         "end-of-central-directory record disagrees with the ZIP64 end record"),
+        (lambda d: _patch_record(_saturate_end_record(d), b"PK\x06\x06", 48, "<Q",
+                                 d.find(b"PK\x01\x02") + 1),
+         "inconsistent end-of-central-directory offsets"),
+        (lambda d: _zip64_declared_count(_saturate_end_record(d), 3),
+         "end record declares 3 entries but the directory holds 2"),
+        (lambda d: _patch_record(d, b"PK\x01\x02", _SECOND_EXTRA_LEN, "<H", 16, nth=1),
+         "ZIP64 field without a matching ZIP64 extra field"),
+        (lambda d: _patch_record(d, b"PK\x01\x02", _SECOND_EXTRA_LEN, "<H", 0xFFFF, nth=1),
+         "ZIP64 field without a matching ZIP64 extra field"),
+        (lambda d: _patch_record(d, b"PK\x01\x02", _SECOND_EXTRA, "<H", 0xCAFE, nth=1),
+         "ZIP64 field without a matching ZIP64 extra field"),
+        (lambda d: _patch_record(d, b"PK\x01\x02", _SECOND_EXTRA_OFFSET, "<Q",
+                                 d.find(b"PK\x01\x02"), nth=1),
+         "inconsistent member offset"),
+    ])
+    def test_malformed_zip64_structures_are_refused(
+        self, monkeypatch: pytest.MonkeyPatch, mutate, reason: str,
+    ) -> None:
+        """B-F14: accepting ZIP64 keeps the refusals for ZIP64 records that
+        are malformed or disagree with each other."""
+        data = mutate(_zip64_npz_bytes())
         calls = _forbid_zipfile(monkeypatch)
         assert OL._zip_central_directory_problem(io.BytesIO(data)) == reason
         assert OL._npz_array_summary("odd.npz", data) is None
