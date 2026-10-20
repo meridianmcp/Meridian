@@ -9,12 +9,14 @@ import json
 import os
 import shutil
 import sys
+import threading
 from pathlib import Path
+from typing import Any
 
 import pytest
 
 sys.path.insert(0, str(Path(__file__).parent.parent))
-from meridian_outputs import annotate, artifact_registry, fingerprint, outputs_local, run_manifest
+from meridian_outputs import annotate, artifact_registry, fingerprint, ledger_io, outputs_local, run_manifest
 from meridian_outputs import bundle as B
 
 _READERS = {
@@ -106,6 +108,26 @@ def _copy_bundle(src_outputs: Path, rel: str, dst_outputs: Path, dst_rel: str = 
     dst.parent.mkdir(parents=True, exist_ok=True)
     shutil.copyfile(src_outputs / rel, dst)
     return dst
+
+
+def _fingerprint_import_setup(root: Path) -> tuple[Path, Path]:
+    """A bundle whose only change for the target is one fingerprint entry
+    (a.csv), copied into a target that already has its own entry (b.csv)
+    and an untagged c.csv for a concurrent writer to tag."""
+    gen = root / "gen.py"
+    gen.write_text("print(1)\n", encoding="utf-8")
+    src = _empty_target(root, "fp_src")
+    (src / "a.csv").write_text("x\n1\n", encoding="utf-8")
+    fingerprint.tag_output(str(src / "a.csv"), str(src), script_path=str(gen))
+    _export(src)
+    target = _empty_target(root, "fp_dst")
+    (target / "b.csv").write_text("x\n2\n", encoding="utf-8")
+    (target / "c.csv").write_text("x\n3\n", encoding="utf-8")
+    fingerprint.tag_output(str(target / "b.csv"), str(target), script_path=str(gen))
+    _copy_bundle(src, "backup/bundle.json", target)
+    dry = B.import_bundle("incoming.json", str(target))
+    assert dry["would_write"] == ["fingerprint_ledger"], dry
+    return target, gen
 
 
 class TestExport:
@@ -245,7 +267,37 @@ class TestExport:
         monkeypatch.setattr(B.os, "fsync", lambda fd: (calls.append("fsync"), real_fsync(fd))[1])
         monkeypatch.setattr(B.os, "replace", lambda s, d: (calls.append("replace"), real_replace(s, d))[1])
         _export(populated["outputs"])
-        assert calls == ["fsync", "replace"]
+        # The file fsync precedes the rename; on POSIX the directory fsync
+        # after it adds a second fsync.
+        assert calls[:2] == ["fsync", "replace"]
+        assert calls.count("replace") == 1
+
+    def test_directory_is_fsynced_after_replace(self, populated, monkeypatch) -> None:
+        events: list[str] = []
+        real_replace = os.replace
+        monkeypatch.setattr(B.os, "replace", lambda s, d: (events.append("replace"), real_replace(s, d))[1])
+        monkeypatch.setattr(ledger_io, "_fsync_directory", lambda d: events.append(f"dir:{d}"))
+        _export(populated["outputs"])
+        assert len(events) == 2 and events[0] == "replace"
+        assert events[1].startswith("dir:")
+        assert os.path.samefile(events[1][len("dir:"):], populated["outputs"] / "backup")
+
+    def test_transient_sharing_violation_on_replace_is_retried(self, populated, monkeypatch) -> None:
+        real_replace = os.replace
+        failures = {"left": 2}
+
+        def _flaky(src, dst):
+            if failures["left"]:
+                failures["left"] -= 1
+                raise PermissionError("sharing violation")
+            real_replace(src, dst)
+
+        monkeypatch.setattr(ledger_io, "_SHARING_RETRY_SLEEP_SECONDS", 0.0)
+        monkeypatch.setattr(B.os, "replace", _flaky)
+        _export(populated["outputs"])
+        assert failures["left"] == 0
+        assert B.verify_bundle(str(populated["outputs"] / "backup" / "bundle.json"))["verified"] is True
+        assert [p.name for p in (populated["outputs"] / "backup").iterdir()] == ["bundle.json"]
 
 
 class TestVerify:
@@ -594,6 +646,23 @@ class TestImport:
         assert result["reason"] == "write_failed"
         assert result["written_members"] == []
 
+    def test_import_replace_failure_leaves_no_temp_file(self, populated, monkeypatch) -> None:
+        _export(populated["outputs"])
+        target = _empty_target(populated["root"])
+        _copy_bundle(populated["outputs"], "backup/bundle.json", target)
+
+        def _fail(_src, _dst):
+            raise OSError("disk full")
+
+        monkeypatch.setattr(B.os, "replace", _fail)
+        result = B.import_bundle("incoming.json", str(target), dry_run=False)
+        assert result["imported"] is False
+        assert result["reason"] == "write_failed"
+        assert result["written_members"] == []
+        cache = target / ".meridian-outputs-cache"
+        assert [p.name for p in cache.iterdir() if p.name.endswith(".tmp")] == []
+        assert _snapshot(target) == {name: None for name in _LEDGER_FILES}
+
     def test_busy_ledger_lock_is_a_write_failure_not_a_hang(self, populated, monkeypatch) -> None:
         _export(populated["outputs"])
         target = _empty_target(populated["root"])
@@ -610,6 +679,80 @@ class TestImport:
         result = B.import_bundle("incoming.json", str(target), dry_run=False)
         assert result["reason"] == "write_failed"
         assert result["written_members"] == []
+
+    def test_commit_inside_the_write_window_is_not_lost(self, tmp_path, monkeypatch) -> None:
+        """A writer that commits between the import's pre-write re-check and
+        its replace must not be overwritten (L1)."""
+        target, gen = _fingerprint_import_setup(tmp_path)
+        ledger = os.path.normcase(os.path.abspath(_ledger_path(target, "fingerprint_ledger")))
+        real_write = B._atomic_write_json
+        writer: dict[str, Any] = {}
+
+        def _tag_c() -> None:
+            try:
+                fingerprint.tag_output(str(target / "c.csv"), str(target), script_path=str(gen))
+            except BaseException as exc:  # noqa: BLE001 -- surfaced by the assert below
+                writer["error"] = exc
+
+        def _write_with_a_racing_writer(path, obj, *, indent):
+            if os.path.normcase(os.path.abspath(path)) == ledger and "thread" not in writer:
+                writer["thread"] = threading.Thread(target=_tag_c, daemon=True)
+                writer["thread"].start()
+                # Without the cross-process ledger lock the tag commits right
+                # here, inside the window. Under the lock it waits for this
+                # import to release it, then commits on top of the import.
+                writer["thread"].join(timeout=1.5)
+            real_write(path, obj, indent=indent)
+
+        monkeypatch.setattr(B, "_atomic_write_json", _write_with_a_racing_writer)
+        result = B.import_bundle("incoming.json", str(target), dry_run=False)
+        writer["thread"].join(timeout=60)
+        assert not writer["thread"].is_alive()
+        assert "error" not in writer, writer.get("error")
+        keys = set(fingerprint._read_ledger(str(target)))
+        assert {"b.csv", "c.csv"} <= keys, f"a concurrent commit was overwritten: {keys}"
+        if result["imported"]:
+            assert result["written_members"] == ["fingerprint_ledger"]
+            assert "a.csv" in keys
+        else:
+            assert result["reason"] == "concurrent_modification"
+
+    def test_same_signature_change_after_the_plan_is_detected(self, tmp_path, monkeypatch) -> None:
+        """A rewrite that keeps (mtime_ns, size) -- same size inside one mtime
+        tick -- passes the signature check; the content re-read under the lock
+        still catches it."""
+        target, gen = _fingerprint_import_setup(tmp_path)
+        monkeypatch.setattr(B, "_file_signature", lambda path: (1, 1))
+        real_read = fingerprint._read_ledger
+        calls = {"n": 0}
+
+        def _read_then_race(outputs_dir):
+            calls["n"] += 1
+            data = real_read(outputs_dir)
+            if calls["n"] == 1:  # the plan's read; another writer commits after it
+                fingerprint.tag_output(str(target / "c.csv"), str(target), script_path=str(gen))
+            return data
+
+        monkeypatch.setattr(fingerprint, "_read_ledger", _read_then_race)
+        result = B.import_bundle("incoming.json", str(target), dry_run=False)
+        assert result["imported"] is False
+        assert result["reason"] == "concurrent_modification"
+        assert result["written_members"] == []
+        assert set(real_read(str(target))) == {"b.csv", "c.csv"}
+
+    def test_busy_cross_process_ledger_lock_is_a_write_failure(self, tmp_path, monkeypatch) -> None:
+        target, _gen = _fingerprint_import_setup(tmp_path)
+        before = _snapshot(target)
+
+        def _busy(self, *, timeout=None):
+            raise outputs_local.IndexLockAcquireError("held by another process")
+
+        monkeypatch.setattr(outputs_local.IndexFileLock, "acquire", _busy)
+        result = B.import_bundle("incoming.json", str(target), dry_run=False)
+        assert result["imported"] is False
+        assert result["reason"] == "write_failed"
+        assert result["written_members"] == []
+        assert _snapshot(target) == before
 
     def test_import_paths_and_missing_dir(self, populated) -> None:
         _export(populated["outputs"])

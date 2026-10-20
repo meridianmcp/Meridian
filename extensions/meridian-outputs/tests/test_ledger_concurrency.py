@@ -22,6 +22,7 @@ from __future__ import annotations
 import json
 import logging
 import os
+import socket
 import subprocess
 import sys
 import threading
@@ -411,13 +412,32 @@ class TestStrictReadAndQuarantine:
         ledger.write_bytes(b"second")
         fixed = str(ledger) + ".corrupt-FIXED"
         Path(fixed).write_bytes(b"first")
-        monkeypatch.setattr(LIO, "_quarantine_name", lambda path: fixed)
+        monkeypatch.setattr(LIO, "_quarantine_name", lambda path, raw: fixed)
 
         copy = LIO.quarantine_ledger(str(ledger))
 
         assert copy == fixed + "-1"
         assert Path(fixed).read_bytes() == b"first"
         assert Path(copy).read_bytes() == b"second"
+
+    def test_repeated_failing_commits_keep_one_quarantine_copy(self, tmp_path: Path) -> None:
+        ledger = tmp_path / "ledger.json"
+        ledger.write_bytes(_GARBAGE)
+        for _ in range(3):
+            with pytest.raises(TypeError):
+                with LIO.ledger_transaction(str(ledger)) as txn:
+                    assert txn.load() == {}
+                    txn.commit({"bad": object()})  # fails after the quarantine
+        copies = [n for n in os.listdir(tmp_path) if ".corrupt-" in n]
+        assert len(copies) == 1, copies
+        assert (tmp_path / copies[0]).read_bytes() == _GARBAGE
+        assert ledger.read_bytes() == _GARBAGE  # never replaced
+
+        # Different corrupt bytes are a different quarantine copy.
+        ledger.write_bytes(b"[1, 2]")
+        second = LIO.quarantine_ledger(str(ledger))
+        assert second is not None and os.path.basename(second) not in copies
+        assert Path(second).read_bytes() == b"[1, 2]"
 
     def test_quarantine_of_missing_ledger_is_none(self, tmp_path: Path) -> None:
         assert LIO.quarantine_ledger(str(tmp_path / "gone.json")) is None
@@ -607,6 +627,202 @@ class TestIndexFileLockSharingViolations:
         # The in-process lock was released on failure.
         assert lock._thread_lock.acquire(blocking=False)
         lock._thread_lock.release()
+
+
+def _write_lease_file(lock_path: str, **overrides: object) -> dict:
+    """Write a lock-file lease; the default is a stale owner on another host
+    (pid liveness unknown, heartbeat far past any threshold)."""
+    lease: dict = {
+        "pid": 4, "hostname": "some-other-host-entirely", "session_id": "gone",
+        "started_at": time.time() - 10_000, "heartbeat_at": time.time() - 10_000,
+        "lock_mode": "atomic_create", "token": "stale-token",
+    }
+    lease.update(overrides)
+    Path(lock_path).write_text(json.dumps(lease), encoding="utf-8")
+    return lease
+
+
+class TestIndexFileLockStaleReclaim:
+    """Stale-lock reclaim in IndexFileLock's atomic-create fallback: bounded
+    by the timeout, never removes a lock file that changed hands, and never
+    lets an abandoned lock file block writers forever."""
+
+    def test_unremovable_stale_lock_raises_near_the_timeout(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        monkeypatch.setitem(sys.modules, "portalocker", None)
+        db_path = str(tmp_path / "ledger.json")
+        lock_path = db_path + ".lock"
+        _write_lease_file(lock_path)
+        assert OL.read_index_lock_owner(db_path).is_stale is True
+        real_remove = os.remove
+        attempts = {"n": 0}
+        start = time.monotonic()
+
+        def _held_open(path: str) -> None:
+            if str(path).endswith(".lock"):
+                attempts["n"] += 1
+                # The stale holder keeps the file open (Windows sharing
+                # violation). Let the removal through after 5 s so the old
+                # unbounded busy-spin fails this test instead of hanging it.
+                if time.monotonic() - start < 5.0:
+                    raise PermissionError("sharing violation")
+            real_remove(path)
+
+        lock = OL.IndexFileLock(db_path, timeout=0.5)
+        with monkeypatch.context() as m:
+            m.setattr(os, "remove", _held_open)
+            with pytest.raises(OL.IndexLockAcquireError) as exc_info:
+                lock.acquire()
+        elapsed = time.monotonic() - start
+        assert elapsed < 3.0, f"acquire ran {elapsed:.1f}s past a 0.5s timeout"
+        assert attempts["n"] < 50, f"{attempts['n']} removal attempts: busy-spin"
+        assert exc_info.value.owner is not None and exc_info.value.owner.is_stale
+        assert os.path.exists(lock_path)
+        assert lock._thread_lock.acquire(blocking=False)
+        lock._thread_lock.release()
+
+    def test_reclaim_skips_a_lock_file_that_changed_hands(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        monkeypatch.setitem(sys.modules, "portalocker", None)
+        db_path = str(tmp_path / "ledger.json")
+        lock_path = db_path + ".lock"
+        _write_lease_file(lock_path)
+        successor: dict = {}
+        real_read = OL._read_lease_from_path
+        calls = {"n": 0}
+
+        def _successor_takes_over(path: str):
+            calls["n"] += 1
+            lease = real_read(path)
+            if calls["n"] == 1:
+                # Between this waiter's stale verdict and its removal, another
+                # waiter reclaims the file and a live successor's lease lands.
+                successor.update(_write_lease_file(
+                    lock_path, pid=os.getpid(), hostname=socket.gethostname(),
+                    session_id="successor", started_at=time.time(),
+                    heartbeat_at=time.time(), token="successor-token",
+                ))
+            return lease
+
+        monkeypatch.setattr(OL, "_read_lease_from_path", _successor_takes_over)
+        lock = OL.IndexFileLock(db_path, timeout=0.3)
+        with pytest.raises(OL.IndexLockAcquireError):
+            lock.acquire()
+        assert json.loads(Path(lock_path).read_text(encoding="utf-8")) == successor
+
+    def test_release_keeps_a_lock_file_that_names_another_token(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        monkeypatch.setitem(sys.modules, "portalocker", None)
+        db_path = str(tmp_path / "ledger.json")
+        lock_path = db_path + ".lock"
+        lock = OL.IndexFileLock(db_path, session_id="first")
+        lock.acquire()
+        # This holder's lease was reclaimed as stale and a successor now owns
+        # the path: the lease on disk names the successor's token.
+        successor = _write_lease_file(
+            lock_path, pid=os.getpid(), hostname=socket.gethostname(),
+            session_id="successor", started_at=time.time(),
+            heartbeat_at=time.time(), token="successor-token",
+        )
+        lock.release()
+        assert json.loads(Path(lock_path).read_text(encoding="utf-8")) == successor
+        assert lock._thread_lock.acquire(blocking=False)
+        lock._thread_lock.release()
+
+    def test_release_removes_its_own_file_when_the_lease_write_failed(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        monkeypatch.setitem(sys.modules, "portalocker", None)
+        db_path = str(tmp_path / "ledger.json")
+        lock_path = db_path + ".lock"
+
+        def _disk_full(*_a, **_k) -> None:
+            raise OSError("disk full")
+
+        monkeypatch.setattr(OL, "_write_lease_to_handle", _disk_full)
+        lock = OL.IndexFileLock(db_path)
+        lock.acquire()
+        assert Path(lock_path).read_bytes() == b""  # no lease, no token on disk
+        lock.release()
+        assert not os.path.exists(lock_path)
+
+    @pytest.mark.parametrize("content", [b"", b'{"pid": 12, "trunc'])
+    def test_old_lock_file_without_a_lease_is_reclaimed(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, content: bytes,
+    ) -> None:
+        """A holder whose lease write failed and which then crashed leaves a
+        lock file with no parseable lease; once it is older than the stale
+        threshold it must not block writers forever."""
+        monkeypatch.setitem(sys.modules, "portalocker", None)
+        db_path = str(tmp_path / "ledger.json")
+        lock_path = Path(db_path + ".lock")
+        lock_path.write_bytes(content)
+        old = time.time() - 10_000
+        os.utime(lock_path, (old, old))
+
+        owner = OL.read_index_lock_owner(db_path)
+        assert owner.held is True
+        assert owner.is_stale is True
+        assert owner.stale_reason is not None and "no readable lease" in owner.stale_reason
+
+        lock = OL.IndexFileLock(db_path, timeout=5.0)
+        start = time.monotonic()
+        lock.acquire()
+        try:
+            assert time.monotonic() - start < 2.0
+            assert json.loads(lock_path.read_text(encoding="utf-8"))["pid"] == os.getpid()
+        finally:
+            lock.release()
+
+    def test_fresh_lock_file_without_a_lease_is_not_reclaimed(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """A just-created lock file whose owner has not written its lease yet
+        is a live owner, not an abandoned one."""
+        monkeypatch.setitem(sys.modules, "portalocker", None)
+        db_path = str(tmp_path / "ledger.json")
+        lock_path = Path(db_path + ".lock")
+        lock_path.write_bytes(b"")
+
+        owner = OL.read_index_lock_owner(db_path)
+        assert owner.held is True
+        assert owner.is_stale is False
+
+        lock = OL.IndexFileLock(db_path, timeout=0.3)
+        with pytest.raises(OL.IndexLockAcquireError):
+            lock.acquire()
+        assert lock_path.read_bytes() == b""
+
+
+class TestTransactionHeartbeat:
+    def test_commit_heartbeat_keeps_a_long_transaction_from_being_reclaimed(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """Work between load and commit outlasts the stale threshold; a
+        waiter that inspects the lease during the (slow) commit must see a
+        live owner, not a stale one it may reclaim."""
+        monkeypatch.setitem(sys.modules, "portalocker", None)
+        monkeypatch.setenv("MERIDIAN_OUTPUTS_LOCK_STALE_SECONDS", "0.3")
+        ledger = str(tmp_path / "ledger.json")
+        seen: dict[str, OL.IndexLockOwner] = {}
+        real_write = LIO.write_ledger_atomic
+
+        def _slow_commit(path: str, data: dict) -> None:
+            seen["owner"] = OL.read_index_lock_owner(path)  # the waiter's view
+            real_write(path, data)
+
+        monkeypatch.setattr(LIO, "write_ledger_atomic", _slow_commit)
+        with LIO.ledger_transaction(ledger) as txn:
+            txn.load()
+            time.sleep(0.6)
+            txn.commit({"k": 1})
+        owner = seen["owner"]
+        assert owner.held is True
+        assert owner.is_stale is False, owner.stale_reason
+        assert json.loads(Path(ledger).read_text(encoding="utf-8")) == {"k": 1}
 
 
 # ---------------------------------------------------------------------------

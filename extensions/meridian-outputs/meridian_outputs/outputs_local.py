@@ -950,6 +950,7 @@ class IndexLockOwner:
 def _write_lease_to_handle(
     fh: Any, *, pid: int, hostname: str, session_id: str | None,
     started_at: float, heartbeat_at: float, lock_mode: str,
+    token: str | None = None,
 ) -> None:
     """Overwrite ``fh`` (already positioned at a lock file this caller owns)
     with the current lease payload. Best-effort by design -- a lease-write
@@ -965,11 +966,16 @@ def _write_lease_to_handle(
     of a value nobody reads across restarts, at a real, measured per-call
     cost (called on every lock acquire AND every heartbeat -- see a52216e2's
     investigation notes for the tight-rebuild-budget regression this caused
-    when it was here)."""
+    when it was here).
+
+    ``token`` is a random value unique to one acquisition. It lets a releasing
+    holder or a reclaiming waiter tell "this lock file is still the one I saw"
+    from "another process owns this path now"; see
+    :func:`_reclaim_stale_lock_file` and :meth:`IndexFileLock.release`."""
     payload = json.dumps({
         "pid": pid, "hostname": hostname, "session_id": session_id,
         "started_at": started_at, "heartbeat_at": heartbeat_at,
-        "lock_mode": lock_mode,
+        "lock_mode": lock_mode, "token": token,
     })
     fh.seek(0)
     fh.write(payload)
@@ -1041,8 +1047,32 @@ def read_index_lock_owner(
     from any read path (search, diagnostics, get_convergence_state) without
     disturbing a live writer. See :class:`IndexLockOwner` for field meanings.
     """
+    return _inspect_index_lock(db_path, stale_seconds=stale_seconds)[0]
+
+
+# What a reclaimer compares before removing a stale lock file: the parsed
+# lease (token included), or, when the file holds no parseable lease, its
+# (st_mtime_ns, st_size).
+_LockSnapshot = tuple[dict[str, Any] | None, tuple[int, int] | None]
+
+
+def _lock_file_signature(path: str) -> tuple[int, int] | None:
+    try:
+        st = os.stat(path)
+    except OSError:
+        return None
+    return st.st_mtime_ns, st.st_size
+
+
+def _inspect_index_lock(
+    db_path: str, *, stale_seconds: float | None = None,
+) -> tuple[IndexLockOwner, _LockSnapshot]:
+    """:func:`read_index_lock_owner` plus a snapshot of the lock file it
+    judged, so a reclaimer can later check the file is still that same lease
+    (token included) before removing it. The token stays out of
+    :class:`IndexLockOwner`, which is surfaced as public diagnostics."""
     if not db_path or db_path == ":memory:":
-        return IndexLockOwner(db_path=db_path, lock_path=None, held=False)
+        return IndexLockOwner(db_path=db_path, lock_path=None, held=False), (None, None)
     canonical = os.path.abspath(db_path)
     lock_path = canonical + ".lock"
     meta = _read_lease_from_path(lock_path)
@@ -1059,12 +1089,27 @@ def read_index_lock_owner(
     if meta is None:
         # No lease content -- either never used, cleanly released (atomic
         # mode always removes the file on release; see IndexFileLock.release),
-        # or a narrow race where the file was just created but its owner
-        # hasn't written a lease yet. None of those are "stale" -- there is
-        # nothing here to reclaim.
+        # a narrow race where the file was just created but its owner hasn't
+        # written a lease yet, or a holder whose best-effort lease write
+        # failed (or was torn) and which then died. The first three need no
+        # reclaim. The last would block every writer forever, so a held file
+        # with no parseable lease is stale once it has not been modified for
+        # longer than the heartbeat threshold: a live holder rewrites its
+        # lease (and so the file's mtime) on every heartbeat. The stat comes
+        # after the read, so a lease written in between reads as fresh.
+        signature = _lock_file_signature(lock_path) if held is True else None
+        idle = None if signature is None else now - signature[0] / 1e9
+        if idle is not None and idle > threshold:
+            return IndexLockOwner(
+                db_path=db_path, lock_path=lock_path, held=True, is_stale=True,
+                stale_reason=(
+                    f"lock file has no readable lease and was last modified "
+                    f"{idle:.1f}s ago (> {threshold:.0f}s threshold)"
+                ),
+            ), (None, signature)
         return IndexLockOwner(
             db_path=db_path, lock_path=lock_path, held=bool(held) if held is not None else False,
-        )
+        ), (None, signature)
 
     pid = meta.get("pid")
     hostname = meta.get("hostname")
@@ -1100,7 +1145,62 @@ def read_index_lock_owner(
         started_at=started_at, heartbeat_at=heartbeat_at, age_seconds=age,
         lock_mode=meta.get("lock_mode"), pid_alive=pid_alive,
         is_stale=is_stale, stale_reason=stale_reason,
-    )
+    ), (meta, None)
+
+
+def _reclaim_stale_lock_file(lock_path: str, snapshot: _LockSnapshot) -> bool:
+    """Remove a lock file judged stale from ``snapshot``, but only if the
+    file still holds that same lease (pid, token, heartbeat and the rest),
+    or, for a file with no parseable lease, is still unparseable with the
+    same mtime and size. A lease that changed since the verdict belongs to a
+    holder that refreshed it or to a successor, and is left alone. Returns
+    True when the path is now free (removed here, or already gone).
+
+    Residual window, documented rather than closed: the re-read and the
+    remove are two steps, so on POSIX a second waiter can remove the same
+    stale file and create its own lock in between, and this remove then
+    deletes that successor's file. On Windows the successor holds its file
+    open without FILE_SHARE_DELETE, so the remove fails and nothing is lost.
+    Closing it on POSIX needs a rename-then-verify reclaim.
+    """
+    lease, signature = snapshot
+    if _read_lease_from_path(lock_path) != lease:
+        return False
+    if lease is None and _lock_file_signature(lock_path) != signature:
+        return False
+    try:
+        os.remove(lock_path)
+    except FileNotFoundError:
+        return True
+    except OSError:
+        return False
+    return True
+
+
+def _lock_file_is_ours(lock_path: str, token: str | None, handle: Any) -> bool:
+    """True when ``lock_path`` is still this holder's lock file: the path
+    names the very file ``handle`` has open, and that file's lease names
+    ``token`` (or holds no readable lease, because this holder's own
+    best-effort lease write failed).
+
+    The lease is read through ``handle`` once the identity check passes.
+    Reopening the path instead costs several milliseconds per release on
+    Windows (on-access scanning of a just-written file), measured at about
+    10x the whole uncontended acquire/release cycle."""
+    try:
+        if not os.path.samestat(os.fstat(handle.fileno()), os.stat(lock_path)):
+            return False  # removed and re-created: a successor's file
+        handle.seek(0)
+        text = handle.read()
+    except (OSError, ValueError):
+        return False
+    try:
+        lease = json.loads(text) if text.strip() else None
+    except ValueError:
+        lease = None
+    if not isinstance(lease, dict):
+        return True
+    return token is not None and lease.get("token") == token
 
 
 # Windows: every waiting acquirer reads the holder's lease
@@ -1188,6 +1288,7 @@ class IndexFileLock:
         self._lock_mode: str | None = None
         self._started_at: float | None = None
         self._last_heartbeat_write: float | None = None
+        self._token: str | None = None
 
     @property
     def session_id(self) -> str | None:
@@ -1214,6 +1315,7 @@ class IndexFileLock:
 
         now = time.time()
         self._started_at = now
+        self._token = os.urandom(16).hex()
         self._write_lease(now)
 
     def _acquire_portalocker(self, portalocker: Any, lock_path: str) -> None:
@@ -1270,19 +1372,23 @@ class IndexFileLock:
                 continue
             except FileExistsError:
                 denied_since = None
-                owner = read_index_lock_owner(self._db_path)
+                owner, lease = _inspect_index_lock(self._db_path)
                 if owner.is_stale:
-                    try:
-                        os.remove(lock_path)
-                    except OSError:
-                        _log.debug(
-                            "IndexFileLock: lost the race reclaiming stale "
-                            "lock %r -- retrying", lock_path,
-                        )
-                    continue
+                    if _reclaim_stale_lock_file(lock_path, lease):
+                        continue  # freed: retry the create at once
+                    # Not removed: the lease changed hands since it was judged
+                    # stale, or (Windows) the stale holder still has the file
+                    # open. Fall through to the deadline check and the poll
+                    # sleep below instead of retrying at once, which
+                    # busy-spun past the timeout.
+                    _log.debug(
+                        "IndexFileLock: did not reclaim stale lock %r "
+                        "-- retrying after a poll interval", lock_path,
+                    )
                 if deadline is not None and time.monotonic() >= deadline:
+                    state = "a stale" if owner.is_stale else "an active"
                     raise IndexLockAcquireError(
-                        f"index lock at {lock_path!r} is held by an active "
+                        f"index lock at {lock_path!r} is held by {state} "
                         f"owner (pid={owner.pid}, session={owner.session_id!r}) "
                         f"and did not become available within "
                         f"{effective_timeout}s", owner=owner,
@@ -1319,6 +1425,7 @@ class IndexFileLock:
                 session_id=self._session_id,
                 started_at=self._started_at or heartbeat_at,
                 heartbeat_at=heartbeat_at, lock_mode=self._lock_mode or "unknown",
+                token=self._token,
             )
             self._last_heartbeat_write = heartbeat_at
         except Exception:  # noqa: BLE001 -- diagnostics-only, never fatal
@@ -1347,6 +1454,12 @@ class IndexFileLock:
     def release(self) -> None:
         try:
             if self._file_handle is not None:
+                lock_path = self._canonical + ".lock"
+                # Checked before the handle is closed: _lock_file_is_ours
+                # compares the path with the open handle and reads through it.
+                owns_file = self._lock_mode == "atomic_create" and _lock_file_is_ours(
+                    lock_path, self._token, self._file_handle,
+                )
                 if self._lock_mode == "portalocker":
                     try:
                         import portalocker  # noqa: PLC0415
@@ -1361,14 +1474,26 @@ class IndexFileLock:
                     # a52216e2 -- unlike portalocker's OS-level lock, this is
                     # a plain file: it is NOT released just by closing the
                     # handle, so a clean release must remove it explicitly to
-                    # make the path available to the next acquirer. Best-
-                    # effort: if this races a concurrent stale-reclaim from
-                    # another process, both sides converge on the same "free"
-                    # end state regardless of who wins.
-                    _remove_released_lock_file(self._canonical + ".lock")
+                    # make the path available to the next acquirer. Only when
+                    # the on-disk lease still names this holder's token: if
+                    # this lease was reclaimed as stale, the path now belongs
+                    # to a successor and removing it would free a live lock.
+                    # Residual window: a waiter that reclaims this lease
+                    # between the check above and the remove below (possible
+                    # only once this hold has outlasted the stale threshold
+                    # without a heartbeat) still loses its file.
+                    if owns_file:
+                        _remove_released_lock_file(lock_path)
+                    else:
+                        _log.warning(
+                            "IndexFileLock: lock file %r no longer holds this "
+                            "holder's lease (reclaimed as stale while held?); "
+                            "leaving it for its current owner", lock_path,
+                        )
                 self._file_handle = None
                 self._lock_mode = None
                 self._last_heartbeat_write = None
+                self._token = None
         finally:
             self._thread_lock.release()
 

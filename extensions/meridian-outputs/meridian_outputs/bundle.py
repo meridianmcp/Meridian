@@ -87,11 +87,17 @@ Merge and conflict rules (import)
 * A target ledger that exists but is not valid JSON refuses the import:
   merging into it through a reader that maps corruption to ``{}`` would
   silently wipe it.
-* Writes take each ledger module's own in-process ``_write_lock`` (when it
-  has one) and re-check the file's ``(mtime_ns, size)`` signature first; a
-  ledger that changed after it was read stops the import with
-  ``reason="concurrent_modification"``. Like the ledgers' own writers at
-  this revision, this is in-process locking only.
+* Each ledger write runs inside ``ledger_io.ledger_transaction`` on that
+  ledger's path -- the cross-process lock the provenance and fingerprint
+  writers (``record_provenance``, ``tag_output``) commit under -- and, for
+  the registry and run manifest, whose writers still lock in-process only,
+  also inside that module's ``_write_lock``. Under the lock the import
+  re-checks the file's ``(mtime_ns, size)`` signature and re-reads the
+  ledger; a ledger that changed after the plan read it stops the import
+  with ``reason="concurrent_modification"``, and no writer can commit
+  between that check and the replace. Registry and run-manifest writers in
+  another process are not excluded until those modules adopt
+  ``ledger_io``.
 
 Paths
 -----
@@ -116,7 +122,7 @@ import tempfile
 from datetime import datetime, timezone
 from typing import Any, Iterator
 
-from . import annotate, artifact_registry, fingerprint, outputs_local, run_manifest
+from . import annotate, artifact_registry, fingerprint, ledger_io, outputs_local, run_manifest
 from .path_security import _require_within, relative_output_path
 
 __all__ = [
@@ -150,6 +156,12 @@ _LEDGER_MEMBERS: dict[str, tuple[Any, str, str]] = {
     "run_manifest_ledger": (run_manifest, "_read_ledger", "run_manifest_ledger.json"),
 }
 MEMBER_NAMES: tuple[str, ...] = tuple(sorted([*_LEDGER_MEMBERS, INDEX_META]))
+
+# Ledgers whose own writers serialise only on their module's in-process
+# ``_write_lock`` (they have not adopted ledger_io yet); see
+# _ledger_write_lock. The provenance and fingerprint writers use
+# ledger_io.ledger_transaction.
+_IN_PROCESS_LOCKED_MEMBERS = frozenset({"artifact_registry", "run_manifest_ledger"})
 
 _PROTECTED_CACHE_FILES = frozenset(
     name.lower()
@@ -259,8 +271,11 @@ def _file_signature(path: str) -> tuple[int, int] | None:
 
 
 def _atomic_write_json(path: str, obj: Any, *, indent: int | None) -> None:
-    """Temp file in the same directory, fsync, ``os.replace``; the temp file
-    is removed on any failure so nothing half-written is left behind."""
+    """Temp file in the same directory, fsync, ``os.replace``, directory
+    fsync; the temp file is removed on any failure so nothing half-written
+    is left behind. The replace retries a transient Windows sharing
+    violation (a lock-free reader holding the target open) the same way
+    ``ledger_io.write_ledger_atomic`` does."""
     directory = os.path.dirname(path)
     os.makedirs(directory, exist_ok=True)
     fd, tmp = tempfile.mkstemp(dir=directory, prefix=".bundle-", suffix=".tmp")
@@ -269,11 +284,12 @@ def _atomic_write_json(path: str, obj: Any, *, indent: int | None) -> None:
             json.dump(obj, fh, indent=indent, sort_keys=True)
             fh.flush()
             os.fsync(fh.fileno())
-        os.replace(tmp, path)
+        ledger_io._retry_sharing(lambda: os.replace(tmp, path))
     except BaseException:
         with contextlib.suppress(OSError):
             os.unlink(tmp)
         raise
+    ledger_io._fsync_directory(directory)
 
 
 def _ensure_cache_dir(outputs_dir: str) -> None:
@@ -286,17 +302,29 @@ def _ensure_cache_dir(outputs_dir: str) -> None:
 
 
 @contextlib.contextmanager
-def _module_write_lock(module: Any) -> Iterator[None]:
-    lock = getattr(module, "_write_lock", None)
-    if lock is None or not hasattr(lock, "acquire"):
-        yield
-        return
-    if not lock.acquire(timeout=_LOCK_TIMEOUT_SECONDS):
-        raise TimeoutError("ledger write lock is busy")
-    try:
-        yield
-    finally:
-        lock.release()
+def _ledger_write_lock(name: str, module: Any, path: str) -> Iterator[None]:
+    """Hold the locks that ledger ``name``'s own writers serialise on.
+
+    Always ``ledger_io.ledger_transaction`` on the ledger path: the
+    cross-process lock ``record_provenance`` and ``tag_output`` commit
+    under. For the members in :data:`_IN_PROCESS_LOCKED_MEMBERS`, whose
+    writers still use only their module's in-process ``_write_lock``, that
+    lock is taken too, inside the transaction (those writers never take the
+    ledger transaction, so the order cannot deadlock). ``annotate._write_lock``
+    is deliberately NOT taken: it guards only that module's read cache, and
+    annotate's writers take it inside their own transaction.
+    """
+    with ledger_io.ledger_transaction(path):
+        if name not in _IN_PROCESS_LOCKED_MEMBERS:
+            yield
+            return
+        lock = module._write_lock
+        if not lock.acquire(timeout=_LOCK_TIMEOUT_SECONDS):
+            raise TimeoutError("ledger write lock is busy")
+        try:
+            yield
+        finally:
+            lock.release()
 
 
 def _invalidate_annotate_cache(path: str) -> None:
@@ -711,6 +739,12 @@ def import_bundle(
          ``overwrite=True``.
       5. Nothing is written when ``dry_run`` is True (the default).
 
+    A real import replaces each changed ledger file atomically, one after
+    another; it is NOT atomic across the ledgers. If a later ledger's write
+    fails or stops (``"write_failed"``, ``"concurrent_modification"``), the
+    ledgers already replaced stay replaced: ``written_members`` lists exactly
+    those, in write order, and the rest are untouched.
+
     Args:
       bundle_path:                The bundle file, inside ``outputs_dir``.
       outputs_dir:                The outputs directory to import into.
@@ -798,7 +832,8 @@ def import_bundle(
         else:
             merged, stats = _merge_mapping(dict(current), incoming, overwrite=overwrite)
         plan[name] = {
-            "module": module, "path": path, "signature": signature,
+            "module": module, "reader": reader_name, "path": path,
+            "signature": signature, "base": current,
             "merged": merged, "stats": stats,
             "changed": bool(stats["added"] or stats["replaced"]),
         }
@@ -820,16 +855,24 @@ def import_bundle(
     for name in result["would_write"]:
         step = plan[name]
         try:
-            with _module_write_lock(step["module"]):
-                if _file_signature(step["path"]) != step["signature"]:
+            # Re-check and write under the same lock the ledger's own writers
+            # commit under, so no writer can commit between the check and
+            # the replace. The plan was read without it: a ledger that changed
+            # since (signature, or content for a same-size rewrite inside one
+            # mtime tick) stops the import instead of being overwritten.
+            with _ledger_write_lock(name, step["module"], step["path"]):
+                if (
+                    _file_signature(step["path"]) != step["signature"]
+                    or getattr(step["module"], step["reader"])(outputs_dir) != step["base"]
+                ):
                     result["reason"] = "concurrent_modification"
                     return result
                 _atomic_write_json(step["path"], step["merged"], indent=2)
+                result["written_members"].append(name)
                 if step["module"] is annotate:
                     _invalidate_annotate_cache(step["path"])
-        except (OSError, TimeoutError, TypeError, ValueError):
+        except (OSError, TimeoutError, TypeError, ValueError, outputs_local.IndexLockAcquireError):
             result["reason"] = "write_failed"
             return result
-        result["written_members"].append(name)
     result["imported"] = True
     return result
