@@ -526,29 +526,48 @@ class TestNpzDegradesToFilenameOnly:
         self, monkeypatch: pytest.MonkeyPatch,
     ) -> None:
         """B-F15: the walk bounded the record count but not the directory's
-        bytes. 17 records (far under the member cap) whose extra fields hold
-        16,000 empty subfields each make a 1.09 MB directory, and zipfile's
+        bytes. 66 records (far under the member cap) whose extra fields hold
+        16,000 empty subfields each make a 4.2 MB directory, and zipfile's
         per-record extra parsing is quadratic in the extra length. The
-        archive is refused before a record is read or zipfile is built."""
+        archive is refused before a record is read or zipfile is built.
+        (S-R4-13 raised the cap from 1 MiB to 4 MiB; this was 17 records.)"""
         extra = struct.pack("<2H", 0xCAFE, 0) * 16_000
         buf = io.BytesIO()
         with zipfile.ZipFile(buf, "w") as zf:
-            for i in range(17):
+            for i in range(66):
                 info = zipfile.ZipInfo(f"a{i:02d}.npy")
                 info.extra = extra
                 zf.writestr(info, _npy_bytes("<f8", (1,)))
         data = buf.getvalue()
         cd_size = struct.unpack_from("<L", data, data.rfind(b"PK\x05\x06") + 12)[0]
-        assert cd_size > 1 << 20
+        assert cd_size > 4 << 20
         fh = _CountingBytesIO(data)
         calls = _forbid_zipfile(monkeypatch)
         assert OL._zip_central_directory_problem(fh) == (
-            f"central directory of {cd_size} bytes exceeds the cap of {1 << 20} bytes"
+            f"central directory of {cd_size} bytes exceeds the cap of {4 << 20} bytes"
         )
-        assert OL._NPZ_MAX_CENTRAL_DIRECTORY_BYTES == 1 << 20
+        assert OL._NPZ_MAX_CENTRAL_DIRECTORY_BYTES == 4 << 20
         assert fh.central_headers_read == 0
         assert OL._npz_array_summary("padded.npz", data) is None
         assert calls == []
+
+    def test_long_member_names_past_one_mib_of_directory_still_parse(self) -> None:
+        """S-R4-13: a valid archive of 256 members (the member cap) with
+        4 KiB names has a central directory just over 1 MiB. The old 1 MiB
+        byte cap refused it, so it lost every array name, shape and dtype.
+        It is under the 4 MiB cap and every member header is read."""
+        names = [
+            f"a{i:03d}" + "x" * (4096 - len("a000") - len(".npy"))
+            for i in range(OL._NPZ_MAX_MEMBERS)
+        ]
+        data = _npz_bytes({name: _npy_bytes("<f8", (i + 1, 3)) for i, name in enumerate(names)})
+        cd_size = struct.unpack_from("<L", data, data.rfind(b"PK\x05\x06") + 12)[0]
+        assert 1 << 20 < cd_size <= OL._NPZ_MAX_CENTRAL_DIRECTORY_BYTES
+        assert OL._zip_central_directory_problem(io.BytesIO(data)) is None
+        assert OL._npz_array_summary("long_names.npz", data) == [
+            {"name": name, "shape": [i + 1, 3], "dtype": "float64"}
+            for i, name in enumerate(names)
+        ]
 
     def test_numpy_sized_directory_is_far_under_the_byte_cap(self) -> None:
         """256 members named like numpy's (``arr_0.npy`` ...) make a
