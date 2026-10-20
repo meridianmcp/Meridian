@@ -205,6 +205,7 @@ this package, with no second codec.
 | `finalize_run_manifest` | Bind exact (re-hashed now) output paths and validated artifact-id references to a started run, and mark its final phase — fails closed to `partial` on anything unverified |
 | `get_run_manifest` | Look up the current run-manifest record for a `run_id`, whatever phase it's in |
 | `list_run_manifests` | List every run-manifest record started under an outputs directory |
+| `check_input_staleness` | Report which of a run's inputs changed, went missing, or appeared since `start_run_manifest`, and the run's outputs that are therefore stale. Stat first, re-hash only on a size/mtime mismatch; `strict=True` re-hashes every input. `get_provenance_status` adds the same signal as `input_staleness` |
 | `get_run_manifest_envelope` | Typed, lossless `RUN`-kind `ProvenanceEnvelope` for one run manifest |
 
 ### Derived-artifact cache & fast variant rendering (item 19917525)

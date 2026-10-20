@@ -1693,6 +1693,37 @@ def list_run_manifests(outputs_dir: str) -> list[dict[str, Any]]:
 
 
 @mcp.tool()
+def check_input_staleness(
+    outputs_dir: str, run_id: str, strict: bool = False,
+) -> dict[str, Any]:
+    """Have any of a run's inputs changed since ``start_run_manifest``?
+
+    Stat first: an input whose size and mtime are unchanged is reported
+    unchanged without being read; only a mismatch re-hashes it.
+    ``strict=True`` re-hashes every input and also catches an edit that kept
+    size and mtime (the default misses that case).
+
+    Args:
+      outputs_dir:  Absolute path to the outputs directory.
+      run_id:        The run started via ``start_run_manifest``.
+      strict:        Re-hash every input regardless of its stat.
+
+    Returns:
+      {run_id, strict, baseline, stale, reason, inputs, stale_inputs,
+      stale_outputs, hashed_count}. Each ``inputs`` entry has a status:
+      unchanged, absent, or one of the stale statuses changed, missing,
+      appeared (absent at start, present now), unreadable, unverifiable.
+      ``stale_outputs`` lists the run's finalized output paths when any
+      input is stale.
+
+    Raises:
+      ValueError (run_manifest.RunManifestError): no manifest exists for
+      ``run_id`` under ``outputs_dir``.
+    """
+    return run_manifest.check_input_staleness(outputs_dir, run_id, strict=strict)
+
+
+@mcp.tool()
 def get_run_manifest_envelope(outputs_dir: str, run_id: str) -> dict[str, Any]:
     """Typed, lossless research-evidence envelope for one run manifest (item
     37ce5537) -- a single ``RUN``-kind ``EvidenceRecord`` (the

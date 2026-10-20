@@ -265,6 +265,7 @@ every one of its other read-only helpers.
 """
 from __future__ import annotations
 
+import functools
 import logging
 import os
 from datetime import datetime, timezone
@@ -565,6 +566,74 @@ def _basename_relocation_lookup(
     return best
 
 
+def _input_staleness(
+    outputs_dir: str, path: str, status: dict[str, Any],
+) -> dict[str, Any] | None:
+    """Input-change staleness for ``path`` from the run manifests that cover
+    it: runs whose finalized outputs list ``path``, plus the exact record's
+    own ``run_id``. ``None`` when no run manifest covers ``path``. A run
+    whose check fails is reported with ``error`` and never counted stale
+    (staleness cannot be confirmed either way). Run manifests only: tag_output
+    and artifact source edges record no input hashes."""
+    from . import run_manifest  # noqa: PLC0415 -- lazy: keep module import order unchanged
+
+    record = status.get("record")
+    record_run_id = (
+        record.get("run_id")
+        if isinstance(record, dict) and status.get("provenance_type") in (EXACT, STALE_BY_SCRIPT)
+        else None
+    )
+    try:
+        run_ids = run_manifest.run_ids_for_output(outputs_dir, path, record_run_id=record_run_id)
+    except Exception:  # noqa: BLE001 -- additive signal, never breaks the status call
+        _log.debug("get_provenance_status: run lookup failed for %r", path, exc_info=True)
+        return None
+    if not run_ids:
+        return None
+    runs: list[dict[str, Any]] = []
+    for run_id in run_ids:
+        try:
+            result = run_manifest.check_input_staleness(outputs_dir, run_id)
+        except Exception as exc:  # noqa: BLE001
+            runs.append({"run_id": run_id, "stale": False, "error": str(exc)})
+            continue
+        runs.append({
+            "run_id": run_id,
+            "stale": result["stale"],
+            "stale_inputs": result["stale_inputs"],
+            "reason": result["reason"],
+        })
+    stale_runs = [r for r in runs if r["stale"]]
+    reason = (
+        "; ".join(f"run {r['run_id']}: {r['reason']}" for r in stale_runs)
+        if stale_runs else "no input of a covering run changed since that run started"
+    )
+    return {"stale": bool(stale_runs), "runs": runs, "reason": reason}
+
+
+def _with_input_staleness(fn: Any) -> Any:
+    """Adds the ``input_staleness`` key to every non-error answer and, when
+    an input of a covering run changed, sets ``staleness["stale"]`` and
+    appends the reason -- only on branches that carry a ``staleness`` dict
+    (EXACT, STALE_BY_SCRIPT, RELOCATED). Every existing key is unchanged."""
+    @functools.wraps(fn)
+    def wrapper(outputs_dir: str, path: str) -> dict[str, Any]:
+        status = fn(outputs_dir, path)
+        if not isinstance(status, dict) or "error" in status:
+            return status
+        input_staleness = _input_staleness(outputs_dir, path, status)
+        status["input_staleness"] = input_staleness
+        staleness = status.get("staleness")
+        if input_staleness and input_staleness["stale"] and isinstance(staleness, dict):
+            staleness["stale"] = True
+            note = f"an input changed since its run started ({input_staleness['reason']})"
+            staleness["reason"] = f"{staleness['reason']}; {note}" if staleness.get("reason") else note
+        return status
+
+    return wrapper
+
+
+@_with_input_staleness
 def get_provenance_status(outputs_dir: str, path: str) -> dict[str, Any]:
     """The richer, authoritative answer to "what do we know about this
     file's provenance", composed from both underlying systems and ranked by
@@ -632,6 +701,15 @@ def get_provenance_status(outputs_dir: str, path: str) -> dict[str, Any]:
       only when ``provenance_type`` is :data:`UNREGISTERED`/:data:`UNKNOWN`
       AND the index has not yet converged -- always ``False`` for the other
       three statuses (finding something is never inconclusive).
+
+      ``input_staleness`` (additive, every branch): ``None`` when no run
+      manifest covers ``path``; else ``{stale, runs, reason}`` from
+      :func:`run_manifest.check_input_staleness` for each covering run (a run
+      whose finalized outputs list ``path``, or the exact record's
+      ``run_id``). When it is stale and the branch has a ``staleness`` dict,
+      ``staleness["stale"]`` is set and the reason appended, for this path
+      only -- other outputs are affected only if their own runs' inputs
+      changed.
     """
     if not outputs_dir or not str(outputs_dir).strip():
         return {"error": "outputs_dir is required"}
