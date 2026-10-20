@@ -1171,6 +1171,27 @@ def _resolve_lineage_source(
     return entry
 
 
+def _check_registry_readable(outputs_dir: str) -> None:
+    """Strict read of the artifact registry for :func:`get_output_lineage`.
+
+    ``artifact_registry``'s reader returns an empty registry for a file it
+    cannot parse, so without this check a damaged registry looks like "no
+    artifact registered" and the lineage can still report ``complete``. A
+    missing registry is fine (nothing was registered). Raises
+    ``ledger_io.LedgerCorruptError`` when the file exists but is not a JSON
+    object whose ``artifacts`` is an object and ``edges`` a list; other
+    ``OSError`` read failures propagate.
+    """
+    from . import artifact_registry
+
+    path = artifact_registry._registry_path(outputs_dir, create=False)
+    data = ledger_io.read_ledger_strict(path)
+    if not isinstance(data.get("artifacts", {}), dict) or not isinstance(data.get("edges", []), list):
+        raise ledger_io.LedgerCorruptError(
+            path, "artifacts is not an object or edges is not a list",
+        )
+
+
 def _set_script_staleness(entry: dict[str, Any], recorded: str | None, current: str | None,
                           *, script_known: bool) -> None:
     """Fill the stale fields the way fingerprint.check_staleness reasons,
@@ -1212,7 +1233,9 @@ def get_output_lineage(
          registry artifact through ``artifact_registry.resolve_artifact``
          (content hash, then exact prior path sighting -- never a basename
          guess); an ``artifact_id`` without a ``path`` uses the artifact's
-         most recent local sighting inside ``outputs_dir``.
+         most recent local sighting inside ``outputs_dir``. The registry is
+         read strictly first: a registry file that exists but cannot be
+         parsed is a ``store_unreadable`` gap, never read as empty.
       2. Sources are the UNION of the registry's SourceEdges for that
          artifact, the provenance ledger's ``generating_script`` and the
          fingerprint ledger's ``generating_script`` (or ``script_path``).
@@ -1291,6 +1314,9 @@ def get_output_lineage(
     artifact: dict[str, Any] | None = None
     artifact_evidence: str | None = None
     try:
+        # artifact_registry's own reader turns a damaged registry into an
+        # empty one; read it strictly first so damage is a store gap here.
+        _check_registry_readable(outputs_dir)
         if has_id:
             artifact = artifact_registry.get_artifact(outputs_dir, str(artifact_id))
             if artifact is None:

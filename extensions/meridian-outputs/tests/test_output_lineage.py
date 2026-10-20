@@ -218,6 +218,35 @@ class TestSourceResolution:
         assert {"kind": "store", "store": "artifact_registry",
                 "reason": "store_unreadable", "error_type": "OSError"} in result["unresolved"]
 
+    @pytest.mark.parametrize("content", [
+        b"", b"{not json", b"[1, 2]", b'{"artifacts": [], "edges": []}',
+    ])
+    def test_unreadable_registry_file_is_a_gap_not_an_empty_registry(
+        self, layout, content,
+    ) -> None:
+        """The registry's own reader returns an empty registry for a damaged
+        file; lineage must report the damage instead of complete=True."""
+        outputs = str(layout["outputs"])
+        upstream = layout["outputs"] / "upstream.csv"
+        upstream.write_text("u\n1\n", encoding="utf-8")
+        annotate.record_provenance(outputs, str(upstream), generating_script="fetch.py")
+        annotate.record_provenance(outputs, str(layout["out"]), generating_script="upstream.csv")
+        assert PV.get_output_lineage(outputs, path=str(layout["out"]))["complete"] is True
+
+        registry = layout["outputs"] / ".meridian-outputs-cache" / "artifact_registry.json"
+        registry.write_bytes(content)
+        gap = {"kind": "store", "store": "artifact_registry",
+               "reason": "store_unreadable", "error_type": "LedgerCorruptError"}
+
+        result = PV.get_output_lineage(outputs, path=str(layout["out"]))
+        assert result["complete"] is False
+        assert gap in result["unresolved"]
+        _assert_no_absolute_path(result, layout["root"])
+
+        by_id = PV.get_output_lineage(outputs, artifact_id="some-id")
+        assert gap in by_id["unresolved"]
+        assert all(g.get("reason") != "artifact_not_registered" for g in by_id["unresolved"])
+
     def test_edge_read_failure_is_a_gap(self, layout, monkeypatch) -> None:
         outputs = str(layout["outputs"])
         artifact_registry.register_artifact(
