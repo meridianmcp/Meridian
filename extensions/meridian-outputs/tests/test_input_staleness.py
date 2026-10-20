@@ -297,6 +297,71 @@ class TestProvenanceStatusInputStaleness:
 
         assert "input_staleness" not in PS.get_provenance_status(str(tmp_path), "")
 
+    def _covered_output(self, tmp_path: Path) -> Path:
+        inp = _write(tmp_path / "in.csv", "a\n1\n")
+        out = _write(tmp_path / "out.csv", "r\n1\n")
+        _start(tmp_path, "r1", [str(inp)])
+        RM.finalize_run_manifest(str(tmp_path), "r1", output_paths=[str(out)])
+        AN.record_provenance(str(tmp_path), str(out), run_id="r1")
+        return out
+
+    @pytest.mark.parametrize("garbage", [b"", b"{not json", b'{"r1": null}'])
+    def test_corrupt_run_manifest_ledger_is_unknown_not_fresh(
+        self, tmp_path: Path, garbage: bytes,
+    ) -> None:
+        pytest.importorskip("duckdb")
+        from meridian_outputs import ledger_io as LIO
+        from meridian_outputs import provenance_status as PS
+        from meridian_outputs import research_evidence as RE
+
+        out = self._covered_output(tmp_path)
+        before = PS.get_provenance_status(str(tmp_path), str(out))
+        assert before["input_staleness"]["stale"] is False
+        assert PS.evidence_record_from_provenance_status(before).resolver.status is (
+            RE.ResolverStatus.VERIFIED
+        )
+
+        ledger = tmp_path / ".meridian-outputs-cache" / "run_manifest_ledger.json"
+        ledger.write_bytes(garbage)
+        status = PS.get_provenance_status(str(tmp_path), str(out))
+        assert status["provenance_type"] == PS.EXACT
+        assert status["input_staleness"]["stale"] is None
+        assert status["input_staleness"]["error"] == "LedgerCorruptError"
+        assert "run_manifest_ledger.json" in status["input_staleness"]["reason"]
+        assert str(tmp_path) not in status["input_staleness"]["reason"]
+        assert status["staleness"]["stale"] is None
+        assert "input staleness unknown" in status["staleness"]["reason"]
+        assert PS.evidence_record_from_provenance_status(status).resolver.status is (
+            RE.ResolverStatus.AMBIGUOUS
+        )
+        with pytest.raises(LIO.LedgerCorruptError):
+            RM.run_ids_for_output(str(tmp_path), str(out))
+        with pytest.raises(LIO.LedgerCorruptError):
+            RM.check_input_staleness(str(tmp_path), "r1")
+
+    def test_failed_run_check_is_unknown_not_fresh(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        pytest.importorskip("duckdb")
+        from meridian_outputs import provenance_status as PS
+        from meridian_outputs import research_evidence as RE
+
+        out = self._covered_output(tmp_path)
+
+        def _boom(*_a, **_k):
+            raise OSError("input volume went away")
+
+        monkeypatch.setattr(RM, "check_input_staleness", _boom)
+        status = PS.get_provenance_status(str(tmp_path), str(out))
+        assert status["input_staleness"]["stale"] is None
+        assert status["input_staleness"]["runs"] == [
+            {"run_id": "r1", "stale": None, "error": "input volume went away"},
+        ]
+        assert status["staleness"]["stale"] is None
+        assert PS.evidence_record_from_provenance_status(status).resolver.status is (
+            RE.ResolverStatus.AMBIGUOUS
+        )
+
 
 class TestServerWrapper:
     def test_check_input_staleness_tool(self, tmp_path: Path) -> None:

@@ -71,7 +71,7 @@ import threading
 from datetime import datetime, timezone
 from typing import Any, Callable
 
-from . import artifact_registry, environment, fingerprint, outputs_local, research_evidence
+from . import artifact_registry, environment, fingerprint, ledger_io, outputs_local, research_evidence
 from .path_security import relative_reference
 
 _log = logging.getLogger(__name__)
@@ -163,6 +163,22 @@ def _read_ledger(outputs_dir: str) -> dict[str, dict[str, Any]]:
     except (OSError, ValueError):
         return {}
     return data if isinstance(data, dict) else {}
+
+
+def _read_ledger_strict(outputs_dir: str) -> dict[str, dict[str, Any]]:
+    """Strict read for staleness lookups (:func:`check_input_staleness`,
+    :func:`run_ids_for_output`): ``{}`` only for a missing ledger. Bytes that
+    are not a JSON object, or a run row that is not an object, raise
+    ``ledger_io.LedgerCorruptError`` -- an unreadable ledger is never read
+    as "no run covers this output". :func:`_read_ledger` keeps its lenient
+    behaviour for the writers and plain listings."""
+    path = _ledger_path(outputs_dir, create=False)
+    ledger = ledger_io.read_ledger_strict(path)
+    for record in ledger.values():
+        if not isinstance(record, dict):
+            kind = "null" if record is None else type(record).__name__
+            raise ledger_io.LedgerCorruptError(path, f"a run row is {kind}, not an object")
+    return ledger
 
 
 def _write_ledger_entry(outputs_dir: str, key: str, record: dict[str, Any]) -> None:
@@ -837,10 +853,13 @@ def check_input_staleness(
     Raises:
       RunManifestError: missing ``outputs_dir``/``run_id``, or no manifest
       was ever started for ``run_id``.
+      ledger_io.LedgerCorruptError: the run-manifest ledger exists but
+      cannot be parsed (strict read) -- never reported as "no manifest".
     """
     if not outputs_dir or not str(outputs_dir).strip():
         raise RunManifestError("outputs_dir is required")
-    manifest = get_run_manifest(outputs_dir, run_id)
+    key = str(run_id).strip() if run_id else ""
+    manifest = _read_ledger_strict(outputs_dir).get(key) if key else None
     if manifest is None:
         raise RunManifestError(f"no run manifest found for run_id={run_id!r}")
 
@@ -895,12 +914,15 @@ def run_ids_for_output(
     """Run ids whose manifest covers output ``path``: every run whose
     finalized ``output_identity`` lists it (relative paths resolved against
     ``outputs_dir``), plus ``record_run_id`` (a provenance record's
-    ``run_id``) when that run exists. Sorted; one ledger read."""
+    ``run_id``) when that run exists. Sorted; one strict ledger read:
+    raises ``ledger_io.LedgerCorruptError`` for an unreadable ledger rather
+    than returning ``[]`` ("no run covers it")."""
     if not path or not str(path).strip():
         return []
     target = os.path.normcase(_resolve_ref(outputs_dir, str(path)))
     found: set[str] = set()
-    for manifest in list_run_manifests(outputs_dir):
+    ledger = _read_ledger_strict(outputs_dir)
+    for manifest in (ledger[k] for k in sorted(ledger)):
         rid = manifest.get("run_id")
         if not isinstance(rid, str):
             continue
