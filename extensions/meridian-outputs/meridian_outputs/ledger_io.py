@@ -30,10 +30,11 @@ primitive rather than adding a new one:
   that are not a JSON object raise :class:`LedgerCorruptError`; they are never
   read as empty.
 * Inside a transaction, :meth:`LedgerTransaction.load` copies corrupt bytes to
-  ``<ledger>.corrupt-<utc>`` (quarantine), logs a warning and continues from an
-  empty ledger, so the writer is not blocked and the original bytes stay
-  recoverable. If the quarantine copy cannot be written, the error propagates
-  and nothing is replaced.
+  ``<ledger>.corrupt-<sha256 prefix>`` (quarantine), logs a warning and
+  continues from an empty ledger, so the writer is not blocked and the
+  original bytes stay recoverable. The name comes from the bytes, so retries
+  over the same corrupt content reuse one copy. If the quarantine copy cannot
+  be written, the error propagates and nothing is replaced.
 * :func:`write_ledger_atomic` writes a unique temporary file in the ledger's
   own directory, flushes it, calls ``os.fsync`` on it, then moves it over the
   ledger with ``os.replace``. On any failure the temporary file is removed and
@@ -53,13 +54,13 @@ rest of the ``meridian_outputs`` package.
 """
 from __future__ import annotations
 
+import hashlib
 import json
 import logging
 import os
 import tempfile
 import time
 from contextlib import contextmanager
-from datetime import datetime, timezone
 from typing import Any, Callable, Iterator
 
 from . import outputs_local
@@ -160,28 +161,41 @@ def read_ledger_strict(path: str) -> dict[str, Any]:
     return parse_ledger_bytes(path, raw)
 
 
-def _quarantine_name(path: str) -> str:
-    stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S%fZ")
-    return f"{path}.corrupt-{stamp}"
+# Hex digits of the content sha256 in a quarantine name. A prefix keeps the
+# name about as long as the old UTC stamp (Windows MAX_PATH); a prefix
+# collision is harmless because an existing file is reused only when its
+# bytes are identical.
+_QUARANTINE_DIGEST_CHARS = 16
+
+
+def _quarantine_name(path: str, raw: bytes) -> str:
+    digest = hashlib.sha256(raw).hexdigest()[:_QUARANTINE_DIGEST_CHARS]
+    return f"{path}.corrupt-{digest}"
 
 
 def quarantine_ledger(path: str) -> str | None:
-    """Copy ``path``'s current bytes to ``<path>.corrupt-<utc>``.
+    """Copy ``path``'s current bytes to ``<path>.corrupt-<sha256 prefix>``.
 
-    The copy is created exclusively (an existing quarantine file is never
-    overwritten) and fsynced. Returns the quarantine path, or ``None`` when
-    ``path`` no longer exists. Raises ``OSError`` when the copy cannot be
-    written; callers must then leave the ledger alone.
+    The name comes from the bytes, so the same corrupt content always maps
+    to one quarantine file: when every commit after a quarantine fails, a
+    retry reuses the existing copy instead of adding another full-size one.
+    The copy is created exclusively and fsynced; an existing file is reused
+    only when its bytes are identical, and is never overwritten (different
+    bytes under the same name get a ``-<n>`` suffix). Returns the quarantine
+    path, or ``None`` when ``path`` no longer exists. Raises ``OSError`` when
+    the copy cannot be written; callers must then leave the ledger alone.
     """
     raw = _read_bytes(path)
     if raw is None:
         return None
-    base = _quarantine_name(path)
+    base = _quarantine_name(path, raw)
     candidate = base
     for suffix in range(1, 1000):
         try:
             fd = os.open(candidate, os.O_CREAT | os.O_EXCL | os.O_WRONLY | getattr(os, "O_BINARY", 0))
         except FileExistsError:
+            if _read_bytes(candidate) == raw:
+                return candidate  # these exact bytes are already quarantined
             candidate = f"{base}-{suffix}"
             continue
         try:

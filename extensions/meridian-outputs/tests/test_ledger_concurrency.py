@@ -412,13 +412,32 @@ class TestStrictReadAndQuarantine:
         ledger.write_bytes(b"second")
         fixed = str(ledger) + ".corrupt-FIXED"
         Path(fixed).write_bytes(b"first")
-        monkeypatch.setattr(LIO, "_quarantine_name", lambda path: fixed)
+        monkeypatch.setattr(LIO, "_quarantine_name", lambda path, raw: fixed)
 
         copy = LIO.quarantine_ledger(str(ledger))
 
         assert copy == fixed + "-1"
         assert Path(fixed).read_bytes() == b"first"
         assert Path(copy).read_bytes() == b"second"
+
+    def test_repeated_failing_commits_keep_one_quarantine_copy(self, tmp_path: Path) -> None:
+        ledger = tmp_path / "ledger.json"
+        ledger.write_bytes(_GARBAGE)
+        for _ in range(3):
+            with pytest.raises(TypeError):
+                with LIO.ledger_transaction(str(ledger)) as txn:
+                    assert txn.load() == {}
+                    txn.commit({"bad": object()})  # fails after the quarantine
+        copies = [n for n in os.listdir(tmp_path) if ".corrupt-" in n]
+        assert len(copies) == 1, copies
+        assert (tmp_path / copies[0]).read_bytes() == _GARBAGE
+        assert ledger.read_bytes() == _GARBAGE  # never replaced
+
+        # Different corrupt bytes are a different quarantine copy.
+        ledger.write_bytes(b"[1, 2]")
+        second = LIO.quarantine_ledger(str(ledger))
+        assert second is not None and os.path.basename(second) not in copies
+        assert Path(second).read_bytes() == b"[1, 2]"
 
     def test_quarantine_of_missing_ledger_is_none(self, tmp_path: Path) -> None:
         assert LIO.quarantine_ledger(str(tmp_path / "gone.json")) is None
