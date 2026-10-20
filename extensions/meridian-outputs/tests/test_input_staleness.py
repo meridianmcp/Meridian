@@ -131,25 +131,67 @@ class TestCheckInputStaleness:
     def test_relative_input_is_stat_ed_and_hashed_as_one_file(
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
     ) -> None:
-        """A relative input used to be stat-ed under outputs_dir but hashed
-        against the working directory. Both now use one resolver."""
+        """The staleness baseline (input_stat) stats and hashes ONE file, the
+        input resolved against outputs_dir. The identity hash (file_hashes)
+        keeps its original meaning, the path as given against the working
+        directory (S-F5: changing it broke resuming existing runs)."""
         outputs = tmp_path / "outputs"
         inp = _write(outputs / "data" / "in.csv", "a\n1\n")
-        _write(tmp_path / "cwd" / "data" / "in.csv", "same name, different file\n")
+        cwd_copy = _write(tmp_path / "cwd" / "data" / "in.csv", "same name, different file\n")
         monkeypatch.chdir(tmp_path / "cwd")
 
         rec = _start(outputs, "r1", ["data/in.csv"])
         expected = RM.fingerprint.script_content_hash(str(inp))
-        assert rec["input_identity"]["file_hashes"] == {"data/in.csv": expected}
         assert rec["input_stat"]["data/in.csv"]["sha256"] == expected
+        assert rec["input_identity"]["file_hashes"] == {
+            "data/in.csv": RM.fingerprint.script_content_hash(str(cwd_copy)),
+        }
         assert RM.check_input_staleness(str(outputs), "r1")["stale"] is False
-
-        # The identity no longer depends on the working directory.
-        monkeypatch.chdir(outputs)
         assert _start(outputs, "r1", ["data/in.csv"])["manifest_hash"] == rec["manifest_hash"]
 
         inp.write_text("a\n1\n2\n", encoding="utf-8")
         result = RM.check_input_staleness(str(outputs), "r1")
+        assert result["stale"] is True
+        assert _by_input(result) == {"data/in.csv": "changed"}
+
+    def test_run_recorded_with_working_directory_identity_still_resumes(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """S-F5: a run started before input_stat existed recorded file_hashes
+        as script_content_hash of each path as given (relative to the working
+        directory), and that value is inside manifest_hash. Restarting it
+        must return the stored record, not raise 'DIFFERENT hash'; staleness
+        still follows the real input under outputs_dir."""
+        outputs = tmp_path / "outputs"
+        inp = _write(outputs / "data" / "in.csv", "a\n1\n")
+        cwd_copy = _write(tmp_path / "cwd" / "data" / "in.csv", "same name, different file\n")
+        monkeypatch.chdir(tmp_path / "cwd")
+
+        # The record as the pre-input_stat code wrote it: identity hashes of
+        # the path as given, no input_stat.
+        fresh = _start(outputs, "old-run", ["data/in.csv"])
+        old_hashes = {"data/in.csv": RM.fingerprint.script_content_hash(str(cwd_copy))}
+        old = {k: v for k, v in fresh.items() if k != "input_stat"}
+        old["input_identity"] = {
+            "file_hashes": old_hashes, "file_set_hash": RM._file_set_hash(old_hashes),
+        }
+        old["manifest_hash"] = RM.run_manifest_hash(old)
+        ledger_file = outputs / ".meridian-outputs-cache" / "run_manifest_ledger.json"
+        ledger_file.write_text(json.dumps({"old-run": old}), encoding="utf-8")
+
+        resumed = _start(outputs, "old-run", ["data/in.csv"])
+        assert resumed == json.loads(json.dumps(old))  # the stored record, unchanged
+        assert resumed["manifest_hash"] == old["manifest_hash"]
+
+        # A run started now from the same working directory: its staleness
+        # baseline is the real input under outputs_dir, checked from anywhere.
+        _start(outputs, "new-run", ["data/in.csv"])
+        elsewhere = tmp_path / "elsewhere"
+        elsewhere.mkdir()
+        monkeypatch.chdir(elsewhere)
+        assert RM.check_input_staleness(str(outputs), "new-run")["stale"] is False
+        inp.write_text("a\n1\n2\n", encoding="utf-8")
+        result = RM.check_input_staleness(str(outputs), "new-run")
         assert result["stale"] is True
         assert _by_input(result) == {"data/in.csv": "changed"}
 
@@ -158,10 +200,15 @@ class TestCheckInputStaleness:
     ) -> None:
         outputs = tmp_path / "outputs"
         inp = _write(outputs / "data" / "in.csv", "a\n1\n")
+        # A legacy record's identity hash is of the path as given against the
+        # start-time working directory (S-F5), so start from outputs_dir and
+        # then check from elsewhere: the legacy baseline must resolve against
+        # outputs_dir, not the check-time working directory.
+        monkeypatch.chdir(outputs)
+        _start(outputs, "r1", ["data/in.csv"])
         elsewhere = tmp_path / "elsewhere"
         elsewhere.mkdir()
         monkeypatch.chdir(elsewhere)
-        _start(outputs, "r1", ["data/in.csv"])
         ledger_file = outputs / ".meridian-outputs-cache" / "run_manifest_ledger.json"
         ledger = json.loads(ledger_file.read_text(encoding="utf-8"))
         del ledger["r1"]["input_stat"]
