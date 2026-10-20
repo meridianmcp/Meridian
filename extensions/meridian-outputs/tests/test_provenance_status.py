@@ -849,6 +849,30 @@ class TestStaleByScript:
         assert backed["provenance_type"] == PS.EXACT
         assert backed["script_staleness"]["is_stale"] is None
 
+    @duckdb_required
+    @pytest.mark.parametrize("row", ["null", "3", '"x"', "[1]"])
+    def test_non_object_fingerprint_row_is_corruption_not_attribute_error(
+        self, tmp_path: Path, row: str,
+    ) -> None:
+        """A valid-JSON ledger with a non-object row passes the top-level
+        parse; the strict read must still reject it as corrupt."""
+        from meridian_outputs import ledger_io as LIO
+
+        output = tmp_path / "result.csv"
+        output.write_text("a,b\n1,2\n", encoding="utf-8")
+        AN.record_provenance(str(tmp_path), str(output))
+        Path(FP._ledger_path(str(tmp_path))).write_text(
+            '{"result.csv": ' + row + "}", encoding="utf-8",
+        )
+
+        with pytest.raises(LIO.LedgerCorruptError, match="not an object"):
+            FP.check_staleness(str(tmp_path))
+        with pytest.raises(LIO.LedgerCorruptError):
+            FP.find_stale_by_script(str(tmp_path), str(tmp_path / "train.py"))
+        status = PS.get_provenance_status(str(tmp_path), str(output))
+        assert status["provenance_type"] == PS.EXACT
+        assert status["script_staleness"]["is_stale"] is None
+
 
 # ---------------------------------------------------------------------------
 # Canonical/archival identity (item d3374b0e)

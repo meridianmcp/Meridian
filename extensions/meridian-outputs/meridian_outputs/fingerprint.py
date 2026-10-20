@@ -298,8 +298,16 @@ def _read_ledger(outputs_dir: str) -> dict[str, dict[str, Any]]:
     """Strict read: ``{}`` only for a missing ledger. A corrupt ledger raises
     ``ledger_io.LedgerCorruptError`` instead of reading as empty, so
     :func:`check_staleness` and :func:`find_stale_by_script` can never report
-    "nothing stale" for a ledger they could not parse."""
-    return ledger_io.read_ledger_strict(_ledger_path(outputs_dir))
+    "nothing stale" for a ledger they could not parse. A row that is not a
+    JSON object (e.g. ``{"a.csv": null}``) is corruption too: it raises
+    ``LedgerCorruptError`` here rather than ``AttributeError`` in a caller."""
+    path = _ledger_path(outputs_dir)
+    ledger = ledger_io.read_ledger_strict(path)
+    for entry in ledger.values():
+        if not isinstance(entry, dict):
+            kind = "null" if entry is None else type(entry).__name__
+            raise ledger_io.LedgerCorruptError(path, f"a row is {kind}, not an object")
+    return ledger
 
 
 def _write_ledger_entry(outputs_dir: str, tagged: ScriptTaggedFingerprint) -> str | None:
