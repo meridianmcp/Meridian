@@ -195,30 +195,77 @@ class TestCheckInputStaleness:
         assert result["stale"] is True
         assert _by_input(result) == {"data/in.csv": "changed"}
 
-    def test_legacy_baseline_of_relative_input_uses_the_same_resolver(
+    @staticmethod
+    def _strip_input_stat(outputs: Path, run_id: str) -> None:
+        """Rewrite ``run_id`` as a record written before input_stat existed."""
+        ledger_file = outputs / ".meridian-outputs-cache" / "run_manifest_ledger.json"
+        ledger = json.loads(ledger_file.read_text(encoding="utf-8"))
+        del ledger[run_id]["input_stat"]
+        ledger_file.write_text(json.dumps(ledger), encoding="utf-8")
+
+    def test_legacy_baseline_of_relative_input_is_unknown(
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
     ) -> None:
+        """A legacy record's identity hash of a relative input is of the path
+        as given against the start-time working directory (S-F5), which the
+        record does not keep. Even when that directory happened to be
+        outputs_dir, nothing in the record says so: the input is unknown
+        and staleness is unknown, before and after an edit (S-R4-16)."""
         outputs = tmp_path / "outputs"
         inp = _write(outputs / "data" / "in.csv", "a\n1\n")
-        # A legacy record's identity hash is of the path as given against the
-        # start-time working directory (S-F5), so start from outputs_dir and
-        # then check from elsewhere: the legacy baseline must resolve against
-        # outputs_dir, not the check-time working directory.
         monkeypatch.chdir(outputs)
         _start(outputs, "r1", ["data/in.csv"])
         elsewhere = tmp_path / "elsewhere"
         elsewhere.mkdir()
         monkeypatch.chdir(elsewhere)
-        ledger_file = outputs / ".meridian-outputs-cache" / "run_manifest_ledger.json"
-        ledger = json.loads(ledger_file.read_text(encoding="utf-8"))
-        del ledger["r1"]["input_stat"]
-        ledger_file.write_text(json.dumps(ledger), encoding="utf-8")
+        self._strip_input_stat(outputs, "r1")
 
-        unchanged = RM.check_input_staleness(str(outputs), "r1")
-        assert unchanged["baseline"] == "legacy_hash_only"
-        assert unchanged["stale"] is False
+        before = RM.check_input_staleness(str(outputs), "r1")
+        assert before["baseline"] == "legacy_hash_only"
+        assert before["stale"] is None
+        assert _by_input(before) == {"data/in.csv": "unknown"}
+        assert before["stale_inputs"] == []
+        assert before["hashed_count"] == 0
+        assert "cannot be confirmed" in before["reason"]
         inp.write_text("a\n2\n", encoding="utf-8")
-        assert _by_input(RM.check_input_staleness(str(outputs), "r1")) == {"data/in.csv": "changed"}
+        after = RM.check_input_staleness(str(outputs), "r1")
+        assert after["stale"] is None
+        assert _by_input(after) == {"data/in.csv": "unknown"}
+
+    def test_legacy_relative_input_never_reads_unchanged(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """S-R4-16: the legacy fallback compared the outputs_dir file with a
+        hash of the working-directory copy. An untouched outputs file read
+        "changed", and an outputs file edited to match that copy read
+        "unchanged" -- a real change reported fresh."""
+        outputs = tmp_path / "outputs"
+        inp = _write(outputs / "data" / "in.csv", "outputs copy\n")
+        _write(tmp_path / "cwd" / "data" / "in.csv", "working-directory copy\n")
+        absolute = _write(tmp_path / "raw" / "abs.csv", "a\n1\n")
+        monkeypatch.chdir(tmp_path / "cwd")
+        _start(outputs, "r1", ["data/in.csv", str(absolute)])
+        self._strip_input_stat(outputs, "r1")
+        elsewhere = tmp_path / "elsewhere"
+        elsewhere.mkdir()
+        monkeypatch.chdir(elsewhere)
+
+        untouched = RM.check_input_staleness(str(outputs), "r1", strict=True)
+        assert _by_input(untouched) == {"data/in.csv": "unknown", "../raw/abs.csv": "unchanged"}
+        assert untouched["stale"] is None
+
+        inp.write_text("working-directory copy\n", encoding="utf-8")  # a real change
+        for strict in (False, True):
+            changed = RM.check_input_staleness(str(outputs), "r1", strict=strict)
+            assert _by_input(changed)["data/in.csv"] == "unknown"
+            assert changed["stale"] is not False
+
+        # An absolute legacy input is still compared, and a confirmed change wins.
+        absolute.write_text("a\n2\n", encoding="utf-8")
+        result = RM.check_input_staleness(str(outputs), "r1")
+        assert result["stale"] is True
+        assert result["stale_inputs"] == ["../raw/abs.csv"]
+        assert _by_input(result)["data/in.csv"] == "unknown"
 
     def test_strict_catches_same_size_same_mtime_edit_default_misses_it(
         self, tmp_path: Path,
@@ -306,6 +353,34 @@ class TestCheckInputStaleness:
         result = RM.check_input_staleness(str(tmp_path), "r1", strict=True)
         assert _by_input(result) == {"in.csv": "unreadable"}
         assert result["stale"] is True
+
+    @pytest.mark.parametrize("realpath_rejects", [False, True])
+    def test_input_path_with_nul_byte_records_none(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, realpath_rejects: bool,
+    ) -> None:
+        """S-R4-17: os.stat raises ValueError (not OSError) for an embedded
+        NUL byte, which escaped _stat_or_none and failed start_run_manifest.
+        Such a path names no file: it is recorded absent with a None hash,
+        as dev did. ``realpath_rejects`` reproduces POSIX, where realpath
+        (inside _resolve_ref) raises the same ValueError first."""
+        if realpath_rejects:
+            real_resolve = RM._resolve_ref
+
+            def _posix_like(outputs_dir: str, raw: str) -> str:
+                if "\x00" in raw:
+                    raise ValueError("lstat: embedded null character in path")
+                return real_resolve(outputs_dir, raw)
+
+            monkeypatch.setattr(RM, "_resolve_ref", _posix_like)
+        assert RM._stat_or_none(str(tmp_path / "bad\x00name.csv")) is None
+        rec = _start(tmp_path, "r1", ["bad\x00name.csv"])
+        assert rec["input_identity"]["file_hashes"] == {"bad\x00name.csv": None}
+        assert rec["input_stat"] == {
+            "bad\x00name.csv": {"exists": False, "size": None, "mtime_ns": None, "sha256": None},
+        }
+        result = RM.check_input_staleness(str(tmp_path), "r1")
+        assert result["stale"] is False
+        assert _by_input(result) == {"bad\x00name.csv": "absent"}
 
     def test_run_without_inputs_and_unknown_runs(self, tmp_path: Path) -> None:
         _start(tmp_path, "r1", [])

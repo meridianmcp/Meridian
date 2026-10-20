@@ -180,8 +180,10 @@ The ``provenance_type`` -> :class:`~research_evidence.ResolverStatus` mapping
   - :data:`RELOCATED` -> ``VERIFIED`` (confidence 0.75, lower than a
     same-path :data:`EXACT` match's 0.95) -- content identity IS confirmed
     by hash, just at a different path than originally recorded; the reason
-    string names the matched prior path. ``AMBIGUOUS`` instead while script
-    or input staleness is unknown.
+    string names the matched prior path. ``STALE`` (as for
+    :data:`STALE_BY_SCRIPT`) when ``script_staleness`` shows the tagged
+    generating script changed, and ``AMBIGUOUS`` while script or input
+    staleness is unknown.
   - :data:`AMBIGUOUS` (this module's ``provenance_type``, not to be confused
     with the identically-named :class:`~research_evidence.ResolverStatus`
     member several OTHER branches below also map to) -> ``AMBIGUOUS``, low
@@ -276,6 +278,7 @@ from datetime import datetime, timezone
 from typing import Any
 
 from . import annotate, fingerprint, ledger_io, outputs_local, research_evidence
+from .path_security import resolve_reference
 
 _log = logging.getLogger(__name__)
 
@@ -420,8 +423,21 @@ def _stale_by_script_result(outputs_dir: str, path: str) -> dict[str, Any] | Non
     is a dict of the same shape with ``is_stale`` ``None``, a ``reason``
     saying why, and ``error="ledger_unreadable"`` -- never ``None`` ("never
     tagged") and never an exception that would lose the exact record.
+
+    ``path`` is resolved the way :func:`annotate.get_provenance` resolves it:
+    a relative path against ``outputs_dir`` (never the working directory),
+    through ``realpath``, so it compares equal to the ``realpath``-resolved
+    paths :func:`fingerprint.check_staleness` returns, also when
+    ``outputs_dir`` is reached through a symlink. Otherwise a relative
+    spelling of a tagged file would miss its row and read as "never tagged".
     """
-    target = annotate._normalize_path(path)
+    if not isinstance(path, str) or not path.strip():
+        return None
+    try:
+        resolved = resolve_reference(outputs_dir, path.strip())
+    except (OSError, TypeError, ValueError):
+        resolved = path
+    target = annotate._normalize_path(resolved)
     if not target:
         return None
     try:
@@ -1172,7 +1188,12 @@ def _resolver_state_for_provenance_status(
         else None
     )
 
-    if ptype == STALE_BY_SCRIPT:
+    # A relocated file whose fingerprint-tagged generating script changed is
+    # stale exactly as an exact record would be (get_provenance_status
+    # promotes that one to STALE_BY_SCRIPT); a relocation never verifies it.
+    if ptype == STALE_BY_SCRIPT or (
+        ptype == RELOCATED and script_staleness.get("is_stale") is True
+    ):
         return research_evidence.ResolverState(
             status=research_evidence.ResolverStatus.STALE,
             confidence=0.3,

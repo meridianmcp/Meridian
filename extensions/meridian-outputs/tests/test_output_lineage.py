@@ -452,6 +452,44 @@ class TestRunAndArtifact:
         assert all(s["scope"] == "output" for s in result["sources"])
         _assert_no_absolute_path(result, layout["root"])
 
+    def test_relative_run_input_reports_the_outputs_dir_hash(
+        self, layout, monkeypatch,
+    ) -> None:
+        """S-R4-15: run.inputs took sha256 from input_identity.file_hashes,
+        which hashes a relative input against the working directory: null
+        for an input that exists only under outputs_dir, while input_stat
+        (what staleness checks) holds its real hash."""
+        outputs = str(layout["outputs"])
+        inp = layout["outputs"] / "data" / "in.csv"
+        inp.parent.mkdir()
+        inp.write_text("x\n1\n", encoding="utf-8")
+        elsewhere = layout["root"] / "elsewhere"
+        elsewhere.mkdir()
+        monkeypatch.chdir(elsewhere)  # no data/in.csv under the working directory
+
+        manifest = run_manifest.start_run_manifest(
+            outputs, run_id="run-rel", command_name="gen", input_paths=["data/in.csv"],
+        )
+        assert manifest["input_identity"]["file_hashes"] == {"data/in.csv": None}
+        run_manifest.finalize_run_manifest(outputs, "run-rel", output_paths=[str(layout["out"])])
+        artifact_registry.register_artifact(
+            outputs, "output", canonical_path=str(layout["out"]), generator="gen.py",
+            run_id="run-rel",
+        )
+        result = PV.get_output_lineage(outputs, path=str(layout["out"]))
+        expected = fingerprint.script_content_hash(str(inp))
+        assert expected is not None
+        assert result["run"]["inputs"] == [{
+            "locator": "data/in.csv",
+            "sha256": expected,
+            "scope": "run",
+            "origin": "run_manifest",
+        }]
+        # Identity is untouched: file_hashes and manifest_hash are as recorded.
+        stored = run_manifest.get_run_manifest(outputs, "run-rel")
+        assert stored["input_identity"]["file_hashes"] == {"data/in.csv": None}
+        assert result["run"]["manifest_hash"] == stored["manifest_hash"]
+
     def test_run_id_without_manifest_is_unresolved(self, layout) -> None:
         outputs = str(layout["outputs"])
         artifact_registry.register_artifact(
