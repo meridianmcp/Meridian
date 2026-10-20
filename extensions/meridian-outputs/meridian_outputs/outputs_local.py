@@ -1442,9 +1442,11 @@ _PDF_TIMEOUT_SECONDS = 5.0
 # any failure degrades to filename-only indexing. Parsing is stdlib only
 # (zipfile plus ast.literal_eval on the .npy header dict); no numpy, and
 # nothing is ever unpickled. Bounded on two axes: at most _NPZ_MAX_MEMBERS
-# members (more, or an unreadable archive, means filename-only), and at most
-# _NPZ_MAX_HEADER_BYTES decompressed bytes read from each member. .npy stays
-# filename-only (_METADATA_ONLY_SUFFIXES).
+# members, counted by walking the central directory before zipfile parses
+# it (more, ZIP64, or an unreadable archive means filename-only), and at
+# most _NPZ_MAX_HEADER_BYTES decompressed bytes read from each member, which
+# must be stored or deflated. .npy stays filename-only
+# (_METADATA_ONLY_SUFFIXES).
 _NPZ_SUFFIXES: frozenset[str] = frozenset({".npz"})
 _NPZ_MAX_MEMBERS = 256
 _NPZ_MAX_HEADER_BYTES = 64 * 1024
@@ -2016,35 +2018,91 @@ def _parse_npy_header(head: bytes) -> tuple[list[int], str | None] | None:
     return [int(d) for d in shape], _npy_descr_to_dtype(meta.get("descr"))
 
 
-def _zip_declared_entry_count(fh: Any) -> int | None:
-    """Total entry count from a zip's end-of-central-directory record.
+_ZIP_END_SIG = b"PK\x05\x06"
+_ZIP_END_LEN = 22
+_ZIP64_LOCATOR_SIG = b"PK\x06\x07"
+_ZIP64_LOCATOR_LEN = 20
+_ZIP_CENTRAL_SIG = b"PK\x01\x02"
+_ZIP_CENTRAL_LEN = 46
 
-    Read before :class:`zipfile.ZipFile` parses the central directory, so an
-    archive declaring more than ``_NPZ_MAX_MEMBERS`` members is refused
-    without listing them. None means no end record was found (not a zip).
-    """
+
+def _zip_end_record(fh: Any) -> tuple[int, bytes] | None:
+    """``(offset, bytes)`` of the end-of-central-directory record, found the
+    way ``zipfile`` finds it (a comment-free record at the very end first,
+    else the last signature in the final 64 KiB), or None for no record."""
     fh.seek(0, os.SEEK_END)
     size = fh.tell()
-    if size < 22:
+    if size < _ZIP_END_LEN:
         return None
-    tail_len = min(size, 22 + 0xFFFF)
-    fh.seek(size - tail_len)
-    tail = fh.read(tail_len)
-    pos = tail.rfind(b"PK\x05\x06")
-    if pos < 0 or len(tail) - pos < 22:
+    fh.seek(size - _ZIP_END_LEN)
+    record = fh.read(_ZIP_END_LEN)
+    if record[:4] == _ZIP_END_SIG and record[-2:] == b"\0\0":
+        return size - _ZIP_END_LEN, record
+    start = max(size - (1 << 16) - _ZIP_END_LEN, 0)
+    fh.seek(start)
+    tail = fh.read(size - start)
+    pos = tail.rfind(_ZIP_END_SIG)
+    if pos < 0 or len(tail) - pos < _ZIP_END_LEN:
         return None
-    return struct.unpack_from("<H", tail, pos + 10)[0]
+    return start + pos, tail[pos:pos + _ZIP_END_LEN]
+
+
+def _zip_central_directory_problem(fh: Any) -> str | None:
+    """Why ``fh`` must not be handed to :class:`zipfile.ZipFile`, or None.
+
+    ``ZipFile`` parses every central-directory record before the member cap
+    can run, and it walks the directory by its byte size, ignoring the end
+    record's entry count (which an attacker sets freely). So the directory
+    is walked here first, record by record, reading only each record's
+    fixed 46-byte header, and the walk stops at record
+    ``_NPZ_MAX_MEMBERS + 1``. ZIP64 structures and offsets that do not line
+    up are refused rather than interpreted; numpy writes neither.
+    """
+    found = _zip_end_record(fh)
+    if found is None:
+        return "not a zip archive"
+    end_pos, end = found
+    (_sig, disk, cd_disk, disk_entries, total_entries,
+     cd_size, cd_offset, _comment_len) = struct.unpack("<4s4H2LH", end)
+    if end_pos >= _ZIP64_LOCATOR_LEN:
+        fh.seek(end_pos - _ZIP64_LOCATOR_LEN)
+        if fh.read(4) == _ZIP64_LOCATOR_SIG:
+            return "ZIP64 archive"
+    if 0xFFFF in (disk_entries, total_entries) or 0xFFFFFFFF in (cd_size, cd_offset):
+        return "ZIP64 archive"
+    if disk or cd_disk or disk_entries != total_entries or cd_offset + cd_size != end_pos:
+        return "inconsistent end-of-central-directory offsets"
+    count = 0
+    pos = cd_offset
+    while pos < end_pos:
+        if end_pos - pos < _ZIP_CENTRAL_LEN:
+            return "truncated central directory"
+        fh.seek(pos)
+        header = fh.read(_ZIP_CENTRAL_LEN)
+        if len(header) != _ZIP_CENTRAL_LEN or header[:4] != _ZIP_CENTRAL_SIG:
+            return "bad central directory record"
+        count += 1
+        if count > _NPZ_MAX_MEMBERS:
+            return f"more than {_NPZ_MAX_MEMBERS} members exceeds the cap"
+        compress_size, file_size = struct.unpack_from("<2L", header, 20)
+        name_len, extra_len, comment_len = struct.unpack_from("<3H", header, 28)
+        local_offset = struct.unpack_from("<L", header, 42)[0]
+        if 0xFFFFFFFF in (compress_size, file_size, local_offset):
+            return "ZIP64 archive"
+        if local_offset >= cd_offset:
+            return "inconsistent member offset"
+        pos += _ZIP_CENTRAL_LEN + name_len + extra_len + comment_len
+    if pos != end_pos:
+        return "inconsistent central directory size"
+    if count != total_entries:
+        return f"end record declares {total_entries} entries but the directory holds {count}"
+    return None
 
 
 def _npz_members(fh: Any, path: str) -> list[dict[str, Any]] | None:
-    declared = _zip_declared_entry_count(fh)
-    if declared is None:
-        _log_npz_unreadable_once(path, "not a zip archive")
-        return None
-    if declared > _NPZ_MAX_MEMBERS:
-        _log_npz_unreadable_once(
-            path, f"{declared} members exceeds the cap of {_NPZ_MAX_MEMBERS}",
-        )
+    problem = _zip_central_directory_problem(fh)
+    if problem is not None:
+        _log_npz_unreadable_once(path, problem)
         return None
     fh.seek(0)
     with zipfile.ZipFile(fh) as zf:
