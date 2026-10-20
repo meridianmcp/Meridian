@@ -24,6 +24,8 @@ from __future__ import annotations
 import hashlib
 import os
 import sys
+import threading
+from contextlib import contextmanager
 from pathlib import Path
 
 import pytest
@@ -256,6 +258,113 @@ class TestFinalizeRunManifest:
         assert rec["unknown_artifact_ids"] == []
         # A finalize that names no artifact never consults the registry.
         assert RM.finalize_run_manifest(od, "r1", status="complete")["phase"] == "complete"
+
+    @pytest.mark.parametrize("before", ["x\n1\n", None], ids=["rewritten", "appeared"])
+    def test_output_changed_between_hash_and_commit_is_recorded_as_it_is_now(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, before: "str | None",
+    ) -> None:
+        """R6-B: the outputs were hashed, and convergence read, before the
+        transaction, and nothing was checked again under it. An output
+        rewritten (or first written) in between was committed with its old
+        hash (or as missing, downgrading the phase to "partial")."""
+        od = str(tmp_path)
+        out = tmp_path / "out.csv"
+        if before is not None:
+            _write(out, before)
+        RM.start_run_manifest(od, run_id="r1", command_name="build")
+        real_txn = RM._ledger_write_transaction
+        held = {"now": False, "at_snapshot": None}
+
+        @contextmanager
+        def _changed_before_the_lock(outputs_dir: str):
+            _write(out, "x\n1\n2\n")  # after finalize hashed, before it locks
+            with real_txn(outputs_dir) as txn:
+                held["now"] = True
+                try:
+                    yield txn
+                finally:
+                    held["now"] = False
+
+        def _convergence(outputs_dir: str) -> dict:
+            held["at_snapshot"] = held["now"]
+            return {"converged": True}
+
+        monkeypatch.setattr(RM, "_ledger_write_transaction", _changed_before_the_lock)
+        monkeypatch.setattr(RM, "_safe_convergence", _convergence)
+        rec = RM.finalize_run_manifest(od, "r1", output_paths=[str(out)], status="complete")
+
+        current = FP.script_content_hash(str(out))
+        assert rec["output_identity"]["file_hashes"] == {str(out): current}
+        assert rec["output_identity"]["file_set_hash"] == RM._file_set_hash({str(out): current})
+        assert rec["output_identity"]["missing_or_unreadable"] == []
+        assert rec["phase"] == "complete" and rec["status_reason"] is None
+        assert held["at_snapshot"] is True  # convergence read under the lock
+        assert RM.get_run_manifest(od, "r1") == rec
+
+    def test_two_threads_finalizing_one_run_never_leave_an_older_hash(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """R6-B: finalize A hashes v1 and is about to lock; the output is
+        rewritten to v2 and finalize B hashes, snapshots and commits v2;
+        then A commits. A's pre-lock v1 hash and older convergence snapshot
+        used to overwrite B's newer ones."""
+        od = str(tmp_path)
+        out = tmp_path / "out.csv"
+        _write(out, "v1\n")
+        RM.start_run_manifest(od, run_id="r1", command_name="build")
+        snapshots = {"n": 0}
+        snapshot_lock = threading.Lock()
+
+        def _convergence(outputs_dir: str) -> dict:
+            with snapshot_lock:
+                snapshots["n"] += 1
+                return {"snapshot": snapshots["n"]}
+
+        real_txn = RM._ledger_write_transaction
+        a_hashed, b_done = threading.Event(), threading.Event()
+
+        @contextmanager
+        def _a_waits_for_b(outputs_dir: str):
+            if threading.current_thread().name == "finalize-a":
+                a_hashed.set()
+                assert b_done.wait(30)
+            with real_txn(outputs_dir) as txn:
+                yield txn
+
+        monkeypatch.setattr(RM, "_safe_convergence", _convergence)
+        monkeypatch.setattr(RM, "_ledger_write_transaction", _a_waits_for_b)
+        returned: dict[str, dict] = {}
+        errors: list[BaseException] = []
+
+        def _finalize(name: str) -> None:
+            try:
+                returned[name] = RM.finalize_run_manifest(
+                    od, "r1", output_paths=[str(out)], status="complete",
+                )
+            except BaseException as exc:  # surfaced below
+                errors.append(exc)
+
+        a = threading.Thread(target=_finalize, args=("a",), name="finalize-a", daemon=True)
+        a.start()
+        assert a_hashed.wait(30)  # A has hashed v1 and has not locked yet
+        _write(out, "v2, rewritten\n")
+        b = threading.Thread(target=_finalize, args=("b",), name="finalize-b", daemon=True)
+        b.start()
+        b.join(30)
+        b_done.set()
+        a.join(30)
+        assert not a.is_alive() and not b.is_alive()
+        assert errors == []
+
+        current = FP.script_content_hash(str(out))
+        stored = RM.get_run_manifest(od, "r1")
+        # A returned last: the ledger holds exactly what it returned, which
+        # is the current hash, never A's pre-lock one.
+        assert stored == returned["a"]
+        assert stored["output_identity"]["file_hashes"] == {str(out): current}
+        assert returned["b"]["output_identity"]["file_hashes"] == {str(out): current}
+        assert stored["convergence_at_finish"] == {"snapshot": snapshots["n"]}
+        assert stored["phase"] == "complete"
 
 
 # ---------------------------------------------------------------------------

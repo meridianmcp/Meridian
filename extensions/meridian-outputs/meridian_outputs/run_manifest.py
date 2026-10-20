@@ -351,6 +351,15 @@ def _stat_or_none(path: str) -> "os.stat_result | None":
     return st if os.path.isfile(path) else None
 
 
+def _stat_signature(path: str) -> "tuple[int, int] | None":
+    """``(size, mtime_ns)`` of ``path`` (as given, the way :func:`_hash_paths`
+    opens it), or ``None`` when it is not a regular file :func:`_stat_or_none`
+    can stat. :func:`finalize_run_manifest` compares it before hashing and
+    again under the ledger lock to tell whether a hash is still current."""
+    st = _stat_or_none(path)
+    return None if st is None else (st.st_size, st.st_mtime_ns)
+
+
 def _snapshot_inputs(
     outputs_dir: str, input_paths: "list[str] | None",
 ) -> "tuple[dict[str, str | None], dict[str, dict[str, Any]]]":
@@ -734,7 +743,11 @@ def finalize_run_manifest(
 
     Fail-closed exact output binding: every path in ``output_paths`` is
     RE-HASHED right now via :func:`fingerprint.script_content_hash` --
-    never trusts a caller-declared hash. A path that is missing/unreadable
+    never trusts a caller-declared hash -- and its ``(size, mtime_ns)`` is
+    checked again under the ledger lock; an output that changed since its
+    hash is hashed again there, so the hash committed (and the convergence
+    snapshot, read under the lock) is current at commit time even when two
+    finalizes of one run race. A path that is missing/unreadable
     at finalize time is recorded under ``output_identity.missing_or_unreadable``
     and downgrades an attempted ``status="complete"`` to ``"partial"``
     automatically (never silently reported as a clean, fully-verified
@@ -789,17 +802,14 @@ def finalize_run_manifest(
             f"status must be one of {_VALID_FINAL_STATUSES}, got {status!r}"
         )
 
-    # Hashing the outputs and the convergence snapshot read no ledger, so
-    # they run before the cross-process lock: hashing large outputs while
-    # holding it would stall every other process's run-manifest writer.
-    output_hashes = _hash_paths(output_paths)
-    missing = sorted(p for p, h in output_hashes.items() if h is None)
-    output_identity = {
-        "file_hashes": dict(sorted(output_hashes.items())),
-        "file_set_hash": _file_set_hash(output_hashes),
-        "missing_or_unreadable": missing,
-    }
-    convergence_at_finish = _safe_convergence(outputs_dir)
+    # Hashing the outputs reads no ledger, so it runs before the
+    # cross-process lock: hashing large outputs while holding it would stall
+    # every other process's run-manifest writer. Each output's (size,
+    # mtime_ns) is taken BEFORE it is hashed and compared again under the
+    # lock below, so a change at any point after the stat is caught there.
+    output_list = [str(p) for p in output_paths or []]
+    signatures = {p: _stat_signature(p) for p in output_list}
+    output_hashes = _hash_paths(output_list)
 
     # The registry is read inside this transaction without a lock of its own
     # (a strict, lock-free read of a different ledger path), so no second
@@ -830,6 +840,22 @@ def finalize_run_manifest(
                 resolved_artifact_ids.append(aid)
             else:
                 unknown_artifact_ids.append(aid)
+
+        # Commit only what is current now. Another finalize of this run, or
+        # the producer, may have rewritten an output while this one waited
+        # for the lock: an output whose signature moved since its hash is
+        # hashed again here, and the (cheap) convergence snapshot is read
+        # here, so a late committer never puts an older hash, snapshot or
+        # "missing" verdict over a newer one.
+        changed = [p for p, sig in signatures.items() if _stat_signature(p) != sig]
+        output_hashes.update(_hash_paths(changed))
+        missing = sorted(p for p, h in output_hashes.items() if h is None)
+        output_identity = {
+            "file_hashes": dict(sorted(output_hashes.items())),
+            "file_set_hash": _file_set_hash(output_hashes),
+            "missing_or_unreadable": missing,
+        }
+        convergence_at_finish = _safe_convergence(outputs_dir)
 
         effective_status = status
         problems: list[str] = []

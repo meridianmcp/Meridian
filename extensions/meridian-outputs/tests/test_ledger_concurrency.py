@@ -28,8 +28,10 @@ import socket
 import stat
 import subprocess
 import sys
+import tempfile
 import threading
 import time
+from contextlib import contextmanager
 from pathlib import Path
 
 import pytest
@@ -524,11 +526,38 @@ class TestLedgerTempFileMode:
         assert flags & os.O_CREAT and flags & os.O_EXCL
         binary = getattr(os, "O_BINARY", 0)
         assert flags & binary == binary
-        assert re.fullmatch(r"ledger\.json\.[0-9a-f]{16}\.tmp", name), name
+        assert re.fullmatch(r"ledger\.json\.[0-9a-f]{8}\.tmp", name), name
         raw = ledger.read_bytes()
         assert b"\r\r\n" not in raw  # no CRT text-mode translation on Windows
         assert json.loads(raw.decode("utf-8")) == {"k": [1, 2]}
         assert sorted(os.listdir(tmp_path)) == ["ledger.json"]
+
+    def test_temp_name_is_no_longer_than_the_mkstemp_name_it_replaced(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """R6-C: the 16-hex token made the temporary name 8 characters longer
+        than tempfile.mkstemp's ``<ledger>.<8 chars>.tmp``, so on Windows
+        without long-path support a cache directory 216-223 characters deep
+        pushed every ledger write past MAX_PATH."""
+        ledger = tmp_path / "run_manifest_ledger.json"
+        real_open = os.open
+        names: list[str] = []
+
+        def _spy(path, flags, mode=0o777, *args, **kwargs):
+            if str(path).endswith(".tmp"):
+                names.append(os.path.basename(path))
+            return real_open(path, flags, mode, *args, **kwargs)
+
+        with monkeypatch.context() as m:
+            m.setattr(os, "open", _spy)
+            LIO.write_ledger_atomic(str(ledger), {"k": 1})
+
+        fd, reference = tempfile.mkstemp(prefix=ledger.name + ".", suffix=".tmp", dir=tmp_path)
+        os.close(fd)
+        os.remove(reference)
+        assert len(names) == 1, names
+        assert len(names[0]) <= len(os.path.basename(reference)), (names[0], reference)
+        assert re.fullmatch(r"run_manifest_ledger\.json\.[0-9a-f]{8}\.tmp", names[0]), names[0]
 
     @pytest.mark.skipif(os.name != "posix", reason="POSIX permission bits")
     @pytest.mark.parametrize("umask", [0o022, 0o002])
@@ -568,11 +597,11 @@ class TestLedgerTempFileSweep:
         self, tmp_path: Path,
     ) -> None:
         ledger = tmp_path / "ledger.json"
-        stale = _aged(tmp_path / f"ledger.json.{'a' * 16}.tmp", 2 * 3600)
-        fresh = _aged(tmp_path / f"ledger.json.{'b' * 16}.tmp", 60)
+        stale = _aged(tmp_path / f"ledger.json.{'a' * 8}.tmp", 2 * 3600)
+        fresh = _aged(tmp_path / f"ledger.json.{'b' * 8}.tmp", 60)
         # Old, but not this ledger's temporary files: never touched.
         others = [
-            _aged(tmp_path / f"other.json.{'c' * 16}.tmp", 2 * 3600),
+            _aged(tmp_path / f"other.json.{'c' * 8}.tmp", 2 * 3600),
             _aged(tmp_path / "ledger.json.corrupt-0123456789abcdef", 2 * 3600),
             _aged(tmp_path / "ledger.json.lock", 2 * 3600),
             _aged(tmp_path / "ledger.json.notatoken.tmp", 2 * 3600),
@@ -585,12 +614,33 @@ class TestLedgerTempFileSweep:
         assert all(p.exists() for p in others)
         assert json.loads(ledger.read_text(encoding="utf-8")) == {"k": 1}
 
+    def test_sweep_matches_only_this_ledgers_eight_hex_temp_names(self, tmp_path: Path) -> None:
+        """R6-C: the sweep pattern follows the 8-hex token exactly. Another
+        ledger's temporary file, or a name whose token has another length,
+        is never this writer's to remove, however old."""
+        ledger = tmp_path / "ledger.json"
+        stale = _aged(tmp_path / "ledger.json.0a1b2c3d.tmp", 2 * 3600)
+        others = [
+            _aged(tmp_path / "other.json.0a1b2c3d.tmp", 2 * 3600),
+            _aged(tmp_path / "ledger.json.x.0a1b2c3d.tmp", 2 * 3600),
+            _aged(tmp_path / f"ledger.json.{'0a1b2c3d' * 2}.tmp", 2 * 3600),
+            _aged(tmp_path / "ledger.json.0a1b2c3.tmp", 2 * 3600),
+            _aged(tmp_path / "ledger.json.0a1b2c3d4.tmp", 2 * 3600),
+            _aged(tmp_path / "ledger.json.0a1b2c3g.tmp", 2 * 3600),
+        ]
+
+        LIO.write_ledger_atomic(str(ledger), {"k": 1})
+
+        assert not stale.exists()
+        assert [p.name for p in others if not p.exists()] == []
+        assert json.loads(ledger.read_text(encoding="utf-8")) == {"k": 1}
+
     def test_a_writer_sweeps_through_its_ledger_transaction(self, tmp_path: Path) -> None:
         outputs = _outputs(tmp_path)
         a = _write(outputs / "a.csv", "x\n1\n")
         assert "error" not in AN.record_provenance(str(outputs), str(a))
         cache = outputs / ".meridian-outputs-cache"
-        stale = _aged(cache / f"provenance_ledger.json.{'d' * 16}.tmp", 2 * 3600)
+        stale = _aged(cache / f"provenance_ledger.json.{'d' * 8}.tmp", 2 * 3600)
         b = _write(outputs / "b.csv", "x\n2\n")
         assert "error" not in AN.record_provenance(str(outputs), str(b))
         assert not stale.exists()
@@ -600,7 +650,7 @@ class TestLedgerTempFileSweep:
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
     ) -> None:
         ledger = tmp_path / "ledger.json"
-        stale = _aged(tmp_path / f"ledger.json.{'e' * 16}.tmp", 2 * 3600)
+        stale = _aged(tmp_path / f"ledger.json.{'e' * 8}.tmp", 2 * 3600)
         real_remove = os.remove
 
         def _held_open(path: str) -> None:
@@ -613,6 +663,45 @@ class TestLedgerTempFileSweep:
             LIO.write_ledger_atomic(str(ledger), {"k": 2})
         assert stale.exists()
         assert json.loads(ledger.read_text(encoding="utf-8")) == {"k": 2}
+
+    @pytest.mark.parametrize("failing", ["stat", "is_file"])
+    def test_an_entry_that_cannot_be_stat_ed_is_skipped_and_the_sweep_goes_on(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, failing: str,
+    ) -> None:
+        """R6-D: one entry whose is_file() or stat() raised OSError (removed
+        or locked between the listing and the stat) aborted the whole sweep,
+        so every other stale temporary file stayed behind."""
+        ledger = tmp_path / "ledger.json"
+        bad = _aged(tmp_path / f"ledger.json.{'1' * 8}.tmp", 2 * 3600)
+        stale = _aged(tmp_path / f"ledger.json.{'2' * 8}.tmp", 2 * 3600)
+        real_scandir = os.scandir
+
+        class _Entry:
+            def __init__(self, real: os.DirEntry) -> None:
+                self._real, self.name, self.path = real, real.name, real.path
+
+            def is_file(self, *, follow_symlinks: bool = True) -> bool:
+                if failing == "is_file" and self.name == bad.name:
+                    raise PermissionError("is_file failed")
+                return self._real.is_file(follow_symlinks=follow_symlinks)
+
+            def stat(self, *, follow_symlinks: bool = True) -> os.stat_result:
+                if failing == "stat" and self.name == bad.name:
+                    raise FileNotFoundError("stat failed")
+                return self._real.stat(follow_symlinks=follow_symlinks)
+
+        @contextmanager
+        def _scandir(path: str):
+            with real_scandir(path) as entries:
+                # The failing entry first, so the sweep must get past it.
+                yield sorted((_Entry(e) for e in entries), key=lambda e: e.name != bad.name)
+
+        with monkeypatch.context() as m:
+            m.setattr(os, "scandir", _scandir)
+            LIO.write_ledger_atomic(str(ledger), {"k": 3})
+        assert bad.exists()  # skipped, left for a later write
+        assert not stale.exists()
+        assert json.loads(ledger.read_text(encoding="utf-8")) == {"k": 3}
 
 
 # ---------------------------------------------------------------------------
