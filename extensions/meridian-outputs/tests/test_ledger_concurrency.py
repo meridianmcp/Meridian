@@ -22,6 +22,7 @@ from __future__ import annotations
 import json
 import logging
 import os
+import socket
 import subprocess
 import sys
 import threading
@@ -661,6 +662,73 @@ class TestIndexFileLockStaleReclaim:
         assert os.path.exists(lock_path)
         assert lock._thread_lock.acquire(blocking=False)
         lock._thread_lock.release()
+
+    def test_reclaim_skips_a_lock_file_that_changed_hands(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        monkeypatch.setitem(sys.modules, "portalocker", None)
+        db_path = str(tmp_path / "ledger.json")
+        lock_path = db_path + ".lock"
+        _write_lease_file(lock_path)
+        successor: dict = {}
+        real_read = OL._read_lease_from_path
+        calls = {"n": 0}
+
+        def _successor_takes_over(path: str):
+            calls["n"] += 1
+            lease = real_read(path)
+            if calls["n"] == 1:
+                # Between this waiter's stale verdict and its removal, another
+                # waiter reclaims the file and a live successor's lease lands.
+                successor.update(_write_lease_file(
+                    lock_path, pid=os.getpid(), hostname=socket.gethostname(),
+                    session_id="successor", started_at=time.time(),
+                    heartbeat_at=time.time(), token="successor-token",
+                ))
+            return lease
+
+        monkeypatch.setattr(OL, "_read_lease_from_path", _successor_takes_over)
+        lock = OL.IndexFileLock(db_path, timeout=0.3)
+        with pytest.raises(OL.IndexLockAcquireError):
+            lock.acquire()
+        assert json.loads(Path(lock_path).read_text(encoding="utf-8")) == successor
+
+    def test_release_keeps_a_lock_file_that_names_another_token(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        monkeypatch.setitem(sys.modules, "portalocker", None)
+        db_path = str(tmp_path / "ledger.json")
+        lock_path = db_path + ".lock"
+        lock = OL.IndexFileLock(db_path, session_id="first")
+        lock.acquire()
+        # This holder's lease was reclaimed as stale and a successor now owns
+        # the path: the lease on disk names the successor's token.
+        successor = _write_lease_file(
+            lock_path, pid=os.getpid(), hostname=socket.gethostname(),
+            session_id="successor", started_at=time.time(),
+            heartbeat_at=time.time(), token="successor-token",
+        )
+        lock.release()
+        assert json.loads(Path(lock_path).read_text(encoding="utf-8")) == successor
+        assert lock._thread_lock.acquire(blocking=False)
+        lock._thread_lock.release()
+
+    def test_release_removes_its_own_file_when_the_lease_write_failed(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        monkeypatch.setitem(sys.modules, "portalocker", None)
+        db_path = str(tmp_path / "ledger.json")
+        lock_path = db_path + ".lock"
+
+        def _disk_full(*_a, **_k) -> None:
+            raise OSError("disk full")
+
+        monkeypatch.setattr(OL, "_write_lease_to_handle", _disk_full)
+        lock = OL.IndexFileLock(db_path)
+        lock.acquire()
+        assert Path(lock_path).read_bytes() == b""  # no lease, no token on disk
+        lock.release()
+        assert not os.path.exists(lock_path)
 
 
 # ---------------------------------------------------------------------------
