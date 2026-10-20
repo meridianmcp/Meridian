@@ -51,7 +51,8 @@ class RepoScopeError(ValueError):
 # WHOLE string (after stripping a trailing slash) so `C:\Users\me\project`
 # does not match -- only `C:\Users\me` itself does.
 _HOME_DIR_SHAPE_RE = re.compile(
-    r"^(?:[A-Za-z]:[\\/]Users[\\/][^\\/]+|/home/[^/]+|/Users/[^/]+|/root)$"
+    r"^(?:[A-Za-z]:[\\/]Users[\\/][^\\/]+|/home/[^/]+|/Users/[^/]+|/root)$",
+    re.IGNORECASE,
 )
 
 
@@ -70,6 +71,38 @@ def looks_like_bare_home_directory(path_str: "str | None") -> bool:
     if not candidate:
         return False
     return bool(_HOME_DIR_SHAPE_RE.match(candidate))
+
+
+# Spellings that name one place in more than one way. A remote caller can use any of them to reach a folder that the
+# denylist compares by its plain spelling, so they are refused outright rather than rewritten.
+_SHORT_NAME_RE = re.compile(r"~\d")
+_DRIVE_RELATIVE_RE = re.compile(r"^[A-Za-z]:(?![\\/])")
+
+
+def ambiguous_path_spelling(path_str: "str | None") -> "str | None":
+    """Why a remote-supplied path is refused as an ambiguous spelling, or None when it is plain.
+
+    Plain means an ordinary absolute or relative path. Refused: two leading separators of either kind (UNC, device,
+    extended-length, and mixed forms), a drive-relative form, a colon outside the drive (an alternate data stream),
+    an 8.3 short name, a control character, and a ``..`` segment. A ``.`` segment is harmless and is dropped before
+    the name check. The denylist compares paths by their plain spelling, so every other spelling is refused.
+    """
+    if not path_str:
+        return None
+    text = path_str.strip()
+    if any(ord(ch) < 32 for ch in text):
+        return "the path contains a control character"
+    if len(text) >= 2 and text[0] in "\\/" and text[1] in "\\/":
+        return "the path starts with a UNC, device, or extended-length prefix"
+    if _DRIVE_RELATIVE_RE.match(text):
+        return "the path is drive-relative"
+    if ":" in text[2:]:
+        return "the path has a colon outside the drive, which names an alternate data stream"
+    if _SHORT_NAME_RE.search(text):
+        return "the path uses an 8.3 short name"
+    if any(part == ".." for part in re.split(r"[\\/]", text)):
+        return "the path has a .. segment"
+    return None
 
 
 def _is_home_or_ancestor_of_home(path: Path, home: Path) -> bool:

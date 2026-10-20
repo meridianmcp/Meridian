@@ -6791,11 +6791,16 @@ async def _handle_tunnel_tools(
         # whole home tree" failure mode this criterion targets. Fails closed:
         # a bare home-directory string is rejected outright, never silently
         # accepted as a project scope.
-        from ..repo_scope import looks_like_bare_home_directory  # noqa: PLC0415
+        from ..repo_scope import ambiguous_path_spelling, looks_like_bare_home_directory  # noqa: PLC0415
         if looks_like_bare_home_directory(repo_path):
             raise ValueError(
                 f"repo_path looks like a bare home directory ({repo_path!r}), "
                 "not a project checkout -- pass the specific project repo path"
+            )
+        spelling = ambiguous_path_spelling(repo_path)
+        if spelling is not None:
+            raise ValueError(
+                f"repo_path is refused: {spelling} ({repo_path!r}) -- pass a plain absolute project path"
             )
         if tenant is None:
             raise ValueError("set_active_repo requires an authenticated tenant (tunnel mode)")

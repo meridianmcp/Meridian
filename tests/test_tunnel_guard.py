@@ -171,9 +171,10 @@ def test_unparseable_request_naming_a_key_file_fails_closed():
     assert _refused({"id": "r9", "body": body}, label="fs") is not None
 
 
-def test_unparseable_request_naming_nothing_passes_the_guard():
+def test_unparseable_request_is_refused_whole_because_it_cannot_be_checked():
+    # Not JSON, so the guard cannot read it. Refusing it whole closes escaped and encoded names.
     body = base64.b64encode(b"<<<not json>>>").decode()
-    assert _refused({"id": "r10", "body": body}, label="fs") is None
+    assert _refused({"id": "r10", "body": body}, label="fs") is not None
 
 
 # ---------------------------------------------------------------------------

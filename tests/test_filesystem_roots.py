@@ -15,13 +15,19 @@ from meridian.executor_config import normalize_executor_config
 from meridian.routes import tunnel as tn
 
 
+def _p(path: str) -> str:
+    """A path that is absolute on this platform. A POSIX literal such as "/a" has no drive on Windows."""
+    import os  # noqa: PLC0415
+    return os.path.abspath(path)
+
+
 # ---------------------------------------------------------------------------
 # Schema + DB round-trip
 # ---------------------------------------------------------------------------
 
 def test_normalize_executor_config_keeps_filesystem_roots():
-    out = normalize_executor_config({"filesystem_roots": ["/x", "/y"], "bogus": 1})
-    assert out["filesystem_roots"] == ["/x", "/y"]
+    out = normalize_executor_config({"filesystem_roots": [_p("/x"), _p("/y")], "bogus": 1})
+    assert out["filesystem_roots"] == [_p("/x"), _p("/y")]
     assert "bogus" not in out
 
 
@@ -45,13 +51,13 @@ def test_executor_config_filesystem_roots_roundtrip():
 
 def test_union_filesystem_roots_dedupes_and_parses():
     projects = [
-        {"executor_config": json.dumps({"filesystem_roots": ["/a", "/b"]})},
-        {"executor_config": {"filesystem_roots": ["/b", "/c"]}},  # already a dict
+        {"executor_config": json.dumps({"filesystem_roots": [_p("/a"), _p("/b")]})},
+        {"executor_config": {"filesystem_roots": [_p("/b"), _p("/c")]}},  # already a dict
         {"executor_config": None},                                 # no config
         {"executor_config": "not json at all"},                    # malformed
-        {"executor_config": json.dumps({"filesystem_roots": [" ", 5, "/d "]})},  # junk + trim
+        {"executor_config": json.dumps({"filesystem_roots": [" ", 5, _p("/d ")]})},  # junk + trim
     ]
-    assert tn._union_filesystem_roots(projects) == ["/a", "/b", "/c", "/d"]
+    assert tn._union_filesystem_roots(projects) == [_p("/a"), _p("/b"), _p("/c"), _p("/d")]
 
 
 def test_union_filesystem_roots_empty_when_none_set():
@@ -137,23 +143,23 @@ def test_union_filesystem_roots_keeps_path_with_space():
 # ---------------------------------------------------------------------------
 
 def test_build_proxy_command_uses_roots_when_provided():
-    cmd = tc._build_proxy_command("npx", "/home/me", 8808, roots=["/a", "/b"])
+    cmd = tc._build_proxy_command("npx", _p("/home/me"), 8808, roots=[_p("/a"), _p("/b")])
     assert tc.FS_SERVER_PACKAGE in cmd
     # Both roots are appended as the served dirs.
     sep = cmd.index("--")
-    assert cmd[sep + 1:] == ["npx", "-y", tc.FS_SERVER_PACKAGE, "/a", "/b"]
+    assert cmd[sep + 1:] == ["npx", "-y", tc.FS_SERVER_PACKAGE, _p("/a"), _p("/b")]
 
 
 def test_build_proxy_command_falls_back_to_repo_path():
-    cmd = tc._build_proxy_command("npx", "/home/me", 8808, roots=[])
-    assert cmd[-1] == "/home/me"
+    cmd = tc._build_proxy_command("npx", _p("/home/me"), 8808, roots=[])
+    assert cmd[-1] == _p("/home/me")
     # None behaves the same (default unchanged).
-    assert tc._build_proxy_command("npx", "/home/me", 8808)[-1] == "/home/me"
+    assert tc._build_proxy_command("npx", _p("/home/me"), 8808)[-1] == _p("/home/me")
 
 
 def test_build_proxy_command_ignores_blank_roots():
-    cmd = tc._build_proxy_command("npx", "/home/me", 8808, roots=["", "  "])
-    assert cmd[-1] == "/home/me"
+    cmd = tc._build_proxy_command("npx", _p("/home/me"), 8808, roots=["", "  "])
+    assert cmd[-1] == _p("/home/me")
 
 
 def test_unservable_roots_flags_missing_and_space(tmp_path, monkeypatch):
@@ -183,27 +189,27 @@ def test_unservable_roots_flags_missing_and_space(tmp_path, monkeypatch):
 
 def test_union_repo_paths_collects_from_executor_config():
     projects = [
-        {"executor_config": json.dumps({"repo_path": "/home/me/proj"})},
-        {"executor_config": {"repo_path": "/other/repo"}},   # already a dict
+        {"executor_config": json.dumps({"repo_path": _p("/home/me/proj")})},
+        {"executor_config": {"repo_path": _p("/other/repo")}},   # already a dict
         {"executor_config": None},                            # no config
         {"executor_config": "bad json"},                      # malformed
         {"executor_config": json.dumps({"repo_path": "  "})},  # blank
     ]
-    assert tn._union_repo_paths(projects) == ["/home/me/proj", "/other/repo"]
+    assert tn._union_repo_paths(projects) == [_p("/home/me/proj"), _p("/other/repo")]
 
 
 def test_union_repo_paths_deduplicates():
     projects = [
-        {"executor_config": json.dumps({"repo_path": "/a"})},
-        {"executor_config": json.dumps({"repo_path": "/a"})},
-        {"executor_config": json.dumps({"repo_path": "/b"})},
+        {"executor_config": json.dumps({"repo_path": _p("/a")})},
+        {"executor_config": json.dumps({"repo_path": _p("/a")})},
+        {"executor_config": json.dumps({"repo_path": _p("/b")})},
     ]
-    assert tn._union_repo_paths(projects) == ["/a", "/b"]
+    assert tn._union_repo_paths(projects) == [_p("/a"), _p("/b")]
 
 
 def test_union_repo_paths_empty():
     assert tn._union_repo_paths([]) == []
-    assert tn._union_repo_paths([{"executor_config": json.dumps({"filesystem_roots": ["/x"]})}]) == []
+    assert tn._union_repo_paths([{"executor_config": json.dumps({"filesystem_roots": [_p("/x")]})}]) == []
 
 
 # ---------------------------------------------------------------------------
@@ -215,11 +221,11 @@ def test_normalize_executor_config_keeps_serena_repo_path_and_code_dirs():
     is preserved (and junk keys are still dropped)."""
     out = normalize_executor_config({
         "serena_repo_path": "  C:/repo  ",
-        "codebase_code_dirs": ["/a", "/b"],
+        "codebase_code_dirs": [_p("/a"), _p("/b")],
         "bogus": 1,
     })
     assert out["serena_repo_path"] == "C:/repo"          # str trimmed
-    assert out["codebase_code_dirs"] == ["/a", "/b"]     # non-empty list kept
+    assert out["codebase_code_dirs"] == [_p("/a"), _p("/b")]     # non-empty list kept
     assert "bogus" not in out
 
 
@@ -249,18 +255,18 @@ def test_executor_config_serena_and_code_dirs_roundtrip():
 
 def test_first_serena_repo_path_takes_first_non_empty():
     projects = [
-        {"executor_config": json.dumps({"repo_path": "/x"})},          # no serena key
+        {"executor_config": json.dumps({"repo_path": _p("/x")})},          # no serena key
         {"executor_config": json.dumps({"serena_repo_path": "  "})},   # blank → skip
-        {"executor_config": {"serena_repo_path": "/first/repo"}},      # dict, wins
-        {"executor_config": json.dumps({"serena_repo_path": "/second"})},
+        {"executor_config": {"serena_repo_path": _p("/first/repo")}},      # dict, wins
+        {"executor_config": json.dumps({"serena_repo_path": _p("/second")})},
     ]
-    assert tn._first_serena_repo_path(projects) == "/first/repo"
+    assert tn._first_serena_repo_path(projects) == _p("/first/repo")
 
 
 def test_first_serena_repo_path_empty_when_unset():
     assert tn._first_serena_repo_path([]) == ""
     assert tn._first_serena_repo_path(
-        [{"executor_config": json.dumps({"filesystem_roots": ["/x"]})},
+        [{"executor_config": json.dumps({"filesystem_roots": [_p("/x")]})},
          {"executor_config": None},
          {"executor_config": "not json"}]
     ) == ""
@@ -268,19 +274,19 @@ def test_first_serena_repo_path_empty_when_unset():
 
 def test_union_codebase_code_dirs_dedupes_and_parses():
     projects = [
-        {"executor_config": json.dumps({"codebase_code_dirs": ["/a", "/b"]})},
-        {"executor_config": {"codebase_code_dirs": ["/b", "/c"]}},     # dict, dedupe /b
+        {"executor_config": json.dumps({"codebase_code_dirs": [_p("/a"), _p("/b")]})},
+        {"executor_config": {"codebase_code_dirs": [_p("/b"), _p("/c")]}},     # dict, dedupe /b
         {"executor_config": None},                                     # no config
         {"executor_config": "bad json"},                               # malformed
-        {"executor_config": json.dumps({"codebase_code_dirs": [" ", 5, "/d "]})},
+        {"executor_config": json.dumps({"codebase_code_dirs": [" ", 5, _p("/d ")]})},
     ]
-    assert tn._union_codebase_code_dirs(projects) == ["/a", "/b", "/c", "/d"]
+    assert tn._union_codebase_code_dirs(projects) == [_p("/a"), _p("/b"), _p("/c"), _p("/d")]
 
 
 def test_union_codebase_code_dirs_empty_when_unset():
     assert tn._union_codebase_code_dirs([]) == []
     assert tn._union_codebase_code_dirs(
-        [{"executor_config": json.dumps({"repo_path": "/x"})}]
+        [{"executor_config": json.dumps({"repo_path": _p("/x")})}]
     ) == []
 
 
@@ -289,25 +295,25 @@ def test_union_codebase_code_dirs_empty_when_unset():
 # ---------------------------------------------------------------------------
 
 def test_add_fs_roots_to_cmd_appends_new_roots():
-    cmd = tc._build_proxy_command("npx", "/home/me", 8808, roots=["/a"])
-    updated, changed = tc._add_fs_roots_to_cmd(cmd, ["/b", "/c"])
+    cmd = tc._build_proxy_command("npx", _p("/home/me"), 8808, roots=[_p("/a")])
+    updated, changed = tc._add_fs_roots_to_cmd(cmd, [_p("/b"), _p("/c")])
     assert changed is True
     assert tc.FS_SERVER_PACKAGE in updated
-    assert "/b" in updated
-    assert "/c" in updated
-    assert "/a" in updated
+    assert _p("/b") in updated
+    assert _p("/c") in updated
+    assert _p("/a") in updated
 
 
 def test_add_fs_roots_to_cmd_deduplicates_existing():
-    cmd = tc._build_proxy_command("npx", "/home/me", 8808, roots=["/a", "/b"])
-    updated, changed = tc._add_fs_roots_to_cmd(cmd, ["/a", "/b"])
+    cmd = tc._build_proxy_command("npx", _p("/home/me"), 8808, roots=[_p("/a"), _p("/b")])
+    updated, changed = tc._add_fs_roots_to_cmd(cmd, [_p("/a"), _p("/b")])
     assert changed is False
     assert updated is cmd
 
 
 def test_add_fs_roots_to_cmd_no_server_token():
     cmd = ["npx", "-y", "mcp-proxy", "--port", "8808"]
-    _, changed = tc._add_fs_roots_to_cmd(cmd, ["/x"])
+    _, changed = tc._add_fs_roots_to_cmd(cmd, [_p("/x")])
     assert changed is False
 
 
@@ -341,14 +347,14 @@ def test_extract_denied_path_returns_none_on_bad_body():
 
 def test_is_subpath_detects_child():
     from pathlib import Path
-    assert tc._is_subpath(Path("/a/b/c"), Path("/a/b")) is True
-    assert tc._is_subpath(Path("/a/b"), Path("/a/b")) is True  # same path
+    assert tc._is_subpath(Path(_p("/a/b/c")), Path(_p("/a/b"))) is True
+    assert tc._is_subpath(Path(_p("/a/b")), Path(_p("/a/b"))) is True  # same path
 
 
 def test_is_subpath_rejects_sibling():
     from pathlib import Path
-    assert tc._is_subpath(Path("/a/x"), Path("/a/b")) is False
-    assert tc._is_subpath(Path("/other"), Path("/a/b")) is False
+    assert tc._is_subpath(Path(_p("/a/x")), Path(_p("/a/b"))) is False
+    assert tc._is_subpath(Path(_p("/other")), Path(_p("/a/b"))) is False
 
 
 # ---------------------------------------------------------------------------
@@ -368,7 +374,7 @@ class _FakeFsWS:
 
 
 def test_send_add_fs_roots_control_not_connected():
-    result = asyncio.run(tn.send_add_fs_roots_control("no-tenant", ["/x"]))
+    result = asyncio.run(tn.send_add_fs_roots_control("no-tenant", [_p("/x")]))
     assert result["status"] == "not_connected"
 
 
@@ -376,9 +382,9 @@ def test_send_add_fs_roots_control_ok():
     ws = _FakeFsWS()
     tn._tunnel_sockets["t2"] = ws
     try:
-        result = asyncio.run(tn.send_add_fs_roots_control("t2", ["/a", "/b"]))
-        assert result == {"status": "ok", "roots": ["/a", "/b"]}
-        assert ws.sent == [{"type": "add_fs_roots", "roots": ["/a", "/b"]}]
+        result = asyncio.run(tn.send_add_fs_roots_control("t2", [_p("/a"), _p("/b")]))
+        assert result == {"status": "ok", "roots": [_p("/a"), _p("/b")]}
+        assert ws.sent == [{"type": "add_fs_roots", "roots": [_p("/a"), _p("/b")]}]
     finally:
         tn._tunnel_sockets.pop("t2", None)
 
@@ -387,7 +393,7 @@ def test_send_add_fs_roots_control_send_error():
     ws = _FakeFsWS(raise_on_send=True)
     tn._tunnel_sockets["t3"] = ws
     try:
-        result = asyncio.run(tn.send_add_fs_roots_control("t3", ["/x"]))
+        result = asyncio.run(tn.send_add_fs_roots_control("t3", [_p("/x")]))
         assert result["status"] == "error"
     finally:
         tn._tunnel_sockets.pop("t3", None)
@@ -402,12 +408,12 @@ def test_run_connection_lazy_handles_add_fs_roots(monkeypatch):
     import websockets as _ws
     import httpx as _httpx
 
-    cmd_orig = tc._build_proxy_command("npx", "/home/me", 8808, roots=["/a"])
+    cmd_orig = tc._build_proxy_command("npx", _p("/home/me"), 8808, roots=[_p("/a")])
 
     class FakeWS:
         def __init__(self):
             self._msgs = [
-                json.dumps({"type": "add_fs_roots", "roots": ["/b"]}),
+                json.dumps({"type": "add_fs_roots", "roots": [_p("/b")]}),
             ]
         async def __aenter__(self): return self
         async def __aexit__(self, *a): pass
@@ -438,7 +444,7 @@ def test_run_connection_lazy_handles_add_fs_roots(monkeypatch):
     monkeypatch.setattr(tc.SlotProxy, "ensure_running", fake_ensure)
 
     asyncio.run(tc._run_connection_lazy("wss://x/tunnel/t", proxy, "fs"))
-    assert "/b" in proxy.cmd
+    assert _p("/b") in proxy.cmd
 
 
 class _FakeProc:
@@ -467,14 +473,14 @@ def test_get_tunnel_filesystem_roots_returns_serena_and_code_dirs(monkeypatch):
     codebase_code_dirs (deduped union) alongside the existing fields."""
     projects = [
         {"executor_config": json.dumps({
-            "filesystem_roots": ["/root/a"],
-            "repo_path": "/repo/a",
-            "serena_repo_path": "/serena/a",
-            "codebase_code_dirs": ["/code/a", "/code/b"],
+            "filesystem_roots": [_p("/root/a")],
+            "repo_path": _p("/repo/a"),
+            "serena_repo_path": _p("/serena/a"),
+            "codebase_code_dirs": [_p("/code/a"), _p("/code/b")],
         })},
         {"executor_config": json.dumps({
-            "serena_repo_path": "/serena/b",       # second project — first wins
-            "codebase_code_dirs": ["/code/b", "/code/c"],  # /code/b dedupes
+            "serena_repo_path": _p("/serena/b"),       # second project — first wins
+            "codebase_code_dirs": [_p("/code/b"), _p("/code/c")],  # /code/b dedupes
         })},
     ]
     monkeypatch.setattr(tn, "_get_tenant_from_request", AsyncMock(return_value={"id": "t1"}))
@@ -483,15 +489,15 @@ def test_get_tunnel_filesystem_roots_returns_serena_and_code_dirs(monkeypatch):
 
     resp = asyncio.run(tn.get_tunnel_filesystem_roots(object()))
     data = _decode_route_body(resp)
-    assert data["filesystem_roots"] == ["/root/a"]
-    assert data["known_repo_paths"] == ["/repo/a"]
-    assert data["serena_repo_path"] == "/serena/a"                      # first non-empty
-    assert data["codebase_code_dirs"] == ["/code/a", "/code/b", "/code/c"]  # deduped union
+    assert data["filesystem_roots"] == [_p("/root/a")]
+    assert data["known_repo_paths"] == [_p("/repo/a")]
+    assert data["serena_repo_path"] == _p("/serena/a")                      # first non-empty
+    assert data["codebase_code_dirs"] == [_p("/code/a"), _p("/code/b"), _p("/code/c")]  # deduped union
 
 
 def test_get_tunnel_filesystem_roots_defaults_when_unset(monkeypatch):
     """No project configures the new keys → empty defaults (today's behaviour)."""
-    projects = [{"executor_config": json.dumps({"filesystem_roots": ["/x"]})}]
+    projects = [{"executor_config": json.dumps({"filesystem_roots": [_p("/x")]})}]
     monkeypatch.setattr(tn, "_get_tenant_from_request", AsyncMock(return_value={"id": "t1"}))
     monkeypatch.setattr(tn, "_db", AsyncMock(return_value=object()))
     monkeypatch.setattr(tn.db_module, "list_projects", AsyncMock(return_value=projects))
@@ -569,33 +575,33 @@ def test_fetch_filesystem_roots_defaults_on_error(monkeypatch):
 def test_set_fs_roots_on_cmd_replaces_dirs_exactly():
     """The dirs after the fs-server token are REPLACED with exactly the new set
     (normalized, deduped, order-preserved) — a removal shrinks the served list."""
-    cmd = tc._build_proxy_command("npx", "/home/me", 8808, roots=["/a", "/b", "/c"])
-    updated, changed = tc._set_fs_roots_on_cmd(cmd, ["/a", "/c"])
+    cmd = tc._build_proxy_command("npx", _p("/home/me"), 8808, roots=[_p("/a"), _p("/b"), _p("/c")])
+    updated, changed = tc._set_fs_roots_on_cmd(cmd, [_p("/a"), _p("/c")])
     assert changed is True
     idx = updated.index(tc.FS_SERVER_PACKAGE)
-    assert updated[idx + 1:] == ["/a", "/c"]  # /b removed, order kept
+    assert updated[idx + 1:] == [_p("/a"), _p("/c")]  # /b removed, order kept
 
 
 def test_set_fs_roots_on_cmd_dequotes_and_dedupes():
     """Quoted paths are de-quoted (via _normalize_path_arg) and exact dups collapse."""
-    cmd = tc._build_proxy_command("npx", "/home/me", 8808, roots=["/a"])
-    updated, changed = tc._set_fs_roots_on_cmd(cmd, ['"/x"', "/x", "  /y  "])
+    cmd = tc._build_proxy_command("npx", _p("/home/me"), 8808, roots=[_p("/a")])
+    updated, changed = tc._set_fs_roots_on_cmd(cmd, ['"' + _p("/x") + '"', _p("/x"), "  " + _p("/y") + "  "])
     assert changed is True
     idx = updated.index(tc.FS_SERVER_PACKAGE)
-    assert updated[idx + 1:] == ["/x", "/y"]
+    assert updated[idx + 1:] == [_p("/x"), _p("/y")]
 
 
 def test_set_fs_roots_on_cmd_noop_when_unchanged():
     """Requesting the current dir set changes nothing (changed False, cmd is-same)."""
-    cmd = tc._build_proxy_command("npx", "/home/me", 8808, roots=["/a", "/b"])
-    updated, changed = tc._set_fs_roots_on_cmd(cmd, ["/a", "/b"])
+    cmd = tc._build_proxy_command("npx", _p("/home/me"), 8808, roots=[_p("/a"), _p("/b")])
+    updated, changed = tc._set_fs_roots_on_cmd(cmd, [_p("/a"), _p("/b")])
     assert changed is False
     assert updated is cmd
 
 
 def test_set_fs_roots_on_cmd_refuses_empty():
     """An empty/all-blank list is a no-op — never strip the fs server to zero dirs."""
-    cmd = tc._build_proxy_command("npx", "/home/me", 8808, roots=["/a"])
+    cmd = tc._build_proxy_command("npx", _p("/home/me"), 8808, roots=[_p("/a")])
     for empty in ([], ["", "  "], ['""']):
         updated, changed = tc._set_fs_roots_on_cmd(cmd, empty)
         assert changed is False
@@ -605,7 +611,7 @@ def test_set_fs_roots_on_cmd_refuses_empty():
 def test_set_fs_roots_on_cmd_no_server_token():
     """No fs-server token in the command → no change."""
     cmd = ["npx", "-y", "mcp-proxy", "--port", "8808"]
-    _, changed = tc._set_fs_roots_on_cmd(cmd, ["/x"])
+    _, changed = tc._set_fs_roots_on_cmd(cmd, [_p("/x")])
     assert changed is False
 
 
@@ -621,12 +627,12 @@ def test_run_connection_lazy_handles_set_fs_roots(monkeypatch):
     import httpx as _httpx
 
     # Start with 3 roots served; set_fs_roots down to 2 (a removal).
-    cmd_orig = tc._build_proxy_command("npx", "/home/me", 8808, roots=["/a", "/b", "/c"])
+    cmd_orig = tc._build_proxy_command("npx", _p("/home/me"), 8808, roots=[_p("/a"), _p("/b"), _p("/c")])
 
     class FakeWS:
         def __init__(self):
             self._msgs = [
-                json.dumps({"type": "set_fs_roots", "roots": ['"/a"', "/c"]}),
+                json.dumps({"type": "set_fs_roots", "roots": ['"' + _p("/a") + '"', _p("/c")]}),
             ]
         async def __aenter__(self): return self
         async def __aexit__(self, *a): pass
@@ -670,8 +676,8 @@ def test_run_connection_lazy_handles_set_fs_roots(monkeypatch):
     asyncio.run(tc._run_connection_lazy("wss://x/tunnel/t", proxy, "fs"))
 
     idx = proxy.cmd.index(tc.FS_SERVER_PACKAGE)
-    assert proxy.cmd[idx + 1:] == ["/a", "/c"]  # exactly the new set, de-quoted
-    assert "/b" not in proxy.cmd                 # the removed root is gone
+    assert proxy.cmd[idx + 1:] == [_p("/a"), _p("/c")]  # exactly the new set, de-quoted
+    assert _p("/b") not in proxy.cmd                 # the removed root is gone
     assert kills["n"] == 1 and respawns["n"] == 1
 
 
@@ -680,7 +686,7 @@ def test_run_connection_lazy_handles_set_fs_roots(monkeypatch):
 # ---------------------------------------------------------------------------
 
 def test_send_set_fs_roots_control_not_connected():
-    result = asyncio.run(tn.send_set_fs_roots_control("no-tenant", ["/x"]))
+    result = asyncio.run(tn.send_set_fs_roots_control("no-tenant", [_p("/x")]))
     assert result["status"] == "not_connected"
 
 
@@ -688,9 +694,9 @@ def test_send_set_fs_roots_control_ok():
     ws = _FakeFsWS()
     tn._tunnel_sockets["t-set"] = ws
     try:
-        result = asyncio.run(tn.send_set_fs_roots_control("t-set", ["/a", "/b"]))
-        assert result == {"status": "ok", "roots": ["/a", "/b"]}
-        assert ws.sent == [{"type": "set_fs_roots", "roots": ["/a", "/b"]}]
+        result = asyncio.run(tn.send_set_fs_roots_control("t-set", [_p("/a"), _p("/b")]))
+        assert result == {"status": "ok", "roots": [_p("/a"), _p("/b")]}
+        assert ws.sent == [{"type": "set_fs_roots", "roots": [_p("/a"), _p("/b")]}]
     finally:
         tn._tunnel_sockets.pop("t-set", None)
 
@@ -699,7 +705,7 @@ def test_send_set_fs_roots_control_send_error():
     ws = _FakeFsWS(raise_on_send=True)
     tn._tunnel_sockets["t-set-err"] = ws
     try:
-        result = asyncio.run(tn.send_set_fs_roots_control("t-set-err", ["/x"]))
+        result = asyncio.run(tn.send_set_fs_roots_control("t-set-err", [_p("/x")]))
         assert result["status"] == "error"
     finally:
         tn._tunnel_sockets.pop("t-set-err", None)
@@ -713,29 +719,29 @@ def test_persist_add_filesystem_root_appends_and_returns_union():
     async def _run():
         db = await db_module.init_db(":memory:")
         p1 = await db_module.create_project(db, "fs-add-1")
-        await db_module.set_executor_config(db, p1["id"], {"filesystem_roots": ["/a"]})
+        await db_module.set_executor_config(db, p1["id"], {"filesystem_roots": [_p("/a")]})
         projects = await db_module.list_projects(db)
-        union = await tn._persist_add_filesystem_root(db, projects, "/b")
+        union = await tn._persist_add_filesystem_root(db, projects, _p("/b"))
         # Re-read from DB to confirm it persisted (not just the in-memory copy).
         cfg = await db_module.get_executor_config(db, p1["id"])
         return union, cfg
     union, cfg = asyncio.run(_run())
-    assert union == ["/a", "/b"]
-    assert cfg["filesystem_roots"] == ["/a", "/b"]
+    assert union == [_p("/a"), _p("/b")]
+    assert cfg["filesystem_roots"] == [_p("/a"), _p("/b")]
 
 
 def test_persist_add_filesystem_root_dedupes_existing():
     async def _run():
         db = await db_module.init_db(":memory:")
         p1 = await db_module.create_project(db, "fs-add-dup")
-        await db_module.set_executor_config(db, p1["id"], {"filesystem_roots": ["/a"]})
+        await db_module.set_executor_config(db, p1["id"], {"filesystem_roots": [_p("/a")]})
         projects = await db_module.list_projects(db)
-        union = await tn._persist_add_filesystem_root(db, projects, "/a")
+        union = await tn._persist_add_filesystem_root(db, projects, _p("/a"))
         cfg = await db_module.get_executor_config(db, p1["id"])
         return union, cfg
     union, cfg = asyncio.run(_run())
-    assert union == ["/a"]
-    assert cfg["filesystem_roots"] == ["/a"]  # no duplicate written
+    assert union == [_p("/a")]
+    assert cfg["filesystem_roots"] == [_p("/a")]  # no duplicate written
 
 
 def test_persist_remove_filesystem_root_strips_from_all_projects():
@@ -743,17 +749,17 @@ def test_persist_remove_filesystem_root_strips_from_all_projects():
         db = await db_module.init_db(":memory:")
         p1 = await db_module.create_project(db, "fs-rm-1")
         p2 = await db_module.create_project(db, "fs-rm-2")
-        await db_module.set_executor_config(db, p1["id"], {"filesystem_roots": ["/a", "/shared"]})
-        await db_module.set_executor_config(db, p2["id"], {"filesystem_roots": ["/shared", "/b"]})
+        await db_module.set_executor_config(db, p1["id"], {"filesystem_roots": [_p("/a"), _p("/shared")]})
+        await db_module.set_executor_config(db, p2["id"], {"filesystem_roots": [_p("/shared"), _p("/b")]})
         projects = await db_module.list_projects(db)
-        union = await tn._persist_remove_filesystem_root(db, projects, "/shared")
+        union = await tn._persist_remove_filesystem_root(db, projects, _p("/shared"))
         c1 = await db_module.get_executor_config(db, p1["id"])
         c2 = await db_module.get_executor_config(db, p2["id"])
         return union, c1, c2
     union, c1, c2 = asyncio.run(_run())
-    assert "/shared" not in union
-    assert c1["filesystem_roots"] == ["/a"]
-    assert c2["filesystem_roots"] == ["/b"]
+    assert _p("/shared") not in union
+    assert c1["filesystem_roots"] == [_p("/a")]
+    assert c2["filesystem_roots"] == [_p("/b")]
 
 
 # ---------------------------------------------------------------------------
@@ -783,45 +789,45 @@ def _patch_route_db(monkeypatch, projects):
 def test_add_route_persists_and_pushes_add_control(monkeypatch):
     """POST persists the root via _persist_add_filesystem_root AND pushes it live
     via send_add_fs_roots_control (spied). Returns the union + live status."""
-    projects = [{"id": "p1", "executor_config": json.dumps({"filesystem_roots": ["/a"]})}]
+    projects = [{"id": "p1", "executor_config": json.dumps({"filesystem_roots": [_p("/a")]})}]
     _patch_route_db(monkeypatch, projects)
-    persisted = AsyncMock(return_value=["/a", "/b"])
+    persisted = AsyncMock(return_value=[_p("/a"), _p("/b")])
     monkeypatch.setattr(tn, "_persist_add_filesystem_root", persisted)
-    add_spy = AsyncMock(return_value={"status": "ok", "roots": ["/b"]})
+    add_spy = AsyncMock(return_value={"status": "ok", "roots": [_p("/b")]})
     monkeypatch.setattr(tn, "send_add_fs_roots_control", add_spy)
 
-    resp = asyncio.run(tn.add_tunnel_filesystem_root(_FakeReq(body={"path": "/b"})))
+    resp = asyncio.run(tn.add_tunnel_filesystem_root(_FakeReq(body={"path": _p("/b")})))
     data = _decode_route_body(resp)
-    assert data["roots"] == ["/a", "/b"]
-    assert data["live"] == {"status": "ok", "roots": ["/b"]}
+    assert data["roots"] == [_p("/a"), _p("/b")]
+    assert data["live"] == {"status": "ok", "roots": [_p("/b")]}
     # persisted with the normalized path; live pushed the same single path.
-    assert persisted.await_args.args[2] == "/b"
-    add_spy.assert_awaited_once_with("t1", ["/b"])
+    assert persisted.await_args.args[2] == _p("/b")
+    add_spy.assert_awaited_once_with("t1", [_p("/b")])
 
 
 def test_add_route_dequotes_path(monkeypatch):
     """A quoted path is de-quoted before persist + live push."""
     projects = [{"id": "p1", "executor_config": json.dumps({"filesystem_roots": []})}]
     _patch_route_db(monkeypatch, projects)
-    persisted = AsyncMock(return_value=["/quoted/dir"])
+    persisted = AsyncMock(return_value=[_p("/quoted/dir")])
     monkeypatch.setattr(tn, "_persist_add_filesystem_root", persisted)
     add_spy = AsyncMock(return_value={"status": "not_connected"})
     monkeypatch.setattr(tn, "send_add_fs_roots_control", add_spy)
 
-    resp = asyncio.run(tn.add_tunnel_filesystem_root(_FakeReq(body={"path": '"/quoted/dir"'})))
-    assert _decode_route_body(resp)["roots"] == ["/quoted/dir"]
-    assert persisted.await_args.args[2] == "/quoted/dir"        # de-quoted for persist
-    add_spy.assert_awaited_once_with("t1", ["/quoted/dir"])     # de-quoted for live push
+    resp = asyncio.run(tn.add_tunnel_filesystem_root(_FakeReq(body={"path": '"' + _p("/quoted/dir") + '"'})))
+    assert _decode_route_body(resp)["roots"] == [_p("/quoted/dir")]
+    assert persisted.await_args.args[2] == _p("/quoted/dir")        # de-quoted for persist
+    add_spy.assert_awaited_once_with("t1", [_p("/quoted/dir")])     # de-quoted for live push
 
 
 def test_add_route_accepts_root_key(monkeypatch):
     """The body may use "root" instead of "path"."""
     projects = [{"id": "p1", "executor_config": json.dumps({"filesystem_roots": []})}]
     _patch_route_db(monkeypatch, projects)
-    monkeypatch.setattr(tn, "_persist_add_filesystem_root", AsyncMock(return_value=["/via-root"]))
+    monkeypatch.setattr(tn, "_persist_add_filesystem_root", AsyncMock(return_value=[_p("/via-root")]))
     monkeypatch.setattr(tn, "send_add_fs_roots_control", AsyncMock(return_value={"status": "ok"}))
-    resp = asyncio.run(tn.add_tunnel_filesystem_root(_FakeReq(body={"root": "/via-root"})))
-    assert _decode_route_body(resp)["roots"] == ["/via-root"]
+    resp = asyncio.run(tn.add_tunnel_filesystem_root(_FakeReq(body={"root": _p("/via-root")})))
+    assert _decode_route_body(resp)["roots"] == [_p("/via-root")]
 
 
 def test_add_route_rejects_empty_path(monkeypatch):
@@ -841,7 +847,7 @@ def test_add_route_rejects_empty_path(monkeypatch):
 def test_add_route_requires_auth(monkeypatch):
     """No tenant → 401."""
     monkeypatch.setattr(tn, "_get_tenant_from_request", AsyncMock(return_value=None))
-    resp = asyncio.run(tn.add_tunnel_filesystem_root(_FakeReq(body={"path": "/x"})))
+    resp = asyncio.run(tn.add_tunnel_filesystem_root(_FakeReq(body={"path": _p("/x")})))
     assert resp.status_code == 401
 
 
@@ -852,48 +858,48 @@ def test_add_route_requires_auth(monkeypatch):
 def test_delete_route_persists_and_pushes_set_control(monkeypatch):
     """DELETE persists the removal via _persist_remove_filesystem_root AND pushes
     the FULL new list live via send_set_fs_roots_control (spied)."""
-    projects = [{"id": "p1", "executor_config": json.dumps({"filesystem_roots": ["/a", "/b"]})}]
+    projects = [{"id": "p1", "executor_config": json.dumps({"filesystem_roots": [_p("/a"), _p("/b")]})}]
     _patch_route_db(monkeypatch, projects)
-    persisted = AsyncMock(return_value=["/a"])  # /b removed → union is ["/a"]
+    persisted = AsyncMock(return_value=[_p("/a")])  # /b removed → union is [_p("/a")]
     monkeypatch.setattr(tn, "_persist_remove_filesystem_root", persisted)
-    set_spy = AsyncMock(return_value={"status": "ok", "roots": ["/a"]})
+    set_spy = AsyncMock(return_value={"status": "ok", "roots": [_p("/a")]})
     monkeypatch.setattr(tn, "send_set_fs_roots_control", set_spy)
 
-    resp = asyncio.run(tn.remove_tunnel_filesystem_root(_FakeReq(body={"path": "/b"})))
+    resp = asyncio.run(tn.remove_tunnel_filesystem_root(_FakeReq(body={"path": _p("/b")})))
     data = _decode_route_body(resp)
-    assert data["roots"] == ["/a"]
-    assert data["live"] == {"status": "ok", "roots": ["/a"]}
-    assert persisted.await_args.args[2] == "/b"
+    assert data["roots"] == [_p("/a")]
+    assert data["live"] == {"status": "ok", "roots": [_p("/a")]}
+    assert persisted.await_args.args[2] == _p("/b")
     # set_fs_roots gets the FULL remaining list, not the removed path.
-    set_spy.assert_awaited_once_with("t1", ["/a"])
+    set_spy.assert_awaited_once_with("t1", [_p("/a")])
 
 
 def test_delete_route_reads_path_from_query(monkeypatch):
     """The path may come from ?path= (no body)."""
-    projects = [{"id": "p1", "executor_config": json.dumps({"filesystem_roots": ["/a", "/b"]})}]
+    projects = [{"id": "p1", "executor_config": json.dumps({"filesystem_roots": [_p("/a"), _p("/b")]})}]
     _patch_route_db(monkeypatch, projects)
-    persisted = AsyncMock(return_value=["/a"])
+    persisted = AsyncMock(return_value=[_p("/a")])
     monkeypatch.setattr(tn, "_persist_remove_filesystem_root", persisted)
     monkeypatch.setattr(tn, "send_set_fs_roots_control", AsyncMock(return_value={"status": "ok"}))
     resp = asyncio.run(
-        tn.remove_tunnel_filesystem_root(_FakeReq(query={"path": "/b"}, bad_json=True))
+        tn.remove_tunnel_filesystem_root(_FakeReq(query={"path": _p("/b")}, bad_json=True))
     )
-    assert _decode_route_body(resp)["roots"] == ["/a"]
-    assert persisted.await_args.args[2] == "/b"
+    assert _decode_route_body(resp)["roots"] == [_p("/a")]
+    assert persisted.await_args.args[2] == _p("/b")
 
 
 def test_delete_route_dequotes_path(monkeypatch):
     """A quoted path is de-quoted before the remove + live push."""
-    projects = [{"id": "p1", "executor_config": json.dumps({"filesystem_roots": ["/keep", "/drop"]})}]
+    projects = [{"id": "p1", "executor_config": json.dumps({"filesystem_roots": [_p("/keep"), _p("/drop")]})}]
     _patch_route_db(monkeypatch, projects)
-    persisted = AsyncMock(return_value=["/keep"])
+    persisted = AsyncMock(return_value=[_p("/keep")])
     monkeypatch.setattr(tn, "_persist_remove_filesystem_root", persisted)
     set_spy = AsyncMock(return_value={"status": "ok"})
     monkeypatch.setattr(tn, "send_set_fs_roots_control", set_spy)
-    resp = asyncio.run(tn.remove_tunnel_filesystem_root(_FakeReq(body={"path": '"/drop"'})))
-    assert _decode_route_body(resp)["roots"] == ["/keep"]
-    assert persisted.await_args.args[2] == "/drop"  # de-quoted
-    set_spy.assert_awaited_once_with("t1", ["/keep"])
+    resp = asyncio.run(tn.remove_tunnel_filesystem_root(_FakeReq(body={"path": '"' + _p("/drop") + '"'})))
+    assert _decode_route_body(resp)["roots"] == [_p("/keep")]
+    assert persisted.await_args.args[2] == _p("/drop")  # de-quoted
+    set_spy.assert_awaited_once_with("t1", [_p("/keep")])
 
 
 def test_delete_route_rejects_empty_path(monkeypatch):
@@ -912,7 +918,7 @@ def test_delete_route_rejects_empty_path(monkeypatch):
 def test_delete_route_requires_auth(monkeypatch):
     """No tenant → 401."""
     monkeypatch.setattr(tn, "_get_tenant_from_request", AsyncMock(return_value=None))
-    resp = asyncio.run(tn.remove_tunnel_filesystem_root(_FakeReq(body={"path": "/x"})))
+    resp = asyncio.run(tn.remove_tunnel_filesystem_root(_FakeReq(body={"path": _p("/x")})))
     assert resp.status_code == 401
 
 
@@ -926,7 +932,7 @@ def test_add_then_delete_route_roundtrip_real_db(monkeypatch):
     async def _run():
         db = await db_module.init_db(":memory:")
         p1 = await db_module.create_project(db, "fs-e2e")
-        await db_module.set_executor_config(db, p1["id"], {"filesystem_roots": ["/existing"]})
+        await db_module.set_executor_config(db, p1["id"], {"filesystem_roots": [_p("/existing")]})
 
         monkeypatch.setattr(tn, "_get_tenant_from_request", AsyncMock(return_value={"id": "t1"}))
         monkeypatch.setattr(tn, "_db", AsyncMock(return_value=db))
@@ -936,24 +942,24 @@ def test_add_then_delete_route_roundtrip_real_db(monkeypatch):
         monkeypatch.setattr(tn, "send_add_fs_roots_control", add_spy)
         monkeypatch.setattr(tn, "send_set_fs_roots_control", set_spy)
 
-        add_resp = await tn.add_tunnel_filesystem_root(_FakeReq(body={"path": "  /new/dir  "}))
+        add_resp = await tn.add_tunnel_filesystem_root(_FakeReq(body={"path": "  " + _p("/new/dir") + "  "}))
         after_add = await db_module.get_executor_config(db, p1["id"])
 
-        del_resp = await tn.remove_tunnel_filesystem_root(_FakeReq(body={"path": "/existing"}))
+        del_resp = await tn.remove_tunnel_filesystem_root(_FakeReq(body={"path": _p("/existing")}))
         after_del = await db_module.get_executor_config(db, p1["id"])
         return (_decode_route_body(add_resp), after_add,
                 _decode_route_body(del_resp), after_del, add_spy, set_spy)
 
     add_data, after_add, del_data, after_del, add_spy, set_spy = asyncio.run(_run())
     # ADD: normalized (trimmed) path appended + persisted; union returned.
-    assert add_data["roots"] == ["/existing", "/new/dir"]
-    assert after_add["filesystem_roots"] == ["/existing", "/new/dir"]
-    add_spy.assert_awaited_once_with("t1", ["/new/dir"])
+    assert add_data["roots"] == [_p("/existing"), _p("/new/dir")]
+    assert after_add["filesystem_roots"] == [_p("/existing"), _p("/new/dir")]
+    add_spy.assert_awaited_once_with("t1", [_p("/new/dir")])
     # DELETE: /existing stripped from the persisted config; set_fs_roots gets the
     # remaining full list.
-    assert del_data["roots"] == ["/new/dir"]
-    assert after_del["filesystem_roots"] == ["/new/dir"]
-    set_spy.assert_awaited_once_with("t1", ["/new/dir"])
+    assert del_data["roots"] == [_p("/new/dir")]
+    assert after_del["filesystem_roots"] == [_p("/new/dir")]
+    set_spy.assert_awaited_once_with("t1", [_p("/new/dir")])
 
 
 def _patch_filesystem_member_policy(
@@ -982,17 +988,17 @@ def _patch_filesystem_member_policy(
 
 def test_add_route_denies_scoped_member_without_write_project_before_any_changes(monkeypatch):
     projects = [
-        {"id": "p1", "executor_config": json.dumps({"filesystem_roots": ["/one"]})},
-        {"id": "p2", "executor_config": json.dumps({"filesystem_roots": ["/two"]})},
+        {"id": "p1", "executor_config": json.dumps({"filesystem_roots": [_p("/one")]})},
+        {"id": "p2", "executor_config": json.dumps({"filesystem_roots": [_p("/two")]})},
     ]
     _patch_route_db(monkeypatch, projects)
     _patch_filesystem_member_policy(monkeypatch, allows_write=False, project_ids=("p1", "p2"))
-    persisted = AsyncMock(return_value=["/one", "/two", "/new"])
+    persisted = AsyncMock(return_value=[_p("/one"), _p("/two"), _p("/new")])
     live = AsyncMock(return_value={"status": "ok"})
     monkeypatch.setattr(tn, "_persist_add_filesystem_root", persisted)
     monkeypatch.setattr(tn, "send_add_fs_roots_control", live)
 
-    resp = asyncio.run(tn.add_tunnel_filesystem_root(_FakeReq(body={"path": "/new"})))
+    resp = asyncio.run(tn.add_tunnel_filesystem_root(_FakeReq(body={"path": _p("/new")})))
 
     data = _decode_route_body(resp)
     assert resp.status_code == 403
@@ -1004,17 +1010,17 @@ def test_add_route_denies_scoped_member_without_write_project_before_any_changes
 
 def test_delete_route_denies_scoped_member_without_write_project_before_any_changes(monkeypatch):
     projects = [
-        {"id": "p1", "executor_config": json.dumps({"filesystem_roots": ["/one"]})},
-        {"id": "p2", "executor_config": json.dumps({"filesystem_roots": ["/two"]})},
+        {"id": "p1", "executor_config": json.dumps({"filesystem_roots": [_p("/one")]})},
+        {"id": "p2", "executor_config": json.dumps({"filesystem_roots": [_p("/two")]})},
     ]
     _patch_route_db(monkeypatch, projects)
     _patch_filesystem_member_policy(monkeypatch, allows_write=False, project_ids=("p1", "p2"))
-    persisted = AsyncMock(return_value=["/two"])
+    persisted = AsyncMock(return_value=[_p("/two")])
     live = AsyncMock(return_value={"status": "ok"})
     monkeypatch.setattr(tn, "_persist_remove_filesystem_root", persisted)
     monkeypatch.setattr(tn, "send_set_fs_roots_control", live)
 
-    resp = asyncio.run(tn.remove_tunnel_filesystem_root(_FakeReq(body={"path": "/one"})))
+    resp = asyncio.run(tn.remove_tunnel_filesystem_root(_FakeReq(body={"path": _p("/one")})))
 
     data = _decode_route_body(resp)
     assert resp.status_code == 403
@@ -1026,29 +1032,29 @@ def test_delete_route_denies_scoped_member_without_write_project_before_any_chan
 
 def test_add_route_allows_write_project_but_excludes_out_of_scope_projects(monkeypatch):
     projects = [
-        {"id": "p1", "executor_config": json.dumps({"filesystem_roots": ["/one"]})},
-        {"id": "outside", "executor_config": json.dumps({"filesystem_roots": ["/private"]})},
+        {"id": "p1", "executor_config": json.dumps({"filesystem_roots": [_p("/one")]})},
+        {"id": "outside", "executor_config": json.dumps({"filesystem_roots": [_p("/private")]})},
     ]
     _patch_route_db(monkeypatch, projects)
     _patch_filesystem_member_policy(monkeypatch, allows_write=True, project_ids=("p1",))
-    persisted = AsyncMock(return_value=["/one", "/new"])
+    persisted = AsyncMock(return_value=[_p("/one"), _p("/new")])
     live = AsyncMock(return_value={"status": "ok"})
     monkeypatch.setattr(tn, "_persist_add_filesystem_root", persisted)
     monkeypatch.setattr(tn, "send_add_fs_roots_control", live)
 
-    resp = asyncio.run(tn.add_tunnel_filesystem_root(_FakeReq(body={"path": "/new"})))
+    resp = asyncio.run(tn.add_tunnel_filesystem_root(_FakeReq(body={"path": _p("/new")})))
 
     assert resp.status_code == 200
     assert [project["id"] for project in persisted.await_args.args[1]] == ["p1"]
     persisted.assert_awaited_once()
-    live.assert_awaited_once_with("t1", ["/new"])
-    assert projects[1]["executor_config"] == json.dumps({"filesystem_roots": ["/private"]})
+    live.assert_awaited_once_with("t1", [_p("/new")])
+    assert projects[1]["executor_config"] == json.dumps({"filesystem_roots": [_p("/private")]})
 
 
 def test_delete_route_allows_write_project_but_excludes_out_of_scope_projects(monkeypatch):
     projects = [
-        {"id": "p1", "executor_config": json.dumps({"filesystem_roots": ["/shared"]})},
-        {"id": "outside", "executor_config": json.dumps({"filesystem_roots": ["/shared"]})},
+        {"id": "p1", "executor_config": json.dumps({"filesystem_roots": [_p("/shared")]})},
+        {"id": "outside", "executor_config": json.dumps({"filesystem_roots": [_p("/shared")]})},
     ]
     _patch_route_db(monkeypatch, projects)
     _patch_filesystem_member_policy(monkeypatch, allows_write=True, project_ids=("p1",))
@@ -1057,25 +1063,25 @@ def test_delete_route_allows_write_project_but_excludes_out_of_scope_projects(mo
     monkeypatch.setattr(tn, "_persist_remove_filesystem_root", persisted)
     monkeypatch.setattr(tn, "send_set_fs_roots_control", live)
 
-    resp = asyncio.run(tn.remove_tunnel_filesystem_root(_FakeReq(body={"path": "/shared"})))
+    resp = asyncio.run(tn.remove_tunnel_filesystem_root(_FakeReq(body={"path": _p("/shared")})))
 
     assert resp.status_code == 200
     assert [project["id"] for project in persisted.await_args.args[1]] == ["p1"]
     persisted.assert_awaited_once()
     live.assert_awaited_once_with("t1", [])
-    assert projects[1]["executor_config"] == json.dumps({"filesystem_roots": ["/shared"]})
+    assert projects[1]["executor_config"] == json.dumps({"filesystem_roots": [_p("/shared")]})
 
 
 def test_add_route_fails_closed_when_member_policy_is_unavailable(monkeypatch):
     projects = [{"id": "p1", "executor_config": json.dumps({"filesystem_roots": []})}]
     _patch_route_db(monkeypatch, projects)
     _patch_filesystem_member_policy(monkeypatch, allows_write=False, unavailable=True)
-    persisted = AsyncMock(return_value=["/new"])
+    persisted = AsyncMock(return_value=[_p("/new")])
     live = AsyncMock(return_value={"status": "ok"})
     monkeypatch.setattr(tn, "_persist_add_filesystem_root", persisted)
     monkeypatch.setattr(tn, "send_add_fs_roots_control", live)
 
-    resp = asyncio.run(tn.add_tunnel_filesystem_root(_FakeReq(body={"path": "/new"})))
+    resp = asyncio.run(tn.add_tunnel_filesystem_root(_FakeReq(body={"path": _p("/new")})))
 
     assert resp.status_code == 503
     assert _decode_route_body(resp)["error"] == "member_policy_unavailable"
@@ -1084,7 +1090,7 @@ def test_add_route_fails_closed_when_member_policy_is_unavailable(monkeypatch):
 
 
 def test_delete_route_fails_closed_when_member_policy_is_unavailable(monkeypatch):
-    projects = [{"id": "p1", "executor_config": json.dumps({"filesystem_roots": ["/old"]})}]
+    projects = [{"id": "p1", "executor_config": json.dumps({"filesystem_roots": [_p("/old")]})}]
     _patch_route_db(monkeypatch, projects)
     _patch_filesystem_member_policy(monkeypatch, allows_write=False, unavailable=True)
     persisted = AsyncMock(return_value=[])
@@ -1092,7 +1098,7 @@ def test_delete_route_fails_closed_when_member_policy_is_unavailable(monkeypatch
     monkeypatch.setattr(tn, "_persist_remove_filesystem_root", persisted)
     monkeypatch.setattr(tn, "send_set_fs_roots_control", live)
 
-    resp = asyncio.run(tn.remove_tunnel_filesystem_root(_FakeReq(body={"path": "/old"})))
+    resp = asyncio.run(tn.remove_tunnel_filesystem_root(_FakeReq(body={"path": _p("/old")})))
 
     assert resp.status_code == 503
     assert _decode_route_body(resp)["error"] == "member_policy_unavailable"

@@ -16,6 +16,7 @@ import asyncio
 import base64
 import json
 import sys
+from pathlib import Path
 
 import pytest
 
@@ -219,9 +220,10 @@ def test_unparseable_body_naming_a_write_tool_is_refused():
     assert denial["status"] == 403
 
 
-def test_unparseable_body_naming_nothing_passes():
+def test_unparseable_body_is_refused_even_when_it_names_nothing():
+    # A body that is not JSON cannot be checked, so it is refused whole: escapes, gzip and other encodings included.
     body = base64.b64encode(b"not json at all").decode()
-    assert _refused({"id": "r3", "body": body}) is None
+    assert _refused({"id": "r3", "body": body}) is not None
 
 
 def test_request_without_body_passes():
@@ -487,3 +489,292 @@ def test_posix_root_with_a_space_is_not_refused_for_that():
 def test_served_roots_drop_a_windows_root_that_would_smuggle_a_folder(local_home):
     smuggled = str(local_home / "Projects") + " " + str(local_home / ".ssh")
     assert tc._allowed_served_roots([smuggled, str(local_home / "Notes")]) == [str(local_home / "Notes")]
+
+
+# ---------------------------------------------------------------------------
+# review fixes: extract-pool credential, Serena roots, key-file names, slots with no write list
+# ---------------------------------------------------------------------------
+
+def test_extract_pool_connect_sends_the_bearer_header(local_home, monkeypatch):
+    captured: dict = {}
+
+    def fake_connect(url, **kwargs):
+        captured.update(kwargs)
+        raise RuntimeError("stop after the connect call")
+
+    monkeypatch.setattr(websockets, "connect", fake_connect)
+    ws_url = tc._authed_url("wss://usemeridian.us/tunnel-extract/tenant-1", "sk_meridian_secret123")
+    pool = type("Pool", (), {"default_repo_path": None, "_normalize": staticmethod(lambda p: p)})()
+    with pytest.raises(RuntimeError, match="stop after"):
+        asyncio.run(tc._run_extract_pool_connection(ws_url, pool, str(local_home), label="extract"))
+    headers = captured.get("additional_headers") or captured.get("extra_headers") or {}
+    assert headers == {"Authorization": "Bearer sk_meridian_secret123"}
+
+
+@pytest.mark.parametrize("root_of", [
+    lambda home: "",
+    lambda home: "relative/project",
+    lambda home: str(home),
+    lambda home: str(home / ".ssh"),
+    lambda home: str(Path(home).anchor),
+])
+def test_serena_root_refuses_home_drive_root_and_credential_folders(local_home, root_of):
+    assert tc._serena_root_refusal(root_of(local_home)) is not None
+
+
+def test_serena_root_accepts_a_project_folder(local_home):
+    assert tc._serena_root_refusal(str(local_home / "proj")) is None
+
+
+@pytest.mark.skipif(sys.platform != "win32", reason="drive-letter spellings only exist on Windows")
+@pytest.mark.parametrize("spelling", [
+    "\\\\?\\{ssh}",
+    "\\\\localhost\\{admin}\\{rest}",
+    "\\\\?\\UNC\\localhost\\{admin}\\{rest}",
+])
+def test_denylist_sees_through_extended_length_and_admin_share_spellings(local_home, spelling):
+    ssh = local_home / ".ssh"
+    drive = Path(local_home).drive.rstrip(":")
+    rest = str(ssh)[len(Path(local_home).anchor):]
+    assert tc._is_denied_root(spelling.format(ssh=str(ssh), admin=f"{drive}$", rest=rest))
+
+
+def test_windows_path_text_leaves_other_paths_alone():
+    assert tc._windows_path_text("/home/me/notes") == "/home/me/notes"
+    assert tc._windows_path_text("C:\\Users\\me\\notes") == "C:\\Users\\me\\notes"
+
+
+@pytest.mark.parametrize("name", ["id_rsa.", "id_rsa::$DATA", ".env.", "server.key.", "server.pem::$DATA"])
+def test_key_file_names_with_a_trailing_dot_or_stream_are_refused(name):
+    assert _refused(_read_request(name)) is not None
+
+
+@pytest.mark.parametrize("name", [".env.example.", "docs.md."])
+def test_template_names_with_a_trailing_dot_still_pass(name):
+    assert _refused(_read_request(name)) is None
+
+
+def test_alternate_data_stream_on_any_file_is_refused():
+    assert _refused(_read_request("docs.md::$DATA")) is not None
+
+
+@pytest.mark.parametrize("label,name", [("ppt", "add_slide"), ("zotero", "search_items")])
+def test_unlisted_slot_calls_are_refused_by_default(label, name):
+    assert _refused(_request_msg(_call(name)), label=label) is not None
+
+
+def test_unlisted_slot_calls_pass_when_the_local_policy_allows_writes():
+    msg = _request_msg(_call("add_slide"))
+    assert tc._guard_request(msg, "ppt", {**tc._LOCKED_POLICY, "allow_tunnel_writes": True}) is None
+
+
+# ---------------------------------------------------------------------------
+# ambiguous spellings are refused outright; unreadable bodies are refused whole
+# ---------------------------------------------------------------------------
+
+@pytest.mark.parametrize("path", [
+    "\\\\?\\C:\\Users\\me\\.ssh",
+    "\\\\?\\UNC\\localhost\\C$\\Users\\me",
+    "\\\\localhost\\C$\\Users\\me",
+    "//localhost/C$/Users/me",
+    "//?/C:/Users/me",
+    "\\\\.\\C:\\Users\\me",
+    "C:server.key",
+    "C:",
+    "C:\\Users\\me\\..\\other",
+    "C:\\PROGRA~1\\x",
+    "ENV~1.PRO",
+    "C:\\Users\\me\\proj:stream\\x",
+    "bad\x01name",
+])
+def test_ambiguous_path_spelling_is_refused(path):
+    from meridian.repo_scope import ambiguous_path_spelling  # noqa: PLC0415
+    assert ambiguous_path_spelling(path) is not None
+
+
+@pytest.mark.parametrize("path", [
+    "C:\\Users\\me\\proj",
+    "C:/Users/me/proj",
+    "/home/me/proj",
+    "proj/src/main.py",
+    "docs/readme.md",
+])
+def test_plain_path_spelling_is_accepted(path):
+    from meridian.repo_scope import ambiguous_path_spelling  # noqa: PLC0415
+    assert ambiguous_path_spelling(path) is None
+
+
+@pytest.mark.parametrize("name", ["ENV~1.PRO", "ID_ED2~1", "C:server.key", "id_rsa\\."])
+def test_tool_argument_with_an_ambiguous_spelling_is_refused(name):
+    assert _refused(_read_request(name), label="extract") is not None
+
+
+def test_unparseable_body_naming_a_write_tool_still_refused_on_any_slot():
+    body = base64.b64encode(b'{"method": "tools/call", "params": {"name": "write_file"').decode()
+    assert _refused({"id": "r9", "body": body}, label="ppt") is not None
+
+
+def test_resources_read_with_an_ambiguous_uri_is_refused():
+    msg = _request_msg({"jsonrpc": "2.0", "id": 6, "method": "resources/read",
+                        "params": {"uri": "file://localhost/C$/Users/me/notes.txt"}})
+    assert _refused(msg) is not None
+
+
+# ---------------------------------------------------------------------------
+# the extract loop: a caller's root header or set_active_repo cannot pick a credential folder
+# ---------------------------------------------------------------------------
+
+class _FakePool:
+    default_repo_path = None
+
+    def __init__(self):
+        self.spawned: list[str] = []
+
+    def _normalize(self, path):
+        return path
+
+    def get_or_spawn(self, repo_path, on_launch=None):
+        self.spawned.append(repo_path)
+        raise RuntimeError("no Serena daemon in tests")
+
+
+class _FakeExtractWS:
+    def __init__(self, messages):
+        self._messages = list(messages)
+        self.sent: list = []
+
+    async def __aenter__(self):
+        return self
+
+    async def __aexit__(self, *exc):
+        return False
+
+    def __aiter__(self):
+        return self
+
+    async def __anext__(self):
+        if not self._messages:
+            raise StopAsyncIteration
+        return self._messages.pop(0)
+
+    async def send(self, data):
+        self.sent.append(data)
+
+
+def _run_extract_loop(monkeypatch, messages, default_path):
+    pool = _FakePool()
+    ws = _FakeExtractWS(messages)
+    monkeypatch.setattr(websockets, "connect", lambda url, **kw: ws)
+    url = tc._authed_url("wss://usemeridian.us/tunnel-extract/tenant-1", "sk_meridian_secret123")
+    asyncio.run(tc._run_extract_pool_connection(url, pool, default_path, label="extract"))
+    return pool
+
+
+def test_extract_loop_replaces_a_credential_folder_header_with_the_tunnel_default(local_home, monkeypatch):
+    project = str(local_home / "proj")
+    denied_header = {"X-Meridian-Repo-Path": str(local_home / ".ssh")}
+    request = json.dumps({"type": "request", "id": "1", "method": "POST", "path": "/mcp",
+                          "headers": denied_header, "body": ""})
+    pool = _run_extract_loop(monkeypatch, [request], project)
+    assert pool.spawned == [project]
+
+
+def test_extract_loop_refuses_set_active_repo_into_a_credential_folder(local_home, monkeypatch):
+    project = str(local_home / "proj")
+    set_repo = json.dumps({"type": "set_active_repo", "repo_path": str(local_home / ".ssh")})
+    plain = json.dumps({"type": "request", "id": "2", "method": "POST", "path": "/mcp", "headers": {}, "body": ""})
+    pool = _run_extract_loop(monkeypatch, [set_repo, plain], project)
+    assert pool.default_repo_path is None
+    assert pool.spawned == [project]
+
+
+# ---------------------------------------------------------------------------
+# the refinements: path-named arguments only, mixed prefixes, credential folders, unreadable bodies
+# ---------------------------------------------------------------------------
+
+def test_multiline_file_content_with_tilde_and_control_character_is_not_refused():
+    msg = _request_msg({"jsonrpc": "2.0", "id": 11, "method": "tools/call",
+                        "params": {"name": "write_file", "arguments": {
+                            "path": "notes.md", "content": "line one\nsee HEAD~1\n// copyright\x01\n"}}})
+    assert tc._guard_request(msg, "fs", {**tc._LOCKED_POLICY, "allow_tunnel_writes": True}) is None
+
+
+def test_shell_command_with_tilde_and_dot_slash_is_not_refused_for_its_spelling():
+    msg = _request_msg({"jsonrpc": "2.0", "id": 12, "method": "tools/call",
+                        "params": {"name": "execute_shell_command",
+                                   "arguments": {"command": "git show HEAD~1 --stat && ./gradlew test"}}})
+    assert tc._guard_request(msg, "extract", {**tc._LOCKED_POLICY, "enable_shell_slot": True}) is None
+
+
+def test_dot_segment_on_a_plain_folder_read_is_allowed():
+    msg = _request_msg({"jsonrpc": "2.0", "id": 13, "method": "tools/call",
+                        "params": {"name": "list_directory", "arguments": {"path": "."}}})
+    assert _refused(msg) is None
+
+
+@pytest.mark.parametrize("path", ["/\\localhost\\C$\\Users\\me", "\\/?/C:/Users/me", "//\\?\\C:\\x"])
+def test_mixed_separator_prefixes_are_refused(path):
+    from meridian.repo_scope import ambiguous_path_spelling  # noqa: PLC0415
+    assert ambiguous_path_spelling(path) is not None
+
+
+@pytest.mark.parametrize("path", [
+    ".aws/credentials", ".ssh/config", "home/.kube/config",
+    ".config/gh/hosts.yml", ".config/gcloud/creds.db", "x/.gnupg/random",
+])
+def test_files_inside_credential_folders_are_refused(path):
+    assert _refused(_read_request(path)) is not None
+
+
+def test_ordinary_config_folder_file_passes():
+    assert _refused(_read_request(".config/nvim/init.lua")) is None
+
+
+@pytest.mark.parametrize("path", ["proj/src/../secret.txt", "C:\\Users\\me\\.."])
+def test_parent_segments_are_refused(path):
+    assert _refused(_read_request(path)) is not None
+
+
+def test_relative_served_root_is_refused():
+    assert tc._allowed_served_roots(["relative/project"]) == []
+
+
+def test_alternate_data_stream_directory_spelling_is_refused():
+    from meridian.repo_scope import ambiguous_path_spelling  # noqa: PLC0415
+    assert ambiguous_path_spelling("C:\\Users\\me\\proj:stream\\x") is not None
+
+
+def test_resources_read_of_a_drive_relative_key_name_is_refused():
+    msg = _request_msg({"jsonrpc": "2.0", "id": 14, "method": "resources/read",
+                        "params": {"uri": "file:///C:server.key"}})
+    assert _refused(msg) is not None
+
+
+def test_undecodable_base64_body_is_refused():
+    assert _refused({"id": "r15", "body": "!!!not base64!!!"}) is not None
+
+
+def test_over_deep_json_body_is_refused_not_crashed_on():
+    deep = "[" * 100000 + "]" * 100000
+    body = base64.b64encode(deep.encode()).decode()
+    assert _refused({"id": "r16", "body": body}) is not None
+
+
+# ---------------------------------------------------------------------------
+# the credential-folder boundary: credential folders are refused, project config is not
+# ---------------------------------------------------------------------------
+
+@pytest.mark.parametrize("path", [".meridian/tool-routing.toml", ".docker/compose.yml", "proj/.meridian/tool-routing.toml"])
+def test_project_config_in_a_meridian_or_docker_folder_still_passes(path):
+    assert _refused(_read_request(path)) is None
+
+
+@pytest.mark.parametrize("path", [".docker/config.json", "home/.docker/config.json"])
+def test_docker_registry_config_is_refused_wherever_it_sits(path):
+    assert _refused(_read_request(path)) is not None
+
+
+@pytest.mark.parametrize("path", [".aws", ".ssh", "proj/.aws", "proj/.config/gh"])
+def test_a_credential_folder_named_as_the_path_is_refused(path):
+    # A search or listing rooted at the folder would return the files inside it, so the folder itself is refused.
+    assert _refused(_read_request(path)) is not None

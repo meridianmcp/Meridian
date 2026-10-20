@@ -275,7 +275,9 @@ def test_find_npx_returns_nonempty_string():
 
 
 def test_build_proxy_command_structure():
-    cmd = tc._build_proxy_command("npx", "/repo", port=9000)
+    # A served root must be absolute on this platform; "/repo" is absolute on POSIX only.
+    repo = os.path.abspath("/repo")
+    cmd = tc._build_proxy_command("npx", repo, port=9000)
     assert cmd[0] == "npx"
     assert tc.MCP_PROXY_PACKAGE in cmd
     assert "--port" in cmd
@@ -287,7 +289,7 @@ def test_build_proxy_command_structure():
     # The separator + the wrapped filesystem server must be present.
     assert "--" in cmd
     assert tc.FS_SERVER_PACKAGE in cmd
-    assert cmd[-1] == "/repo"
+    assert cmd[-1] == repo
     # mcp-proxy comes before the separator; filesystem server after it.
     sep = cmd.index("--")
     assert tc.MCP_PROXY_PACKAGE in cmd[:sep]

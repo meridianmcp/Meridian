@@ -2618,7 +2618,7 @@ async def _run_extract_pool_connection(
     try:
         async with websockets.connect(
             ws_url, max_size=None, ping_interval=20, ping_timeout=_WS_PING_TIMEOUT,
-            open_timeout=_tunnel_connect_timeout(),
+            open_timeout=_tunnel_connect_timeout(), **_ws_connect_kwargs(ws_url),
         ) as ws:
             print(f"tunnel:{label}: connected (Serena daemon pool)", flush=True)
             async with httpx.AsyncClient() as http_client:
@@ -2634,6 +2634,10 @@ async def _run_extract_pool_connection(
                     if msg.get("type") == "set_active_repo":
                         new_path = str(msg.get("repo_path") or "").strip()
                         if new_path:
+                            refusal = _serena_root_refusal(new_path)
+                            if refusal is not None:
+                                print(f"tunnel:extract: refused active repo {new_path!r}: {refusal}", flush=True)
+                                continue
                             pool.default_repo_path = pool._normalize(new_path)
                             print(
                                 f"tunnel:extract: active repo → {pool.default_repo_path}",
@@ -2646,6 +2650,14 @@ async def _run_extract_pool_connection(
                     repo_path = _serena_pool.resolve_repo_path(
                         msg.get("headers") or {}, pool.default_repo_path or default_repo_path
                     )
+                    _header_refusal = _serena_root_refusal(repo_path)
+                    if _header_refusal is not None:
+                        print(
+                            f"tunnel:extract: refused caller repo {repo_path!r}: {_header_refusal}; "
+                            "serving the tunnel's own repo instead",
+                            flush=True,
+                        )
+                        repo_path = pool.default_repo_path or default_repo_path
                     daemon = None
                     _spawn_exc: object = None
                     try:
@@ -6447,6 +6459,11 @@ _SECRET_VALUE_PATTERNS = (
 _REDACTED = "[redacted by the Meridian tunnel]"
 
 
+# Built-in slots a hosted caller can switch on but that have no write list yet. Their tools can change files whatever
+# they are called, so every call on them is refused unless this machine allows tunnel writes.
+UNLISTED_WRITE_SLOTS = frozenset({"ppt", "zotero"})
+
+
 def _bare_names(table: dict, label: "str | None") -> frozenset:
     """The names a slot label answers to. An unlabelled loop gets the union, so it fails closed."""
     if label is None:
@@ -6454,8 +6471,13 @@ def _bare_names(table: dict, label: "str | None") -> frozenset:
     return table.get(label, frozenset())
 
 
+def _normalized_file_name(name: str) -> str:
+    """The name as Windows opens it. A trailing dot or space is ignored, and ``name:stream`` is the file ``name``."""
+    return name.strip().split(":", 1)[0].rstrip(" .").lower()
+
+
 def _sensitive_file_name(name: str) -> bool:
-    n = name.strip().lower()
+    n = _normalized_file_name(name)
     if not n:
         return False
     if n.startswith(".env"):
@@ -6464,18 +6486,31 @@ def _sensitive_file_name(name: str) -> bool:
 
 
 def _path_parts(path: str) -> list[str]:
-    return [p for p in re.split(r"[\\/]", path.strip()) if p]
+    """The components of a path. A ``.`` component names the folder it sits in, so it is dropped."""
+    return [p for p in re.split(r"[\\/]", path.strip()) if p and p != "."]
+
+
+# Folders whose every file is a credential. A read of anything inside one is refused whatever the file is called, and so
+# is a search or listing rooted at the folder itself. The rule applies at any depth, because a copied home folder can sit
+# anywhere in a project. Folders that Meridian itself reads from a project (such as .meridian) are not listed here.
+_CREDENTIAL_FOLDER_NAMES = frozenset({".ssh", ".aws", ".gnupg", ".kube", ".azure"})
+# Consecutive folder pairs that name a credential folder, and a file pair that is a credential wherever it sits.
+_CREDENTIAL_PAIRS = frozenset({(".config", "gh"), (".config", "gcloud"), (".config", "op"), (".docker", "config.json")})
 
 
 def _sensitive_path(path: str) -> bool:
-    """True when a path names a key or credential file. Matches the final name, and .git/config."""
+    """True when a path names a key or credential file, or sits inside or is a credential folder."""
     parts = _path_parts(path)
     if not parts:
         return False
     if _sensitive_file_name(parts[-1]):
         return True
-    lowered = [p.lower() for p in parts]
-    return len(lowered) >= 2 and lowered[-2:] == [".git", "config"]
+    normalized = [_normalized_file_name(p) for p in parts]
+    if any(name in _CREDENTIAL_FOLDER_NAMES for name in normalized):
+        return True
+    if any(pair in _CREDENTIAL_PAIRS for pair in zip(normalized, normalized[1:])):
+        return True
+    return len(normalized) >= 2 and normalized[-2:] == [".git", "config"]
 
 
 def _resolved_sensitive(path: str) -> bool:
@@ -6500,27 +6535,51 @@ def _argument_paths(arguments: Any) -> list[str]:
     return out
 
 
+# An argument whose name says it is a path. Content, commands and search patterns are not, and are never refused for
+# their spelling: a multi-line file or a command with HEAD~1 in it is ordinary text.
+_PATH_ARGUMENT_KEY_RE = re.compile(r"path|file|dir|uri|root|source|destination|target", re.IGNORECASE)
+
+
+def _path_keyed_values(arguments: Any) -> list[str]:
+    out: list[str] = []
+    if isinstance(arguments, dict):
+        for key, value in arguments.items():
+            if not _PATH_ARGUMENT_KEY_RE.search(str(key)):
+                continue
+            if isinstance(value, str):
+                out.append(value)
+            elif isinstance(value, list):
+                out.extend(v for v in value if isinstance(v, str))
+    return out
+
+
 def _uri_path(uri: str) -> str:
     from urllib.parse import unquote, urlparse  # noqa: PLC0415
     parsed = urlparse(uri)
     return unquote(parsed.path) if parsed.scheme == "file" else uri
 
 
-def _request_body(msg: dict) -> bytes:
-    try:
-        return base64.b64decode(msg.get("body")) if msg.get("body") else b""
-    except (ValueError, TypeError):
+def _request_body(msg: dict) -> "bytes | None":
+    """The decoded body, empty when there is none, or None when the base64 is invalid and nothing can be read."""
+    body = msg.get("body")
+    if not body:
         return b""
+    try:
+        return base64.b64decode(body, validate=True)
+    except (ValueError, TypeError):
+        return None
 
 
 def _rpc_calls(msg: dict) -> "tuple[list[dict], bool]":
     """The JSON-RPC requests in a relayed body, and whether the body parsed at all."""
     raw = _request_body(msg)
+    if raw is None:
+        return [], False
     if not raw:
         return [], True
     try:
         parsed = json.loads(raw)
-    except (ValueError, TypeError):
+    except (ValueError, TypeError, RecursionError):
         return [], False
     items = parsed if isinstance(parsed, list) else [parsed]
     return [c for c in items if isinstance(c, dict)], True
@@ -6529,8 +6588,16 @@ def _rpc_calls(msg: dict) -> "tuple[list[dict], bool]":
 def _tool_refusal(bare: str, label: "str | None", policy: dict, arguments: Any) -> "str | None":
     if bare in _bare_names(TUNNEL_EXEC_TOOLS, label) and not policy["enable_shell_slot"]:
         return f"{bare} runs commands on this machine, and enable_shell_slot is off"
+    if label in UNLISTED_WRITE_SLOTS and not policy["allow_tunnel_writes"]:
+        return f"{bare} is on the {label} slot, which has no read-only list, and allow_tunnel_writes is off"
     if bare in _bare_names(TUNNEL_WRITE_TOOLS, label) and not policy["allow_tunnel_writes"]:
         return f"{bare} changes files on this machine, and allow_tunnel_writes is off"
+    from .repo_scope import ambiguous_path_spelling  # noqa: PLC0415
+
+    for candidate in _path_keyed_values(arguments):
+        spelling = ambiguous_path_spelling(candidate)
+        if spelling is not None:
+            return f"a path argument is refused: {spelling}"
     for candidate in _argument_paths(arguments):
         if _sensitive_path(candidate):
             return f"{_path_parts(candidate)[-1] if _path_parts(candidate) else 'a path'} looks like a key or credential file"
@@ -6555,27 +6622,37 @@ def _refusal_response(msg: dict, rpc_id: Any, reason: str) -> "tuple[dict, str]"
     return resp, reason
 
 
+def _ambiguous_file_uri(uri: str) -> bool:
+    """A ``file:`` URI with a host names a UNC or admin-share path, which is never a plain local path."""
+    from urllib.parse import urlparse  # noqa: PLC0415
+    parsed = urlparse(uri)
+    return parsed.scheme == "file" and bool(parsed.netloc)
+
+
 def _guard_request(msg: dict, label: "str | None", policy: dict) -> "tuple[dict, str] | None":
     """Refuse a hosted request that would write, run a program, or read a key or credential file.
 
-    Returns ``(response, reason)`` for a refusal, or None to let the request through. A body that cannot be parsed
-    fails closed when it names a blocked tool or a sensitive file.
+    Returns ``(response, reason)`` for a refusal, or None to let the request through. A body that is not readable
+    JSON is refused whole, because its content cannot be checked.
     """
+    from .repo_scope import ambiguous_path_spelling  # noqa: PLC0415
+
     calls, parsed = _rpc_calls(msg)
     if not parsed:
-        raw = _request_body(msg).lower()
-        blocked = _bare_names(TUNNEL_WRITE_TOOLS, label) | _bare_names(TUNNEL_EXEC_TOOLS, label)
-        sensitive = [n.encode() for n in _SENSITIVE_EXACT_NAMES] + [b".env"] + [s.encode() for s in _SENSITIVE_SUFFIXES]
-        if any(n.encode() in raw for n in blocked) or any(s in raw for s in sensitive):
-            return _refusal_response(msg, None, "an unreadable request names a blocked tool or file")
-        return None
+        # A body that is not JSON cannot be read, so it cannot be checked. Escapes, gzip and other encodings all
+        # arrive here. No MCP request is sent in that form, so refusing it costs nothing legitimate.
+        return _refusal_response(msg, None, "the request body is not readable JSON, so it cannot be checked")
     for call in calls:
         params = call.get("params") if isinstance(call.get("params"), dict) else {}
         method = call.get("method")
         if method == "resources/read":
             uri = params.get("uri")
-            if isinstance(uri, str) and _sensitive_path(_uri_path(uri)):
-                return _refusal_response(msg, call.get("id"), "the resource is a key or credential file")
+            if isinstance(uri, str):
+                resource_path = _uri_path(uri)
+                if _ambiguous_file_uri(uri) or ambiguous_path_spelling(resource_path.lstrip("/")) is not None:
+                    return _refusal_response(msg, call.get("id"), "the resource path uses an ambiguous spelling")
+                if _sensitive_path(resource_path):
+                    return _refusal_response(msg, call.get("id"), "the resource is a key or credential file")
             continue
         if method != "tools/call":
             continue
@@ -6703,18 +6780,68 @@ _DENIED_HOME_FOLDERS = (
 _DENIED_APPDATA_FOLDERS = ("Zotero", "GitHub CLI", "gcloud")
 
 
+_LOCAL_ADMIN_SHARE_RE = re.compile(r"^\\\\(?:localhost|127\.0\.0\.1)\\([A-Za-z])\$(?=\\|$)", re.IGNORECASE)
+
+
+def _windows_path_text(root: str) -> str:
+    """Rewrite the other spellings of a local Windows path into the plain form the denylist compares.
+
+    ``\\\\?\\C:\\x`` and ``\\\\?\\UNC\\localhost\\C$\\x`` name the same folder as ``C:\\x``, as does
+    ``\\\\localhost\\C$\\x``. Anything else is returned unchanged.
+    """
+    text = root
+    if text.startswith("\\\\?\\UNC\\"):
+        text = "\\\\" + text[len("\\\\?\\UNC\\"):]
+    elif text.startswith("\\\\?\\"):
+        text = text[len("\\\\?\\"):]
+    match = _LOCAL_ADMIN_SHARE_RE.match(text)
+    if match:
+        text = match.group(1).upper() + ":" + text[match.end():]
+    return text
+
+
 def _is_denied_root(root: str) -> bool:
     """True when a served root is, contains, or lies inside a credential or token folder. Fails closed.
 
     Containment in both directions matters: a root that contains the token folder would serve it just as a root
-    inside it does.
+    inside it does. Extended-length, UNC-admin-share and drive-letter spellings of the same folder are compared as
+    the plain path.
     """
     try:
-        target = Path(root).resolve()
+        target = Path(_windows_path_text(root)).resolve()
         folders = [folder.resolve() for folder in _denied_root_folders()]
     except (OSError, RuntimeError, ValueError):
         return True
     return any(_is_subpath(target, folder) or _is_subpath(folder, target) for folder in folders)
+
+
+def _serena_root_refusal(path: str) -> "str | None":
+    """Why a Serena project root must not be used, or None when it may be.
+
+    Serena reads every file under its project root. A root that is a home folder, a drive root, or contains a
+    credential folder would expose the key files the fs slot refuses. Roots a remote caller names are checked here,
+    including the per-request header and the set_active_repo message.
+    """
+    from .repo_scope import ambiguous_path_spelling  # noqa: PLC0415
+
+    text = (path or "").strip()
+    if not text:
+        return "the root is empty"
+    spelling = ambiguous_path_spelling(text)
+    if spelling is not None:
+        return spelling
+    if not Path(text).is_absolute():
+        return "the root is not an absolute path"
+    if _is_denied_root(text):
+        return "the root is, contains, or lies inside a credential or token folder"
+    try:
+        resolved = Path(_windows_path_text(text)).resolve()
+        home = Path.home().resolve()
+    except (OSError, RuntimeError, ValueError):
+        return "the root cannot be resolved"
+    if resolved == Path(resolved.anchor) or resolved == home:
+        return "the root is a home folder or a drive root"
+    return None
 
 
 # Characters that split or operate on a command line under cmd.exe, plus whitespace, which splits argv.
@@ -6736,8 +6863,17 @@ def _unsafe_windows_root(root: str, platform: "str | None" = None) -> bool:
 
 def _allowed_served_roots(roots: "list[str]") -> "list[str]":
     """The roots that may be served. A refused root is logged and dropped, never served."""
+    from .repo_scope import ambiguous_path_spelling  # noqa: PLC0415
+
     kept: list[str] = []
     for root in roots:
+        spelling = ambiguous_path_spelling(root)
+        if spelling is not None:
+            print(f"tunnel: refused served root {root!r}: {spelling}", flush=True)
+            continue
+        if not Path(root).is_absolute():
+            print(f"tunnel: refused served root {root!r}: the root is not an absolute path", flush=True)
+            continue
         if _unsafe_windows_root(root):
             print(
                 f"tunnel: refused served root {root!r}: it has a space or a cmd.exe character, which mcp-proxy "
@@ -8517,15 +8653,23 @@ async def run_tunnel(
     serena_repo_path = repo_path
     if not _repo_path_from_cli and cfg_serena_repo_path:
         cfg_serena_repo_path = _normalize_path_arg(cfg_serena_repo_path)
-        try:
-            serena_repo_path = str(Path(cfg_serena_repo_path).resolve())
+        # The dashboard value is set from the hosted side, so it gets the same check as a root a caller names.
+        _cfg_refusal = _serena_root_refusal(cfg_serena_repo_path)
+        if _cfg_refusal is not None:
             print(
-                f"  code-extractor:    Serena default repo from dashboard config: "
-                f"{serena_repo_path}",
+                f"  code-extractor:    dashboard Serena repo refused ({_cfg_refusal}); using the tunnel repo",
                 flush=True,
             )
-        except Exception:  # noqa: BLE001 — bad config path → keep the cwd default
-            serena_repo_path = repo_path
+        else:
+            try:
+                serena_repo_path = str(Path(cfg_serena_repo_path).resolve())
+                print(
+                    f"  code-extractor:    Serena default repo from dashboard config: "
+                    f"{serena_repo_path}",
+                    flush=True,
+                )
+            except Exception:  # noqa: BLE001 — bad config path → keep the cwd default
+                serena_repo_path = repo_path
     # b970fe07 — code-intel auto-index dirs. --code-dir always wins; only when it
     # was absent does the configured codebase_code_dirs fill in. Unset config →
     # code_dirs stays as passed (today's behaviour: no auto-index unless flagged).

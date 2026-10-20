@@ -187,9 +187,9 @@ logged and dropped. If the check cannot resolve a path, it refuses that root.
   puts the token in the URL is refused, and its token is never logged. Release
   ordering matters: ship the client that sends the header before the server change
   goes live, or older clients cannot connect.
-- The hosted keepalive refreshes a tunnel's session only while that tunnel has
-  relayed a request within `MERIDIAN_TUNNEL_IDLE_KEEPALIVE_S` seconds (default 900).
-  An idle, connected client stops generating database writes.
+- The hosted keepalive refreshes the session of every connected tunnel, including one
+  that has made no tool call for a long run (4b698ea5). It touches only tenants whose
+  project database is already open, so it never opens a new connection.
 - Each request on a socket is served on its own task, so a slow tool call no longer
   holds up the others. A socket close gives in-flight work 5 seconds before it is
   cancelled.

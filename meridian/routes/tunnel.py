@@ -501,16 +501,8 @@ _config_generation_locks: "dict[str, asyncio.Lock]" = defaultdict(asyncio.Lock)
 _inflight_count: "dict[str, dict[str, int]]" = defaultdict(lambda: defaultdict(int))
 
 
-# Monotonic time of the last request relayed to each tenant's tunnel. The keepalive only refreshes sessions for a tunnel
-# that has served a request inside TUNNEL_IDLE_KEEPALIVE_TTL_S, so an idle, connected client stops writing to the database.
-_tunnel_last_request_at: dict[str, float] = {}
-TUNNEL_IDLE_KEEPALIVE_TTL_S = float(os.environ.get("MERIDIAN_TUNNEL_IDLE_KEEPALIVE_S", "900"))
-
-
 def _mark_inflight(tenant_id: str, label: str, delta: int) -> None:
     """Adjust the (tenant, slot) in-flight counter, pruning empty entries."""
-    if delta > 0:
-        _tunnel_last_request_at[tenant_id] = time.monotonic()
     per_tenant = _inflight_count[tenant_id]
     new_val = per_tenant.get(label, 0) + delta
     if new_val <= 0:
@@ -1389,6 +1381,22 @@ async def set_tunnel_active_repo(request: Request) -> Response:
     if not repo_path:
         return Response(
             content='{"error":"repo_path is required"}',
+            status_code=400,
+            media_type="application/json",
+        )
+    # Serena reads everything under its project root, so a home folder would expose every project and key file in it.
+    # The MCP path refuses the same thing; this route must too.
+    from ..repo_scope import ambiguous_path_spelling, looks_like_bare_home_directory  # noqa: PLC0415
+    if looks_like_bare_home_directory(repo_path):
+        return Response(
+            content='{"error":"repo_path is a home folder; name a project folder"}',
+            status_code=400,
+            media_type="application/json",
+        )
+    spelling = ambiguous_path_spelling(repo_path)
+    if spelling is not None:
+        return Response(
+            content=json.dumps({"error": f"repo_path is refused: {spelling}"}),
             status_code=400,
             media_type="application/json",
         )
@@ -4346,11 +4354,7 @@ async def keepalive_tunnel_sessions(app: Any) -> "list[str]":
     from .._deps import _tenant_db_cache  # noqa: PLC0415
 
     refreshed: list[str] = []
-    now = time.monotonic()
     for tenant_id in active_tunnel_tenant_ids():
-        last = _tunnel_last_request_at.get(tenant_id)
-        if last is None or now - last > TUNNEL_IDLE_KEEPALIVE_TTL_S:
-            continue  # idle tunnel: nothing has been relayed inside the window, so no database write
         conn = _tenant_db_cache.get(tenant_id)
         if conn is None:
             continue  # no MCP activity yet → nothing to keep alive

@@ -3,7 +3,7 @@
 Covers:
   - A slow request does not hold up a later request on the same socket. A sequential loop would deadlock here and time
     out, so the test fails instead of hanging.
-  - The keepalive refreshes only tunnels that have relayed a request inside the idle window.
+  - The keepalive refreshes every live tunnel, including one that has made no request recently (4b698ea5).
   - A WebSocket that sends its token in the URL gets no token. Only the Authorization header counts.
 """
 from __future__ import annotations
@@ -11,7 +11,6 @@ from __future__ import annotations
 import asyncio
 import base64
 import json
-import time
 from types import SimpleNamespace
 
 import pytest
@@ -103,7 +102,9 @@ def test_a_slow_request_does_not_hold_up_a_later_request(monkeypatch):
 # idle keepalive window
 # ---------------------------------------------------------------------------
 
-def test_keepalive_refreshes_only_tunnels_that_relayed_a_request_recently(monkeypatch):
+def test_keepalive_refreshes_every_live_tunnel_even_with_no_recent_request(monkeypatch):
+    # 4b698ea5: an executor with a live tunnel doing a long non-Meridian run calls no tool, so the keepalive must
+    # refresh its session from the open socket alone. An idle-window gate would let that session go stale.
     import meridian._deps as deps
 
     touched: list[str] = []
@@ -112,26 +113,24 @@ def test_keepalive_refreshes_only_tunnels_that_relayed_a_request_recently(monkey
         touched.append(conn)
         return [f"session-{conn}"]
 
-    monkeypatch.setattr(tun, "active_tunnel_tenant_ids", lambda: {"busy", "idle", "never"})
-    monkeypatch.setattr(deps, "_tenant_db_cache", {"busy": "conn-busy", "idle": "conn-idle", "never": "conn-never"})
+    monkeypatch.setattr(tun, "active_tunnel_tenant_ids", lambda: {"busy", "quiet"})
+    monkeypatch.setattr(deps, "_tenant_db_cache", {"busy": "conn-busy", "quiet": "conn-quiet"})
     monkeypatch.setattr(tun.db_module, "touch_latest_active_session", fake_touch)
-    now = time.monotonic()
-    monkeypatch.setattr(tun, "_tunnel_last_request_at", {"busy": now, "idle": now - 10 * tun.TUNNEL_IDLE_KEEPALIVE_TTL_S})
 
     refreshed = asyncio.run(tun.keepalive_tunnel_sessions(app=SimpleNamespace()))
 
-    assert touched == ["conn-busy"]
-    assert refreshed == ["session-conn-busy"]
+    assert sorted(touched) == ["conn-busy", "conn-quiet"]
+    assert sorted(refreshed) == ["session-conn-busy", "session-conn-quiet"]
 
 
-def test_relaying_a_request_marks_the_tenant_active(monkeypatch):
-    monkeypatch.setattr(tun, "_tunnel_last_request_at", {})
-    tun._mark_inflight("tenant-x", "fs", 1)
-    try:
-        assert "tenant-x" in tun._tunnel_last_request_at
-        assert time.monotonic() - tun._tunnel_last_request_at["tenant-x"] < 5
-    finally:
-        tun._mark_inflight("tenant-x", "fs", -1)
+def test_keepalive_skips_a_live_tunnel_with_no_cached_database(monkeypatch):
+    # No MCP call has been made, so there is no session to keep alive yet.
+    import meridian._deps as deps
+
+    monkeypatch.setattr(tun, "active_tunnel_tenant_ids", lambda: {"never"})
+    monkeypatch.setattr(deps, "_tenant_db_cache", {})
+
+    assert asyncio.run(tun.keepalive_tunnel_sessions(app=SimpleNamespace())) == []
 
 
 # ---------------------------------------------------------------------------
