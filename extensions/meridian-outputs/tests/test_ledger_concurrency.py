@@ -778,6 +778,34 @@ class TestIndexFileLockStaleReclaim:
         assert lock_path.read_bytes() == b""
 
 
+class TestTransactionHeartbeat:
+    def test_commit_heartbeat_keeps_a_long_transaction_from_being_reclaimed(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """Work between load and commit outlasts the stale threshold; a
+        waiter that inspects the lease during the (slow) commit must see a
+        live owner, not a stale one it may reclaim."""
+        monkeypatch.setitem(sys.modules, "portalocker", None)
+        monkeypatch.setenv("MERIDIAN_OUTPUTS_LOCK_STALE_SECONDS", "0.3")
+        ledger = str(tmp_path / "ledger.json")
+        seen: dict[str, OL.IndexLockOwner] = {}
+        real_write = LIO.write_ledger_atomic
+
+        def _slow_commit(path: str, data: dict) -> None:
+            seen["owner"] = OL.read_index_lock_owner(path)  # the waiter's view
+            real_write(path, data)
+
+        monkeypatch.setattr(LIO, "write_ledger_atomic", _slow_commit)
+        with LIO.ledger_transaction(ledger) as txn:
+            txn.load()
+            time.sleep(0.6)
+            txn.commit({"k": 1})
+        owner = seen["owner"]
+        assert owner.held is True
+        assert owner.is_stale is False, owner.stale_reason
+        assert json.loads(Path(ledger).read_text(encoding="utf-8")) == {"k": 1}
+
+
 # ---------------------------------------------------------------------------
 # Non-reentrant lock: nested reads inside a transaction
 # ---------------------------------------------------------------------------

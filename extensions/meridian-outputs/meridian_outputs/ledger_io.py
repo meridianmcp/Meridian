@@ -252,10 +252,11 @@ class LedgerTransaction:
     ``load`` had to quarantine.
     """
 
-    def __init__(self, path: str) -> None:
+    def __init__(self, path: str, lock: Any = None) -> None:
         self.path = path
         self.quarantined_path: str | None = None
         self.committed = False
+        self._lock = lock
 
     def load(
         self, loader: Callable[[str], dict[str, Any]] | None = None,
@@ -290,6 +291,15 @@ class LedgerTransaction:
             return {}
 
     def commit(self, data: dict[str, Any]) -> None:
+        # Refresh the lease before the write so a waiter never judges this
+        # holder stale (heartbeat older than the 120 s threshold) during the
+        # commit and reclaims the lock mid-write. The commit phase is only
+        # the atomic write below; callers keep their own work before it.
+        # Remaining limit: work between acquire and commit that by itself
+        # outlasts the threshold can still be reclaimed before this runs
+        # (on POSIX; on Windows the open lock file cannot be removed).
+        if self._lock is not None:
+            self._lock.heartbeat(force=True)
         write_ledger_atomic(self.path, data)
         self.committed = True
 
@@ -321,6 +331,6 @@ def ledger_transaction(
     lock = outputs_local.IndexFileLock(path, timeout=timeout)
     lock.acquire()
     try:
-        yield LedgerTransaction(path)
+        yield LedgerTransaction(path, lock)
     finally:
         lock.release()
