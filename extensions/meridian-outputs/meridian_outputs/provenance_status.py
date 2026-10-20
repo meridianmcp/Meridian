@@ -276,6 +276,7 @@ from datetime import datetime, timezone
 from typing import Any
 
 from . import annotate, fingerprint, ledger_io, outputs_local, research_evidence
+from .path_security import resolve_reference
 
 _log = logging.getLogger(__name__)
 
@@ -420,8 +421,21 @@ def _stale_by_script_result(outputs_dir: str, path: str) -> dict[str, Any] | Non
     is a dict of the same shape with ``is_stale`` ``None``, a ``reason``
     saying why, and ``error="ledger_unreadable"`` -- never ``None`` ("never
     tagged") and never an exception that would lose the exact record.
+
+    ``path`` is resolved the way :func:`annotate.get_provenance` resolves it:
+    a relative path against ``outputs_dir`` (never the working directory),
+    through ``realpath``, so it compares equal to the ``realpath``-resolved
+    paths :func:`fingerprint.check_staleness` returns, also when
+    ``outputs_dir`` is reached through a symlink. Otherwise a relative
+    spelling of a tagged file would miss its row and read as "never tagged".
     """
-    target = annotate._normalize_path(path)
+    if not isinstance(path, str) or not path.strip():
+        return None
+    try:
+        resolved = resolve_reference(outputs_dir, path.strip())
+    except (OSError, TypeError, ValueError):
+        resolved = path
+    target = annotate._normalize_path(resolved)
     if not target:
         return None
     try:

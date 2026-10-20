@@ -29,6 +29,7 @@ Sprint item d3374b0e additionally covers (hash- and convergence-awareness):
 """
 from __future__ import annotations
 
+import os
 import sys
 from pathlib import Path
 
@@ -928,6 +929,78 @@ class TestStaleByScript:
             PS._resolver_state_for_provenance_status(status).status
             is RE.ResolverStatus.VERIFIED
         )
+
+    @staticmethod
+    def _stale_tagged_output(outputs: Path, script: Path) -> Path:
+        """An output under ``outputs`` with an exact record, fingerprint-tagged
+        against ``script``, whose script has since changed."""
+        output = outputs / "run" / "table.csv"
+        output.parent.mkdir(parents=True, exist_ok=True)
+        output.write_text("a,b\n1,2\n", encoding="utf-8")
+        script.write_text("print('v1')\n", encoding="utf-8")
+        recorded = AN.record_provenance(str(outputs), str(output), generating_script=str(script))
+        assert "error" not in recorded
+        FP.tag_output(str(output), str(outputs), script_path=str(script))
+        script.write_text("print('v2 -- changed')\n", encoding="utf-8")
+        return output
+
+    @duckdb_required
+    def test_relative_and_absolute_spellings_get_the_same_script_verdict(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """S-R4-3: the script-staleness lookup resolved a relative path
+        against the working directory while the record lookup resolved it
+        against outputs_dir, so the relative spelling missed its fingerprint
+        row, read as "never tagged", and was VERIFIED at 0.95 while the
+        absolute spelling of the same file was STALE_BY_SCRIPT."""
+        outputs = tmp_path / "outputs"
+        output = self._stale_tagged_output(outputs, tmp_path / "train.py")
+        elsewhere = tmp_path / "elsewhere"
+        elsewhere.mkdir()
+        monkeypatch.chdir(elsewhere)  # the working directory is not outputs_dir
+
+        verdicts = {}
+        for spelling in ("run/table.csv", str(output)):
+            status = PS.get_provenance_status(str(outputs), spelling)
+            assert status["record"] is not None, spelling
+            assert status["provenance_type"] == PS.STALE_BY_SCRIPT, spelling
+            assert status["script_staleness"]["is_stale"] is True, spelling
+            resolver = PS.evidence_record_from_provenance_status(status).resolver
+            assert resolver.status is not RE.ResolverStatus.VERIFIED, spelling
+            verdicts[spelling] = (status["provenance_type"], resolver.status, resolver.confidence)
+        assert verdicts["run/table.csv"] == verdicts[str(output)]
+
+    @duckdb_required
+    def test_symlinked_outputs_dir_still_matches_the_tagged_row(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """S-R4-3: check_staleness reports realpath-resolved paths, so the
+        query must be resolved through realpath too; a path through a linked
+        outputs_dir (relative or absolute) must find the same row."""
+        real = tmp_path / "real_outputs"
+        real.mkdir()
+        link = tmp_path / "linked_outputs"
+        try:
+            link.symlink_to(real, target_is_directory=True)
+        except (OSError, NotImplementedError):
+            if os.name != "nt":
+                pytest.skip("directory symlinks unavailable")
+            try:
+                import _winapi
+
+                _winapi.CreateJunction(str(real), str(link))
+            except (ImportError, OSError) as exc:
+                pytest.skip(f"directory links unavailable: {exc}")
+        self._stale_tagged_output(link, tmp_path / "train.py")
+        elsewhere = tmp_path / "elsewhere"
+        elsewhere.mkdir()
+        monkeypatch.chdir(elsewhere)
+
+        for spelling in ("run/table.csv", str(link / "run" / "table.csv")):
+            status = PS.get_provenance_status(str(link), spelling)
+            assert status["record"] is not None, spelling
+            assert status["provenance_type"] == PS.STALE_BY_SCRIPT, spelling
+            assert status["script_staleness"]["is_stale"] is True, spelling
 
 
 # ---------------------------------------------------------------------------
