@@ -226,7 +226,7 @@ sits under `.meridian-outputs-cache/bundles/`, which the index walk skips.
 
 | Tool | Description |
 |------|-------------|
-| `export_outputs_bundle` | Write every ledger plus index metadata to one checksummed bundle; refuses if a ledger file is empty or not valid JSON rather than backing it up as empty |
+| `export_outputs_bundle` | Write every ledger plus index metadata to one checksummed bundle; refuses if a ledger file is empty or not valid JSON rather than backing it up as empty, if a file already exists at `bundle_path` (unless `overwrite`), or if the path is inside `.meridian-outputs-cache` outside its `bundles/` subdirectory |
 | `verify_outputs_bundle` | Recompute every member digest and the bundle digest; reports `mismatches`, `missing`, `unexpected`, `malformed`, `errors` (read-only) |
 | `import_outputs_bundle` | Verify, then merge a bundle into `outputs_dir`; dry run by default, refuses on any verification failure, hash-algorithm version mismatch (unless accepted), unreadable target ledger, or conflict (unless `overwrite`) |
 

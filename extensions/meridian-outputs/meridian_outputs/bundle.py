@@ -102,9 +102,14 @@ Merge and conflict rules (import)
 Paths
 -----
 ``bundle_path`` must resolve inside ``outputs_dir``
-(:func:`path_security._require_within`, symlink-aware) and must not name a
-live ledger or index file. A relative ``bundle_path`` is relative to
-``outputs_dir``. The default, ``.meridian-outputs-cache/bundles/
+(:func:`path_security._require_within`, symlink-aware). Inside
+``.meridian-outputs-cache`` only the ``bundles/`` subdirectory may hold a
+bundle: everything else there is live state (the ledgers, ``index.duckdb``,
+the ``*.lock`` files the index and ledger writers hold, the derived cache).
+A ``:`` anywhere but a drive letter is refused, since on Windows it names an
+alternate data stream of another file. Export also refuses to replace an
+existing file unless ``overwrite=True``. A relative ``bundle_path`` is
+relative to ``outputs_dir``. The default, ``.meridian-outputs-cache/bundles/
 meridian-outputs-bundle.json``, sits in a dot-directory, which the outputs
 walk skips, so the bundle is never indexed as an output itself. Results
 report the bundle path relative to ``outputs_dir``, never absolute.
@@ -143,6 +148,7 @@ MAX_BUNDLE_BYTES = 1 << 30  # 1 GiB: refuse to json-parse anything larger
 INDEX_META = "index_meta"
 
 _CACHE_DIRNAME = ".meridian-outputs-cache"
+_BUNDLES_SUBDIR = "bundles"  # the only part of the cache a bundle may live in
 _LOCK_TIMEOUT_SECONDS = 30.0
 _CONFLICT_LIST_CAP = 500
 
@@ -218,18 +224,56 @@ def _ledger_file(outputs_dir: str, filename: str) -> str:
     return os.path.join(_cache_dir(outputs_dir), filename)
 
 
+def _inside(path: str, root: str) -> bool:
+    """``path`` is ``root`` or below it, compared case-insensitively.
+
+    Case-insensitive on every platform: on a case-insensitive filesystem
+    (Windows, default macOS) ``.MERIDIAN-OUTPUTS-CACHE`` is the cache, and on
+    a case-sensitive one refusing a look-alike directory costs nothing.
+    """
+    path_key, root_key = os.path.normcase(path).lower(), os.path.normcase(root).lower()
+    try:
+        return os.path.commonpath((root_key, path_key)) == root_key
+    except ValueError:  # different drives
+        return False
+
+
+def _stream_separator_error(bundle_path: Any) -> str | None:
+    """Refuse a ``:`` outside the drive letter: on Windows ``name:stream``
+    writes an alternate data stream of ``name``, an existing file."""
+    if not isinstance(bundle_path, (str, os.PathLike)):
+        return None  # _require_within reports the type problem
+    raw = os.fsdecode(os.fspath(bundle_path))
+    if ":" in os.path.splitdrive(raw)[1]:
+        return "bundle_path rejected: ':' is only allowed in a drive letter"
+    return None
+
+
 def _resolve_bundle_path(outputs_dir: str, bundle_path: Any) -> tuple[str | None, str | None]:
     """``(real_path, None)`` or ``(None, error)``; never leaks an absolute path."""
+    stream_error = _stream_separator_error(bundle_path)
+    if stream_error:
+        return None, stream_error
     try:
         real = _require_within(outputs_dir, bundle_path)
     except ValueError as exc:
         return None, f"bundle_path rejected: {exc}"
     cache_real = os.path.realpath(os.path.join(os.path.realpath(outputs_dir), _CACHE_DIRNAME))
-    if (
-        os.path.normcase(os.path.dirname(real)) == os.path.normcase(cache_real)
-        and os.path.basename(real).lower() in _PROTECTED_CACHE_FILES
-    ):
-        return None, "bundle_path rejected: it names a live ledger or index file"
+    if _inside(real, cache_real):
+        if (
+            os.path.normcase(os.path.dirname(real)).lower() == os.path.normcase(cache_real).lower()
+            and os.path.basename(real).lower() in _PROTECTED_CACHE_FILES
+        ):
+            return None, "bundle_path rejected: it names a live ledger or index file"
+        # Not realpath'd on purpose: ``real`` is already fully resolved, so a
+        # bundles/ link back into the cache cannot pass this check.
+        bundles_dir = os.path.join(cache_real, _BUNDLES_SUBDIR)
+        if not _inside(real, bundles_dir) or _inside(bundles_dir, real):
+            return None, (
+                f"bundle_path rejected: inside {_CACHE_DIRNAME} only the "
+                f"{_BUNDLES_SUBDIR}/ subdirectory may hold a bundle (the rest "
+                "is live ledger, index, lock and derived-cache state)"
+            )
     if os.path.isdir(real):
         return None, "bundle_path rejected: it names a directory"
     return real, None
@@ -363,6 +407,54 @@ def _entry_count(name: str, payload: Any) -> int:
     return len(payload) if isinstance(payload, dict) else 0
 
 
+def _str_or_none(value: Any) -> bool:
+    return value is None or isinstance(value, str)
+
+
+# Row-level checks. Whoever edits a bundle can recompute its digests, so
+# verify must also reject rows the ledger readers would crash on after an
+# import: fingerprint.check_staleness passes script_path to os.fspath, the
+# registry sorts local_paths by last_seen and edges by artifact_id/
+# source_locator/relation, and reads every sighting with .get. Messages
+# never quote a ledger key, since legacy keys can be absolute paths.
+
+def _fingerprint_row_error(row: dict[str, Any]) -> str | None:
+    for field_name in ("script_path", "script_hash"):
+        if not _str_or_none(row.get(field_name)):
+            return f"a fingerprint_ledger entry's {field_name} is not a string or null"
+    digest = row.get("content_digest")
+    if isinstance(digest, dict):
+        digest = digest.get("digest")
+    if not _str_or_none(digest):
+        return "a fingerprint_ledger entry's content_digest is not a string, null or digest object"
+    return None
+
+
+def _artifact_record_error(record: dict[str, Any]) -> str | None:
+    if not isinstance(record.get("artifact_id"), str):
+        return "an artifact_registry record's artifact_id is not a string"
+    sightings = record.get("local_paths", [])
+    if not isinstance(sightings, list) or not all(isinstance(s, dict) for s in sightings):
+        return "an artifact_registry record's local_paths is not a list of objects"
+    for sighting in sightings:
+        for field_name in ("local_only_path", "last_seen"):
+            if not _str_or_none(sighting.get(field_name)):
+                return (
+                    f"an artifact_registry record's local_paths {field_name} "
+                    "is not a string or null"
+                )
+    return None
+
+
+def _edge_error(edge: dict[str, Any]) -> str | None:
+    for field_name in ("artifact_id", "source_locator", "relation"):
+        if not isinstance(edge.get(field_name), str):
+            return f"an artifact_registry edge's {field_name} is not a string"
+    if not isinstance(edge.get("metadata") or {}, dict):
+        return "an artifact_registry edge's metadata is not an object"
+    return None
+
+
 def _payload_shape_error(name: str, payload: Any) -> str | None:
     if not isinstance(payload, dict):
         return "payload is not a JSON object"
@@ -378,9 +470,24 @@ def _payload_shape_error(name: str, payload: Any) -> str | None:
             return "artifact_registry.artifacts is not an object of records"
         if not isinstance(edges, list) or not all(isinstance(e, dict) for e in edges):
             return "artifact_registry.edges is not a list of edge objects"
+        for record in artifacts.values():
+            error = _artifact_record_error(record)
+            if error:
+                return error
+        for edge in edges:
+            error = _edge_error(edge)
+            if error:
+                return error
         return None
+    # Every provenance, fingerprint and run-manifest row must be an object;
+    # fingerprint rows are then checked field by field.
     if not all(isinstance(v, dict) for v in payload.values()):
         return "ledger entries are not all JSON objects"
+    if name == "fingerprint_ledger":
+        for row in payload.values():
+            error = _fingerprint_row_error(row)
+            if error:
+                return error
     return None
 
 
@@ -388,14 +495,21 @@ def _payload_shape_error(name: str, payload: Any) -> str | None:
 # Export
 # ---------------------------------------------------------------------------
 
-def export_bundle(outputs_dir: str, bundle_path: str | None = None) -> dict[str, Any]:
+def export_bundle(
+    outputs_dir: str, bundle_path: str | None = None, *, overwrite: bool = False,
+) -> dict[str, Any]:
     """Write every Outputs ledger plus index metadata to one verified file.
 
     Args:
       outputs_dir:  Absolute path to the outputs directory.
       bundle_path:  Where to write, inside ``outputs_dir`` (relative paths are
                     relative to it). Defaults to
-                    :data:`DEFAULT_BUNDLE_RELPATH`.
+                    :data:`DEFAULT_BUNDLE_RELPATH`. Inside
+                    ``.meridian-outputs-cache`` only its ``bundles/``
+                    subdirectory is allowed.
+      overwrite:    Replace a file that already exists at ``bundle_path``.
+                    Off by default, so an export never silently replaces a
+                    user's file or an earlier bundle.
 
     Returns:
       ``{"exported": True, "bundle_path", "bundle_digest", "members":
@@ -410,6 +524,12 @@ def export_bundle(outputs_dir: str, bundle_path: str | None = None) -> dict[str,
     target, error = _resolve_bundle_path(outputs_dir, bundle_path or DEFAULT_BUNDLE_RELPATH)
     if target is None:
         return {"exported": False, "error": error}
+    if not overwrite and os.path.lexists(target):
+        return {
+            "exported": False,
+            "error": "bundle_path rejected: a file already exists there "
+                     "(pass overwrite=True to replace it)",
+        }
 
     payloads: dict[str, Any] = {}
     errors: list[str] = []
@@ -712,6 +832,22 @@ def _summarise(stats: dict[str, list[str]]) -> dict[str, Any]:
         "conflicts": conflicts[:_CONFLICT_LIST_CAP],
         "conflicts_truncated": len(conflicts) > _CONFLICT_LIST_CAP,
     }
+
+
+def _concurrent_modification_result(result: dict[str, Any]) -> dict[str, Any]:
+    """Mark ``result`` as stopped because a target ledger changed after the
+    plan read it, and return it.
+
+    The import declines to write anything further, so this is a refusal:
+    ``refused`` is True like every other stop, ``imported`` stays False, and
+    ``written_members`` keeps whatever was already replaced. The import
+    write loop's signature re-check should return through this helper
+    rather than setting ``reason`` by hand.
+    """
+    result["refused"] = True
+    result["imported"] = False
+    result["reason"] = "concurrent_modification"
+    return result
 
 
 def import_bundle(

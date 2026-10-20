@@ -229,6 +229,102 @@ class TestExport:
         result = B.export_bundle(str(populated["outputs"]), "somedir")
         assert result == {"exported": False, "error": "bundle_path rejected: it names a directory"}
 
+    @pytest.mark.parametrize("rel", [
+        ".meridian-outputs-cache/index.duckdb.lock",
+        ".MERIDIAN-OUTPUTS-CACHE/index.duckdb.lock",
+        ".meridian-outputs-cache/bundles/../index.duckdb.lock",
+        ".meridian-outputs-cache/provenance_ledger.json.lock",
+        ".meridian-outputs-cache/derived/manifest.json",
+        ".meridian-outputs-cache/derived/artifacts/abc.png",
+        ".meridian-outputs-cache/bundles",
+    ])
+    def test_cache_files_outside_bundles_dir_are_refused_even_with_overwrite(
+        self, populated, rel,
+    ) -> None:
+        """B1: the lock, derived-cache and other live files in the cache are
+        never an export target -- index.duckdb.lock being replaced wedged
+        every index writer."""
+        cache = populated["outputs"] / ".meridian-outputs-cache"
+        lock = cache / "index.duckdb.lock"
+        manifest = cache / "derived" / "manifest.json"
+        artifact = cache / "derived" / "artifacts" / "abc.png"
+        artifact.parent.mkdir(parents=True)
+        for path in (lock, manifest, artifact):
+            path.write_bytes(b"live state")
+        try:
+            before = _snapshot(populated["outputs"])
+            result = B.export_bundle(str(populated["outputs"]), rel, overwrite=True)
+            assert result["exported"] is False
+            assert "bundles/ subdirectory" in result["error"]
+            for path in (lock, manifest, artifact):
+                assert path.read_bytes() == b"live state"
+            assert not (cache / "bundles").exists()
+            assert _snapshot(populated["outputs"]) == before
+        finally:
+            # A planted lock file reads as "held" to IndexFileLock, which
+            # would stall the index cache's close at teardown -- the very
+            # wedge this test guards against.
+            lock.unlink()
+
+    def test_existing_user_file_is_refused_without_overwrite(self, populated) -> None:
+        """B1: an existing file at bundle_path is never silently replaced."""
+        results = populated["outputs"] / "results.csv"
+        results.write_text("x,y\n1,2\n", encoding="utf-8")
+        refused = B.export_bundle(str(populated["outputs"]), "results.csv")
+        assert refused == {
+            "exported": False,
+            "error": "bundle_path rejected: a file already exists there "
+                     "(pass overwrite=True to replace it)",
+        }
+        assert results.read_text(encoding="utf-8") == "x,y\n1,2\n"
+
+        replaced = B.export_bundle(str(populated["outputs"]), "results.csv", overwrite=True)
+        assert replaced["exported"] is True
+        assert B.verify_bundle(str(results))["verified"] is True
+
+    def test_existing_bundle_at_default_path_needs_overwrite(self, populated) -> None:
+        od = str(populated["outputs"])
+        first = B.export_bundle(od)
+        assert first["exported"] is True
+        again = B.export_bundle(od)
+        assert again["exported"] is False
+        assert "already exists" in again["error"]
+        assert B.export_bundle(od, overwrite=True)["exported"] is True
+
+    @pytest.mark.parametrize("rel", [
+        "results.csv:hidden",
+        "backup.json:evil",
+        ".meridian-outputs-cache/bundles/b.json::$DATA",
+        "sub/name:stream:$DATA",
+    ])
+    def test_stream_suffixed_name_is_refused(self, populated, rel) -> None:
+        """B1: on Windows ``name:stream`` writes an alternate data stream of
+        an existing file, so a ':' outside the drive letter is refused."""
+        results = populated["outputs"] / "results.csv"
+        results.write_text("x,y\n1,2\n", encoding="utf-8")
+        result = B.export_bundle(str(populated["outputs"]), rel, overwrite=True)
+        assert result == {
+            "exported": False,
+            "error": "bundle_path rejected: ':' is only allowed in a drive letter",
+        }
+        assert results.read_text(encoding="utf-8") == "x,y\n1,2\n"
+        assert not (populated["outputs"] / "backup.json").exists()
+        assert not (populated["outputs"] / "sub").exists()
+
+    def test_drive_qualified_absolute_path_inside_outputs_is_allowed(self, populated) -> None:
+        target = populated["outputs"] / "abs_bundle.json"
+        result = B.export_bundle(str(populated["outputs"]), str(target))
+        assert result["exported"] is True
+        assert result["bundle_path"] == "abs_bundle.json"
+
+    def test_verify_refuses_cache_paths_outside_bundles_dir(self, populated) -> None:
+        report = B.verify_bundle(
+            ".meridian-outputs-cache/derived/manifest.json",
+            outputs_dir=str(populated["outputs"]),
+        )
+        assert report["verified"] is False
+        assert "bundles/ subdirectory" in report["errors"][0]
+
     def test_missing_outputs_dir(self, tmp_path) -> None:
         assert B.export_bundle(str(tmp_path / "nope"), "x.json") == {
             "exported": False, "error": "outputs_dir does not exist",
@@ -361,6 +457,100 @@ class TestVerify:
         assert report["malformed"] == ["artifact_registry"]
         assert "shape_error" in report["members"]["artifact_registry"]
         assert report["verified"] is False
+
+    def test_resealed_non_string_script_path_fails_verify_and_import(self, populated) -> None:
+        """B2: digests can be recomputed, so a fingerprint row with
+        script_path 5 used to verify, import, and then raise TypeError in
+        every fingerprint.check_staleness call on the target."""
+        _export(populated["outputs"])
+        target = _empty_target(populated["root"])
+        dst = _copy_bundle(populated["outputs"], "backup/bundle.json", target)
+        envelope = _load(dst)
+        row = next(iter(envelope["members"]["fingerprint_ledger"]["payload"].values()))
+        row["script_path"] = 5
+        dst.write_text(json.dumps(_reseal(envelope)), encoding="utf-8")
+
+        report = B.verify_bundle(str(dst))
+        assert report["verified"] is False
+        assert report["mismatches"] == []  # the digests were recomputed
+        assert report["malformed"] == ["fingerprint_ledger"]
+        assert report["members"]["fingerprint_ledger"]["shape_error"] == (
+            "a fingerprint_ledger entry's script_path is not a string or null"
+        )
+        result = B.import_bundle("incoming.json", str(target), dry_run=False)
+        assert result["refused"] is True
+        assert result["reason"] == "verification_failed"
+        assert _snapshot(target) == {name: None for name in _LEDGER_FILES}
+        assert fingerprint.check_staleness(str(target)) == []
+
+    @pytest.mark.parametrize("field, value, reason", [
+        ("script_hash", 5, "a fingerprint_ledger entry's script_hash is not a string or null"),
+        ("content_digest", {"digest": 5}, "a fingerprint_ledger entry's content_digest is "
+                                          "not a string, null or digest object"),
+        ("content_digest", [1], "a fingerprint_ledger entry's content_digest is "
+                                "not a string, null or digest object"),
+    ])
+    def test_resealed_bad_fingerprint_hash_fields_are_malformed(
+        self, populated, field, value, reason,
+    ) -> None:
+        _export(populated["outputs"])
+        path = populated["outputs"] / "backup" / "bundle.json"
+        envelope = _load(path)
+        row = next(iter(envelope["members"]["fingerprint_ledger"]["payload"].values()))
+        row[field] = value
+        path.write_text(json.dumps(_reseal(envelope)), encoding="utf-8")
+        report = B.verify_bundle(str(path))
+        assert report["verified"] is False
+        assert report["malformed"] == ["fingerprint_ledger"]
+        assert report["members"]["fingerprint_ledger"]["shape_error"] == reason
+
+    @pytest.mark.parametrize("mutate, reason", [
+        (lambda rec, edge: rec.__setitem__("local_paths", "fig.csv"),
+         "an artifact_registry record's local_paths is not a list of objects"),
+        (lambda rec, edge: rec.__setitem__("local_paths", None),
+         "an artifact_registry record's local_paths is not a list of objects"),
+        (lambda rec, edge: rec.__setitem__("local_paths", [5]),
+         "an artifact_registry record's local_paths is not a list of objects"),
+        (lambda rec, edge: rec["local_paths"][0].__setitem__("last_seen", 5),
+         "an artifact_registry record's local_paths last_seen is not a string or null"),
+        (lambda rec, edge: rec.pop("artifact_id"),
+         "an artifact_registry record's artifact_id is not a string"),
+        (lambda rec, edge: edge.__setitem__("relation", None),
+         "an artifact_registry edge's relation is not a string"),
+        (lambda rec, edge: edge.__setitem__("metadata", [1]),
+         "an artifact_registry edge's metadata is not an object"),
+    ])
+    def test_resealed_bad_registry_rows_are_refused(self, populated, mutate, reason) -> None:
+        """B2: an artifact whose local_paths is not a list of objects (or an
+        edge missing a sort key) used to raise on every registry lookup
+        after import."""
+        _export(populated["outputs"])
+        target = _empty_target(populated["root"])
+        dst = _copy_bundle(populated["outputs"], "backup/bundle.json", target)
+        envelope = _load(dst)
+        registry = envelope["members"]["artifact_registry"]["payload"]
+        mutate(registry["artifacts"][populated["artifact_id"]], registry["edges"][0])
+        dst.write_text(json.dumps(_reseal(envelope)), encoding="utf-8")
+
+        report = B.verify_bundle(str(dst))
+        assert report["verified"] is False
+        assert report["malformed"] == ["artifact_registry"]
+        assert report["members"]["artifact_registry"]["shape_error"] == reason
+        result = B.import_bundle("incoming.json", str(target), dry_run=False)
+        assert result["reason"] == "verification_failed"
+        assert _snapshot(target) == {name: None for name in _LEDGER_FILES}
+
+    def test_export_refuses_a_live_ledger_row_that_would_not_verify(self, populated) -> None:
+        path = _ledger_path(populated["outputs"], "fingerprint_ledger")
+        ledger = json.loads(path.read_text(encoding="utf-8"))
+        next(iter(ledger.values()))["script_path"] = 5
+        path.write_text(json.dumps(ledger), encoding="utf-8")
+        result = B.export_bundle(str(populated["outputs"]), "x.json")
+        assert result["exported"] is False
+        assert result["errors"] == [
+            "fingerprint_ledger: a fingerprint_ledger entry's script_path is not a string or null",
+        ]
+        assert not (populated["outputs"] / "x.json").exists()
 
     @pytest.mark.parametrize("mutate, expected_error", [
         (lambda raw: raw[: len(raw) // 2], "bundle is not valid JSON (JSONDecodeError)"),
@@ -632,6 +822,20 @@ class TestImport:
         assert result["written_members"] == []
         assert _snapshot(target) == {name: None for name in _LEDGER_FILES}
 
+    def test_concurrent_modification_result_is_a_refusal(self) -> None:
+        """B3: a concurrent_modification stop declines to write anything
+        more, so it reports refused=True, not refused=False beside
+        imported=False. Exercised through the helper: the write loop that
+        returns it is owned by the import-write-path change."""
+        result = {"imported": False, "dry_run": False, "refused": False, "reason": None,
+                  "written_members": ["artifact_registry"]}
+        out = B._concurrent_modification_result(result)
+        assert out is result
+        assert out["refused"] is True
+        assert out["imported"] is False
+        assert out["reason"] == "concurrent_modification"
+        assert out["written_members"] == ["artifact_registry"]
+
     def test_write_failure_is_reported(self, populated, monkeypatch) -> None:
         _export(populated["outputs"])
         target = _empty_target(populated["root"])
@@ -802,6 +1006,19 @@ class TestWiring:
 
         default = inspect.signature(srv.export_outputs_bundle).parameters["bundle_path"].default
         assert default == B.DEFAULT_BUNDLE_RELPATH
+
+    def test_mcp_export_passes_overwrite_through(self, populated) -> None:
+        import inspect
+
+        from meridian_outputs import server as srv
+
+        params = inspect.signature(srv.export_outputs_bundle).parameters
+        assert params["overwrite"].default is False
+        od = str(populated["outputs"])
+        assert srv.export_outputs_bundle(od)["exported"] is True
+        again = srv.export_outputs_bundle(od)
+        assert again["exported"] is False and "already exists" in again["error"]
+        assert srv.export_outputs_bundle(od, overwrite=True)["exported"] is True
 
     def test_readme_documents_the_tools(self) -> None:
         readme = (Path(__file__).parent.parent / "README.md").read_text(encoding="utf-8")

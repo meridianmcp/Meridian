@@ -101,6 +101,56 @@ _MODEL_ARRAYS = [
 ]
 
 
+def _patch_end(data: bytes, offset: int, fmt: str, value: int) -> bytes:
+    """Overwrite one field of the end-of-central-directory record."""
+    out = bytearray(data)
+    struct.pack_into(fmt, out, data.rfind(b"PK\x05\x06") + offset, value)
+    return bytes(out)
+
+
+def _patch_central(data: bytes, offset: int, fmt: str, value: int) -> bytes:
+    """Overwrite one field of the first central-directory record."""
+    out = bytearray(data)
+    struct.pack_into(fmt, out, data.find(b"PK\x01\x02") + offset, value)
+    return bytes(out)
+
+
+def _insert_before_end(data: bytes, blob: bytes) -> bytes:
+    pos = data.rfind(b"PK\x05\x06")
+    return data[:pos] + blob + data[pos:]
+
+
+def _with_declared_count(data: bytes, count: int) -> bytes:
+    """Rewrite the end record's (this-disk and total) entry counts."""
+    return _patch_end(_patch_end(data, 8, "<H", count), 10, "<H", count)
+
+
+class _CountingBytesIO(io.BytesIO):
+    """Counts reads of 46-byte central-directory record headers."""
+
+    def __init__(self, data: bytes) -> None:
+        super().__init__(data)
+        self.central_headers_read = 0
+
+    def read(self, size: int | None = -1) -> bytes:
+        chunk = super().read(size)
+        if size == 46 and chunk[:4] == b"PK\x01\x02":
+            self.central_headers_read += 1
+        return chunk
+
+
+def _forbid_zipfile(monkeypatch: pytest.MonkeyPatch) -> list[object]:
+    """Record (and fail) any zipfile.ZipFile construction by the parser."""
+    calls: list[object] = []
+
+    def _refuse(*args: object, **kwargs: object) -> None:
+        calls.append(args)
+        raise AssertionError("zipfile.ZipFile was handed the archive")
+
+    monkeypatch.setattr(OL.zipfile, "ZipFile", _refuse)
+    return calls
+
+
 def _single_page_pdf(text: str) -> bytes:
     """Minimal one-page PDF (same construction as test_fingerprint.py)."""
     stream_body = f"BT /F1 12 Tf 20 250 Td ({text}) Tj ET".encode("ascii")
@@ -265,17 +315,72 @@ class TestNpzParser:
             {"name": "nested/grid", "shape": [4, 4], "dtype": "float64"},
         ]
 
-    def test_unreadable_member_is_listed_without_header(self, tmp_path: Path) -> None:
-        """A member whose compression method is unsupported (for example an
-        AES-encrypted entry) keeps its name and loses only shape/dtype."""
+    def test_unknown_compression_method_is_filename_only(self, tmp_path: Path) -> None:
+        """A member whose compression method is neither stored nor deflated
+        (here 99, as an AES-encrypted entry declares) makes the whole file
+        filename-only. Before B4 the member was opened and listed without a
+        header; only stored and deflated reads are bounded, so no other
+        method is opened at all now."""
         data = bytearray(_npz_bytes({"weights": _npy_bytes("<f8", (2,))}))
         cd = data.find(b"PK\x01\x02")
         struct.pack_into("<H", data, cd + 10, 99)  # unknown compression method
         f = tmp_path / "odd.npz"
         f.write_bytes(bytes(data))
-        assert OL._npz_array_summary(str(f)) == [
-            {"name": "weights", "shape": None, "dtype": None},
-        ]
+        assert OL._npz_array_summary(str(f)) is None
+
+    @pytest.mark.parametrize("method, expect_parsed", [
+        (zipfile.ZIP_STORED, True),
+        (zipfile.ZIP_DEFLATED, True),
+        (zipfile.ZIP_BZIP2, False),
+        (zipfile.ZIP_LZMA, False),
+    ])
+    def test_only_stored_and_deflated_members_are_opened(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+        caplog: pytest.LogCaptureFixture, method: int, expect_parsed: bool,
+    ) -> None:
+        """B4: zipfile inflates a whole BZIP2/LZMA block on one read, so the
+        64 KiB header read did not bound those members. They are refused
+        before any member is opened; stored and deflated still parse."""
+        buf = io.BytesIO()
+        with zipfile.ZipFile(buf, "w", compression=method) as zf:
+            zf.writestr("weights.npy", _npy_bytes("<f8", (100, 3), payload=b"\0" * 4096))
+        f = tmp_path / "model.npz"
+        f.write_bytes(buf.getvalue())
+
+        opened: list[str] = []
+        real_open = zipfile.ZipFile.open
+
+        def _spy_open(self, name, *args, **kwargs):
+            opened.append(getattr(name, "filename", name))
+            return real_open(self, name, *args, **kwargs)
+
+        monkeypatch.setattr(zipfile.ZipFile, "open", _spy_open)
+        monkeypatch.setattr(OL, "_NPZ_UNREADABLE_LOGGED", False)
+        caplog.set_level(logging.INFO, logger=OL._log.name)
+        arrays = OL._npz_array_summary(str(f))
+        if expect_parsed:
+            assert arrays == [{"name": "weights", "shape": [100, 3], "dtype": "float64"}]
+            assert opened == ["weights.npy"]
+        else:
+            assert arrays is None
+            assert opened == []
+            logged = [r.getMessage() for r in caplog.records if ".npz archive" in r.getMessage()]
+            assert len(logged) == 1
+            assert f"compression method {method} is not stored or deflated" in logged[0]
+
+    def test_one_bzip2_member_refuses_the_whole_archive_unread(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        buf = io.BytesIO()
+        with zipfile.ZipFile(buf, "w") as zf:
+            zf.writestr("a.npy", _npy_bytes("<f8", (2,)), compress_type=zipfile.ZIP_STORED)
+            zf.writestr("b.npy", _npy_bytes("<f8", (3,)), compress_type=zipfile.ZIP_BZIP2)
+        f = tmp_path / "mixed.npz"
+        f.write_bytes(buf.getvalue())
+        opened: list[object] = []
+        monkeypatch.setattr(zipfile.ZipFile, "open", lambda self, name, *a, **k: opened.append(name))
+        assert OL._npz_array_summary(str(f)) is None
+        assert opened == []
 
 
 # ---------------------------------------------------------------------------
@@ -318,15 +423,109 @@ class TestNpzDegradesToFilenameOnly:
     def test_cap_applies_to_listed_members_too(
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
     ) -> None:
-        """An end record that under-declares its entries is still caught
-        once the central directory is listed."""
+        """An end record that under-declares its entries is still caught,
+        by the central-directory walk, before zipfile lists anything. (This
+        used to monkeypatch the removed _zip_declared_entry_count.)"""
         monkeypatch.setattr(OL, "_NPZ_MAX_MEMBERS", 2)
-        monkeypatch.setattr(OL, "_zip_declared_entry_count", lambda _fh: 1)
-        f = tmp_path / "three.npz"
-        f.write_bytes(_npz_bytes(
+        data = _with_declared_count(_npz_bytes(
             {name: _npy_bytes("<f8", (1,)) for name in ("a", "b", "c")},
-        ))
-        assert OL._npz_array_summary(str(f)) is None
+        ), 1)
+        calls = _forbid_zipfile(monkeypatch)
+        assert OL._zip_central_directory_problem(io.BytesIO(data)) == (
+            "more than 2 members exceeds the cap"
+        )
+        assert OL._npz_array_summary("three.npz", data) is None
+        assert calls == []
+
+    def test_walk_stops_at_cap_plus_one_records(
+        self, monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """B5: 300 records are refused after reading 257 record headers;
+        zipfile never builds its entry list."""
+        data = _npz_bytes({f"a{i:03d}": b"" for i in range(300)})
+        fh = _CountingBytesIO(data)
+        calls = _forbid_zipfile(monkeypatch)
+        assert OL._npz_members(fh, "many.npz") is None
+        assert fh.central_headers_read == OL._NPZ_MAX_MEMBERS + 1
+        assert calls == []
+
+    def test_zero_declared_entries_with_300_records_is_refused(
+        self, monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """B5: the 16-bit end-record count is attacker-controlled (zipfile
+        ignores it), so a count of 0 cannot smuggle 300 records past the
+        cap."""
+        data = _with_declared_count(_npz_bytes({f"a{i:03d}": b"" for i in range(300)}), 0)
+        fh = _CountingBytesIO(data)
+        calls = _forbid_zipfile(monkeypatch)
+        assert OL._zip_central_directory_problem(fh) == (
+            f"more than {OL._NPZ_MAX_MEMBERS} members exceeds the cap"
+        )
+        assert fh.central_headers_read == OL._NPZ_MAX_MEMBERS + 1
+        assert OL._npz_array_summary("many.npz", data) is None
+        assert calls == []
+
+    def test_under_declared_count_below_the_cap_is_refused(
+        self, monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        data = _with_declared_count(_model_npz(), 0)
+        calls = _forbid_zipfile(monkeypatch)
+        assert OL._zip_central_directory_problem(io.BytesIO(data)) == (
+            "end record declares 0 entries but the directory holds 2"
+        )
+        assert OL._npz_array_summary("model.npz", data) is None
+        assert calls == []
+
+    @pytest.mark.parametrize("mutate, reason", [
+        (lambda d: _patch_end(d, 10, "<H", 0xFFFF), "ZIP64 archive"),
+        (lambda d: _patch_end(d, 16, "<L", 0xFFFFFFFF), "ZIP64 archive"),
+        (lambda d: _insert_before_end(d, b"PK\x06\x07" + b"\0" * 16), "ZIP64 archive"),
+        (lambda d: _patch_central(d, 42, "<L", 0xFFFFFFFF), "ZIP64 archive"),
+        (lambda d: _patch_central(d, 20, "<L", 0xFFFFFFFF), "ZIP64 archive"),
+        (lambda d: _patch_end(d, 16, "<L", 1), "inconsistent end-of-central-directory offsets"),
+        (lambda d: _patch_end(d, 12, "<L", 10), "inconsistent end-of-central-directory offsets"),
+        (lambda d: _patch_end(d, 4, "<H", 1), "inconsistent end-of-central-directory offsets"),
+        (lambda d: b"MZ-stub" + d, "inconsistent end-of-central-directory offsets"),
+        (lambda d: _patch_central(d, 42, "<L", d.find(b"PK\x01\x02")),
+         "inconsistent member offset"),
+        (lambda d: _patch_central(d, 28, "<H", 200), "inconsistent central directory size"),
+    ])
+    def test_zip64_and_inconsistent_offsets_are_refused(
+        self, monkeypatch: pytest.MonkeyPatch, mutate, reason: str,
+    ) -> None:
+        data = mutate(_model_npz())
+        calls = _forbid_zipfile(monkeypatch)
+        assert OL._zip_central_directory_problem(io.BytesIO(data)) == reason
+        assert OL._npz_array_summary("odd.npz", data) is None
+        assert calls == []
+
+    @pytest.mark.parametrize("compressed", [False, True])
+    def test_numpy_style_force_zip64_members_still_parse(self, compressed: bool) -> None:
+        """numpy.savez writes each member with force_zip64=True; that puts
+        ZIP64 extras in the local headers only, so the walk accepts it."""
+        buf = io.BytesIO()
+        method = zipfile.ZIP_DEFLATED if compressed else zipfile.ZIP_STORED
+        with zipfile.ZipFile(buf, "w", compression=method, allowZip64=True) as zf:
+            for name, npy in (
+                ("weights", _npy_bytes("<f8", (100, 3), payload=b"\0" * 64)),
+                ("labels", _npy_bytes("<i8", (100,), payload=b"\0" * 32)),
+            ):
+                with zf.open(f"{name}.npy", "w", force_zip64=True) as member:
+                    member.write(npy)
+        data = buf.getvalue()
+        assert OL._zip_central_directory_problem(io.BytesIO(data)) is None
+        assert OL._npz_array_summary("model.npz", data) == _MODEL_ARRAYS
+
+    def test_archive_comment_and_empty_archive_are_walked(self) -> None:
+        buf = io.BytesIO()
+        with zipfile.ZipFile(buf, "w") as zf:
+            zf.writestr("weights.npy", _npy_bytes("<f8", (100, 3)))
+            zf.comment = b"PK written by a tool that likes comments"
+        assert OL._zip_central_directory_problem(io.BytesIO(buf.getvalue())) is None
+        empty = io.BytesIO()
+        zipfile.ZipFile(empty, "w").close()
+        assert OL._zip_central_directory_problem(io.BytesIO(empty.getvalue())) is None
+        assert OL._npz_array_summary("empty.npz", empty.getvalue()) == []
 
     def test_missing_file_is_none(self, tmp_path: Path) -> None:
         assert OL._npz_array_summary(str(tmp_path / "gone.npz")) is None
