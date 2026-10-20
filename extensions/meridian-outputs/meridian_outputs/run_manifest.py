@@ -136,8 +136,13 @@ class RunManifestError(ValueError):
 # Ledger location + atomic read/write (same convention as annotate.py)
 # ---------------------------------------------------------------------------
 
-def _cache_dir(outputs_dir: str) -> str:
+def _cache_dir(outputs_dir: str, *, create: bool = True) -> str:
+    """``<outputs_dir>/.meridian-outputs-cache``, created + gitignored on a
+    write. ``create=False`` (every read path) only computes the path: a read
+    never creates the directory or edits a ``.gitignore``."""
     cache_dir = os.path.join(outputs_dir, _CACHE_DIRNAME)
+    if not create:
+        return cache_dir
     try:
         os.makedirs(cache_dir, exist_ok=True)
         outputs_local.ensure_gitignored(cache_dir)
@@ -146,12 +151,12 @@ def _cache_dir(outputs_dir: str) -> str:
     return cache_dir
 
 
-def _ledger_path(outputs_dir: str) -> str:
-    return os.path.join(_cache_dir(outputs_dir), _LEDGER_FILENAME)
+def _ledger_path(outputs_dir: str, *, create: bool = True) -> str:
+    return os.path.join(_cache_dir(outputs_dir, create=create), _LEDGER_FILENAME)
 
 
 def _read_ledger(outputs_dir: str) -> dict[str, dict[str, Any]]:
-    path = _ledger_path(outputs_dir)
+    path = _ledger_path(outputs_dir, create=False)
     try:
         with open(path, "r", encoding="utf-8") as fh:
             data = json.load(fh)
