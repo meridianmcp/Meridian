@@ -41,14 +41,16 @@ already works, and only ADDS:
   2. ``size`` / ``mtime`` / ``mtime_iso`` surfaced directly on every
      classification record, so "which one is newer/bigger" no longer
      requires a manual file-properties check outside the tool.
-  3. When the broader heuristic finds a plausible canonical twin but this
-     module can't reuse ``outputs_local``'s private hasher to *confirm*
-     byte-identity, it is honest about that: it compares size (a
-     cheap, always-correct "these definitely differ" signal, same idea as
-     the size-prefilter ``outputs_local`` itself uses in its own rebuild
-     path) and attaches an explicit "unconfirmed, same size, verify with a
-     hash if you need certainty" note plus a size/mtime pair rather than
-     ever asserting a false-confidence duplicate verdict.
+  3. When the broader heuristic finds a plausible canonical twin, it
+     compares size first (a cheap, always-correct "these definitely
+     differ" signal, same idea as the size-prefilter ``outputs_local``
+     itself uses in its own rebuild path). A same-size pair is then
+     confirmed through the public
+     :func:`outputs_local.files_content_identical`, and ``is_archival`` is
+     set only when the content hashes match. If a hash cannot be computed,
+     the record stays ``is_archival=False`` with an explicit "unconfirmed"
+     reason plus the size/mtime pair, rather than ever asserting a
+     false-confidence duplicate verdict.
 
 Coordination with sibling modules (``annotate.py`` already landed;
 ``fingerprint.py``/``provenance.py`` were being built in parallel):
@@ -72,7 +74,7 @@ import re
 from datetime import datetime, timezone
 from typing import Any
 
-from .outputs_local import classify_canonical_archival
+from .outputs_local import classify_canonical_archival, files_content_identical
 
 __all__ = ["classify_outputs"]
 
@@ -177,12 +179,9 @@ def classify_outputs(paths: list[str]) -> dict[str, Any]:
                         "differs, not a duplicate"
                     )
                 else:
-                    # BUGFIX (found live): a same-size match against a present
-                    # canonical twin is exactly the case this heuristic exists to
-                    # catch -- entry["is_archival"] was never actually being set
-                    # here, so every match still reported is_archival=False
-                    # despite finding and naming the real canonical twin.
-                    entry["is_archival"] = True
+                    # Same size (or a size that could not be read): a name
+                    # guess plus equal size is not proof of a duplicate, so
+                    # is_archival is set only when the content hashes match.
                     relation = "unknown"
                     if this_mtime is not None and twin_mtime is not None:
                         relation = (
@@ -190,12 +189,30 @@ def classify_outputs(paths: list[str]) -> dict[str, Any]:
                             "older" if this_mtime < twin_mtime else
                             "same-mtime"
                         )
-                    entry["reason"] = (
+                    identical = files_content_identical(p, guess)
+                    prefix = (
                         f"broader archival-naming heuristic matched (canonical twin "
-                        f"guess '{guess}' present in batch, same size) -- unconfirmed "
-                        "duplicate (verify with a hash for certainty); this file is "
-                        f"{relation} than that twin by mtime"
+                        f"guess '{guess}' present in batch, same size)"
                     )
+                    if identical:
+                        entry["is_archival"] = True
+                        entry["reason"] = (
+                            f"{prefix} -- content hash identical to that twin, "
+                            f"confirmed duplicate; this file is {relation} than "
+                            "that twin by mtime"
+                        )
+                    elif identical is None:
+                        entry["reason"] = (
+                            f"{prefix} -- unconfirmed: a content hash could not be "
+                            "computed, so it is not marked archival; this file is "
+                            f"{relation} than that twin by mtime"
+                        )
+                    else:
+                        entry["reason"] = (
+                            f"{prefix} -- but content hash differs, not a "
+                            f"duplicate; this file is {relation} than that twin "
+                            "by mtime"
+                        )
             elif guess is not None:
                 entry["reason"] = (
                     f"{rec.reason}; broader heuristic guesses canonical twin "

@@ -23,6 +23,7 @@ Security requirements (non-negotiable, tested):
 """
 from __future__ import annotations
 
+import ast
 import concurrent.futures
 import copy
 import csv as csv_mod
@@ -37,10 +38,12 @@ import random
 import re
 import shutil
 import socket
+import struct
 import subprocess
 import tempfile
 import threading
 import time
+import zipfile
 from collections import OrderedDict
 from dataclasses import asdict, dataclass, replace
 from datetime import datetime, timezone
@@ -1433,6 +1436,30 @@ _PDF_MAX_BYTES = 10 * 1024 * 1024
 _PDF_MAX_PAGES = 200
 _PDF_TIMEOUT_SECONDS = 5.0
 
+# NPZ (numpy savez / savez_compressed) archives get their own kind,
+# "npz_content". Only the array headers are indexed: each member's name,
+# shape and dtype go into the FTS header text, and the body stays empty, so
+# any failure degrades to filename-only indexing. Parsing is stdlib only
+# (zipfile plus ast.literal_eval on the .npy header dict); no numpy, and
+# nothing is ever unpickled. Bounded on two axes: at most _NPZ_MAX_MEMBERS
+# members (more, or an unreadable archive, means filename-only), and at most
+# _NPZ_MAX_HEADER_BYTES decompressed bytes read from each member. .npy stays
+# filename-only (_METADATA_ONLY_SUFFIXES).
+_NPZ_SUFFIXES: frozenset[str] = frozenset({".npz"})
+_NPZ_MAX_MEMBERS = 256
+_NPZ_MAX_HEADER_BYTES = 64 * 1024
+_NPY_MAGIC = b"\x93NUMPY"
+
+# Version of the content the FTS index extracts per kind. Bump it whenever
+# extraction changes for files whose stat signature has not, so that rows
+# written by older code are re-analysed once (see
+# OutputsFtsIndex._check_content_index_version, modelled on
+# _check_hash_algo_version). Unset (0) = written before this marker existed.
+# 2 = NPZ array headers indexed (npz_content); existing pdf_content and .npz
+# rows are re-analysed once.
+_CONTENT_INDEX_VERSION = 2
+_CONTENT_INDEX_VERSION_KEY = "content_index_version"
+
 # fa600e42 follow-up (perf/memory) -- _analyse_file's single-read fast path
 # (below) reads a whole file into one in-memory buffer to derive hash +
 # fingerprint from one pass. That's a real win for the common case (a
@@ -1572,6 +1599,8 @@ def _classify_suffix(path: str) -> str:
         return "metadata_only"
     if suffix in _PDF_SUFFIXES:
         return "pdf_content"
+    if suffix in _NPZ_SUFFIXES:
+        return "npz_content"
     return "binary_metadata"
 
 
@@ -1804,6 +1833,7 @@ def _extract_pdf_text(
     try:
         import pypdf  # noqa: PLC0415 -- optional, lazy
     except ImportError:
+        _log_pypdf_missing_once()
         return None
     try:
         reader = pypdf.PdfReader(io.BytesIO(data))
@@ -1855,6 +1885,230 @@ def _extract_pdf_text_from_path(path: str) -> str | None:
     )
 
 
+# ---------------------------------------------------------------------------
+# Explicit content-extractor degradation (PDF and NPZ)
+# ---------------------------------------------------------------------------
+# Both extractors degrade to filename-only indexing rather than raising.
+# That degrade used to be silent; each cause is now logged once per process
+# at INFO (not per file, so a large tree cannot flood the log), and
+# content_extractor_status() reports the current state for search envelopes.
+
+_DEGRADE_LOG_LOCK = threading.Lock()
+_PYPDF_MISSING_LOGGED = False
+_NPZ_UNREADABLE_LOGGED = False
+
+
+def _log_pypdf_missing_once() -> None:
+    global _PYPDF_MISSING_LOGGED
+    with _DEGRADE_LOG_LOCK:
+        if _PYPDF_MISSING_LOGGED:
+            return
+        _PYPDF_MISSING_LOGGED = True
+    _log.info(
+        "meridian_outputs: pypdf is not importable, so PDF files are indexed "
+        "by filename only (no body text) until it is installed "
+        "(pip install 'pypdf>=4.0'). Logged once per process.",
+    )
+
+
+def _log_npz_unreadable_once(path: str, reason: str) -> None:
+    global _NPZ_UNREADABLE_LOGGED
+    with _DEGRADE_LOG_LOCK:
+        if _NPZ_UNREADABLE_LOGGED:
+            return
+        _NPZ_UNREADABLE_LOGGED = True
+    _log.info(
+        "meridian_outputs: .npz archive %r could not be read (%s), so it is "
+        "indexed by filename only. Further unreadable .npz files are not "
+        "logged in this process.",
+        os.path.basename(path), reason,
+    )
+
+
+def content_extractor_status() -> dict[str, str]:
+    """Current state of the optional body/header extractors.
+
+    ``{"pdf": "ok" | "pypdf_missing", "npz": "ok"}``. NPZ parsing is stdlib
+    only, so it is always available; an individual unreadable archive still
+    degrades to filename-only (logged once, see
+    :func:`_log_npz_unreadable_once`). Never raises.
+    """
+    try:
+        import pypdf  # noqa: F401, PLC0415 -- availability probe only
+        pdf = "ok"
+    except Exception:  # noqa: BLE001 -- any import failure means unavailable
+        pdf = "pypdf_missing"
+    return {"pdf": pdf, "npz": "ok"}
+
+
+# ---------------------------------------------------------------------------
+# NPZ header-only parsing (stdlib, never unpickles)
+# ---------------------------------------------------------------------------
+
+_NPY_KIND_NAMES: dict[str, str] = {
+    "f": "float", "i": "int", "u": "uint", "c": "complex",
+}
+
+
+def _npy_descr_to_dtype(descr: Any) -> str | None:
+    """numpy-style dtype name for an .npy header ``descr`` value.
+
+    ``'<f8'`` gives ``float64``, ``'|b1'`` gives ``bool``, ``'|O'`` gives
+    ``object``, ``'<M8[ns]'`` gives ``datetime64[ns]``. A structured dtype
+    (a list of fields) gives ``structured``. String, bytes and void types
+    keep their descr, matching numpy's own ``str(dtype)``.
+    """
+    if isinstance(descr, list):
+        return "structured"
+    if not isinstance(descr, str) or not descr:
+        return None
+    body = descr[1:] if descr[0] in "<>|=" else descr
+    if not body:
+        return None
+    kind, size = body[0], body[1:]
+    if kind == "b" and size in ("", "1"):
+        return "bool"
+    if kind == "O":
+        return "object"
+    if kind in _NPY_KIND_NAMES and size.isdigit():
+        return f"{_NPY_KIND_NAMES[kind]}{int(size) * 8}"
+    if kind in "Mm" and size.startswith("8"):
+        return ("datetime64" if kind == "M" else "timedelta64") + size[1:]
+    return descr
+
+
+def _parse_npy_header(head: bytes) -> tuple[list[int], str | None] | None:
+    """``(shape, dtype)`` from the first bytes of an .npy stream, or None.
+
+    Supports format versions 1.0, 2.0 and 3.0. The header dict is parsed
+    with :func:`ast.literal_eval`, which accepts only Python literals, so a
+    crafted header cannot run code. Returns None when the magic or version
+    is wrong, the header does not fit in ``head`` (the caller's bounded
+    read), or the dict is malformed.
+    """
+    if len(head) < 10 or not head.startswith(_NPY_MAGIC):
+        return None
+    major = head[6]
+    if major == 1:
+        header_len = struct.unpack_from("<H", head, 8)[0]
+        start, encoding = 10, "latin1"
+    elif major in (2, 3):
+        if len(head) < 12:
+            return None
+        header_len = struct.unpack_from("<I", head, 8)[0]
+        start, encoding = 12, ("latin1" if major == 2 else "utf8")
+    else:
+        return None
+    if start + header_len > len(head):
+        return None
+    try:
+        meta = ast.literal_eval(head[start:start + header_len].decode(encoding))
+    except Exception:  # noqa: BLE001 -- malformed or hostile header text
+        return None
+    if not isinstance(meta, dict):
+        return None
+    shape = meta.get("shape")
+    if not isinstance(shape, tuple) or not all(
+        isinstance(d, int) and not isinstance(d, bool) and d >= 0 for d in shape
+    ):
+        return None
+    return [int(d) for d in shape], _npy_descr_to_dtype(meta.get("descr"))
+
+
+def _zip_declared_entry_count(fh: Any) -> int | None:
+    """Total entry count from a zip's end-of-central-directory record.
+
+    Read before :class:`zipfile.ZipFile` parses the central directory, so an
+    archive declaring more than ``_NPZ_MAX_MEMBERS`` members is refused
+    without listing them. None means no end record was found (not a zip).
+    """
+    fh.seek(0, os.SEEK_END)
+    size = fh.tell()
+    if size < 22:
+        return None
+    tail_len = min(size, 22 + 0xFFFF)
+    fh.seek(size - tail_len)
+    tail = fh.read(tail_len)
+    pos = tail.rfind(b"PK\x05\x06")
+    if pos < 0 or len(tail) - pos < 22:
+        return None
+    return struct.unpack_from("<H", tail, pos + 10)[0]
+
+
+def _npz_members(fh: Any, path: str) -> list[dict[str, Any]] | None:
+    declared = _zip_declared_entry_count(fh)
+    if declared is None:
+        _log_npz_unreadable_once(path, "not a zip archive")
+        return None
+    if declared > _NPZ_MAX_MEMBERS:
+        _log_npz_unreadable_once(
+            path, f"{declared} members exceeds the cap of {_NPZ_MAX_MEMBERS}",
+        )
+        return None
+    fh.seek(0)
+    with zipfile.ZipFile(fh) as zf:
+        infos = [info for info in zf.infolist() if not info.is_dir()]
+        if len(infos) > _NPZ_MAX_MEMBERS:
+            _log_npz_unreadable_once(
+                path, f"{len(infos)} members exceeds the cap of {_NPZ_MAX_MEMBERS}",
+            )
+            return None
+        arrays: list[dict[str, Any]] = []
+        for info in infos:
+            name = info.filename
+            if name.endswith(".npy"):
+                name = name[:-4]
+            parsed: tuple[list[int], str | None] | None
+            try:
+                with zf.open(info) as member:
+                    parsed = _parse_npy_header(member.read(_NPZ_MAX_HEADER_BYTES))
+            except Exception:  # noqa: BLE001 -- encrypted/corrupt member
+                parsed = None
+            shape, dtype = parsed if parsed is not None else (None, None)
+            arrays.append({"name": name, "shape": shape, "dtype": dtype})
+        return arrays
+
+
+def _npz_array_summary(
+    path: str, data: bytes | None = None,
+) -> list[dict[str, Any]] | None:
+    """Array names, shapes and dtypes in an .npz archive, read from headers.
+
+    Each entry is ``{"name", "shape", "dtype"}``; ``shape`` and ``dtype``
+    are None for a member whose .npy header could not be parsed (its name
+    is still listed). ``data`` is the file's bytes when the caller already
+    holds them (the single-read analysis path); otherwise the file is opened
+    and only the zip directory and member headers are read. Returns None
+    (filename-only indexing, logged once) for a file that is not a readable
+    zip or that exceeds ``_NPZ_MAX_MEMBERS``. Never raises.
+    """
+    try:
+        if data is not None:
+            return _npz_members(io.BytesIO(data), path)
+        with open(path, "rb") as fh:
+            return _npz_members(fh, path)
+    except Exception as exc:  # noqa: BLE001 -- BadZipFile, OSError, ...
+        _log_npz_unreadable_once(path, type(exc).__name__)
+        return None
+
+
+def _npz_dims_token(shape: list[int]) -> str:
+    """``[100, 3]`` gives ``100x3``; a 0-d array gives ``scalar``."""
+    return "x".join(str(d) for d in shape) if shape else "scalar"
+
+
+def _npz_fts_terms(arrays: list[dict[str, Any]]) -> list[str]:
+    terms: list[str] = []
+    for arr in arrays:
+        terms.append(str(arr.get("name") or ""))
+        shape = arr.get("shape")
+        if shape is not None:
+            terms.append(_npz_dims_token(shape))
+        if arr.get("dtype"):
+            terms.append(str(arr["dtype"]))
+    return [t for t in terms if t]
+
+
 @dataclass
 class FileFingerprint:
     """Cheap content-derived signature for one output file."""
@@ -1871,6 +2125,10 @@ class FileFingerprint:
     # extraction is comparatively expensive -- computing it once in
     # file_fingerprint and reusing it avoids parsing the same PDF twice.
     pdf_text: str | None = None
+    # NPZ array headers (kind == "npz_content" only): one
+    # {"name", "shape", "dtype"} dict per member, from _npz_array_summary.
+    # None when the archive could not be read or the kind isn't NPZ.
+    npz_arrays: list[dict[str, Any]] | None = None
 
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)
@@ -1879,6 +2137,10 @@ class FileFingerprint:
 def file_fingerprint(path: str) -> FileFingerprint:
     """Compute a cheap FileFingerprint for one output file."""
     kind = _classify_suffix(path)
+    if kind == "npz_content":
+        return FileFingerprint(
+            path=path, kind=kind, npz_arrays=_npz_array_summary(path),
+        )
     if kind == "pdf_content":
         pdf_text = _extract_pdf_text_from_path(path)
         # aa423c7e -- extend the same generating-script-hint inference every
@@ -1929,6 +2191,10 @@ def _content_for_fts(
         terms.extend(fingerprint.json_keys)
     if fingerprint.generating_script:
         terms.append(fingerprint.generating_script)
+    if fingerprint.npz_arrays:
+        # Header-only: array names, dims tokens (e.g. "100x3") and dtypes.
+        # The npz_content body stays empty (the branch below returns header).
+        terms.extend(_npz_fts_terms(fingerprint.npz_arrays))
     header = " ".join(terms)
     if fingerprint.kind == "pdf_content":
         pdf_body = body if body is not None else fingerprint.pdf_text
@@ -1978,13 +2244,81 @@ class ArchivalClassification:
     reason: str = ""
 
 
+def _stat_size_or_none(path: str) -> int | None:
+    """``os.stat(path).st_size``, or ``None`` when the stat fails."""
+    try:
+        return os.stat(path).st_size
+    except (OSError, ValueError):
+        return None
+
+
+def _compare_content(
+    path_a: str,
+    path_b: str,
+    *,
+    hash_of: Callable[[str], str | None],
+    size_of: Callable[[str], int | None],
+) -> bool | None:
+    """Size-first byte-identity check for one pair of files.
+
+    Returns ``False`` without hashing when both sizes are known and differ,
+    since files of different sizes cannot be byte-identical. Otherwise,
+    including when either size is unknown, it compares the two hashes:
+    ``True`` when they are equal, ``False`` when they differ, and ``None``
+    when either hash is unavailable, which means the pair could not be
+    confirmed either way.
+    """
+    size_a = size_of(path_a)
+    size_b = size_of(path_b)
+    if size_a is not None and size_b is not None and size_a != size_b:
+        return False
+    hash_a = hash_of(path_a)
+    if hash_a is None:
+        return None
+    hash_b = hash_of(path_b)
+    if hash_b is None:
+        return None
+    return hash_a == hash_b
+
+
+def files_content_identical(
+    path_a: str,
+    path_b: str,
+    *,
+    hasher: Callable[[str], str | None] = _xxh3_file,
+) -> bool | None:
+    """Public byte-identity check for two files, size first.
+
+    ``False`` when the sizes differ (no hash is computed) or the hashes
+    differ, ``True`` when the hashes are equal, and ``None`` when a hash
+    could not be computed. A failed stat falls back to hashing. This is the
+    same pairwise rule :func:`classify_canonical_archival` applies to an
+    archival candidate and its twin, exposed for callers whose naming
+    heuristics that function's stage-1 filter does not recognise (see
+    :mod:`meridian_outputs.classify`).
+    """
+    return _compare_content(
+        path_a, path_b, hash_of=hasher, size_of=_stat_size_or_none,
+    )
+
+
 def classify_canonical_archival(
     paths: list[str], *, hasher: Callable[[str], str | None] = _xxh3_file,
+    sizer: Callable[[str], int | None] | None = None,
 ) -> dict[str, ArchivalClassification]:
     """Two-stage canonical-vs-archival classification.  Deterministic output
-    order: keys follow the input ``paths`` list order (caller sorts them)."""
+    order: keys follow the input ``paths`` list order (caller sorts them).
+
+    Stage 2 compares sizes before hashes. When the candidate and its twin
+    have different sizes, the candidate is classified "content DIFFERS"
+    without hashing either file. ``sizer`` supplies those sizes: by default
+    each file is stat-ed, and a failed stat (``None``) falls back to the
+    hash comparison. :meth:`OutputsFtsIndex.rebuild` passes the sizes it
+    already holds so that classification adds no file I/O.
+    """
     path_set = set(paths)
     _hash_cache: dict[str, str | None] = {}
+    size_of = sizer if sizer is not None else _stat_size_or_none
 
     def _h(p: str) -> str | None:
         if p not in _hash_cache:
@@ -2004,6 +2338,17 @@ def classify_canonical_archival(
             out[path] = ArchivalClassification(
                 path=path, is_archival=False,
                 reason="archival name pattern but no canonical twin present",
+            )
+            continue
+        cand_size = size_of(path)
+        twin_size = size_of(twin)
+        if cand_size is not None and twin_size is not None and cand_size != twin_size:
+            out[path] = ArchivalClassification(
+                path=path, is_archival=False, canonical_path=twin,
+                reason=(
+                    "archival name pattern but content DIFFERS from twin "
+                    f"(sizes differ: {cand_size} vs {twin_size} bytes)"
+                ),
             )
             continue
         cand_hash = _h(path)
@@ -2292,6 +2637,14 @@ def _analyse_file(
                 fp = FileFingerprint(path=path, kind=kind, pdf_text=pdf_text,
                                      generating_script=pdf_script)
                 fts_content = _content_for_fts(path, fp, body=pdf_text)
+            elif kind == "npz_content":
+                # Parse the member headers from the bytes already read for
+                # hashing above instead of reopening the file.
+                fp = FileFingerprint(
+                    path=path, kind=kind,
+                    npz_arrays=_npz_array_summary(path, data),
+                )
+                fts_content = _content_for_fts(path, fp)
             elif kind != "text_content":
                 fp = FileFingerprint(path=path, kind=kind)
                 fts_content = _content_for_fts(path, fp)
@@ -3535,6 +3888,21 @@ class OutputsFtsIndex:
         # from scratch, AND doubles as the signal the walk throttle (above)
         # uses to pause further discovery until Phase 1/2 catch up.
         self._pending_stale: dict[str, tuple[float | None, int | None]] = {}
+        # Same-size detection follow-up (see _promote_unhashed_same_size_rows).
+        # _same_size_promoted records the stat signature each promoted path
+        # had when it was queued, so a path whose hash still comes back None
+        # (an unreadable file) is not re-queued on every call while its
+        # signature is unchanged. Entries are dropped once the path gets a
+        # real hash. _same_size_scan_needed forces the promotion scan on a
+        # call with an empty backlog: on the first calls of a new instance
+        # (rehydration from disk happens in Phase 2, after the scan) and
+        # after a scan that could not queue every candidate.
+        self._same_size_promoted: dict[str, tuple[float | None, int | None]] = {}
+        self._same_size_scan_needed: bool = True
+        # Paths queued by _check_content_index_version for a one-time
+        # re-analysis. The new content_index_version marker is written only
+        # once none of them is still pending (see the tail of rebuild()).
+        self._content_reindex_pending: set[str] = set()
         # Planner diagnostics: phase timings and discovery coverage from the
         # most recent rebuild.  These are intentionally lightweight and make
         # large-root bottlenecks measurable instead of inferred from a single
@@ -3877,6 +4245,15 @@ class OutputsFtsIndex:
                 _log.debug(
                     "OutputsFtsIndex._connect: legacy-migration-state "
                     "rehydration failed", exc_info=True,
+                )
+            # Runs after both rehydrations above, so it sees the rows and the
+            # pending backlog restored from disk.
+            try:
+                self._check_content_index_version(self._con)
+            except Exception:  # noqa: BLE001
+                _log.debug(
+                    "OutputsFtsIndex._connect: content-index version check "
+                    "failed", exc_info=True,
                 )
         return self._con
 
@@ -4598,6 +4975,89 @@ class OutputsFtsIndex:
         self._pending_hash_upgrade = True
         return True
 
+    def _read_meta_version(self, con: Any, key: str) -> int:
+        """Integer value stored under ``key`` in ``outputs_index_meta``, or 0
+        when it is unset or unreadable."""
+        try:
+            row = con.execute(
+                "SELECT value FROM outputs_index_meta WHERE key = ?", [key],
+            ).fetchone()
+        except Exception:  # noqa: BLE001
+            return 0
+        if row is None or row[0] is None:
+            return 0
+        try:
+            return int(row[0])
+        except (TypeError, ValueError):
+            return 0
+
+    def _write_meta_version(self, con: Any, key: str, version: int) -> None:
+        """Delete-then-insert upsert, the same pattern as
+        :meth:`_write_hash_algo_version`."""
+        con.execute("DELETE FROM outputs_index_meta WHERE key = ?", [key])
+        con.execute(
+            "INSERT INTO outputs_index_meta (key, value) VALUES (?, ?)",
+            [key, str(version)],
+        )
+
+    @staticmethod
+    def _needs_content_reindex(path: str, kind: str | None) -> bool:
+        """Rows whose extracted content changed under the current
+        ``_CONTENT_INDEX_VERSION``: PDF and NPZ, matched by kind or by
+        suffix (an .npz row written before this version has kind
+        ``binary_metadata``)."""
+        if kind in ("pdf_content", "npz_content"):
+            return True
+        suffix = os.path.splitext(path)[1].lower()
+        return suffix in _PDF_SUFFIXES or suffix in _NPZ_SUFFIXES
+
+    def _check_content_index_version(self, con: Any) -> int:
+        """Queue a one-time re-analysis of rows whose extracted content is
+        out of date, modelled on :meth:`_check_hash_algo_version`.
+
+        Fast staleness is stat-based, so a row written by older extraction
+        code is never revisited while its file is unchanged. When the stored
+        ``content_index_version`` is below ``_CONTENT_INDEX_VERSION``, every
+        cached PDF/NPZ row is added to ``self._pending_stale`` with its
+        manifest signature and re-analysed through the normal bounded intake
+        (and the backlog persists across restarts with the walk state). The
+        new marker is written by :meth:`rebuild` only once none of the queued
+        paths is still pending, so an interrupted upgrade is re-queued by the
+        next process rather than silently marked done.
+
+        The marker is written at once when nothing needs queueing: a
+        brand-new index, an index with no PDF/NPZ rows, or one whose rows
+        were not rehydrated because a full re-hash is pending (that pass
+        re-analyses every row anyway, and an interrupted re-hash is retried
+        in full because its own marker is not written until it finishes).
+        Returns the number of rows queued.
+        """
+        self._ensure_schema(con)
+        stored = self._read_meta_version(con, _CONTENT_INDEX_VERSION_KEY)
+        if stored >= _CONTENT_INDEX_VERSION:
+            return 0
+        targets = sorted(
+            p for p, row in self._row_cache.items()
+            if self._needs_content_reindex(p, row.kind)
+        )
+        if not targets:
+            self._write_meta_version(
+                con, _CONTENT_INDEX_VERSION_KEY, _CONTENT_INDEX_VERSION,
+            )
+            return 0
+        for p in targets:
+            row = self._row_cache[p]
+            self._pending_stale.setdefault(
+                p, self._manifest.get(p, (row.mtime, row.size)),
+            )
+        self._content_reindex_pending.update(targets)
+        _log.info(
+            "OutputsFtsIndex: content_index_version %d < current %d for %r -- "
+            "re-analysing %d existing PDF/NPZ row(s) once",
+            stored, _CONTENT_INDEX_VERSION, self._db_path, len(targets),
+        )
+        return len(targets)
+
     @staticmethod
     def _tantivy_schema() -> Any:
         import tantivy  # noqa: PLC0415
@@ -5269,6 +5729,90 @@ class OutputsFtsIndex:
             )
             return None
 
+    def _known_size_counts(
+        self, all_paths: list[str], path_set: set[str],
+    ) -> dict[int, int]:
+        """Return a size -> count map over every path this call knows about.
+
+        A path in ``self._pending_stale`` counts with its freshly stat-ed
+        size, including a path deferred past this call's bounded intake
+        slice. Any other path counts with the size cached in ``_row_cache``.
+        Pending paths outside ``all_paths`` (a backlog restored from disk
+        before the walk revisits them) are counted as well. A path with no
+        known size is not counted. No file is stat-ed here.
+        """
+        counts: dict[int, int] = {}
+        pending = self._pending_stale
+        cache = self._row_cache
+        for p in all_paths:
+            sig = pending.get(p)
+            if sig is not None:
+                sz = sig[1]
+            else:
+                row = cache.get(p)
+                sz = row.size if row is not None else None
+            if sz is not None:
+                counts[sz] = counts.get(sz, 0) + 1
+        for p, sig in pending.items():
+            if p not in path_set and sig[1] is not None:
+                counts[sig[1]] = counts.get(sig[1], 0) + 1
+        return counts
+
+    def _promote_unhashed_same_size_rows(
+        self,
+        all_paths: list[str],
+        size_counts: dict[int, int],
+        analysis_limit: int,
+    ) -> int:
+        """Queue cached rows that were indexed without a hash but now share
+        their size with another known file. Returns the number queued.
+
+        The size prefilter (e1fd4182) skips hashing a file whose size is
+        unique when it is analysed, so its row keeps ``sha256=None``. If a
+        file of the same size appears later, that row is never revisited:
+        its stat signature is unchanged, and archival classification reads
+        the cached ``None`` and reports a byte-identical pair as different.
+        This pass adds each such row back to ``self._pending_stale`` with
+        its manifest signature (the same pattern as strict staleness mode),
+        so ``_needs_hash`` hashes it once and Phase 2 persists the hash.
+
+        Bounded and deterministic: candidates are taken in sorted path
+        order, and at most ``analysis_limit`` minus the current backlog are
+        queued, so promotion never pushes the backlog past one call's
+        intake. When candidates remain, or rehydration from disk has not run
+        yet (``self._con is None``), ``_same_size_scan_needed`` stays set so
+        a later call scans again even with an empty backlog. A path whose
+        hash came back ``None`` is not re-queued while its signature is
+        unchanged (see ``_same_size_promoted``).
+        """
+        pending = self._pending_stale
+        cache = self._row_cache
+        candidates: list[str] = []
+        for p in all_paths:
+            if p in pending:
+                continue
+            row = cache.get(p)
+            if row is None or row.sha256 is not None or row.size is None:
+                continue
+            if size_counts.get(row.size, 0) < 2:
+                continue
+            sig = self._manifest.get(p, (row.mtime, row.size))
+            if self._same_size_promoted.get(p) == sig:
+                continue
+            candidates.append(p)
+        candidates.sort()
+        slots = max(0, analysis_limit - len(pending))
+        queued = candidates[:slots]
+        for p in queued:
+            row = cache[p]
+            sig = self._manifest.get(p, (row.mtime, row.size))
+            pending[p] = sig
+            self._same_size_promoted[p] = sig
+        deferred = len(candidates) - len(queued)
+        self._same_size_scan_needed = deferred > 0 or self._con is None
+        self.last_rebuild_metrics["same_size_promotion_deferred"] = deferred
+        return len(queued)
+
     def rebuild(
         self, *, max_seconds: float | None = DEFAULT_REBUILD_BUDGET_SECONDS,
         staleness_mode: str = "fast", staleness_sample_rate: float = 0.1,
@@ -5631,6 +6175,7 @@ class OutputsFtsIndex:
             # drop it from the backlog so it isn't retried forever.
             for p in removed_paths:
                 self._pending_stale.pop(p, None)
+                self._same_size_promoted.pop(p, None)
             # 6af1518d -- a full pass just completed: this is the new
             # authoritative "expected" total (progress-signal denominator for
             # ConvergenceState), and the scan boundary resets -- the NEXT
@@ -5770,6 +6315,27 @@ class OutputsFtsIndex:
                     # leaving the on-disk row's content untouched.
                     self._pending_stale[p] = self._manifest.get(p, (None, None))
 
+        # Same-size detection: the size -> count map behind _needs_hash below
+        # counts every known path, using the fresh stat signature for any
+        # path in the pending backlog, including paths deferred past this
+        # call's intake slice. Rows indexed while their size was unique carry
+        # sha256=None; once another file of that size appears they are
+        # promoted back into the backlog so they are hashed once and the hash
+        # persists. Both steps cost O(known paths), so they run only when
+        # something is pending (a size count can only rise when a file is new
+        # or changed) or when a scan is still owed (see
+        # _same_size_scan_needed). A call with an empty backlog therefore
+        # adds no work.
+        size_counts: dict[int, int] | None = None
+        same_size_promoted = 0
+        self.last_rebuild_metrics["same_size_promotion_deferred"] = 0
+        if self._pending_stale or self._same_size_scan_needed:
+            size_counts = self._known_size_counts(all_paths, path_set)
+            same_size_promoted = self._promote_unhashed_same_size_rows(
+                all_paths, size_counts, analysis_limit,
+            )
+        self.last_rebuild_metrics["same_size_promoted"] = same_size_promoted
+
         # b85394bd -- BOUNDED ANALYSIS INTAKE: `self._pending_stale` may hold
         # far more than one call should take on at once (discovery capacity
         # is now effectively unbounded per call -- see `walk_batch` above --
@@ -5815,21 +6381,16 @@ class OutputsFtsIndex:
         files_hash_needed = 0
         files_hash_skipped = 0
         if stale:
-            # e1fd4182 (size-prefilter follow-up) -- build a size -> count
-            # map across ALL known paths (stale files use their freshly-
-            # stat'd size from stale_sigs; already-cached files use the size
-            # already sitting in _row_cache from a prior rebuild -- no extra
-            # stat calls either way) so a stale file can be compared against
-            # duplicates that AREN'T themselves stale this call, not just
-            # other members of this batch.
-            size_counts: dict[int, int] = {}
-            for p in all_paths:
-                sz = (
-                    stale_sigs[p][1] if p in stale_sigs
-                    else (self._row_cache[p].size if p in self._row_cache else None)
-                )
-                if sz is not None:
-                    size_counts[sz] = size_counts.get(sz, 0) + 1
+            # e1fd4182 (size-prefilter follow-up) -- a size -> count map
+            # across ALL known paths (pending files use their freshly-stat'd
+            # size, already-cached files the size in _row_cache from a prior
+            # rebuild -- no extra stat calls either way) so a stale file can
+            # be compared against duplicates that AREN'T themselves stale this
+            # call, not just other members of this batch. Built above, before
+            # the intake slice, so deferred paths count too (see
+            # _known_size_counts); a non-empty `stale` implies it was built.
+            if size_counts is None:
+                size_counts = self._known_size_counts(all_paths, path_set)
 
             def _needs_hash(p: str) -> bool:
                 # 49b97a6a -- a pending hash-algo-version upgrade means every
@@ -5912,6 +6473,12 @@ class OutputsFtsIndex:
                 else:
                     pool.shutdown(wait=True)
 
+        if self._same_size_promoted:
+            # A promoted path that now has a real hash needs no retry guard.
+            for p, a in precomputed.items():
+                if a.sha256 is not None:
+                    self._same_size_promoted.pop(p, None)
+
         self.last_rebuild_metrics["analysis_seconds"] = round(
             time.monotonic() - analysis_started, 6,
         )
@@ -5987,8 +6554,21 @@ class OutputsFtsIndex:
                 # its turn in a future Phase 1 comes up.
                 return None
 
+            def _known_size(path: str) -> int | None:
+                # Same-size detection: the sizes this call already holds, so
+                # the size-first check in classify_canonical_archival adds no
+                # stat calls here. None falls back to _cached_hasher.
+                analysis = precomputed.get(path)
+                if analysis is not None:
+                    return analysis.size
+                sig = self._pending_stale.get(path)
+                if sig is not None:
+                    return sig[1]
+                cached_row = self._row_cache.get(path)
+                return cached_row.size if cached_row is not None else None
+
             classifications = classify_canonical_archival(
-                all_paths, hasher=_cached_hasher,
+                all_paths, hasher=_cached_hasher, sizer=_known_size,
             )
         self.last_rebuild_metrics["classification_seconds"] = round(
             time.monotonic() - classify_started, 6,
@@ -6624,6 +7204,29 @@ class OutputsFtsIndex:
                         "OutputsFtsIndex.rebuild: failed to persist "
                         "hash_algo_version", exc_info=True,
                     )
+            # Content-index upgrade (see _check_content_index_version): the
+            # new marker is written only once every queued PDF/NPZ path has
+            # left the backlog (re-analysed and written, or removed from
+            # disk). A path that failed stays pending and keeps it unwritten.
+            if self._content_reindex_pending:
+                self._content_reindex_pending.intersection_update(
+                    self._pending_stale,
+                )
+                if not self._content_reindex_pending:
+                    try:
+                        self._write_meta_version(
+                            self._connect(), _CONTENT_INDEX_VERSION_KEY,
+                            _CONTENT_INDEX_VERSION,
+                        )
+                        _log.info(
+                            "OutputsFtsIndex: PDF/NPZ content re-analysis "
+                            "complete for %r", self._db_path,
+                        )
+                    except Exception:  # noqa: BLE001
+                        _log.debug(
+                            "OutputsFtsIndex.rebuild: failed to persist "
+                            "content_index_version", exc_info=True,
+                        )
             # Durability follow-up to 6af1518d -- persist THIS call's final
             # walk epoch/cursor/pending-backlog/expected-count/last-error,
             # regardless of whether Phase 2's row write above succeeded.
