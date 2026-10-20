@@ -379,6 +379,54 @@ def _entry_count(name: str, payload: Any) -> int:
     return len(payload) if isinstance(payload, dict) else 0
 
 
+def _str_or_none(value: Any) -> bool:
+    return value is None or isinstance(value, str)
+
+
+# Row-level checks. Whoever edits a bundle can recompute its digests, so
+# verify must also reject rows the ledger readers would crash on after an
+# import: fingerprint.check_staleness passes script_path to os.fspath, the
+# registry sorts local_paths by last_seen and edges by artifact_id/
+# source_locator/relation, and reads every sighting with .get. Messages
+# never quote a ledger key, since legacy keys can be absolute paths.
+
+def _fingerprint_row_error(row: dict[str, Any]) -> str | None:
+    for field_name in ("script_path", "script_hash"):
+        if not _str_or_none(row.get(field_name)):
+            return f"a fingerprint_ledger entry's {field_name} is not a string or null"
+    digest = row.get("content_digest")
+    if isinstance(digest, dict):
+        digest = digest.get("digest")
+    if not _str_or_none(digest):
+        return "a fingerprint_ledger entry's content_digest is not a string, null or digest object"
+    return None
+
+
+def _artifact_record_error(record: dict[str, Any]) -> str | None:
+    if not isinstance(record.get("artifact_id"), str):
+        return "an artifact_registry record's artifact_id is not a string"
+    sightings = record.get("local_paths", [])
+    if not isinstance(sightings, list) or not all(isinstance(s, dict) for s in sightings):
+        return "an artifact_registry record's local_paths is not a list of objects"
+    for sighting in sightings:
+        for field_name in ("local_only_path", "last_seen"):
+            if not _str_or_none(sighting.get(field_name)):
+                return (
+                    f"an artifact_registry record's local_paths {field_name} "
+                    "is not a string or null"
+                )
+    return None
+
+
+def _edge_error(edge: dict[str, Any]) -> str | None:
+    for field_name in ("artifact_id", "source_locator", "relation"):
+        if not isinstance(edge.get(field_name), str):
+            return f"an artifact_registry edge's {field_name} is not a string"
+    if not isinstance(edge.get("metadata") or {}, dict):
+        return "an artifact_registry edge's metadata is not an object"
+    return None
+
+
 def _payload_shape_error(name: str, payload: Any) -> str | None:
     if not isinstance(payload, dict):
         return "payload is not a JSON object"
@@ -394,9 +442,24 @@ def _payload_shape_error(name: str, payload: Any) -> str | None:
             return "artifact_registry.artifacts is not an object of records"
         if not isinstance(edges, list) or not all(isinstance(e, dict) for e in edges):
             return "artifact_registry.edges is not a list of edge objects"
+        for record in artifacts.values():
+            error = _artifact_record_error(record)
+            if error:
+                return error
+        for edge in edges:
+            error = _edge_error(edge)
+            if error:
+                return error
         return None
+    # Every provenance, fingerprint and run-manifest row must be an object;
+    # fingerprint rows are then checked field by field.
     if not all(isinstance(v, dict) for v in payload.values()):
         return "ledger entries are not all JSON objects"
+    if name == "fingerprint_ledger":
+        for row in payload.values():
+            error = _fingerprint_row_error(row)
+            if error:
+                return error
     return None
 
 

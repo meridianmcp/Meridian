@@ -406,6 +406,100 @@ class TestVerify:
         assert "shape_error" in report["members"]["artifact_registry"]
         assert report["verified"] is False
 
+    def test_resealed_non_string_script_path_fails_verify_and_import(self, populated) -> None:
+        """B2: digests can be recomputed, so a fingerprint row with
+        script_path 5 used to verify, import, and then raise TypeError in
+        every fingerprint.check_staleness call on the target."""
+        _export(populated["outputs"])
+        target = _empty_target(populated["root"])
+        dst = _copy_bundle(populated["outputs"], "backup/bundle.json", target)
+        envelope = _load(dst)
+        row = next(iter(envelope["members"]["fingerprint_ledger"]["payload"].values()))
+        row["script_path"] = 5
+        dst.write_text(json.dumps(_reseal(envelope)), encoding="utf-8")
+
+        report = B.verify_bundle(str(dst))
+        assert report["verified"] is False
+        assert report["mismatches"] == []  # the digests were recomputed
+        assert report["malformed"] == ["fingerprint_ledger"]
+        assert report["members"]["fingerprint_ledger"]["shape_error"] == (
+            "a fingerprint_ledger entry's script_path is not a string or null"
+        )
+        result = B.import_bundle("incoming.json", str(target), dry_run=False)
+        assert result["refused"] is True
+        assert result["reason"] == "verification_failed"
+        assert _snapshot(target) == {name: None for name in _LEDGER_FILES}
+        assert fingerprint.check_staleness(str(target)) == []
+
+    @pytest.mark.parametrize("field, value, reason", [
+        ("script_hash", 5, "a fingerprint_ledger entry's script_hash is not a string or null"),
+        ("content_digest", {"digest": 5}, "a fingerprint_ledger entry's content_digest is "
+                                          "not a string, null or digest object"),
+        ("content_digest", [1], "a fingerprint_ledger entry's content_digest is "
+                                "not a string, null or digest object"),
+    ])
+    def test_resealed_bad_fingerprint_hash_fields_are_malformed(
+        self, populated, field, value, reason,
+    ) -> None:
+        _export(populated["outputs"])
+        path = populated["outputs"] / "backup" / "bundle.json"
+        envelope = _load(path)
+        row = next(iter(envelope["members"]["fingerprint_ledger"]["payload"].values()))
+        row[field] = value
+        path.write_text(json.dumps(_reseal(envelope)), encoding="utf-8")
+        report = B.verify_bundle(str(path))
+        assert report["verified"] is False
+        assert report["malformed"] == ["fingerprint_ledger"]
+        assert report["members"]["fingerprint_ledger"]["shape_error"] == reason
+
+    @pytest.mark.parametrize("mutate, reason", [
+        (lambda rec, edge: rec.__setitem__("local_paths", "fig.csv"),
+         "an artifact_registry record's local_paths is not a list of objects"),
+        (lambda rec, edge: rec.__setitem__("local_paths", None),
+         "an artifact_registry record's local_paths is not a list of objects"),
+        (lambda rec, edge: rec.__setitem__("local_paths", [5]),
+         "an artifact_registry record's local_paths is not a list of objects"),
+        (lambda rec, edge: rec["local_paths"][0].__setitem__("last_seen", 5),
+         "an artifact_registry record's local_paths last_seen is not a string or null"),
+        (lambda rec, edge: rec.pop("artifact_id"),
+         "an artifact_registry record's artifact_id is not a string"),
+        (lambda rec, edge: edge.__setitem__("relation", None),
+         "an artifact_registry edge's relation is not a string"),
+        (lambda rec, edge: edge.__setitem__("metadata", [1]),
+         "an artifact_registry edge's metadata is not an object"),
+    ])
+    def test_resealed_bad_registry_rows_are_refused(self, populated, mutate, reason) -> None:
+        """B2: an artifact whose local_paths is not a list of objects (or an
+        edge missing a sort key) used to raise on every registry lookup
+        after import."""
+        _export(populated["outputs"])
+        target = _empty_target(populated["root"])
+        dst = _copy_bundle(populated["outputs"], "backup/bundle.json", target)
+        envelope = _load(dst)
+        registry = envelope["members"]["artifact_registry"]["payload"]
+        mutate(registry["artifacts"][populated["artifact_id"]], registry["edges"][0])
+        dst.write_text(json.dumps(_reseal(envelope)), encoding="utf-8")
+
+        report = B.verify_bundle(str(dst))
+        assert report["verified"] is False
+        assert report["malformed"] == ["artifact_registry"]
+        assert report["members"]["artifact_registry"]["shape_error"] == reason
+        result = B.import_bundle("incoming.json", str(target), dry_run=False)
+        assert result["reason"] == "verification_failed"
+        assert _snapshot(target) == {name: None for name in _LEDGER_FILES}
+
+    def test_export_refuses_a_live_ledger_row_that_would_not_verify(self, populated) -> None:
+        path = _ledger_path(populated["outputs"], "fingerprint_ledger")
+        ledger = json.loads(path.read_text(encoding="utf-8"))
+        next(iter(ledger.values()))["script_path"] = 5
+        path.write_text(json.dumps(ledger), encoding="utf-8")
+        result = B.export_bundle(str(populated["outputs"]), "x.json")
+        assert result["exported"] is False
+        assert result["errors"] == [
+            "fingerprint_ledger: a fingerprint_ledger entry's script_path is not a string or null",
+        ]
+        assert not (populated["outputs"] / "x.json").exists()
+
     @pytest.mark.parametrize("mutate, expected_error", [
         (lambda raw: raw[: len(raw) // 2], "bundle is not valid JSON (JSONDecodeError)"),
         (lambda raw: raw.replace('"meridian-outputs-bundle"', '"something-else"'),
