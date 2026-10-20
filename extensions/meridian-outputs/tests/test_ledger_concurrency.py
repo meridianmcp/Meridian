@@ -730,6 +730,53 @@ class TestIndexFileLockStaleReclaim:
         lock.release()
         assert not os.path.exists(lock_path)
 
+    @pytest.mark.parametrize("content", [b"", b'{"pid": 12, "trunc'])
+    def test_old_lock_file_without_a_lease_is_reclaimed(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, content: bytes,
+    ) -> None:
+        """A holder whose lease write failed and which then crashed leaves a
+        lock file with no parseable lease; once it is older than the stale
+        threshold it must not block writers forever."""
+        monkeypatch.setitem(sys.modules, "portalocker", None)
+        db_path = str(tmp_path / "ledger.json")
+        lock_path = Path(db_path + ".lock")
+        lock_path.write_bytes(content)
+        old = time.time() - 10_000
+        os.utime(lock_path, (old, old))
+
+        owner = OL.read_index_lock_owner(db_path)
+        assert owner.held is True
+        assert owner.is_stale is True
+        assert owner.stale_reason is not None and "no readable lease" in owner.stale_reason
+
+        lock = OL.IndexFileLock(db_path, timeout=5.0)
+        start = time.monotonic()
+        lock.acquire()
+        try:
+            assert time.monotonic() - start < 2.0
+            assert json.loads(lock_path.read_text(encoding="utf-8"))["pid"] == os.getpid()
+        finally:
+            lock.release()
+
+    def test_fresh_lock_file_without_a_lease_is_not_reclaimed(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """A just-created lock file whose owner has not written its lease yet
+        is a live owner, not an abandoned one."""
+        monkeypatch.setitem(sys.modules, "portalocker", None)
+        db_path = str(tmp_path / "ledger.json")
+        lock_path = Path(db_path + ".lock")
+        lock_path.write_bytes(b"")
+
+        owner = OL.read_index_lock_owner(db_path)
+        assert owner.held is True
+        assert owner.is_stale is False
+
+        lock = OL.IndexFileLock(db_path, timeout=0.3)
+        with pytest.raises(OL.IndexLockAcquireError):
+            lock.acquire()
+        assert lock_path.read_bytes() == b""
+
 
 # ---------------------------------------------------------------------------
 # Non-reentrant lock: nested reads inside a transaction

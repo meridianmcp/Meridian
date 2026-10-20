@@ -1050,15 +1050,29 @@ def read_index_lock_owner(
     return _inspect_index_lock(db_path, stale_seconds=stale_seconds)[0]
 
 
+# What a reclaimer compares before removing a stale lock file: the parsed
+# lease (token included), or, when the file holds no parseable lease, its
+# (st_mtime_ns, st_size).
+_LockSnapshot = tuple[dict[str, Any] | None, tuple[int, int] | None]
+
+
+def _lock_file_signature(path: str) -> tuple[int, int] | None:
+    try:
+        st = os.stat(path)
+    except OSError:
+        return None
+    return st.st_mtime_ns, st.st_size
+
+
 def _inspect_index_lock(
     db_path: str, *, stale_seconds: float | None = None,
-) -> tuple[IndexLockOwner, dict[str, Any] | None]:
-    """:func:`read_index_lock_owner` plus the raw lease it judged, so a
-    reclaimer can later check the lock file still holds that same lease
+) -> tuple[IndexLockOwner, _LockSnapshot]:
+    """:func:`read_index_lock_owner` plus a snapshot of the lock file it
+    judged, so a reclaimer can later check the file is still that same lease
     (token included) before removing it. The token stays out of
     :class:`IndexLockOwner`, which is surfaced as public diagnostics."""
     if not db_path or db_path == ":memory:":
-        return IndexLockOwner(db_path=db_path, lock_path=None, held=False), None
+        return IndexLockOwner(db_path=db_path, lock_path=None, held=False), (None, None)
     canonical = os.path.abspath(db_path)
     lock_path = canonical + ".lock"
     meta = _read_lease_from_path(lock_path)
@@ -1075,12 +1089,27 @@ def _inspect_index_lock(
     if meta is None:
         # No lease content -- either never used, cleanly released (atomic
         # mode always removes the file on release; see IndexFileLock.release),
-        # or a narrow race where the file was just created but its owner
-        # hasn't written a lease yet. None of those are "stale" -- there is
-        # nothing here to reclaim.
+        # a narrow race where the file was just created but its owner hasn't
+        # written a lease yet, or a holder whose best-effort lease write
+        # failed (or was torn) and which then died. The first three need no
+        # reclaim. The last would block every writer forever, so a held file
+        # with no parseable lease is stale once it has not been modified for
+        # longer than the heartbeat threshold: a live holder rewrites its
+        # lease (and so the file's mtime) on every heartbeat. The stat comes
+        # after the read, so a lease written in between reads as fresh.
+        signature = _lock_file_signature(lock_path) if held is True else None
+        idle = None if signature is None else now - signature[0] / 1e9
+        if idle is not None and idle > threshold:
+            return IndexLockOwner(
+                db_path=db_path, lock_path=lock_path, held=True, is_stale=True,
+                stale_reason=(
+                    f"lock file has no readable lease and was last modified "
+                    f"{idle:.1f}s ago (> {threshold:.0f}s threshold)"
+                ),
+            ), (None, signature)
         return IndexLockOwner(
             db_path=db_path, lock_path=lock_path, held=bool(held) if held is not None else False,
-        ), None
+        ), (None, signature)
 
     pid = meta.get("pid")
     hostname = meta.get("hostname")
@@ -1116,15 +1145,16 @@ def _inspect_index_lock(
         started_at=started_at, heartbeat_at=heartbeat_at, age_seconds=age,
         lock_mode=meta.get("lock_mode"), pid_alive=pid_alive,
         is_stale=is_stale, stale_reason=stale_reason,
-    ), meta
+    ), (meta, None)
 
 
-def _reclaim_stale_lock_file(lock_path: str, snapshot: dict[str, Any] | None) -> bool:
-    """Remove a lock file judged stale from the lease ``snapshot``, but only
-    if the file still holds that same lease (pid, token, heartbeat and the
-    rest). A lease that changed since the verdict belongs to a holder that
-    refreshed it or to a successor, and is left alone. Returns True when the
-    path is now free (removed here, or already gone).
+def _reclaim_stale_lock_file(lock_path: str, snapshot: _LockSnapshot) -> bool:
+    """Remove a lock file judged stale from ``snapshot``, but only if the
+    file still holds that same lease (pid, token, heartbeat and the rest),
+    or, for a file with no parseable lease, is still unparseable with the
+    same mtime and size. A lease that changed since the verdict belongs to a
+    holder that refreshed it or to a successor, and is left alone. Returns
+    True when the path is now free (removed here, or already gone).
 
     Residual window, documented rather than closed: the re-read and the
     remove are two steps, so on POSIX a second waiter can remove the same
@@ -1133,7 +1163,10 @@ def _reclaim_stale_lock_file(lock_path: str, snapshot: dict[str, Any] | None) ->
     open without FILE_SHARE_DELETE, so the remove fails and nothing is lost.
     Closing it on POSIX needs a rename-then-verify reclaim.
     """
-    if _read_lease_from_path(lock_path) != snapshot:
+    lease, signature = snapshot
+    if _read_lease_from_path(lock_path) != lease:
+        return False
+    if lease is None and _lock_file_signature(lock_path) != signature:
         return False
     try:
         os.remove(lock_path)
