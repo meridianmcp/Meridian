@@ -305,19 +305,24 @@ def _display_path(outputs_dir: str, real: str) -> str:
 
 
 def _ledger_file_problem(path: str) -> str | None:
-    """``None`` if the ledger file is absent or a valid JSON object."""
+    """``None`` if the ledger file is absent or a valid JSON object.
+
+    The bytes are read once through ``ledger_io._read_bytes``, the read the
+    strict ledger readers use, so a transient Windows sharing violation (a
+    writer replacing the ledger) is retried instead of refusing a valid
+    export or import. A read that still fails is "unreadable"; only bytes
+    that do not parse are "not valid JSON"."""
     try:
-        st = os.stat(path)
-    except FileNotFoundError:
-        return None
+        raw = ledger_io._read_bytes(path)
     except OSError as exc:
         return f"unreadable ({type(exc).__name__})"
-    if st.st_size == 0:
+    if raw is None:
+        return None
+    if not raw:
         return "file is empty (zero bytes)"
     try:
-        with open(path, "r", encoding="utf-8") as fh:
-            data = json.load(fh)
-    except (OSError, ValueError) as exc:
+        data = json.loads(raw.decode("utf-8"))
+    except ValueError as exc:  # includes UnicodeDecodeError
         return f"not valid JSON ({type(exc).__name__})"
     if not isinstance(data, dict):
         return "top level is not a JSON object"
@@ -1079,8 +1084,11 @@ def import_bundle(
                 result["written_members"].append(name)
                 if step["module"] is annotate:
                     _invalidate_annotate_cache(step["path"])
+        except ledger_io.LedgerCorruptError:
+            # Only the re-check read raises this: the ledger the plan read
+            # cleanly no longer parses, so it changed under the import.
+            return _concurrent_modification_result(result)
         except (OSError, TimeoutError, TypeError, ValueError, outputs_local.IndexLockAcquireError):
-            result["reason"] = "write_failed"
-            return result
+            return _refuse("write_failed")
     result["imported"] = True
     return result

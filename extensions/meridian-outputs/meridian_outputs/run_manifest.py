@@ -10,8 +10,10 @@ package already own -- it COMPOSES them behind one run-scoped receipt:
     module ever computes (never a second hash scheme).
   * :func:`outputs_local.get_convergence_state` for the walk/index's own
     convergence snapshot (never a second progress tracker).
-  * :func:`artifact_registry.get_artifact` to VALIDATE a caller-declared
-    artifact id already exists (never a second artifact identity store).
+  * the artifact registry's strict reader
+    (``artifact_registry._read_registry_strict``) to VALIDATE a
+    caller-declared artifact id already exists (never a second artifact
+    identity store).
   * :class:`research_evidence.EvidenceRecord` (kind ``RUN`` -- a slot that
     module's own ``EvidenceKind`` enum already reserved but nothing in this
     codebase ever populated) so a run manifest is representable inside the
@@ -174,7 +176,13 @@ def _read_ledger_strict(outputs_dir: str) -> dict[str, dict[str, Any]]:
     as "no run covers this output". :func:`_read_ledger` keeps its lenient
     behaviour for plain listings."""
     path = _ledger_path(outputs_dir, create=False)
-    ledger = ledger_io.read_ledger_strict(path)
+    return _parse_ledger_strict(path, ledger_io._read_bytes(path))
+
+
+def _parse_ledger_strict(path: str, raw: "bytes | None") -> dict[str, dict[str, Any]]:
+    """:func:`_read_ledger_strict`'s checks over bytes already read
+    (``None``: no ledger file)."""
+    ledger = {} if raw is None else ledger_io.parse_ledger_bytes(path, raw)
     for record in ledger.values():
         if not isinstance(record, dict):
             kind = "null" if record is None else type(record).__name__
@@ -189,22 +197,29 @@ def _read_ledger_for_write(outputs_dir: str) -> dict[str, dict[str, Any]]:
     replaced by an entry-only ledger. Continuing from empty (as the
     provenance ledger's writer does) would also drop the per-run
     immutability check :func:`start_run_manifest` makes against the existing
-    record. Any other read ``OSError`` propagates; nothing is written."""
+    record. Any other read ``OSError`` propagates; nothing is written. The
+    file is read once and the quarantine copies exactly the bytes that
+    failed: ``_write_lock`` is in-process only, so another process may
+    replace the file meanwhile."""
+    path = _ledger_path(outputs_dir, create=False)
+    raw = ledger_io._read_bytes(path)
     try:
-        return _read_ledger_strict(outputs_dir)
+        return _parse_ledger_strict(path, raw)
     except ledger_io.LedgerCorruptError as exc:
-        ledger_io.raise_quarantined(exc)
+        ledger_io.raise_quarantined(exc, raw)
 
 
 def _write_ledger_entry(outputs_dir: str, key: str, record: dict[str, Any]) -> None:
+    """Read-modify-write one run row. The write is a unique temp file, fsync,
+    then ``os.replace`` (``ledger_io.write_ledger_atomic``): a crash can never
+    leave a zero-length or truncated ledger, which the strict read would
+    refuse for good, and a failed write leaves the previous ledger and no temp
+    file behind."""
     path = _ledger_path(outputs_dir)
     with _write_lock:
         ledger = _read_ledger_for_write(outputs_dir)
         ledger[key] = record
-        tmp = path + ".tmp"
-        with open(tmp, "w", encoding="utf-8") as fh:
-            json.dump(ledger, fh, indent=2, sort_keys=True)
-        os.replace(tmp, path)  # atomic on both POSIX and Windows
+        ledger_io.write_ledger_atomic(path, ledger)
 
 
 def _utcnow_iso() -> str:
@@ -712,10 +727,12 @@ def finalize_run_manifest(
     and downgrades an attempted ``status="complete"`` to ``"partial"``
     automatically (never silently reported as a clean, fully-verified
     run). The same fail-closed treatment applies to ``artifact_ids``: each
-    one is checked against :func:`artifact_registry.get_artifact` (never
-    re-derived or duplicated here) and an id that does not resolve is
-    recorded under ``unknown_artifact_ids`` and likewise downgrades
-    ``"complete"`` to ``"partial"``.
+    one is looked up in the artifact registry, read once through its strict
+    reader (``artifact_registry._read_registry_strict``; never re-derived
+    or duplicated here), and an id that is not registered is recorded under
+    ``unknown_artifact_ids`` and likewise downgrades ``"complete"`` to
+    ``"partial"``. A registry that cannot be read is an error, never "not
+    registered" (see Raises).
 
     Args:
       outputs_dir:    Absolute path to the outputs directory.
@@ -741,7 +758,12 @@ def finalize_run_manifest(
       one of the valid values, or no manifest was ever started for this
       ``run_id`` -- finalize never creates a fresh identity on its own.
       ledger_io.LedgerCorruptError: the run-manifest ledger exists but cannot
-      be parsed (quarantined, nothing written; see :func:`start_run_manifest`).
+      be parsed (quarantined, nothing written; see :func:`start_run_manifest`),
+      or ``artifact_ids`` is non-empty and the artifact registry exists but
+      cannot be parsed (nothing written; the registry is only read, so it is
+      not quarantined here).
+      OSError: ``artifact_ids`` is non-empty and the artifact registry cannot
+      be read; nothing is written.
     """
     if not outputs_dir or not str(outputs_dir).strip():
         raise RunManifestError("outputs_dir is required")
@@ -773,16 +795,20 @@ def finalize_run_manifest(
 
         resolved_artifact_ids: list[str] = []
         unknown_artifact_ids: list[str] = []
+        # One strict registry read, only when ids were given. A registry that
+        # is corrupt (LedgerCorruptError) or cannot be read (OSError) raises
+        # here, before anything is written: read leniently it looked empty,
+        # so every id was recorded as not found and a "partial" verdict was
+        # persisted for a store failure.
+        registered = (
+            artifact_registry._read_registry_strict(outputs_dir)["artifacts"]
+            if artifact_ids else {}
+        )
         for aid in (artifact_ids or []):
-            try:
-                rec = artifact_registry.get_artifact(outputs_dir, aid)
-            except Exception:  # noqa: BLE001 -- treat a lookup failure like "unknown"
-                _log.debug("run_manifest: get_artifact failed for %r", aid, exc_info=True)
-                rec = None
-            if rec is None:
-                unknown_artifact_ids.append(aid)
-            else:
+            if isinstance(aid, str) and aid in registered:
                 resolved_artifact_ids.append(aid)
+            else:
+                unknown_artifact_ids.append(aid)
 
         effective_status = status
         problems: list[str] = []

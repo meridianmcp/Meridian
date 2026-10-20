@@ -16,6 +16,8 @@ Covers:
 """
 from __future__ import annotations
 
+import hashlib
+import os
 import sys
 from pathlib import Path
 
@@ -523,6 +525,78 @@ class TestCorruptRegistryWriters:
         assert Path(quarantined).name.startswith("artifact_registry.json.corrupt-")
         assert Path(quarantined).read_bytes() == truncated
         assert str(tmp_path) not in str(info.value)  # basename only in the message
+
+    def test_quarantine_holds_the_bytes_that_failed_not_a_reread(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """S-R4-9: raise_quarantined re-read the registry to copy it, so a file
+        replaced between the failed parse and the copy (the registry writers
+        hold only an in-process lock) quarantined the new bytes instead of the
+        ones that failed."""
+        registry, truncated, _aid = self._truncated_registry(tmp_path)
+        real_read = ledger_io._read_bytes
+        reads = {"n": 0}
+
+        def _replaced_after_the_parse(path: str) -> bytes | None:
+            if os.path.basename(path) == registry.name:
+                reads["n"] += 1
+                if reads["n"] > 1:  # another process rewrote the registry
+                    return b'{"artifacts": {}, "edges": []}'
+            return real_read(path)
+
+        monkeypatch.setattr(ledger_io, "_read_bytes", _replaced_after_the_parse)
+        with pytest.raises(ledger_io.LedgerCorruptError) as info:
+            AR.register_artifact(str(tmp_path), "figure", generator="c.py")
+        copy = Path(info.value.quarantine_path)
+        assert copy.read_bytes() == truncated
+        digest = hashlib.sha256(truncated).hexdigest()[:16]
+        assert copy.name == f"artifact_registry.json.corrupt-{digest}"  # named by content
+        assert registry.read_bytes() == truncated
+
+
+# ---------------------------------------------------------------------------
+# Registry writes: unique temp file, fsync, atomic replace (S-R4-6)
+# ---------------------------------------------------------------------------
+
+class TestRegistryAtomicWrite:
+    def test_failed_replace_keeps_prior_registry_and_leaves_no_temp(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """S-R4-6: the registry was written to a fixed artifact_registry.json.tmp
+        with no fsync before the rename, so a crash could leave a zero-length
+        or truncated registry that the strict read then refused for good."""
+        od = str(tmp_path)
+        AR.register_artifact(od, "figure", generator="a.py")
+        registry = tmp_path / ".meridian-outputs-cache" / "artifact_registry.json"
+        before = registry.read_bytes()
+        events: list[str] = []
+        real_fsync, real_replace = os.fsync, os.replace
+
+        def _fsync(fd: int) -> None:
+            events.append("fsync")
+            real_fsync(fd)
+
+        def _replace(src: str, dst: str) -> None:
+            if os.path.basename(dst) != registry.name:
+                return real_replace(src, dst)
+            events.append("replace:" + os.path.basename(src))
+            raise OSError("simulated failure before the replace")
+
+        with monkeypatch.context() as m:
+            m.setattr(os, "fsync", _fsync)
+            m.setattr(os, "replace", _replace)
+            with pytest.raises(OSError, match="simulated"):
+                AR.register_artifact(od, "figure", generator="b.py")
+
+        assert registry.read_bytes() == before
+        replaces = [e for e in events if e.startswith("replace:")]
+        assert replaces, events
+        assert replaces[0] != "replace:artifact_registry.json.tmp"  # unique temp name
+        assert "fsync" in events[: events.index(replaces[0])]  # fsynced before the rename
+        assert [n for n in os.listdir(registry.parent) if n.endswith(".tmp")] == []
+        # The next write goes through and keeps the earlier artifact.
+        AR.register_artifact(od, "figure", generator="b.py")
+        assert len(AR.list_artifacts(od)) == 2
 
 
 # ---------------------------------------------------------------------------

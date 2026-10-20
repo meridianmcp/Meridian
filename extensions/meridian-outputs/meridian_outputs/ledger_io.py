@@ -179,21 +179,26 @@ def _quarantine_name(path: str, raw: bytes) -> str:
     return f"{path}.corrupt-{digest}"
 
 
-def quarantine_ledger(path: str) -> str | None:
-    """Copy ``path``'s current bytes to ``<path>.corrupt-<sha256 prefix>``.
+def quarantine_ledger(path: str, raw: bytes | None = None) -> str | None:
+    """Copy ``path``'s bytes to ``<path>.corrupt-<sha256 prefix>``.
 
+    ``raw`` is the bytes to copy. A caller whose strict parse rejected bytes
+    passes exactly those, so the copy is what failed even if the file was
+    replaced since; without ``raw`` the file's current bytes are read.
     The name comes from the bytes, so the same corrupt content always maps
     to one quarantine file: when every commit after a quarantine fails, a
     retry reuses the existing copy instead of adding another full-size one.
     The copy is created exclusively and fsynced; an existing file is reused
     only when its bytes are identical, and is never overwritten (different
     bytes under the same name get a ``-<n>`` suffix). Returns the quarantine
-    path, or ``None`` when ``path`` no longer exists. Raises ``OSError`` when
-    the copy cannot be written; callers must then leave the ledger alone.
+    path, or ``None`` when ``raw`` is not given and ``path`` no longer
+    exists. Raises ``OSError`` when the copy cannot be written; callers must
+    then leave the ledger alone.
     """
-    raw = _read_bytes(path)
     if raw is None:
-        return None
+        raw = _read_bytes(path)
+        if raw is None:
+            return None
     base = _quarantine_name(path, raw)
     candidate = base
     for suffix in range(1, 1000):
@@ -219,12 +224,14 @@ def quarantine_ledger(path: str) -> str | None:
     raise FileExistsError(f"no free quarantine name for {os.path.basename(path)!r}")
 
 
-def _quarantine_or_raise(path: str, exc: LedgerCorruptError) -> str | None:
-    """Quarantine ``path`` (corrupt for ``exc.reason``); if the copy fails,
-    raise a :class:`LedgerCorruptError` saying so (the ledger is left
-    untouched)."""
+def _quarantine_or_raise(
+    path: str, exc: LedgerCorruptError, raw: bytes | None = None,
+) -> str | None:
+    """Quarantine ``path`` (corrupt for ``exc.reason``; ``raw`` as in
+    :func:`quarantine_ledger`); if the copy fails, raise a
+    :class:`LedgerCorruptError` saying so (the ledger is left untouched)."""
     try:
-        return quarantine_ledger(path)
+        return quarantine_ledger(path, raw)
     except OSError as copy_exc:
         raise LedgerCorruptError(
             path,
@@ -233,7 +240,7 @@ def _quarantine_or_raise(path: str, exc: LedgerCorruptError) -> str | None:
         ) from copy_exc
 
 
-def raise_quarantined(exc: LedgerCorruptError) -> NoReturn:
+def raise_quarantined(exc: LedgerCorruptError, raw: bytes | None = None) -> NoReturn:
     """Fail closed on a corrupt ledger: quarantine it, then raise.
 
     For a writer that must not rebuild the ledger from empty the way
@@ -245,8 +252,13 @@ def raise_quarantined(exc: LedgerCorruptError) -> NoReturn:
     warning is logged, and :class:`LedgerCorruptError` is raised with
     ``quarantine_path`` set. Nothing is written over the ledger, so the
     caller's write never happens.
+
+    ``raw`` should be the exact bytes whose parse raised ``exc``. Those are
+    what gets copied, so the quarantine holds what failed even when the
+    file was replaced after the parse (these writers do not hold the
+    cross-process ledger lock). Without ``raw`` the file is read again.
     """
-    quarantined = _quarantine_or_raise(exc.path, exc)
+    quarantined = _quarantine_or_raise(exc.path, exc, raw)
     _log.warning(
         "ledger %r is corrupt (%s); original bytes quarantined to %r, "
         "refusing to write over it",
