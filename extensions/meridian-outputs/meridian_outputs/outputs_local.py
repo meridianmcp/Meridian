@@ -1012,8 +1012,8 @@ def _probe_portalocker_held(lock_path: str, portalocker_module: Any) -> bool | N
     guessed."""
     try:
         # Ensure the file exists so the probe targets the same path a real
-        # acquirer would -- mirrors the original acquire() path (which always
-        # opened the lock file in "w" mode on every attempt).
+        # acquirer would -- mirrors the acquire() path, which creates the lock
+        # file when missing (without truncating it) on every attempt.
         with open(lock_path, "a", encoding="utf-8"):
             pass
         probe = open(lock_path, "r+", encoding="utf-8")
@@ -1062,6 +1062,18 @@ def _lock_file_signature(path: str) -> tuple[int, int] | None:
     except OSError:
         return None
     return st.st_mtime_ns, st.st_size
+
+
+def _lock_file_is_gone(path: str) -> bool:
+    """True only when ``path`` does not exist. Any other stat failure (e.g. a
+    Windows delete-pending file) is not proof the path is free."""
+    try:
+        os.stat(path)
+    except FileNotFoundError:
+        return True
+    except OSError:
+        return False
+    return False
 
 
 def _inspect_index_lock(
@@ -1164,10 +1176,14 @@ def _reclaim_stale_lock_file(lock_path: str, snapshot: _LockSnapshot) -> bool:
     Closing it on POSIX needs a rename-then-verify reclaim.
     """
     lease, signature = snapshot
-    if _read_lease_from_path(lock_path) != lease:
-        return False
-    if lease is None and _lock_file_signature(lock_path) != signature:
-        return False
+    if _read_lease_from_path(lock_path) != lease or (
+        lease is None and _lock_file_signature(lock_path) != signature
+    ):
+        # Changed since the verdict -- or already gone (another waiter
+        # reclaimed it, or its holder released it), which reads as a change
+        # too but leaves the path free: report that so the caller retries the
+        # create at once instead of sleeping, or failing at its deadline.
+        return _lock_file_is_gone(lock_path)
     try:
         os.remove(lock_path)
     except FileNotFoundError:
@@ -1320,7 +1336,12 @@ class IndexFileLock:
 
     def _acquire_portalocker(self, portalocker: Any, lock_path: str) -> None:
         try:
-            self._file_handle = open(lock_path, "w", encoding="utf-8")  # noqa: WPS515
+            # Opened without truncation: this open happens BEFORE the
+            # blocking lock, and "w" mode used to wipe a live holder's lease
+            # for as long as this process waited, leaving a lease-less file
+            # an atomic-create process can judge stale and reclaim.
+            fd = os.open(lock_path, os.O_RDWR | os.O_CREAT)
+            self._file_handle = os.fdopen(fd, "r+", encoding="utf-8")
             portalocker.lock(self._file_handle, portalocker.LOCK_EX)
         except Exception as exc:  # noqa: BLE001 -- a52216e2: no longer swallowed
             if self._file_handle is not None:
@@ -1337,6 +1358,13 @@ class IndexFileLock:
             raise IndexLockAcquireError(
                 f"failed to acquire the cross-process lock at {lock_path!r}: {exc}"
             ) from exc
+        # Only now that the lock is held: drop the previous holder's lease,
+        # so a failed lease write in acquire() leaves no lease rather than a
+        # predecessor's. Best-effort, like the lease write itself.
+        try:
+            self._file_handle.truncate(0)
+        except Exception:  # noqa: BLE001 -- diagnostics-only, never fatal
+            _log.debug("IndexFileLock: failed to clear the previous lease", exc_info=True)
         self._lock_mode = "portalocker"
 
     def _acquire_atomic(self, lock_path: str, timeout: float | None) -> None:
