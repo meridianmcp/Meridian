@@ -7303,6 +7303,84 @@ class TestFtsLeaseHeartbeat:
         finally:
             idx.close()
 
+    def test_lazy_search_build_never_heartbeats_another_threads_lock(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """R6-G: search() runs its lazy _rebuild_fts() holding only its
+        in-process read lock, never the index write lock, yet its pacers
+        used the write lock's heartbeat. With rebuild() holding that lock in
+        another thread, search() rewrote the holder's lease from a thread
+        that does not hold it, unprotected, racing the holder's own lease
+        writes. Neither the lazy delta commit nor the migration it runs may
+        call IndexFileLock.heartbeat."""
+        from types import SimpleNamespace  # noqa: PLC0415
+
+        monkeypatch.setattr(OL, "_FTS_HEARTBEAT_EVERY_ROWS", 1)
+        heartbeats: list[int] = []
+        real_heartbeat = OL.IndexFileLock.heartbeat
+
+        def _spy(lock: Any, *args: Any, **kwargs: Any) -> None:
+            heartbeats.append(threading.get_ident())
+            real_heartbeat(lock, *args, **kwargs)
+
+        monkeypatch.setattr(OL.IndexFileLock, "heartbeat", _spy)
+        db_path = OL._resolve_index_db_path(str(tmp_path))
+        idx = OL.OutputsFtsIndex(str(tmp_path), db_path=db_path)
+        held, done = threading.Event(), threading.Event()
+
+        def _hold_like_rebuild() -> None:
+            idx._write_lock.acquire()
+            try:
+                held.set()
+                done.wait(30.0)
+            finally:
+                idx._write_lock.release()
+
+        holder = threading.Thread(target=_hold_like_rebuild, daemon=True)
+        try:
+            con = idx._connect()
+            idx._ensure_schema(con)
+            # More DuckDB-only rows than pending Tantivy upserts, so the
+            # one-time migration runs after the delta commit too.
+            for i in range(5):
+                con.execute(
+                    "INSERT INTO outputs_index VALUES "
+                    "(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                    [
+                        str(tmp_path / f"legacy_{i}.csv"), f"lazylegacy{i} content",
+                        time.time(), f"{i:08x}", 10, None, "csv", False, None,
+                        None, None,
+                    ],
+                )
+            pending = str(tmp_path / "pending.csv")
+            idx._pending_tantivy_upserts[pending] = SimpleNamespace(
+                path=pending, content="lazypending content",
+            )
+            assert idx._fts_built is False, "test setup: search() must build lazily"
+            holder.start()
+            assert held.wait(10.0), "test setup: the holder never took the lock"
+            lock_path = Path(os.path.abspath(db_path) + ".lock")
+            lease_before = lock_path.read_bytes()
+            try:
+                hits = idx.search("lazylegacy3")
+                lease_after = lock_path.read_bytes()
+            finally:
+                done.set()
+                holder.join(10.0)
+            assert idx._fts_built is True
+            assert idx._last_search_backend == "tantivy"
+            assert [h["path"] for h in hits] == [str(tmp_path / "legacy_3.csv")], (
+                "test setup: the lazy build must run the migration"
+            )
+            assert heartbeats == [], (
+                "search()'s lazy build called heartbeat on the write lock held "
+                f"by another thread ({len(heartbeats)} call(s))"
+            )
+            assert lease_after == lease_before
+        finally:
+            done.set()
+            idx.close()
+
     def test_pacer_heartbeats_by_row_count_not_every_row(
         self, monkeypatch: pytest.MonkeyPatch,
     ) -> None:
