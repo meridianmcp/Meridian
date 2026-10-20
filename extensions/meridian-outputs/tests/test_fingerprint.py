@@ -185,6 +185,35 @@ class TestTagOutputAgainstPdf:
         assert tagged.generating_script == "train.py"
 
 
+class TestTagOutputAgainstNpz:
+    """An .npz output reports the npz_content kind (header-only indexing,
+    stdlib parser), not the binary_metadata kind it used to fall into."""
+
+    def test_kind_is_npz_content(self, tmp_path: Path) -> None:
+        import struct
+        import zipfile
+
+        header = "{'descr': '<f8', 'fortran_order': False, 'shape': (4, 2), }"
+        pad = (64 - (10 + len(header) + 1) % 64) % 64
+        header_bytes = (header + " " * pad + "\n").encode("latin1")
+        npy = (
+            b"\x93NUMPY\x01\x00" + struct.pack("<H", len(header_bytes))
+            + header_bytes + b"\0" * 64
+        )
+        buf = io.BytesIO()
+        with zipfile.ZipFile(buf, "w") as zf:
+            zf.writestr("embedding.npy", npy)
+        output = tmp_path / "vectors.npz"
+        output.write_bytes(buf.getvalue())
+
+        tagged = FP.tag_output(str(output), str(tmp_path))
+
+        assert tagged.kind == "npz_content"
+        assert tagged.csv_columns is None
+        assert tagged.json_keys is None
+        assert tagged.generating_script is None
+
+
 # ---------------------------------------------------------------------------
 # find_stale_by_script -- compatibility path (code-review fix, fa600e42)
 # ---------------------------------------------------------------------------

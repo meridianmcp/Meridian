@@ -102,7 +102,8 @@ Degraded-state signaling (item e631d54f) is untouched: ``degraded``,
 ``zero_hits_warning``, ``total_indexed``, ``total_in_index`` all pass
 through from ``outputs_local.search_outputs`` UNCHANGED -- this module only
 ever reorders/filters/truncates ``hits``, never recomputes or infers any of
-those fields itself. An ``error`` response or a genuinely empty ``hits``
+those fields itself. It adds one field of its own, ``content_extractors``
+(PDF/NPZ extractor availability, see :func:`search_outputs`). An ``error`` response or a genuinely empty ``hits``
 list (nothing indexed matched at all, even before overfetch) is returned
 unchanged, exactly as c6236ef4 already did.
 
@@ -322,6 +323,12 @@ def search_outputs(
       ``degraded`` here exactly as on the undecorated call. On error (missing
       dir, empty query, etc.) or a genuinely empty raw hit set, the result is
       returned unchanged -- no reranking is attempted.
+
+      Every non-error response also carries ``content_extractors``, e.g.
+      ``{"pdf": "ok", "npz": "ok"}``. ``"pdf": "pypdf_missing"`` means PDF
+      files are currently indexed by filename only, so a body-text query
+      cannot match them. NPZ archives are indexed by array name, shape token
+      (``100x3``) and dtype, parsed with the standard library.
     """
     if include_archival:
         overfetch_limit = max(
@@ -340,6 +347,12 @@ def search_outputs(
         max_seconds=max_seconds,
         subtree=subtree,
     )
+    if not result.get("error"):
+        # Explicit degradation: a PDF indexed while pypdf is missing is
+        # searchable by filename only, which a zero-hit body query cannot
+        # reveal on its own. Error responses stay byte-identical to
+        # outputs_local's.
+        result["content_extractors"] = outputs_local.content_extractor_status()
     hits = result.get("hits")
     if not hits or result.get("error"):
         return result
