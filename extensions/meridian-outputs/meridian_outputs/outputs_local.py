@@ -1252,12 +1252,27 @@ _FTS_HEARTBEAT_EVERY_ROWS = 1000
 _FTS_HEARTBEAT_EVERY_SECONDS = 5.0
 
 
+# Set for the current thread while search() runs its lazy _rebuild_fts().
+# search() never holds the index write lock, so a lease heartbeat from that
+# build would rewrite the lease of whichever thread does hold it (rebuild()
+# in another thread), from a thread that does not hold it, racing the
+# holder's own lease writes and able to garble the lease JSON. The pacers in
+# _rebuild_fts() and the migration it runs then get _no_lease_heartbeat, so
+# only the lock owner writes the lease.
+_LAZY_FTS_BUILD = threading.local()
+
+
+def _no_lease_heartbeat() -> None:
+    """The pacer heartbeat in a thread that does not hold the write lock."""
+
+
 class _LeaseHeartbeatPacer:
     """Calls ``heartbeat`` from a long per-row loop at a bounded interval
     (:data:`_FTS_HEARTBEAT_EVERY_ROWS` rows or
     :data:`_FTS_HEARTBEAT_EVERY_SECONDS`, whichever comes first) instead of on
     every row. ``heartbeat`` is :meth:`IndexFileLock.heartbeat`, which is
-    best-effort, never raises, and is a no-op when the lock is not held."""
+    best-effort, never raises, and is a no-op when the lock is not held, or
+    :func:`_no_lease_heartbeat` in search()'s lazy build."""
 
     __slots__ = ("_heartbeat", "_rows", "_last")
 
@@ -5551,8 +5566,8 @@ class OutputsFtsIndex:
         import tantivy  # noqa: PLC0415
         # Runs inside rebuild()'s write-lock section and can take far longer
         # than the lease's stale threshold on a large legacy table: keep the
-        # lease fresh while it runs (a no-op when the lock is not held).
-        pacer = _LeaseHeartbeatPacer(self._write_lock.heartbeat)
+        # lease fresh while it runs (never from search()'s lazy build).
+        pacer = _LeaseHeartbeatPacer(self._fts_lease_heartbeat())
         relation = con.execute("SELECT path, content FROM outputs_index")
         for path, content in relation.fetchall():
             writer.delete_documents("path", path)
@@ -7818,8 +7833,8 @@ class OutputsFtsIndex:
         if deletes or upserts:
             # A large (or long-deferred) delta can outlast the lease's stale
             # threshold: keep the write lock's lease fresh while it runs
-            # (a no-op when the lock is not held, e.g. search()'s lazy build).
-            pacer = _LeaseHeartbeatPacer(self._write_lock.heartbeat)
+            # (never from search()'s lazy build, see _fts_lease_heartbeat).
+            pacer = _LeaseHeartbeatPacer(self._fts_lease_heartbeat())
             for p in deletes:
                 writer.delete_documents("path", p)
                 pacer.tick()
@@ -7836,6 +7851,16 @@ class OutputsFtsIndex:
             self._tantivy_migration_checked = True
             self._migrate_duckdb_rows_to_tantivy_if_needed(con, index, writer)
         self._fts_built = True
+
+    def _fts_lease_heartbeat(self) -> Callable[[], None]:
+        """The heartbeat for the pacers in :meth:`_rebuild_fts` and the
+        migration it runs: the write lock's, or :func:`_no_lease_heartbeat`
+        while search() runs its lazy build in this thread. search() does not
+        hold the write lock, and :meth:`IndexFileLock.heartbeat` would write
+        the lease of the thread that does (see :data:`_LAZY_FTS_BUILD`)."""
+        if getattr(_LAZY_FTS_BUILD, "active", False):
+            return _no_lease_heartbeat
+        return self._write_lock.heartbeat
 
     def search(
         self, query: str, *, limit: int = 10, include_archival: bool = True,
@@ -7890,8 +7915,15 @@ class OutputsFtsIndex:
                     # but FTS was deferred from a prior rebuild(). Attempt a
                     # lazy build now. An empty pending delta is a no-op
                     # (mirrors the old "FTS over an empty table is harmless").
+                    # This thread does not hold the write lock, so the build
+                    # must not heartbeat its lease (_LAZY_FTS_BUILD).
                     self._fts_pending = False
-                    self._rebuild_fts(con)
+                    lazy_before = getattr(_LAZY_FTS_BUILD, "active", False)
+                    _LAZY_FTS_BUILD.active = True
+                    try:
+                        self._rebuild_fts(con)
+                    finally:
+                        _LAZY_FTS_BUILD.active = lazy_before
                 index, _writer = self._connect_tantivy()
                 # 52cbe5d8 -- a single Searcher snapshot must be used for BOTH
                 # the query (which returns DocAddress values that are only

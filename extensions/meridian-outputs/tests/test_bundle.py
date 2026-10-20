@@ -8,7 +8,9 @@ from __future__ import annotations
 import json
 import logging
 import os
+import re
 import shutil
+import stat
 import sys
 import threading
 from pathlib import Path
@@ -750,14 +752,14 @@ class TestExport:
         B._remove_reservation(str(target), None)
         assert not target.exists()
 
-    def test_cleanup_with_no_inode_number_never_removes_the_file(
+    def test_cleanup_with_no_inode_number_never_removes_a_non_empty_file(
         self, tmp_path, monkeypatch, caplog,
     ) -> None:
         """F9: on a volume that reports st_ino 0 for every file, the
         (st_dev, st_ino) identity check matched whatever was at the path, so
         the cleanup could remove another writer's file. An st_ino of 0 is now
-        an unknown identity: nothing is removed and the path is logged as a
-        leftover."""
+        an unknown identity: a non-empty file is never removed and the path
+        is logged (R6-E: only an empty one, the reservation, is removed)."""
         target = tmp_path / "bundle.json"
         target.write_text('{"published": 1}', encoding="utf-8")
         real_stat = os.stat
@@ -783,9 +785,65 @@ class TestExport:
         assert target.read_text(encoding="utf-8") == '{"published": 1}'
         warnings = [r for r in caplog.records if r.name == B.__name__]
         assert len(warnings) == 1
-        assert "leftover" in warnings[0].getMessage()
+        assert "left it untouched" in warnings[0].getMessage()
         assert "identity unknown" in warnings[0].getMessage()
         assert warnings[0].args[0] == str(target)
+
+    def test_cleanup_with_no_inode_number_removes_the_empty_reservation(
+        self, populated, monkeypatch, caplog,
+    ) -> None:
+        """R6-E: with st_ino 0 the cleanup removed nothing, so a failed
+        publish on such a volume left its empty reservation behind and every
+        later create-only export to that path was refused as "already
+        exists". An unknown identity now gets the empty-regular-file test the
+        missing-fstat case uses: the empty reservation is removed, nothing
+        is logged, and a retry succeeds."""
+        monkeypatch.delattr(B.os, "link")
+        od = str(populated["outputs"])
+        real_open, real_fstat, real_stat = os.open, os.fstat, os.stat
+        reservations: list[int] = []
+
+        def _without_inode(st: os.stat_result) -> os.stat_result:
+            return os.stat_result((
+                st.st_mode, 0, st.st_dev, st.st_nlink, st.st_uid, st.st_gid,
+                st.st_size, int(st.st_atime), int(st.st_mtime), int(st.st_ctime),
+            ))
+
+        def _is_target(path: Any) -> bool:
+            return not isinstance(path, int) and os.path.basename(os.fspath(path)) == "x.json"
+
+        def _open(path, flags, *args, **kwargs):
+            fd = real_open(path, flags, *args, **kwargs)
+            if flags & os.O_EXCL and _is_target(path):
+                reservations.append(fd)
+            return fd
+
+        def _fstat(fd):
+            st = real_fstat(fd)
+            if fd in reservations:
+                reservations.remove(fd)  # the fd number may be reused later
+                return _without_inode(st)
+            return st
+
+        def _stat(path, *args, **kwargs):
+            st = real_stat(path, *args, **kwargs)
+            return _without_inode(st) if _is_target(path) else st
+
+        def _fail(_src, _dst):
+            raise OSError("disk full")
+
+        monkeypatch.setattr(B.os, "open", _open)
+        monkeypatch.setattr(B.os, "fstat", _fstat)
+        monkeypatch.setattr(B.os, "stat", _stat)
+        monkeypatch.setattr(B.os, "replace", _fail)
+        with caplog.at_level(logging.WARNING, logger=B.__name__):
+            result = B.export_bundle(od, "backup/x.json")
+        assert result == {"exported": False, "error": "failed to write bundle (OSError)"}
+        assert reservations == []  # the reservation was made with st_ino 0
+        assert list((populated["outputs"] / "backup").iterdir()) == []
+        assert [r for r in caplog.records if r.name == B.__name__] == []
+        monkeypatch.undo()
+        assert B.export_bundle(od, "backup/x.json")["exported"] is True
 
 
 class TestVerify:
@@ -1514,6 +1572,68 @@ class TestImport:
         assert summary["conflicts"] == ["a", "b"]
         assert summary["conflict_count"] == 3
         assert summary["conflicts_truncated"] is True
+
+
+class TestImportTempFileMode:
+    """R6-F: the import replaced each ledger from a tempfile.mkstemp file,
+    which is 0600 whatever the umask, while the ledger writers create
+    0o666 less the umask. The same ledger alternated between modes, and
+    another account lost read access to it after an import."""
+
+    def test_import_temp_files_are_created_like_the_writers(self, populated, monkeypatch) -> None:
+        _export(populated["outputs"])
+        target = _empty_target(populated["root"])
+        _copy_bundle(populated["outputs"], "backup/bundle.json", target)
+        real_open = os.open
+        calls: list[tuple[str, int, int]] = []
+
+        def _spy(path, flags, mode=0o777, *args, **kwargs):
+            if os.fspath(path).endswith(".tmp"):
+                calls.append((os.path.basename(path), flags, mode))
+            return real_open(path, flags, mode, *args, **kwargs)
+
+        with monkeypatch.context() as m:
+            m.setattr(os, "open", _spy)
+            result = B.import_bundle("incoming.json", str(target), dry_run=False)
+        assert result["imported"] is True, result
+        assert len(calls) == len(_LEDGER_FILES), calls
+        # write_ledger_atomic names its temp file "<ledger>.<hex>.tmp".
+        writer_limit = min(
+            len(f"{name}.{'0' * 2 * ledger_io._TEMP_TOKEN_BYTES}.tmp")
+            for name in _LEDGER_FILES.values()
+        )
+        binary = getattr(os, "O_BINARY", 0)
+        for name, flags, mode in calls:
+            assert mode == 0o666  # the umask applies, as for the writers
+            assert flags & os.O_CREAT and flags & os.O_EXCL
+            assert flags & binary == binary
+            assert re.fullmatch(r"\.bundle-[0-9a-f]{%d}\.tmp" % (2 * ledger_io._TEMP_TOKEN_BYTES), name), name
+            assert len(name) <= writer_limit, name
+        assert len({name for name, _flags, _mode in calls}) == len(calls)  # unique names
+        cache = target / ".meridian-outputs-cache"
+        assert [p.name for p in cache.iterdir() if p.name.endswith(".tmp")] == []
+        for name in _LEDGER_FILES:
+            raw = _ledger_path(target, name).read_bytes()
+            assert b"\r\r\n" not in raw  # no CRT text-mode translation on Windows
+
+    @pytest.mark.skipif(os.name != "posix", reason="POSIX permission bits")
+    @pytest.mark.parametrize("umask", [0o022, 0o002])
+    def test_imported_ledger_mode_matches_a_writer_written_ledger(self, populated, umask) -> None:
+        _export(populated["outputs"])
+        target = _empty_target(populated["root"])
+        _copy_bundle(populated["outputs"], "backup/bundle.json", target)
+        reference = populated["root"] / "reference.json"
+        previous = os.umask(umask)
+        try:
+            result = B.import_bundle("incoming.json", str(target), dry_run=False)
+            ledger_io.write_ledger_atomic(str(reference), {"k": 1})
+        finally:
+            os.umask(previous)
+        assert result["imported"] is True, result
+        writer_mode = stat.S_IMODE(os.stat(reference).st_mode)
+        assert writer_mode == 0o666 & ~umask
+        for name in _LEDGER_FILES:
+            assert stat.S_IMODE(os.stat(_ledger_path(target, name)).st_mode) == writer_mode, name
 
 
 class TestSourceEdgeFields:
