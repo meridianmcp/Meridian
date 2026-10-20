@@ -388,7 +388,10 @@ def _remove_reservation(path: str, reserved: os.stat_result | None) -> None:
     st_ino)``. When that ``fstat`` itself failed it is None, and only an
     empty regular file is removed: that is what the reservation is, O_EXCL
     proved the name was free, nothing in this package removes another
-    writer's reservation, and a published bundle is never empty.
+    writer's reservation, and a published bundle is never empty. When
+    ``st_ino`` is 0 the volume reports no file identity (FAT, some network
+    shares) and every file there would match it, so the file at ``path`` is
+    never removed: it is logged as a leftover instead.
 
     The unlink retries a Windows sharing violation the way the rename does,
     since the reader whose open handle made the rename fail usually makes
@@ -399,6 +402,11 @@ def _remove_reservation(path: str, reserved: os.stat_result | None) -> None:
     :func:`verify_bundle` never accepts as a bundle.
     """
     def _unlink_if_reserved() -> None:
+        # The identity check (stat) and the unlink are two separate calls:
+        # a file another writer puts at ``path`` between them is removed.
+        # That window is accepted. It is microseconds wide and only an
+        # ``overwrite=True`` export or a user can write a path that O_EXCL
+        # proved was free a moment before.
         try:
             current = os.stat(path)
             if reserved is not None:
@@ -410,15 +418,20 @@ def _remove_reservation(path: str, reserved: os.stat_result | None) -> None:
         except FileNotFoundError:
             return
 
-    try:
-        ledger_io._retry_sharing(_unlink_if_reserved)
-    except OSError as exc:
-        _log.warning(
-            "%s: failed create-only bundle publish left its empty reservation "
-            "as a leftover (%s); later create-only exports to that path are "
-            "refused until it is removed",
-            path, type(exc).__name__,
-        )
+    if reserved is not None and reserved.st_ino == 0:
+        cause = "file identity unknown: the volume reports no inode number"
+    else:
+        try:
+            ledger_io._retry_sharing(_unlink_if_reserved)
+            return
+        except OSError as exc:
+            cause = type(exc).__name__
+    _log.warning(
+        "%s: failed create-only bundle publish left its empty reservation "
+        "as a leftover (%s); later create-only exports to that path are "
+        "refused until it is removed",
+        path, cause,
+    )
 
 
 def _atomic_write_json(

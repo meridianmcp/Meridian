@@ -727,6 +727,43 @@ class TestExport:
         B._remove_reservation(str(target), None)
         assert not target.exists()
 
+    def test_cleanup_with_no_inode_number_never_removes_the_file(
+        self, tmp_path, monkeypatch, caplog,
+    ) -> None:
+        """F9: on a volume that reports st_ino 0 for every file, the
+        (st_dev, st_ino) identity check matched whatever was at the path, so
+        the cleanup could remove another writer's file. An st_ino of 0 is now
+        an unknown identity: nothing is removed and the path is logged as a
+        leftover."""
+        target = tmp_path / "bundle.json"
+        target.write_text('{"published": 1}', encoding="utf-8")
+        real_stat = os.stat
+
+        def _no_inode(path, *args, **kwargs):
+            st = real_stat(path, *args, **kwargs)
+            return os.stat_result((
+                st.st_mode, 0, st.st_dev, st.st_nlink, st.st_uid, st.st_gid,
+                st.st_size, int(st.st_atime), int(st.st_mtime), int(st.st_ctime),
+            ))
+
+        reserved = _no_inode(str(target))
+        unlinks: list[str] = []
+        real_unlink = os.unlink
+        monkeypatch.setattr(B.os, "stat", _no_inode)
+        monkeypatch.setattr(
+            B.os, "unlink", lambda p, *a, **k: (unlinks.append(p), real_unlink(p, *a, **k))[1],
+        )
+        with caplog.at_level(logging.WARNING, logger=B.__name__):
+            B._remove_reservation(str(target), reserved)
+        monkeypatch.undo()
+        assert unlinks == []
+        assert target.read_text(encoding="utf-8") == '{"published": 1}'
+        warnings = [r for r in caplog.records if r.name == B.__name__]
+        assert len(warnings) == 1
+        assert "leftover" in warnings[0].getMessage()
+        assert "identity unknown" in warnings[0].getMessage()
+        assert warnings[0].args[0] == str(target)
+
 
 class TestVerify:
     def test_fresh_bundle_verifies(self, populated) -> None:
