@@ -550,6 +550,72 @@ class TestLedgerTempFileMode:
 
 
 # ---------------------------------------------------------------------------
+# Temporary files: leftovers from a crash are swept (F8)
+# ---------------------------------------------------------------------------
+
+def _aged(path: Path, seconds: float) -> Path:
+    path.write_bytes(b'{"leftover": "' + b"x" * 4096 + b'"}')
+    when = time.time() - seconds
+    os.utime(path, (when, when))
+    return path
+
+
+class TestLedgerTempFileSweep:
+    """F8: a crash between creating the temporary file and os.replace left a
+    full-size copy of the ledger in the cache, and nothing ever removed it."""
+
+    def test_next_write_removes_this_ledgers_temp_files_older_than_an_hour(
+        self, tmp_path: Path,
+    ) -> None:
+        ledger = tmp_path / "ledger.json"
+        stale = _aged(tmp_path / f"ledger.json.{'a' * 16}.tmp", 2 * 3600)
+        fresh = _aged(tmp_path / f"ledger.json.{'b' * 16}.tmp", 60)
+        # Old, but not this ledger's temporary files: never touched.
+        others = [
+            _aged(tmp_path / f"other.json.{'c' * 16}.tmp", 2 * 3600),
+            _aged(tmp_path / "ledger.json.corrupt-0123456789abcdef", 2 * 3600),
+            _aged(tmp_path / "ledger.json.lock", 2 * 3600),
+            _aged(tmp_path / "ledger.json.notatoken.tmp", 2 * 3600),
+        ]
+
+        LIO.write_ledger_atomic(str(ledger), {"k": 1})
+
+        assert not stale.exists()
+        assert fresh.exists()
+        assert all(p.exists() for p in others)
+        assert json.loads(ledger.read_text(encoding="utf-8")) == {"k": 1}
+
+    def test_a_writer_sweeps_through_its_ledger_transaction(self, tmp_path: Path) -> None:
+        outputs = _outputs(tmp_path)
+        a = _write(outputs / "a.csv", "x\n1\n")
+        assert "error" not in AN.record_provenance(str(outputs), str(a))
+        cache = outputs / ".meridian-outputs-cache"
+        stale = _aged(cache / f"provenance_ledger.json.{'d' * 16}.tmp", 2 * 3600)
+        b = _write(outputs / "b.csv", "x\n2\n")
+        assert "error" not in AN.record_provenance(str(outputs), str(b))
+        assert not stale.exists()
+        assert [n for n in _cache_files(outputs) if n.endswith(".tmp")] == []
+
+    def test_a_temp_file_that_cannot_be_removed_does_not_block_the_write(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        ledger = tmp_path / "ledger.json"
+        stale = _aged(tmp_path / f"ledger.json.{'e' * 16}.tmp", 2 * 3600)
+        real_remove = os.remove
+
+        def _held_open(path: str) -> None:
+            if os.path.basename(path) == stale.name:
+                raise PermissionError("sharing violation")
+            real_remove(path)
+
+        with monkeypatch.context() as m:
+            m.setattr(os, "remove", _held_open)
+            LIO.write_ledger_atomic(str(ledger), {"k": 2})
+        assert stale.exists()
+        assert json.loads(ledger.read_text(encoding="utf-8")) == {"k": 2}
+
+
+# ---------------------------------------------------------------------------
 # Strict reads and quarantine
 # ---------------------------------------------------------------------------
 
