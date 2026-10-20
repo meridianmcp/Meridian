@@ -291,15 +291,21 @@ class TestExport:
         assert "already exists" in again["error"]
         assert B.export_bundle(od, overwrite=True)["exported"] is True
 
-    @pytest.mark.parametrize("rel", [
+    _STREAM_NAMES = [
         "results.csv:hidden",
         "backup.json:evil",
         ".meridian-outputs-cache/bundles/b.json::$DATA",
         "sub/name:stream:$DATA",
-    ])
-    def test_stream_suffixed_name_is_refused(self, populated, rel) -> None:
+    ]
+    _POSIX_COLON_NAME = ".meridian-outputs-cache/bundles/bundle-2026-10-20T10:00:00Z.json"
+
+    @pytest.mark.parametrize("rel", _STREAM_NAMES)
+    def test_stream_suffixed_name_is_refused(self, populated, rel, monkeypatch) -> None:
         """B1: on Windows ``name:stream`` writes an alternate data stream of
-        an existing file, so a ':' outside the drive letter is refused."""
+        an existing file, so a ':' outside the drive letter is refused there.
+        The Windows check is forced on so this runs on every host (B-F11
+        made the refusal Windows-only)."""
+        monkeypatch.setattr(B, "_IS_WINDOWS", True)
         results = populated["outputs"] / "results.csv"
         results.write_text("x,y\n1,2\n", encoding="utf-8")
         result = B.export_bundle(str(populated["outputs"]), rel, overwrite=True)
@@ -310,6 +316,33 @@ class TestExport:
         assert results.read_text(encoding="utf-8") == "x,y\n1,2\n"
         assert not (populated["outputs"] / "backup.json").exists()
         assert not (populated["outputs"] / "sub").exists()
+
+    @pytest.mark.parametrize("rel", [*_STREAM_NAMES, _POSIX_COLON_NAME])
+    def test_colon_is_an_ordinary_character_off_windows(self, rel, monkeypatch) -> None:
+        """B-F11: ':' was refused on every platform, although only Windows
+        reads it as a stream separator."""
+        monkeypatch.setattr(B, "_IS_WINDOWS", False, raising=False)
+        assert B._stream_separator_error(rel) is None
+        monkeypatch.setattr(B, "_IS_WINDOWS", True)
+        assert B._stream_separator_error(rel) == (
+            "bundle_path rejected: ':' is only allowed in a drive letter"
+        )
+
+    def test_posix_colon_name_is_refused_on_windows_only(self, populated) -> None:
+        """B-F11, on the real platform: a timestamped name with colons is
+        refused on Windows and exported (and verifies) everywhere else."""
+        od = str(populated["outputs"])
+        result = B.export_bundle(od, self._POSIX_COLON_NAME)
+        if os.name == "nt":
+            assert result == {
+                "exported": False,
+                "error": "bundle_path rejected: ':' is only allowed in a drive letter",
+            }
+            assert not (populated["outputs"] / ".meridian-outputs-cache" / "bundles").exists()
+        else:
+            assert result["exported"] is True, result
+            assert result["bundle_path"] == self._POSIX_COLON_NAME
+            assert B.verify_bundle(self._POSIX_COLON_NAME, outputs_dir=od)["verified"] is True
 
     def test_drive_qualified_absolute_path_inside_outputs_is_allowed(self, populated) -> None:
         target = populated["outputs"] / "abs_bundle.json"

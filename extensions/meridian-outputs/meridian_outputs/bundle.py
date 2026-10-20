@@ -108,8 +108,10 @@ Paths
 ``.meridian-outputs-cache`` only the ``bundles/`` subdirectory may hold a
 bundle: everything else there is live state (the ledgers, ``index.duckdb``,
 the ``*.lock`` files the index and ledger writers hold, the derived cache).
-A ``:`` anywhere but a drive letter is refused, since on Windows it names an
-alternate data stream of another file. Export also refuses to replace an
+On Windows a ``:`` anywhere but a drive letter is refused, since there it
+names an alternate data stream of another file; on other platforms ``:`` is
+an ordinary file-name character (``bundle-2026-10-20T10:00:00Z.json``) and is
+accepted. Export also refuses to replace an
 existing file unless ``overwrite=True``. A relative ``bundle_path`` is
 relative to ``outputs_dir``. The default, ``.meridian-outputs-cache/bundles/
 meridian-outputs-bundle.json``, sits in a dot-directory, which the outputs
@@ -151,6 +153,7 @@ INDEX_META = "index_meta"
 
 _CACHE_DIRNAME = ".meridian-outputs-cache"
 _BUNDLES_SUBDIR = "bundles"  # the only part of the cache a bundle may live in
+_IS_WINDOWS = os.name == "nt"  # ':' names an alternate data stream only here
 _LOCK_TIMEOUT_SECONDS = 30.0
 _CONFLICT_LIST_CAP = 500
 _EXISTS_ERROR = (
@@ -244,8 +247,12 @@ def _inside(path: str, root: str) -> bool:
 
 
 def _stream_separator_error(bundle_path: Any) -> str | None:
-    """Refuse a ``:`` outside the drive letter: on Windows ``name:stream``
-    writes an alternate data stream of ``name``, an existing file."""
+    """On Windows, refuse a ``:`` outside the drive letter: there
+    ``name:stream`` writes an alternate data stream of ``name``, an existing
+    file. Elsewhere ``:`` is an ordinary file-name character, so a name such
+    as ``bundle-2026-10-20T10:00:00Z.json`` is accepted."""
+    if not _IS_WINDOWS:
+        return None
     if not isinstance(bundle_path, (str, os.PathLike)):
         return None  # _require_within reports the type problem
     raw = os.fsdecode(os.fspath(bundle_path))
