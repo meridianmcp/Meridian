@@ -429,6 +429,52 @@ class TestExport:
         assert "run_manifest_ledger: reader failed (OSError)" in result["errors"]
         assert not (populated["outputs"] / "x.json").exists()
 
+    def test_transient_sharing_violation_on_the_ledger_check_does_not_refuse_export(
+        self, populated, monkeypatch,
+    ) -> None:
+        """S-R4-10: the ledger file check opened the ledger with a bare open()
+        and reported any OSError as "not valid JSON", so a transient Windows
+        sharing violation (a writer replacing the ledger) refused a valid
+        export. It now reads through ledger_io's retrying byte read."""
+        real_open = open
+        failures = {"left": 1}
+
+        def _shared_once(file, mode="r", *args, **kwargs):
+            if (
+                "r" in mode and failures["left"]
+                and os.path.basename(os.fspath(file)) == "run_manifest_ledger.json"
+            ):
+                failures["left"] -= 1
+                raise PermissionError(13, "sharing violation")
+            return real_open(file, mode, *args, **kwargs)
+
+        monkeypatch.setattr(ledger_io, "_SHARING_RETRY_SLEEP_SECONDS", 0.0)
+        monkeypatch.setattr("builtins.open", _shared_once)
+        result = B.export_bundle(str(populated["outputs"]), "x.json")
+        monkeypatch.undo()
+        assert failures["left"] == 0  # the check hit the violation and retried
+        assert result["exported"] is True, result
+        assert B.verify_bundle("x.json", outputs_dir=str(populated["outputs"]))["verified"] is True
+
+    def test_unreadable_ledger_is_reported_as_unreadable_not_invalid_json(
+        self, populated, monkeypatch,
+    ) -> None:
+        """S-R4-10: only a real parse failure is "not valid JSON"; a read
+        error is reported as one."""
+        real_open = open
+
+        def _eio(file, mode="r", *args, **kwargs):
+            if "r" in mode and os.path.basename(os.fspath(file)) == "run_manifest_ledger.json":
+                raise OSError(5, "I/O error")
+            return real_open(file, mode, *args, **kwargs)
+
+        monkeypatch.setattr("builtins.open", _eio)
+        result = B.export_bundle(str(populated["outputs"]), "x.json")
+        monkeypatch.undo()
+        assert result["exported"] is False
+        assert result["errors"] == ["run_manifest_ledger: unreadable (OSError)"]
+        assert not (populated["outputs"] / "x.json").exists()
+
     def test_registry_with_artifacts_list_refuses_export(self, populated) -> None:
         """S-F9: the registry reader normalised a list to {}, so the shape
         check never saw live damage and an empty registry was exported."""
