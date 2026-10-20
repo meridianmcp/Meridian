@@ -1012,8 +1012,8 @@ def _probe_portalocker_held(lock_path: str, portalocker_module: Any) -> bool | N
     guessed."""
     try:
         # Ensure the file exists so the probe targets the same path a real
-        # acquirer would -- mirrors the original acquire() path (which always
-        # opened the lock file in "w" mode on every attempt).
+        # acquirer would -- mirrors the acquire() path, which creates the lock
+        # file when missing (without truncating it) on every attempt.
         with open(lock_path, "a", encoding="utf-8"):
             pass
         probe = open(lock_path, "r+", encoding="utf-8")
@@ -1320,7 +1320,12 @@ class IndexFileLock:
 
     def _acquire_portalocker(self, portalocker: Any, lock_path: str) -> None:
         try:
-            self._file_handle = open(lock_path, "w", encoding="utf-8")  # noqa: WPS515
+            # Opened without truncation: this open happens BEFORE the
+            # blocking lock, and "w" mode used to wipe a live holder's lease
+            # for as long as this process waited, leaving a lease-less file
+            # an atomic-create process can judge stale and reclaim.
+            fd = os.open(lock_path, os.O_RDWR | os.O_CREAT)
+            self._file_handle = os.fdopen(fd, "r+", encoding="utf-8")
             portalocker.lock(self._file_handle, portalocker.LOCK_EX)
         except Exception as exc:  # noqa: BLE001 -- a52216e2: no longer swallowed
             if self._file_handle is not None:
@@ -1337,6 +1342,13 @@ class IndexFileLock:
             raise IndexLockAcquireError(
                 f"failed to acquire the cross-process lock at {lock_path!r}: {exc}"
             ) from exc
+        # Only now that the lock is held: drop the previous holder's lease,
+        # so a failed lease write in acquire() leaves no lease rather than a
+        # predecessor's. Best-effort, like the lease write itself.
+        try:
+            self._file_handle.truncate(0)
+        except Exception:  # noqa: BLE001 -- diagnostics-only, never fatal
+            _log.debug("IndexFileLock: failed to clear the previous lease", exc_info=True)
         self._lock_mode = "portalocker"
 
     def _acquire_atomic(self, lock_path: str, timeout: float | None) -> None:
