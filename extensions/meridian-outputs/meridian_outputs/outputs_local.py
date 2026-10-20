@@ -741,6 +741,32 @@ def ensure_gitignored(path: str) -> None:
 #      Reclaiming a stale LOCK FILE and killing the process that
 #      (legitimately or not) still holds it are two entirely different
 #      things; this module only ever does the former.
+#   4. Two residuals of that reclaim are ACCEPTED, not closed:
+#      a. POSIX: two holders after a reclaim. _reclaim_stale_lock_file
+#         re-reads the lease and then removes the file as two separate steps
+#         (check-then-remove). Two waiters that judged the same lease stale
+#         can both pass the re-read; the first removes the file and creates
+#         its own, and the second's remove then deletes that successor's
+#         file, so both enter the critical section. IndexFileLock.release
+#         has the same window against a waiter that reclaims a hold which
+#         outlasted the stale threshold. Reachable only once a holder is
+#         already stale (dead pid, or a heartbeat silent past the threshold;
+#         long holds keep it fresh, see _LeaseHeartbeatPacer). Closing it
+#         needs a rename-then-verify reclaim. Accepted in
+#         _reclaim_stale_lock_file (and, for the release window, in
+#         IndexFileLock.release), where each is documented.
+#      b. Windows: reclaim blocked by an open handle. The lock file is
+#         opened without FILE_SHARE_DELETE, so while another LIVE process
+#         still has it open (a holder that is alive but stale by heartbeat,
+#         or any lingering reader), os.remove fails and the waiter cannot
+#         reclaim it. The waiter keeps polling and, if that handle is never
+#         closed, waits out its whole acquire timeout and raises
+#         IndexLockAcquireError. This fails closed: no second holder (which
+#         is also why (a) cannot happen on Windows), at the cost of
+#         availability. A dead holder's handles are closed by the OS, so a
+#         crashed holder is still reclaimed promptly. Accepted in
+#         IndexFileLock._acquire_atomic, which falls through to its deadline
+#         check and poll sleep whenever the reclaim did not remove the file.
 
 # Per-canonical-path threading locks (in-process).
 _THREADING_LOCKS: dict[str, threading.Lock] = {}
