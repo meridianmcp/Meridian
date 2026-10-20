@@ -1001,8 +1001,7 @@ def import_bundle(
                     _file_signature(step["path"]) != step["signature"]
                     or getattr(step["module"], step["reader"])(outputs_dir) != step["base"]
                 ):
-                    result["reason"] = "concurrent_modification"
-                    return result
+                    return _concurrent_modification_result(result)
                 _atomic_write_json(step["path"], step["merged"], indent=2)
                 result["written_members"].append(name)
                 if step["module"] is annotate:
