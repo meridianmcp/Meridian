@@ -16,6 +16,7 @@ Covers:
 """
 from __future__ import annotations
 
+import os
 import sys
 from pathlib import Path
 
@@ -523,6 +524,51 @@ class TestCorruptRegistryWriters:
         assert Path(quarantined).name.startswith("artifact_registry.json.corrupt-")
         assert Path(quarantined).read_bytes() == truncated
         assert str(tmp_path) not in str(info.value)  # basename only in the message
+
+
+# ---------------------------------------------------------------------------
+# Registry writes: unique temp file, fsync, atomic replace (S-R4-6)
+# ---------------------------------------------------------------------------
+
+class TestRegistryAtomicWrite:
+    def test_failed_replace_keeps_prior_registry_and_leaves_no_temp(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """S-R4-6: the registry was written to a fixed artifact_registry.json.tmp
+        with no fsync before the rename, so a crash could leave a zero-length
+        or truncated registry that the strict read then refused for good."""
+        od = str(tmp_path)
+        AR.register_artifact(od, "figure", generator="a.py")
+        registry = tmp_path / ".meridian-outputs-cache" / "artifact_registry.json"
+        before = registry.read_bytes()
+        events: list[str] = []
+        real_fsync, real_replace = os.fsync, os.replace
+
+        def _fsync(fd: int) -> None:
+            events.append("fsync")
+            real_fsync(fd)
+
+        def _replace(src: str, dst: str) -> None:
+            if os.path.basename(dst) != registry.name:
+                return real_replace(src, dst)
+            events.append("replace:" + os.path.basename(src))
+            raise OSError("simulated failure before the replace")
+
+        with monkeypatch.context() as m:
+            m.setattr(os, "fsync", _fsync)
+            m.setattr(os, "replace", _replace)
+            with pytest.raises(OSError, match="simulated"):
+                AR.register_artifact(od, "figure", generator="b.py")
+
+        assert registry.read_bytes() == before
+        replaces = [e for e in events if e.startswith("replace:")]
+        assert replaces, events
+        assert replaces[0] != "replace:artifact_registry.json.tmp"  # unique temp name
+        assert "fsync" in events[: events.index(replaces[0])]  # fsynced before the rename
+        assert [n for n in os.listdir(registry.parent) if n.endswith(".tmp")] == []
+        # The next write goes through and keeps the earlier artifact.
+        AR.register_artifact(od, "figure", generator="b.py")
+        assert len(AR.list_artifacts(od)) == 2
 
 
 # ---------------------------------------------------------------------------

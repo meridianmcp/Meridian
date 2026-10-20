@@ -197,14 +197,16 @@ def _read_ledger_for_write(outputs_dir: str) -> dict[str, dict[str, Any]]:
 
 
 def _write_ledger_entry(outputs_dir: str, key: str, record: dict[str, Any]) -> None:
+    """Read-modify-write one run row. The write is a unique temp file, fsync,
+    then ``os.replace`` (``ledger_io.write_ledger_atomic``): a crash can never
+    leave a zero-length or truncated ledger, which the strict read would
+    refuse for good, and a failed write leaves the previous ledger and no temp
+    file behind."""
     path = _ledger_path(outputs_dir)
     with _write_lock:
         ledger = _read_ledger_for_write(outputs_dir)
         ledger[key] = record
-        tmp = path + ".tmp"
-        with open(tmp, "w", encoding="utf-8") as fh:
-            json.dump(ledger, fh, indent=2, sort_keys=True)
-        os.replace(tmp, path)  # atomic on both POSIX and Windows
+        ledger_io.write_ledger_atomic(path, ledger)
 
 
 def _utcnow_iso() -> str:

@@ -283,6 +283,51 @@ class TestCorruptLedgerWriters:
 
 
 # ---------------------------------------------------------------------------
+# Ledger writes: unique temp file, fsync, atomic replace (S-R4-6)
+# ---------------------------------------------------------------------------
+
+class TestLedgerAtomicWrite:
+    def test_failed_replace_keeps_prior_ledger_and_leaves_no_temp(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """S-R4-6: _write_ledger_entry wrote a fixed run_manifest_ledger.json.tmp
+        with no fsync before the rename, so a crash could leave a zero-length
+        or truncated ledger that the strict read then refused for good."""
+        RM.start_run_manifest(str(tmp_path), run_id="r0", command_name="build")
+        ledger = tmp_path / ".meridian-outputs-cache" / "run_manifest_ledger.json"
+        before = ledger.read_bytes()
+        events: list[str] = []
+        real_fsync, real_replace = os.fsync, os.replace
+
+        def _fsync(fd: int) -> None:
+            events.append("fsync")
+            real_fsync(fd)
+
+        def _replace(src: str, dst: str) -> None:
+            if os.path.basename(dst) != ledger.name:
+                return real_replace(src, dst)
+            events.append("replace:" + os.path.basename(src))
+            raise OSError("simulated failure before the replace")
+
+        with monkeypatch.context() as m:
+            m.setattr(os, "fsync", _fsync)
+            m.setattr(os, "replace", _replace)
+            with pytest.raises(OSError, match="simulated"):
+                RM.start_run_manifest(str(tmp_path), run_id="r1", command_name="build")
+            with pytest.raises(OSError, match="simulated"):
+                RM.finalize_run_manifest(str(tmp_path), "r0", status="complete")
+
+        assert ledger.read_bytes() == before
+        replaces = [e for e in events if e.startswith("replace:")]
+        assert len(replaces) == 2, events
+        assert "replace:run_manifest_ledger.json.tmp" not in replaces  # unique temp names
+        assert "fsync" in events[: events.index(replaces[0])]  # fsynced before the rename
+        assert [n for n in os.listdir(ledger.parent) if n.endswith(".tmp")] == []
+        assert RM.get_run_manifest(str(tmp_path), "r0")["phase"] == "in_progress"
+        assert RM.get_run_manifest(str(tmp_path), "r1") is None
+
+
+# ---------------------------------------------------------------------------
 # check_run_manifest_immutable
 # ---------------------------------------------------------------------------
 

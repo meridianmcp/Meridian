@@ -229,11 +229,11 @@ def _read_registry_for_write(outputs_dir: str) -> dict[str, Any]:
 
 
 def _write_registry(outputs_dir: str, registry: dict[str, Any]) -> None:
-    path = _registry_path(outputs_dir)
-    tmp = path + ".tmp"
-    with open(tmp, "w", encoding="utf-8") as fh:
-        json.dump(registry, fh, indent=2, sort_keys=True)
-    os.replace(tmp, path)  # atomic on both POSIX and Windows
+    """Unique temp file, fsync, then ``os.replace``
+    (``ledger_io.write_ledger_atomic``): a crash can never leave a zero-length
+    or truncated registry, which the strict read would refuse for good, and a
+    failed write leaves the previous registry and no temp file behind."""
+    ledger_io.write_ledger_atomic(_registry_path(outputs_dir), registry)
 
 
 def _utcnow_iso() -> str:
