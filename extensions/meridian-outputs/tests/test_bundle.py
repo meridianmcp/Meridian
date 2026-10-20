@@ -8,7 +8,9 @@ from __future__ import annotations
 import json
 import logging
 import os
+import re
 import shutil
+import stat
 import sys
 import threading
 from pathlib import Path
@@ -1570,6 +1572,68 @@ class TestImport:
         assert summary["conflicts"] == ["a", "b"]
         assert summary["conflict_count"] == 3
         assert summary["conflicts_truncated"] is True
+
+
+class TestImportTempFileMode:
+    """R6-F: the import replaced each ledger from a tempfile.mkstemp file,
+    which is 0600 whatever the umask, while the ledger writers create
+    0o666 less the umask. The same ledger alternated between modes, and
+    another account lost read access to it after an import."""
+
+    def test_import_temp_files_are_created_like_the_writers(self, populated, monkeypatch) -> None:
+        _export(populated["outputs"])
+        target = _empty_target(populated["root"])
+        _copy_bundle(populated["outputs"], "backup/bundle.json", target)
+        real_open = os.open
+        calls: list[tuple[str, int, int]] = []
+
+        def _spy(path, flags, mode=0o777, *args, **kwargs):
+            if os.fspath(path).endswith(".tmp"):
+                calls.append((os.path.basename(path), flags, mode))
+            return real_open(path, flags, mode, *args, **kwargs)
+
+        with monkeypatch.context() as m:
+            m.setattr(os, "open", _spy)
+            result = B.import_bundle("incoming.json", str(target), dry_run=False)
+        assert result["imported"] is True, result
+        assert len(calls) == len(_LEDGER_FILES), calls
+        # write_ledger_atomic names its temp file "<ledger>.<hex>.tmp".
+        writer_limit = min(
+            len(f"{name}.{'0' * 2 * ledger_io._TEMP_TOKEN_BYTES}.tmp")
+            for name in _LEDGER_FILES.values()
+        )
+        binary = getattr(os, "O_BINARY", 0)
+        for name, flags, mode in calls:
+            assert mode == 0o666  # the umask applies, as for the writers
+            assert flags & os.O_CREAT and flags & os.O_EXCL
+            assert flags & binary == binary
+            assert re.fullmatch(r"\.bundle-[0-9a-f]{%d}\.tmp" % (2 * ledger_io._TEMP_TOKEN_BYTES), name), name
+            assert len(name) <= writer_limit, name
+        assert len({name for name, _flags, _mode in calls}) == len(calls)  # unique names
+        cache = target / ".meridian-outputs-cache"
+        assert [p.name for p in cache.iterdir() if p.name.endswith(".tmp")] == []
+        for name in _LEDGER_FILES:
+            raw = _ledger_path(target, name).read_bytes()
+            assert b"\r\r\n" not in raw  # no CRT text-mode translation on Windows
+
+    @pytest.mark.skipif(os.name != "posix", reason="POSIX permission bits")
+    @pytest.mark.parametrize("umask", [0o022, 0o002])
+    def test_imported_ledger_mode_matches_a_writer_written_ledger(self, populated, umask) -> None:
+        _export(populated["outputs"])
+        target = _empty_target(populated["root"])
+        _copy_bundle(populated["outputs"], "backup/bundle.json", target)
+        reference = populated["root"] / "reference.json"
+        previous = os.umask(umask)
+        try:
+            result = B.import_bundle("incoming.json", str(target), dry_run=False)
+            ledger_io.write_ledger_atomic(str(reference), {"k": 1})
+        finally:
+            os.umask(previous)
+        assert result["imported"] is True, result
+        writer_mode = stat.S_IMODE(os.stat(reference).st_mode)
+        assert writer_mode == 0o666 & ~umask
+        for name in _LEDGER_FILES:
+            assert stat.S_IMODE(os.stat(_ledger_path(target, name)).st_mode) == writer_mode, name
 
 
 class TestSourceEdgeFields:

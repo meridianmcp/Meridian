@@ -131,8 +131,8 @@ import hashlib
 import json
 import logging
 import os
+import secrets
 import stat
-import tempfile
 from datetime import datetime, timezone
 from typing import Any, Iterator
 
@@ -450,10 +450,23 @@ def _atomic_write_json(
     sharing violation (a lock-free reader holding the target open) the same
     way ``ledger_io.write_ledger_atomic`` does; with ``create_only`` it is
     :func:`_publish_create_only`, which raises FileExistsError and leaves
-    the existing file untouched when ``path`` already exists."""
+    the existing file untouched when ``path`` already exists.
+
+    The temp file is created the way ``write_ledger_atomic`` creates its
+    own: ``O_EXCL`` under a unique name (``.bundle-<16 hex>.tmp``), mode
+    ``0o666`` with the process umask applied, ``O_BINARY`` so Windows' CRT
+    does not translate newlines a second time. ``tempfile.mkstemp`` forced
+    ``0o600``, which the publish carried onto an imported ledger, so the
+    same ledger alternated between modes and other accounts lost read
+    access after an import."""
     directory = os.path.dirname(path)
     os.makedirs(directory, exist_ok=True)
-    fd, tmp = tempfile.mkstemp(dir=directory, prefix=".bundle-", suffix=".tmp")
+    tmp = os.path.join(
+        directory, f".bundle-{secrets.token_hex(ledger_io._TEMP_TOKEN_BYTES)}.tmp",
+    )
+    fd = os.open(
+        tmp, os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_BINARY", 0), 0o666,
+    )
     try:
         with os.fdopen(fd, "w", encoding="utf-8") as fh:
             json.dump(obj, fh, indent=indent, sort_keys=True)
