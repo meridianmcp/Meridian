@@ -129,6 +129,7 @@ import contextlib
 import copy
 import hashlib
 import json
+import logging
 import os
 import stat
 import tempfile
@@ -137,6 +138,8 @@ from typing import Any, Iterator
 
 from . import annotate, artifact_registry, fingerprint, ledger_io, outputs_local, run_manifest
 from .path_security import _require_within, relative_output_path
+
+_log = logging.getLogger(__name__)
 
 __all__ = [
     "BUNDLE_FORMAT",
@@ -381,15 +384,36 @@ def _remove_reservation(path: str, reserved: os.stat_result | None) -> None:
     empty regular file is removed: that is what the reservation is, O_EXCL
     proved the name was free, nothing in this package removes another
     writer's reservation, and a published bundle is never empty.
+
+    The unlink retries a Windows sharing violation the way the rename does,
+    since the reader whose open handle made the rename fail usually makes
+    the first unlink fail too. A reservation that still cannot be removed is
+    logged as a leftover with its path before the caller's error
+    propagates: every later create-only export to that path is refused as
+    "already exists" until it is removed, and it is an empty file, which
+    :func:`verify_bundle` never accepts as a bundle.
     """
-    with contextlib.suppress(OSError):
-        current = os.stat(path)
-        if reserved is not None:
-            if (current.st_dev, current.st_ino) != (reserved.st_dev, reserved.st_ino):
+    def _unlink_if_reserved() -> None:
+        try:
+            current = os.stat(path)
+            if reserved is not None:
+                if (current.st_dev, current.st_ino) != (reserved.st_dev, reserved.st_ino):
+                    return
+            elif not (stat.S_ISREG(current.st_mode) and current.st_size == 0):
                 return
-        elif not (stat.S_ISREG(current.st_mode) and current.st_size == 0):
+            os.unlink(path)
+        except FileNotFoundError:
             return
-        os.unlink(path)
+
+    try:
+        ledger_io._retry_sharing(_unlink_if_reserved)
+    except OSError as exc:
+        _log.warning(
+            "%s: failed create-only bundle publish left its empty reservation "
+            "as a leftover (%s); later create-only exports to that path are "
+            "refused until it is removed",
+            path, type(exc).__name__,
+        )
 
 
 def _atomic_write_json(
