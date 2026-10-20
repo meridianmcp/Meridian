@@ -128,6 +128,51 @@ class TestCheckInputStaleness:
         for run_id in ("rel", "abs", "both"):
             assert RM.check_input_staleness(str(outputs), run_id)["stale_inputs"] == ["data/in.csv"]
 
+    def test_relative_input_is_stat_ed_and_hashed_as_one_file(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """A relative input used to be stat-ed under outputs_dir but hashed
+        against the working directory. Both now use one resolver."""
+        outputs = tmp_path / "outputs"
+        inp = _write(outputs / "data" / "in.csv", "a\n1\n")
+        _write(tmp_path / "cwd" / "data" / "in.csv", "same name, different file\n")
+        monkeypatch.chdir(tmp_path / "cwd")
+
+        rec = _start(outputs, "r1", ["data/in.csv"])
+        expected = RM.fingerprint.script_content_hash(str(inp))
+        assert rec["input_identity"]["file_hashes"] == {"data/in.csv": expected}
+        assert rec["input_stat"]["data/in.csv"]["sha256"] == expected
+        assert RM.check_input_staleness(str(outputs), "r1")["stale"] is False
+
+        # The identity no longer depends on the working directory.
+        monkeypatch.chdir(outputs)
+        assert _start(outputs, "r1", ["data/in.csv"])["manifest_hash"] == rec["manifest_hash"]
+
+        inp.write_text("a\n1\n2\n", encoding="utf-8")
+        result = RM.check_input_staleness(str(outputs), "r1")
+        assert result["stale"] is True
+        assert _by_input(result) == {"data/in.csv": "changed"}
+
+    def test_legacy_baseline_of_relative_input_uses_the_same_resolver(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        outputs = tmp_path / "outputs"
+        inp = _write(outputs / "data" / "in.csv", "a\n1\n")
+        elsewhere = tmp_path / "elsewhere"
+        elsewhere.mkdir()
+        monkeypatch.chdir(elsewhere)
+        _start(outputs, "r1", ["data/in.csv"])
+        ledger_file = outputs / ".meridian-outputs-cache" / "run_manifest_ledger.json"
+        ledger = json.loads(ledger_file.read_text(encoding="utf-8"))
+        del ledger["r1"]["input_stat"]
+        ledger_file.write_text(json.dumps(ledger), encoding="utf-8")
+
+        unchanged = RM.check_input_staleness(str(outputs), "r1")
+        assert unchanged["baseline"] == "legacy_hash_only"
+        assert unchanged["stale"] is False
+        inp.write_text("a\n2\n", encoding="utf-8")
+        assert _by_input(RM.check_input_staleness(str(outputs), "r1")) == {"data/in.csv": "changed"}
+
     def test_strict_catches_same_size_same_mtime_edit_default_misses_it(
         self, tmp_path: Path,
     ) -> None:
