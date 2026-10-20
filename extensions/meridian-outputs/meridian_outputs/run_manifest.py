@@ -66,15 +66,13 @@ import hashlib
 import json
 import logging
 import os
-import platform
 import subprocess
-import sys
 import threading
 from datetime import datetime, timezone
 from typing import Any, Callable
 
-from . import __version__ as _PACKAGE_VERSION
-from . import artifact_registry, fingerprint, outputs_local, research_evidence
+from . import artifact_registry, environment, fingerprint, outputs_local, research_evidence
+from .path_security import relative_reference
 
 _log = logging.getLogger(__name__)
 
@@ -85,6 +83,8 @@ __all__ = [
     "finalize_run_manifest",
     "get_run_manifest",
     "list_run_manifests",
+    "check_input_staleness",
+    "run_ids_for_output",
     "run_manifest_hash",
     "check_run_manifest_immutable",
     "run_manifest_to_evidence_record",
@@ -252,6 +252,76 @@ def _file_set_hash(hashes: "dict[str, str | None]") -> str:
 
 
 # ---------------------------------------------------------------------------
+# Input-change baseline (input_stat) -- see check_input_staleness
+# ---------------------------------------------------------------------------
+
+def _resolve_ref(outputs_dir: str, raw: str) -> str:
+    """Absolute real path for an input/output reference. A relative reference
+    is resolved against ``outputs_dir`` (the package-wide convention, see
+    ``annotate.record_provenance``), never the process's working directory."""
+    p = os.fspath(raw)
+    root = os.path.realpath(os.path.abspath(os.fspath(outputs_dir)))
+    candidate = p if os.path.isabs(p) else os.path.join(root, p)
+    return os.path.realpath(os.path.abspath(candidate))
+
+
+def _input_key(outputs_dir: str, resolved: str) -> str:
+    """Stable input_stat key: outputs_dir-relative (``../data/x.csv`` for a
+    sibling tree), or the absolute path when it is on another volume.
+    Case-normalised like the provenance ledger's keys, so two spellings of
+    one file share a key."""
+    rel = relative_reference(outputs_dir, resolved)
+    key = rel if rel is not None else resolved
+    return os.path.normcase(os.path.normpath(key)).replace("\\", "/")
+
+
+def _key_path(outputs_dir: str, key: str) -> str:
+    if os.path.isabs(key):
+        return key
+    root = os.path.realpath(os.path.abspath(os.fspath(outputs_dir)))
+    return os.path.normpath(os.path.join(root, key))
+
+
+def _stat_or_none(path: str) -> "os.stat_result | None":
+    try:
+        st = os.stat(path)
+    except OSError:
+        return None
+    return st if os.path.isfile(path) else None
+
+
+def _snapshot_inputs(
+    outputs_dir: str, input_paths: "list[str] | None",
+) -> "tuple[dict[str, str | None], dict[str, dict[str, Any]]]":
+    """``(file_hashes, input_stat)`` for ``input_paths``.
+
+    ``file_hashes`` is exactly what ``_hash_paths`` always produced (keyed by
+    the path as given, hashed as given), so ``manifest_hash`` is unchanged by
+    this feature. ``input_stat`` maps each input's normalised key to
+    ``{exists, size, mtime_ns, sha256}``. Each file is stat-ed BEFORE it is
+    hashed: if it changes in between, a later check sees a stat mismatch and
+    re-hashes, so a change during capture can cost one extra hash but can
+    never be missed. An input given by absolute path (or relative to a
+    working directory that is ``outputs_dir``) is hashed once for both maps.
+    """
+    file_hashes: "dict[str, str | None]" = {}
+    input_stat: dict[str, dict[str, Any]] = {}
+    for raw in input_paths or []:
+        given = str(raw)
+        resolved = _resolve_ref(outputs_dir, given)
+        st = _stat_or_none(resolved)
+        file_hashes[given] = fingerprint.script_content_hash(given)
+        same_file = os.path.realpath(os.path.abspath(given)) == resolved
+        if st is None:
+            entry: dict[str, Any] = {"exists": False, "size": None, "mtime_ns": None, "sha256": None}
+        else:
+            sha = file_hashes[given] if same_file else fingerprint.script_content_hash(resolved)
+            entry = {"exists": True, "size": st.st_size, "mtime_ns": st.st_mtime_ns, "sha256": sha}
+        input_stat[_input_key(outputs_dir, resolved)] = entry
+    return file_hashes, dict(sorted(input_stat.items()))
+
+
+# ---------------------------------------------------------------------------
 # Bounds snapshot -- "what limits were ACTUALLY in effect for this run"
 # ---------------------------------------------------------------------------
 
@@ -347,6 +417,11 @@ _HASH_EXCLUDED_KEYS = (
     # class of nondeterminism -- it is recorded for audit on every call, but
     # never treated as part of what makes two runs "the same identity".
     "bounds",
+    # Per-input size/mtime_ns/sha256 baseline for check_input_staleness. The
+    # input identity is already input_identity.file_hashes; a touch that
+    # leaves the bytes unchanged must not turn an idempotent re-start into
+    # an identity collision.
+    "input_stat",
 )
 
 
@@ -436,7 +511,10 @@ def start_run_manifest(
     (:func:`_snapshot_bounds`), the on-disk location of every ledger this
     run can reference (this module's own, plus the provenance/fingerprint/
     artifact-registry ledgers this package already maintains), and a
-    convergence-state snapshot taken right now.
+    convergence-state snapshot taken right now. ``input_stat`` keeps each
+    input's size, mtime_ns and hash under an outputs_dir-relative key as the
+    baseline for :func:`check_input_staleness`; it is excluded from
+    ``manifest_hash`` (see ``_HASH_EXCLUDED_KEYS``).
 
     Idempotent: calling this again with identical identity inputs (same
     ``run_id`` and everything :func:`run_manifest_hash` covers) returns the
@@ -466,12 +544,18 @@ def start_run_manifest(
             )
         expected_counts_normalized[str(k)] = v
 
-    input_hashes = _hash_paths(input_paths)
+    input_hashes, input_stat = _snapshot_inputs(outputs_dir, input_paths)
     git_state = (
         capture_git_state(repo_dir, run=_git_runner)
         if repo_dir else {"head": None, "dirty_files": []}
     )
     cache_dir = _cache_dir(outputs_dir)
+    # Same snapshot record_provenance stores as `reproduction`, so the run's
+    # package identity and each output's record cannot drift apart. Only the
+    # four long-standing fields go into package_identity: adding the
+    # dependency versions here would change manifest_hash and make a resumed
+    # run that was started before this change look like an identity collision.
+    env = environment.capture_environment()
 
     manifest: dict[str, Any] = {
         "schema_version": _SCHEMA_VERSION,
@@ -486,10 +570,10 @@ def start_run_manifest(
             "args": dict(command_args or {}),
         },
         "package_identity": {
-            "name": "meridian_outputs",
-            "version": _PACKAGE_VERSION,
-            "python_version": sys.version.split()[0],
-            "platform": platform.platform(),
+            "name": env["package_name"],
+            "version": env["package_version"],
+            "python_version": env["python_version"],
+            "platform": env["platform"],
         },
         "repo_identity": {"repo_dir": repo_dir, **git_state},
         "input_identity": {
@@ -516,6 +600,8 @@ def start_run_manifest(
         "status_reason": None,
         "convergence_at_start": _safe_convergence(outputs_dir),
         "convergence_at_finish": None,
+        # Baseline for check_input_staleness (excluded from the hash).
+        "input_stat": input_stat,
     }
     manifest["manifest_hash"] = run_manifest_hash(manifest)
     now = _utcnow_iso()
@@ -674,6 +760,152 @@ def list_run_manifests(outputs_dir: str) -> "list[dict[str, Any]]":
     existing no-hidden-dict-order convention)."""
     ledger = _read_ledger(outputs_dir)
     return [dict(ledger[k]) for k in sorted(ledger)]
+
+
+# ---------------------------------------------------------------------------
+# Input-change staleness
+# ---------------------------------------------------------------------------
+
+_STALE_INPUT_STATUSES = ("changed", "missing", "appeared", "unreadable", "unverifiable")
+
+
+def _classify_input(
+    path: str, base: dict[str, Any], *, strict: bool,
+) -> "tuple[str, str, bool]":
+    """``(status, reason, hashed)`` for one input against its baseline."""
+    st = _stat_or_none(path)
+    if not base.get("exists"):
+        if st is None:
+            return "absent", "absent at run start and still absent", False
+        return "appeared", "absent at run start, present now", False
+    if st is None:
+        return "missing", "present at run start, missing now", False
+    if (
+        not strict
+        and base.get("size") is not None
+        and base.get("size") == st.st_size
+        and base.get("mtime_ns") == st.st_mtime_ns
+    ):
+        return "unchanged", "size and mtime unchanged since run start (not re-hashed)", False
+    current = fingerprint.script_content_hash(path)
+    recorded = base.get("sha256")
+    if current is None:
+        return "unreadable", "exists but cannot be read now", True
+    if recorded is None:
+        return "unverifiable", "no content hash was captured at run start", True
+    if current != recorded:
+        return "changed", "content hash differs from the hash recorded at run start", True
+    if strict:
+        return "unchanged", "content hash unchanged (strict re-hash)", True
+    return "unchanged", "size/mtime changed but content hash unchanged", True
+
+
+def check_input_staleness(
+    outputs_dir: str, run_id: str, *, strict: bool = False,
+) -> dict[str, Any]:
+    """Have any of ``run_id``'s inputs changed since the run started?
+
+    Compares every input recorded by :func:`start_run_manifest` with the file
+    on disk now. Stat first: an input whose size and mtime_ns both match the
+    start-time baseline is reported unchanged WITHOUT being read, so a sweep
+    over a large tree costs one ``stat`` per input. Only a stat mismatch (or
+    ``strict=True``) re-hashes, through the same
+    :func:`fingerprint.script_content_hash` used at start. Consequence of the
+    default: an edit that keeps both size and mtime_ns (for example a tool
+    that restores the timestamp) is missed; ``strict=True`` hashes every
+    input and catches it.
+
+    Each input gets a status: ``unchanged``, ``absent`` (absent at start and
+    still absent), or one of the stale statuses ``changed``, ``missing``,
+    ``appeared`` (absent at start, present now), ``unreadable`` and
+    ``unverifiable`` (no start-time hash). Inputs are keyed relative to
+    ``outputs_dir`` (absolute when on another volume); a relative input path
+    is resolved against ``outputs_dir``. A manifest written before
+    ``input_stat`` existed has no stat baseline, so every input is re-hashed
+    against ``input_identity.file_hashes`` (``baseline="legacy_hash_only"``).
+
+    Returns ``{run_id, strict, baseline, stale, reason, inputs, stale_inputs,
+    stale_outputs, hashed_count}``. ``stale_outputs`` lists the run's
+    finalized output paths (as recorded) when any input is stale, else
+    ``[]``; it is also ``[]`` for a run that was never finalized.
+
+    Raises:
+      RunManifestError: missing ``outputs_dir``/``run_id``, or no manifest
+      was ever started for ``run_id``.
+    """
+    if not outputs_dir or not str(outputs_dir).strip():
+        raise RunManifestError("outputs_dir is required")
+    manifest = get_run_manifest(outputs_dir, run_id)
+    if manifest is None:
+        raise RunManifestError(f"no run manifest found for run_id={run_id!r}")
+
+    baseline = manifest.get("input_stat")
+    mode = "stat_and_hash"
+    if not isinstance(baseline, dict):
+        mode = "legacy_hash_only"
+        baseline = {}
+        hashes = (manifest.get("input_identity") or {}).get("file_hashes") or {}
+        for given, sha in hashes.items():
+            key = _input_key(outputs_dir, _resolve_ref(outputs_dir, given))
+            baseline[key] = {"exists": sha is not None, "size": None, "mtime_ns": None, "sha256": sha}
+
+    inputs: list[dict[str, Any]] = []
+    hashed_count = 0
+    for key in sorted(baseline):
+        base = baseline[key] if isinstance(baseline[key], dict) else {}
+        status, reason, hashed = _classify_input(
+            _key_path(outputs_dir, key), base, strict=strict,
+        )
+        hashed_count += int(hashed)
+        inputs.append({"input": key, "status": status, "reason": reason})
+
+    stale_inputs = [i["input"] for i in inputs if i["status"] in _STALE_INPUT_STATUSES]
+    outputs = sorted(((manifest.get("output_identity") or {}).get("file_hashes") or {}))
+    stale = bool(stale_inputs)
+    if not inputs:
+        reason = "run recorded no inputs"
+    elif stale:
+        reason = (
+            f"{len(stale_inputs)} of {len(inputs)} input(s) changed since run start: "
+            + ", ".join(f"{i['input']} ({i['status']})" for i in inputs if i["input"] in stale_inputs)
+        )
+    else:
+        reason = f"all {len(inputs)} input(s) unchanged since run start"
+    return {
+        "run_id": manifest.get("run_id"),
+        "strict": bool(strict),
+        "baseline": mode,
+        "stale": stale,
+        "reason": reason,
+        "inputs": inputs,
+        "stale_inputs": stale_inputs,
+        "stale_outputs": outputs if stale else [],
+        "hashed_count": hashed_count,
+    }
+
+
+def run_ids_for_output(
+    outputs_dir: str, path: str, *, record_run_id: "str | None" = None,
+) -> "list[str]":
+    """Run ids whose manifest covers output ``path``: every run whose
+    finalized ``output_identity`` lists it (relative paths resolved against
+    ``outputs_dir``), plus ``record_run_id`` (a provenance record's
+    ``run_id``) when that run exists. Sorted; one ledger read."""
+    if not path or not str(path).strip():
+        return []
+    target = os.path.normcase(_resolve_ref(outputs_dir, str(path)))
+    found: set[str] = set()
+    for manifest in list_run_manifests(outputs_dir):
+        rid = manifest.get("run_id")
+        if not isinstance(rid, str):
+            continue
+        if record_run_id is not None and rid == record_run_id:
+            found.add(rid)
+            continue
+        outputs = (manifest.get("output_identity") or {}).get("file_hashes") or {}
+        if any(os.path.normcase(_resolve_ref(outputs_dir, str(p))) == target for p in outputs):
+            found.add(rid)
+    return sorted(found)
 
 
 # ---------------------------------------------------------------------------

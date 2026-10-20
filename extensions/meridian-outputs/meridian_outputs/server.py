@@ -479,6 +479,7 @@ def record_provenance(
     decision_id: str | None = None,
     note: str | None = None,
     experiment_run_id: str | None = None,
+    run_id: str | None = None,
 ) -> dict[str, Any]:
     """Attach lightweight reproducibility metadata to one output file.
 
@@ -489,10 +490,12 @@ def record_provenance(
     (upsert by normalized path) at
     ``<outputs_dir>/.meridian-outputs-cache/provenance_ledger.json`` -- fully
     local, no hosted call, no DB engine. Calling this again for the same
-    path OVERWRITES the previous record in place; this is NOT an
-    append-only log and no history is kept (corrected bd5b8d79 -- an earlier
-    version of this docstring incorrectly described an append-only JSONL
-    sidecar, which was never the actual implementation).
+    path makes the new record current and moves the previous one into that
+    path's bounded version history (newest 50 superseded records, read with
+    ``get_provenance_history``); this is still one JSON object per path, not
+    an append-only log (corrected bd5b8d79 -- an earlier version of this
+    docstring incorrectly described an append-only JSONL sidecar, which was
+    never the actual implementation).
 
     Args:
       outputs_dir:        Absolute path to the outputs directory.
@@ -511,12 +514,19 @@ def record_provenance(
                           omitting it is unchanged behavior. Stored as an
                           opaque string, not validated against a live run
                           (this extension has no DB engine access).
+      run_id:              Optional ``start_run_manifest`` run id that
+                          produced this output; stored as an opaque string
+                          so the record joins to that run's manifest.
 
     Returns:
       The stored record as {path, generating_script, params, sprint_item_id,
       decision_id, note, recorded_at, recorded_at_iso, content_hash,
-      experiment_run_id}, or
-      {error: ...}. ``content_hash`` (bd5b8d79) is a best-effort SHA-256 of
+      script_content_hash, experiment_run_id, run_id, reproduction,
+      version}, or {error: ...}. ``version`` is the record's 1-based version
+      for this path. ``reproduction`` holds the interpreter version,
+      platform, this package's version and the installed versions of its
+      direct runtime dependencies at record time (``None`` for one that is
+      not installed); the command line is not recorded. ``content_hash`` (bd5b8d79) is a best-effort SHA-256 of
       ``path``'s on-disk bytes at record time (``None`` if unreadable) --
       used by ``get_provenance_status`` to later detect relocation/drift.
       This is a pure exact-record write; call ``get_provenance_status`` (not
@@ -532,6 +542,7 @@ def record_provenance(
         decision_id=decision_id,
         note=note,
         experiment_run_id=experiment_run_id,
+        run_id=run_id,
     )
 
 
@@ -562,6 +573,30 @@ def get_provenance(outputs_dir: str, path: str) -> dict[str, Any] | None:
       been recorded for this path under this outputs_dir.
     """
     return annotate.get_provenance(outputs_dir, path)
+
+
+@mcp.tool()
+def get_provenance_history(outputs_dir: str, path: str) -> dict[str, Any] | None:
+    """Every retained ``record_provenance`` record for one output file,
+    oldest first, with the current record last.
+
+    Re-recording a path keeps its previous record in a bounded history (the
+    newest 50 superseded records) written in the same atomic ledger update
+    as the new one. ``get_provenance``/``list_provenance`` return only the
+    current record; use this tool to see what changed between runs.
+
+    Args:
+      outputs_dir:  Absolute path to the outputs directory.
+      path:         The output file to look up.
+
+    Returns:
+      None if nothing has been recorded for this path, else {path, versions,
+      current_version, history_dropped, history_limit}. Each entry of
+      ``versions`` has the ``get_provenance`` shape plus ``version``
+      (1-based; stays stable when old entries are dropped past the cap) and
+      ``is_current``.
+    """
+    return annotate.get_provenance_history(outputs_dir, path)
 
 
 @mcp.tool()
@@ -1736,6 +1771,37 @@ def list_run_manifests(outputs_dir: str) -> list[dict[str, Any]]:
       A list of manifest record dicts; ``[]`` if none have been started yet.
     """
     return run_manifest.list_run_manifests(outputs_dir)
+
+
+@mcp.tool()
+def check_input_staleness(
+    outputs_dir: str, run_id: str, strict: bool = False,
+) -> dict[str, Any]:
+    """Have any of a run's inputs changed since ``start_run_manifest``?
+
+    Stat first: an input whose size and mtime are unchanged is reported
+    unchanged without being read; only a mismatch re-hashes it.
+    ``strict=True`` re-hashes every input and also catches an edit that kept
+    size and mtime (the default misses that case).
+
+    Args:
+      outputs_dir:  Absolute path to the outputs directory.
+      run_id:        The run started via ``start_run_manifest``.
+      strict:        Re-hash every input regardless of its stat.
+
+    Returns:
+      {run_id, strict, baseline, stale, reason, inputs, stale_inputs,
+      stale_outputs, hashed_count}. Each ``inputs`` entry has a status:
+      unchanged, absent, or one of the stale statuses changed, missing,
+      appeared (absent at start, present now), unreadable, unverifiable.
+      ``stale_outputs`` lists the run's finalized output paths when any
+      input is stale.
+
+    Raises:
+      ValueError (run_manifest.RunManifestError): no manifest exists for
+      ``run_id`` under ``outputs_dir``.
+    """
+    return run_manifest.check_input_staleness(outputs_dir, run_id, strict=strict)
 
 
 @mcp.tool()
