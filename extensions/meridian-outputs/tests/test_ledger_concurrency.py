@@ -459,7 +459,6 @@ class TestStrictReadAndQuarantine:
 
 _HOLDER_SCRIPT = r"""
 import os, sys, time
-sys.modules["portalocker"] = None  # same atomic-create lock as the test process
 ext_dir, ready_path, release_path = sys.argv[1:4]
 ledger_paths = sys.argv[4:]
 sys.path.insert(0, ext_dir)
@@ -499,7 +498,6 @@ class TestLockContention:
         ])
         try:
             _wait_for_file(str(ready))
-            monkeypatch.setitem(sys.modules, "portalocker", None)
             monkeypatch.setenv(_LOCK_TIMEOUT_ENV, "0.5")
 
             start = time.monotonic()
@@ -530,7 +528,6 @@ class TestIndexFileLockSharingViolations:
     def test_release_retries_a_transient_sharing_violation(
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
     ) -> None:
-        monkeypatch.setitem(sys.modules, "portalocker", None)
         monkeypatch.setattr(OL, "_LOCK_REMOVE_RETRY_SLEEP_SECONDS", 0.0)
         db_path = str(tmp_path / "ledger.json")
         lock = OL.IndexFileLock(db_path)
@@ -583,7 +580,6 @@ class TestIndexFileLockSharingViolations:
     def test_acquire_retries_a_transient_access_denied_create(
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
     ) -> None:
-        monkeypatch.setitem(sys.modules, "portalocker", None)
         db_path = str(tmp_path / "ledger.json")
         real_open = os.open
         failures = {"left": 2}
@@ -607,7 +603,6 @@ class TestIndexFileLockSharingViolations:
     def test_acquire_fails_closed_when_create_stays_denied(
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
     ) -> None:
-        monkeypatch.setitem(sys.modules, "portalocker", None)
         monkeypatch.setattr(OL, "_LOCK_CREATE_DENIED_GRACE_SECONDS", 0.2)
         db_path = str(tmp_path / "ledger.json")
         real_open = os.open
@@ -650,7 +645,6 @@ class TestIndexFileLockStaleReclaim:
     def test_unremovable_stale_lock_raises_near_the_timeout(
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
     ) -> None:
-        monkeypatch.setitem(sys.modules, "portalocker", None)
         db_path = str(tmp_path / "ledger.json")
         lock_path = db_path + ".lock"
         _write_lease_file(lock_path)
@@ -685,7 +679,6 @@ class TestIndexFileLockStaleReclaim:
     def test_reclaim_skips_a_lock_file_that_changed_hands(
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
     ) -> None:
-        monkeypatch.setitem(sys.modules, "portalocker", None)
         db_path = str(tmp_path / "ledger.json")
         lock_path = db_path + ".lock"
         _write_lease_file(lock_path)
@@ -714,11 +707,10 @@ class TestIndexFileLockStaleReclaim:
 
     @pytest.mark.parametrize("with_lease", [True, False])
     def test_reclaim_of_an_already_removed_stale_lock_reports_free(
-        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, with_lease: bool,
+        self, tmp_path: Path, with_lease: bool,
     ) -> None:
         """A stale lock file that is gone by the time of the reclaim (another
         waiter removed it) leaves the path free, which the reclaim reports."""
-        monkeypatch.setitem(sys.modules, "portalocker", None)
         db_path = str(tmp_path / "ledger.json")
         lock_path = Path(db_path + ".lock")
         if with_lease:
@@ -739,7 +731,6 @@ class TestIndexFileLockStaleReclaim:
         stale verdict and its reclaim. The path is free, so the create must
         be retried at once: with a zero timeout, any trip through the poll
         branch instead raises IndexLockAcquireError naming a stale owner."""
-        monkeypatch.setitem(sys.modules, "portalocker", None)
         db_path = str(tmp_path / "ledger.json")
         lock_path = db_path + ".lock"
         _write_lease_file(lock_path)
@@ -765,9 +756,8 @@ class TestIndexFileLockStaleReclaim:
         assert not os.path.exists(lock_path)
 
     def test_release_keeps_a_lock_file_that_names_another_token(
-        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+        self, tmp_path: Path,
     ) -> None:
-        monkeypatch.setitem(sys.modules, "portalocker", None)
         db_path = str(tmp_path / "ledger.json")
         lock_path = db_path + ".lock"
         lock = OL.IndexFileLock(db_path, session_id="first")
@@ -787,7 +777,6 @@ class TestIndexFileLockStaleReclaim:
     def test_release_removes_its_own_file_when_the_lease_write_failed(
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
     ) -> None:
-        monkeypatch.setitem(sys.modules, "portalocker", None)
         db_path = str(tmp_path / "ledger.json")
         lock_path = db_path + ".lock"
 
@@ -803,12 +792,11 @@ class TestIndexFileLockStaleReclaim:
 
     @pytest.mark.parametrize("content", [b"", b'{"pid": 12, "trunc'])
     def test_old_lock_file_without_a_lease_is_reclaimed(
-        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, content: bytes,
+        self, tmp_path: Path, content: bytes,
     ) -> None:
         """A holder whose lease write failed and which then crashed leaves a
         lock file with no parseable lease; once it is older than the stale
         threshold it must not block writers forever."""
-        monkeypatch.setitem(sys.modules, "portalocker", None)
         db_path = str(tmp_path / "ledger.json")
         lock_path = Path(db_path + ".lock")
         lock_path.write_bytes(content)
@@ -830,11 +818,10 @@ class TestIndexFileLockStaleReclaim:
             lock.release()
 
     def test_fresh_lock_file_without_a_lease_is_not_reclaimed(
-        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+        self, tmp_path: Path,
     ) -> None:
         """A just-created lock file whose owner has not written its lease yet
         is a live owner, not an abandoned one."""
-        monkeypatch.setitem(sys.modules, "portalocker", None)
         db_path = str(tmp_path / "ledger.json")
         lock_path = Path(db_path + ".lock")
         lock_path.write_bytes(b"")
@@ -856,7 +843,6 @@ class TestTransactionHeartbeat:
         """Work between load and commit outlasts the stale threshold; a
         waiter that inspects the lease during the (slow) commit must see a
         live owner, not a stale one it may reclaim."""
-        monkeypatch.setitem(sys.modules, "portalocker", None)
         monkeypatch.setenv("MERIDIAN_OUTPUTS_LOCK_STALE_SECONDS", "0.3")
         ledger = str(tmp_path / "ledger.json")
         seen: dict[str, OL.IndexLockOwner] = {}
