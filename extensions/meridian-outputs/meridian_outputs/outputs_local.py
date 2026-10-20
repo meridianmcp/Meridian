@@ -1275,14 +1275,20 @@ class IndexFileLock:
                     try:
                         os.remove(lock_path)
                     except OSError:
+                        # Windows: the stale holder may still have the file
+                        # open. Fall through to the deadline check and the
+                        # poll sleep below instead of retrying at once, which
+                        # busy-spun past the timeout.
                         _log.debug(
-                            "IndexFileLock: lost the race reclaiming stale "
-                            "lock %r -- retrying", lock_path,
+                            "IndexFileLock: could not remove stale lock %r "
+                            "-- retrying after a poll interval", lock_path,
                         )
-                    continue
+                    else:
+                        continue  # freed: retry the create at once
                 if deadline is not None and time.monotonic() >= deadline:
+                    state = "a stale" if owner.is_stale else "an active"
                     raise IndexLockAcquireError(
-                        f"index lock at {lock_path!r} is held by an active "
+                        f"index lock at {lock_path!r} is held by {state} "
                         f"owner (pid={owner.pid}, session={owner.session_id!r}) "
                         f"and did not become available within "
                         f"{effective_timeout}s", owner=owner,

@@ -609,6 +609,60 @@ class TestIndexFileLockSharingViolations:
         lock._thread_lock.release()
 
 
+def _write_lease_file(lock_path: str, **overrides: object) -> dict:
+    """Write a lock-file lease; the default is a stale owner on another host
+    (pid liveness unknown, heartbeat far past any threshold)."""
+    lease: dict = {
+        "pid": 4, "hostname": "some-other-host-entirely", "session_id": "gone",
+        "started_at": time.time() - 10_000, "heartbeat_at": time.time() - 10_000,
+        "lock_mode": "atomic_create", "token": "stale-token",
+    }
+    lease.update(overrides)
+    Path(lock_path).write_text(json.dumps(lease), encoding="utf-8")
+    return lease
+
+
+class TestIndexFileLockStaleReclaim:
+    """Stale-lock reclaim in IndexFileLock's atomic-create fallback: bounded
+    by the timeout, never removes a lock file that changed hands, and never
+    lets an abandoned lock file block writers forever."""
+
+    def test_unremovable_stale_lock_raises_near_the_timeout(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        monkeypatch.setitem(sys.modules, "portalocker", None)
+        db_path = str(tmp_path / "ledger.json")
+        lock_path = db_path + ".lock"
+        _write_lease_file(lock_path)
+        assert OL.read_index_lock_owner(db_path).is_stale is True
+        real_remove = os.remove
+        attempts = {"n": 0}
+        start = time.monotonic()
+
+        def _held_open(path: str) -> None:
+            if str(path).endswith(".lock"):
+                attempts["n"] += 1
+                # The stale holder keeps the file open (Windows sharing
+                # violation). Let the removal through after 5 s so the old
+                # unbounded busy-spin fails this test instead of hanging it.
+                if time.monotonic() - start < 5.0:
+                    raise PermissionError("sharing violation")
+            real_remove(path)
+
+        lock = OL.IndexFileLock(db_path, timeout=0.5)
+        with monkeypatch.context() as m:
+            m.setattr(os, "remove", _held_open)
+            with pytest.raises(OL.IndexLockAcquireError) as exc_info:
+                lock.acquire()
+        elapsed = time.monotonic() - start
+        assert elapsed < 3.0, f"acquire ran {elapsed:.1f}s past a 0.5s timeout"
+        assert attempts["n"] < 50, f"{attempts['n']} removal attempts: busy-spin"
+        assert exc_info.value.owner is not None and exc_info.value.owner.is_stale
+        assert os.path.exists(lock_path)
+        assert lock._thread_lock.acquire(blocking=False)
+        lock._thread_lock.release()
+
+
 # ---------------------------------------------------------------------------
 # Non-reentrant lock: nested reads inside a transaction
 # ---------------------------------------------------------------------------
