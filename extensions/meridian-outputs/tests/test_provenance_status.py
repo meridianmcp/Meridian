@@ -436,6 +436,43 @@ class TestRelocated:
         assert status["provenance_type"] == PS.RELOCATED
         assert status["relocation_evidence"] == "content_hash"
 
+    @duckdb_required
+    def test_relocated_file_whose_script_changed_is_not_verified(
+        self, tmp_path: Path,
+    ) -> None:
+        """S-R4-4: the RELOCATED resolver branch checked unknown script and
+        input staleness but not a confirmed script change, so a relocated
+        file whose tagged generating script changed was VERIFIED at 0.75. It
+        must map to STALE, as STALE_BY_SCRIPT does for an exact record."""
+        script = tmp_path / "train.py"
+        script.write_text("print('v1')\n", encoding="utf-8")
+        old = tmp_path / "run_3" / "metrics.csv"
+        old.parent.mkdir()
+        old.write_text("epoch,accuracy\n1,0.9\n", encoding="utf-8")
+        AN.record_provenance(str(tmp_path), str(old), generating_script=str(script))
+        new = tmp_path / "run_3_moved" / "metrics.csv"
+        new.parent.mkdir()
+        new.write_text("epoch,accuracy\n1,0.9\n", encoding="utf-8")
+        FP.tag_output(str(new), str(tmp_path), script_path=str(script))
+        old.unlink()
+        script.write_text("print('v2 -- changed')\n", encoding="utf-8")
+
+        status = PS.get_provenance_status(str(tmp_path), str(new))
+        assert status["provenance_type"] == PS.RELOCATED
+        assert status["script_staleness"]["is_stale"] is True
+        resolver = PS.evidence_record_from_provenance_status(status).resolver
+        assert resolver.status is not RE.ResolverStatus.VERIFIED
+        assert resolver.status is RE.ResolverStatus.STALE
+        assert resolver.confidence == 0.3
+        assert not resolver.is_authoritative
+
+        # The basename-evidence RELOCATED shape maps the same way.
+        status["relocation_evidence"] = "basename"
+        assert (
+            PS._resolver_state_for_provenance_status(status).status
+            is RE.ResolverStatus.STALE
+        )
+
 
 # ---------------------------------------------------------------------------
 # Basename-fallback relocation routing (sprint item 00c3c3f0)
