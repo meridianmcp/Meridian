@@ -770,6 +770,20 @@ class TestImport:
         assert result["written_members"] == []
         assert _snapshot(target) == {name: None for name in _LEDGER_FILES}
 
+    def test_concurrent_modification_result_is_a_refusal(self) -> None:
+        """B3: a concurrent_modification stop declines to write anything
+        more, so it reports refused=True, not refused=False beside
+        imported=False. Exercised through the helper: the write loop that
+        returns it is owned by the import-write-path change."""
+        result = {"imported": False, "dry_run": False, "refused": False, "reason": None,
+                  "written_members": ["artifact_registry"]}
+        out = B._concurrent_modification_result(result)
+        assert out is result
+        assert out["refused"] is True
+        assert out["imported"] is False
+        assert out["reason"] == "concurrent_modification"
+        assert out["written_members"] == ["artifact_registry"]
+
     def test_write_failure_is_reported(self, populated, monkeypatch) -> None:
         _export(populated["outputs"])
         target = _empty_target(populated["root"])

@@ -806,6 +806,22 @@ def _summarise(stats: dict[str, list[str]]) -> dict[str, Any]:
     }
 
 
+def _concurrent_modification_result(result: dict[str, Any]) -> dict[str, Any]:
+    """Mark ``result`` as stopped because a target ledger changed after the
+    plan read it, and return it.
+
+    The import declines to write anything further, so this is a refusal:
+    ``refused`` is True like every other stop, ``imported`` stays False, and
+    ``written_members`` keeps whatever was already replaced. The import
+    write loop's signature re-check should return through this helper
+    rather than setting ``reason`` by hand.
+    """
+    result["refused"] = True
+    result["imported"] = False
+    result["reason"] = "concurrent_modification"
+    return result
+
+
 def import_bundle(
     bundle_path: str,
     outputs_dir: str,
