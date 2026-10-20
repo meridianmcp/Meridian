@@ -1268,6 +1268,10 @@ def get_output_lineage(
       5. When the artifact names a ``run_id`` with a run manifest, the run's
          input hashes are attached under ``run.inputs`` with
          ``scope="run"`` (they describe the whole run, not this output).
+         Each ``sha256`` is the run's ``input_stat`` hash (the input
+         resolved against ``outputs_dir``, the file input staleness
+         checks), or its ``input_identity`` hash for a run recorded before
+         ``input_stat`` existed.
 
     Args:
       outputs_dir:  Absolute path to the outputs directory.
@@ -1539,10 +1543,28 @@ def get_output_lineage(
                 unresolved.append({"kind": "run", "run_id": run_id, "reason": "run_manifest_not_found"})
         else:
             file_hashes = (manifest.get("input_identity") or {}).get("file_hashes") or {}
+            # file_hashes hashes each input as given (a relative one against
+            # the start-time working directory); input_stat hashes the file
+            # resolved against outputs_dir, the one staleness checks. Report
+            # that one when the run recorded it, file_hashes otherwise.
+            input_stat = manifest.get("input_stat")
+            if not isinstance(input_stat, dict):
+                input_stat = {}
+
+            def _input_sha256(raw: str, digest: Any) -> Any:
+                try:
+                    key = run_manifest_mod._input_key(
+                        outputs_dir, run_manifest_mod._resolve_ref(outputs_dir, raw),
+                    )
+                except (OSError, TypeError, ValueError):
+                    return digest
+                stat_entry = input_stat.get(key)
+                return stat_entry.get("sha256") if isinstance(stat_entry, dict) else digest
+
             inputs = [
                 {
                     "locator": _portable_locator(outputs_dir, raw) or "",
-                    "sha256": digest,
+                    "sha256": _input_sha256(raw, digest),
                     "scope": "run",
                     "origin": "run_manifest",
                 }
