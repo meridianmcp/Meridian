@@ -214,6 +214,48 @@ class TestFinalizeRunManifest:
         assert rec is not None
         assert rec["phase"] == "complete"
 
+    @pytest.mark.parametrize("damage", ["truncated", "unreadable"])
+    def test_broken_registry_refuses_finalize_and_persists_nothing(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, damage: str,
+    ) -> None:
+        """S-R4-7: the artifact check read the registry leniently, so a corrupt
+        or unreadable registry recorded every artifact id as not found,
+        downgraded "complete" to "partial" and persisted that verdict with no
+        error."""
+        od = str(tmp_path)
+        art = AR.register_artifact(od, "output", generator="gen.py", source_locator="src")
+        RM.start_run_manifest(od, run_id="r1", command_name="build")
+        cache = tmp_path / ".meridian-outputs-cache"
+        registry = cache / "artifact_registry.json"
+        ledger = cache / "run_manifest_ledger.json"
+        expected: type[Exception] = OSError
+        if damage == "truncated":
+            raw = registry.read_bytes()
+            registry.write_bytes(raw[: len(raw) // 2])
+            expected = LIO.LedgerCorruptError
+        registry_before, ledger_before = registry.read_bytes(), ledger.read_bytes()
+        if damage == "unreadable":
+            real_open = open
+
+            def _eio(file, mode="r", *args, **kwargs):
+                if "r" in mode and os.path.basename(os.fspath(file)) == registry.name:
+                    raise OSError(5, "I/O error")
+                return real_open(file, mode, *args, **kwargs)
+
+            monkeypatch.setattr("builtins.open", _eio)
+
+        with pytest.raises(expected):
+            RM.finalize_run_manifest(od, "r1", artifact_ids=[art["artifact_id"]], status="complete")
+        monkeypatch.undo()
+
+        assert ledger.read_bytes() == ledger_before  # no verdict persisted
+        assert registry.read_bytes() == registry_before
+        rec = RM.get_run_manifest(od, "r1")
+        assert rec["phase"] == "in_progress"
+        assert rec["unknown_artifact_ids"] == []
+        # A finalize that names no artifact never consults the registry.
+        assert RM.finalize_run_manifest(od, "r1", status="complete")["phase"] == "complete"
+
 
 # ---------------------------------------------------------------------------
 # Writers on a damaged ledger (S-F3): refuse, quarantine, write nothing
