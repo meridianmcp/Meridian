@@ -813,12 +813,14 @@ def bind_source_edge(
 
     Raises:
       RegistryError: ``artifact_id`` was never registered, or
-        ``source_locator``/``relation`` is empty.
+        ``source_locator``/``relation`` is not a non-empty string. A
+        non-string would be stored as-is, and every later bundle export
+        refuses a registry whose edge fields are not strings.
     """
-    if not source_locator or not str(source_locator).strip():
-        raise RegistryError("bind_source_edge: source_locator is required")
-    if not relation or not str(relation).strip():
-        raise RegistryError("bind_source_edge: relation is required")
+    if not isinstance(source_locator, str) or not source_locator.strip():
+        raise RegistryError("bind_source_edge: source_locator must be a non-empty string")
+    if not isinstance(relation, str) or not relation.strip():
+        raise RegistryError("bind_source_edge: relation must be a non-empty string")
 
     with _write_lock:
         registry = _read_registry(outputs_dir)

@@ -974,6 +974,29 @@ class TestImport:
         assert summary["conflicts_truncated"] is True
 
 
+class TestSourceEdgeFields:
+    @pytest.mark.parametrize("field, value", [
+        ("source_locator", 5),
+        ("source_locator", ["../scripts/gen.py"]),
+        ("relation", 5),
+    ])
+    def test_non_string_edge_field_is_refused_and_export_keeps_working(
+        self, populated, field, value,
+    ) -> None:
+        """B-F10: bind_source_edge stored a non-string source_locator or
+        relation, and every later export then refused the registry, whose
+        edge fields must be strings."""
+        od = str(populated["outputs"])
+        before = _snapshot(populated["outputs"])["artifact_registry"]
+        fields: dict[str, Any] = {"source_locator": "data/raw.csv", "relation": "produced_by"}
+        fields[field] = value
+        with pytest.raises(ValueError, match=f"{field} must be a non-empty string"):
+            artifact_registry.bind_source_edge(od, populated["artifact_id"], **fields)
+        assert _snapshot(populated["outputs"])["artifact_registry"] == before
+        assert len(artifact_registry._read_registry(od)["edges"]) == 1
+        assert B.export_bundle(od, "x.json")["exported"] is True
+
+
 class TestWiring:
     def test_package_exports(self) -> None:
         import meridian_outputs
