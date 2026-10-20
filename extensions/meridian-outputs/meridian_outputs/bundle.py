@@ -15,9 +15,10 @@ so a backup was "copy the directory and hope".
 What this module adds
 ---------------------
 * :func:`export_bundle` -- loads the four ledgers through their existing
-  module readers (``annotate._read_ledger``, ``fingerprint._read_ledger``,
-  ``run_manifest._read_ledger``, ``artifact_registry._read_registry``,
-  looked up by name at call time) and writes ONE JSON envelope::
+  strict module readers (``annotate._read_ledger``, ``fingerprint._read_ledger``,
+  ``run_manifest._read_ledger_strict``,
+  ``artifact_registry._read_registry_strict``, looked up by name at call
+  time) and writes ONE JSON envelope::
 
       {"format": "meridian-outputs-bundle", "schema_version": 1,
        "digest_algorithm": "sha256", "exported_at": ..., "package_version": ...,
@@ -84,9 +85,9 @@ Merge and conflict rules (import)
   ``(artifact_id, source_locator, relation)`` -- the same idempotency key
   ``bind_source_edge`` uses -- compared on ``metadata`` only.
 * Any conflict refuses the whole import unless ``overwrite=True``.
-* A target ledger that exists but is not valid JSON refuses the import:
-  merging into it through a reader that maps corruption to ``{}`` would
-  silently wipe it.
+* A target ledger that exists but is not valid JSON, or whose strict reader
+  fails, refuses the import: merging into it through a reader that maps
+  corruption or a read error to ``{}`` would silently wipe it.
 * Each ledger write runs inside ``ledger_io.ledger_transaction`` on that
   ledger's path -- the cross-process lock the provenance and fingerprint
   writers (``record_provenance``, ``tag_output``) commit under -- and, for
@@ -154,12 +155,15 @@ _CONFLICT_LIST_CAP = 500
 
 # member name -> (module, reader attribute, on-disk filename). The reader is
 # looked up by NAME at call time, so a reader replaced on another branch (or
-# monkeypatched in a test) is the one used.
+# monkeypatched in a test) is the one used. Every reader is strict: it raises
+# on a file it cannot read or parse instead of returning an empty ledger, so
+# a failed read refuses the export or import rather than exporting an empty
+# member or planning a merge into "nothing".
 _LEDGER_MEMBERS: dict[str, tuple[Any, str, str]] = {
-    "artifact_registry": (artifact_registry, "_read_registry", "artifact_registry.json"),
+    "artifact_registry": (artifact_registry, "_read_registry_strict", "artifact_registry.json"),
     "fingerprint_ledger": (fingerprint, "_read_ledger", "fingerprint_ledger.json"),
     "provenance_ledger": (annotate, "_read_ledger", "provenance_ledger.json"),
-    "run_manifest_ledger": (run_manifest, "_read_ledger", "run_manifest_ledger.json"),
+    "run_manifest_ledger": (run_manifest, "_read_ledger_strict", "run_manifest_ledger.json"),
 }
 MEMBER_NAMES: tuple[str, ...] = tuple(sorted([*_LEDGER_MEMBERS, INDEX_META]))
 

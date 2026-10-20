@@ -21,6 +21,7 @@ Covers:
 """
 from __future__ import annotations
 
+import os
 import sys
 from pathlib import Path
 
@@ -29,6 +30,7 @@ import pytest
 sys.path.insert(0, str(Path(__file__).parent.parent))
 from meridian_outputs import artifact_registry as AR
 from meridian_outputs import fingerprint as FP
+from meridian_outputs import ledger_io as LIO
 from meridian_outputs import research_evidence as RE
 from meridian_outputs import run_manifest as RM
 
@@ -211,6 +213,73 @@ class TestFinalizeRunManifest:
         rec = RM.get_run_manifest(str(tmp_path), "r1")
         assert rec is not None
         assert rec["phase"] == "complete"
+
+
+# ---------------------------------------------------------------------------
+# Writers on a damaged ledger (S-F3): refuse, quarantine, write nothing
+# ---------------------------------------------------------------------------
+
+def _truncated_ledger(tmp_path: Path) -> tuple[Path, bytes]:
+    """A real two-run ledger cut off mid-file."""
+    RM.start_run_manifest(str(tmp_path), run_id="r0", command_name="build")
+    RM.start_run_manifest(str(tmp_path), run_id="r1", command_name="build")
+    ledger = tmp_path / ".meridian-outputs-cache" / "run_manifest_ledger.json"
+    raw = ledger.read_bytes()
+    truncated = raw[: len(raw) // 2]
+    ledger.write_bytes(truncated)
+    return ledger, truncated
+
+
+class TestCorruptLedgerWriters:
+    def test_start_on_truncated_ledger_raises_quarantines_and_writes_nothing(
+        self, tmp_path: Path,
+    ) -> None:
+        ledger, truncated = _truncated_ledger(tmp_path)
+        with pytest.raises(LIO.LedgerCorruptError) as info:
+            RM.start_run_manifest(str(tmp_path), run_id="r2", command_name="build")
+        # The damaged ledger is not replaced by a ledger holding only r2.
+        assert ledger.read_bytes() == truncated
+        quarantined = info.value.quarantine_path
+        assert quarantined is not None
+        assert Path(quarantined).name.startswith("run_manifest_ledger.json.corrupt-")
+        assert Path(quarantined).read_bytes() == truncated
+        assert str(tmp_path) not in str(info.value)  # basename only in the message
+
+    def test_finalize_on_truncated_ledger_raises_not_run_missing(self, tmp_path: Path) -> None:
+        ledger, truncated = _truncated_ledger(tmp_path)
+        with pytest.raises(LIO.LedgerCorruptError):
+            RM.finalize_run_manifest(str(tmp_path), "r0", status="complete")
+        assert ledger.read_bytes() == truncated
+
+    def test_retry_reuses_one_quarantine_copy(self, tmp_path: Path) -> None:
+        _truncated_ledger(tmp_path)
+        paths = set()
+        for _ in range(2):
+            with pytest.raises(LIO.LedgerCorruptError) as info:
+                RM.start_run_manifest(str(tmp_path), run_id="r2", command_name="build")
+            paths.add(info.value.quarantine_path)
+        assert len(paths) == 1
+
+    def test_transient_read_error_is_not_read_as_empty(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """An OSError reading the ledger used to read as ``{}``, so the write
+        replaced every other run with this one."""
+        RM.start_run_manifest(str(tmp_path), run_id="r0", command_name="build")
+        ledger = tmp_path / ".meridian-outputs-cache" / "run_manifest_ledger.json"
+        before = ledger.read_bytes()
+        real_open = open
+
+        def _flaky_open(file, mode="r", *args, **kwargs):
+            if "r" in mode and os.path.basename(os.fspath(file)) == ledger.name:
+                raise OSError(5, "I/O error")
+            return real_open(file, mode, *args, **kwargs)
+
+        monkeypatch.setattr("builtins.open", _flaky_open)
+        with pytest.raises(OSError):
+            RM.start_run_manifest(str(tmp_path), run_id="r1", command_name="build")
+        monkeypatch.undo()
+        assert ledger.read_bytes() == before
 
 
 # ---------------------------------------------------------------------------

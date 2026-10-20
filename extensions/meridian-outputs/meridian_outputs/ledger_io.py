@@ -35,6 +35,11 @@ primitive rather than adding a new one:
   original bytes stay recoverable. The name comes from the bytes, so retries
   over the same corrupt content reuse one copy. If the quarantine copy cannot
   be written, the error propagates and nothing is replaced.
+* :func:`raise_quarantined` is the fail-closed variant for writers whose
+  existing records carry identity a write is checked against (the run
+  manifest, the artifact registry): the corrupt bytes are quarantined the
+  same way, then :class:`LedgerCorruptError` is raised and nothing is
+  written.
 * :func:`write_ledger_atomic` writes a unique temporary file in the ledger's
   own directory, flushes it, calls ``os.fsync`` on it, then moves it over the
   ledger with ``os.replace``. On any failure the temporary file is removed and
@@ -61,7 +66,7 @@ import os
 import tempfile
 import time
 from contextlib import contextmanager
-from typing import Any, Callable, Iterator
+from typing import Any, Callable, Iterator, NoReturn
 
 from . import outputs_local
 
@@ -73,6 +78,7 @@ __all__ = [
     "ledger_transaction",
     "parse_ledger_bytes",
     "quarantine_ledger",
+    "raise_quarantined",
     "read_ledger_strict",
     "write_ledger_atomic",
 ]
@@ -213,6 +219,48 @@ def quarantine_ledger(path: str) -> str | None:
     raise FileExistsError(f"no free quarantine name for {os.path.basename(path)!r}")
 
 
+def _quarantine_or_raise(path: str, exc: LedgerCorruptError) -> str | None:
+    """Quarantine ``path`` (corrupt for ``exc.reason``); if the copy fails,
+    raise a :class:`LedgerCorruptError` saying so (the ledger is left
+    untouched)."""
+    try:
+        return quarantine_ledger(path)
+    except OSError as copy_exc:
+        raise LedgerCorruptError(
+            path,
+            f"{exc.reason}; quarantine copy failed ({copy_exc.__class__.__name__}), "
+            "ledger left untouched",
+        ) from copy_exc
+
+
+def raise_quarantined(exc: LedgerCorruptError) -> NoReturn:
+    """Fail closed on a corrupt ledger: quarantine it, then raise.
+
+    For a writer that must not rebuild the ledger from empty the way
+    :meth:`LedgerTransaction.load` does -- one whose existing records carry
+    identity the write is checked against (a run manifest's per-run
+    immutability, an artifact's per-id content hash), so continuing from
+    ``{}`` would drop both the records and the check. The bytes are copied
+    to ``<ledger>.corrupt-<sha256 prefix>`` exactly as ``load`` does, a
+    warning is logged, and :class:`LedgerCorruptError` is raised with
+    ``quarantine_path`` set. Nothing is written over the ledger, so the
+    caller's write never happens.
+    """
+    quarantined = _quarantine_or_raise(exc.path, exc)
+    _log.warning(
+        "ledger %r is corrupt (%s); original bytes quarantined to %r, "
+        "refusing to write over it",
+        os.path.basename(exc.path), exc.reason,
+        os.path.basename(quarantined) if quarantined else None,
+    )
+    raise LedgerCorruptError(
+        exc.path,
+        f"{exc.reason}; original bytes quarantined to "
+        f"{os.path.basename(quarantined) if quarantined else None!r}, ledger left untouched",
+        quarantine_path=quarantined,
+    ) from exc
+
+
 def _fsync_directory(directory: str) -> None:
     """Persist a rename on POSIX. Windows cannot open a directory this way,
     and NTFS journals the rename itself, so this is a no-op there."""
@@ -287,14 +335,7 @@ class LedgerTransaction:
         try:
             return read(self.path)
         except LedgerCorruptError as exc:
-            try:
-                quarantined = quarantine_ledger(self.path)
-            except OSError as copy_exc:
-                raise LedgerCorruptError(
-                    self.path,
-                    f"{exc.reason}; quarantine copy failed ({copy_exc.__class__.__name__}), "
-                    "ledger left untouched",
-                ) from copy_exc
+            quarantined = _quarantine_or_raise(self.path, exc)
             self.quarantined_path = quarantined
             _log.warning(
                 "ledger %r is corrupt (%s); original bytes quarantined to %r, "

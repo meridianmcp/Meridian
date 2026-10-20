@@ -110,6 +110,23 @@ def _copy_bundle(src_outputs: Path, rel: str, dst_outputs: Path, dst_rel: str = 
     return dst
 
 
+def _fail_ledger_reads_after(monkeypatch, filename: str, *, allowed: int) -> None:
+    """Let the first ``allowed`` read-mode opens of ``filename`` through, then
+    fail every later one with EIO: a transient read failure that strikes
+    after bundle's own file check has already passed."""
+    real_open = open
+    seen = {"n": 0}
+
+    def _open(file, mode="r", *args, **kwargs):
+        if "r" in mode and os.path.basename(os.fspath(file)) == filename:
+            seen["n"] += 1
+            if seen["n"] > allowed:
+                raise OSError(5, "I/O error")
+        return real_open(file, mode, *args, **kwargs)
+
+    monkeypatch.setattr("builtins.open", _open)
+
+
 def _fingerprint_import_setup(root: Path) -> tuple[Path, Path]:
     """A bundle whose only change for the target is one fingerprint entry
     (a.csv), copied into a target that already has its own entry (b.csv)
@@ -342,10 +359,32 @@ class TestExport:
         def _boom(_outputs_dir):
             raise RuntimeError("strict reader quarantined a corrupt ledger")
 
-        monkeypatch.setattr(run_manifest, "_read_ledger", _boom)
+        monkeypatch.setattr(run_manifest, "_read_ledger_strict", _boom)
         result = B.export_bundle(str(populated["outputs"]), "x.json")
         assert result["exported"] is False
         assert "run_manifest_ledger: reader failed (RuntimeError)" in result["errors"]
+
+    def test_transient_run_manifest_read_failure_refuses_export(
+        self, populated, monkeypatch,
+    ) -> None:
+        """S-F8: the file check passes, then the reader's own read fails. The
+        lenient reader turned that into {} and exported an empty member."""
+        _fail_ledger_reads_after(monkeypatch, "run_manifest_ledger.json", allowed=1)
+        result = B.export_bundle(str(populated["outputs"]), "x.json")
+        monkeypatch.undo()
+        assert result["exported"] is False
+        assert "run_manifest_ledger: reader failed (OSError)" in result["errors"]
+        assert not (populated["outputs"] / "x.json").exists()
+
+    def test_registry_with_artifacts_list_refuses_export(self, populated) -> None:
+        """S-F9: the registry reader normalised a list to {}, so the shape
+        check never saw live damage and an empty registry was exported."""
+        registry = _ledger_path(populated["outputs"], "artifact_registry")
+        registry.write_text('{"artifacts": [{"artifact_id": "a"}], "edges": []}', encoding="utf-8")
+        result = B.export_bundle(str(populated["outputs"]), "x.json")
+        assert result["exported"] is False
+        assert "artifact_registry: reader failed (LedgerCorruptError)" in result["errors"]
+        assert not (populated["outputs"] / "x.json").exists()
 
     def test_failed_replace_leaves_no_temp_file_and_no_bundle(self, populated, monkeypatch) -> None:
         def _fail(_src, _dst):
@@ -801,6 +840,28 @@ class TestImport:
         result = B.import_bundle("backup/bundle.json", str(populated["outputs"]))
         assert result["reason"] == "target_ledger_unreadable"
         assert "fingerprint_ledger: reader failed (RuntimeError)" in result["target_errors"]
+
+    def test_transient_target_read_failure_refuses_and_keeps_target_runs(
+        self, populated, monkeypatch,
+    ) -> None:
+        """S-F8: a plan read that failed after the file check read as {}, so
+        the import planned the bundle's runs alone and replaced the target's
+        run ledger with them."""
+        _export(populated["outputs"])
+        target = _empty_target(populated["root"])
+        run_manifest.start_run_manifest(str(target), run_id="target-only", command_name="t")
+        ledger = _ledger_path(target, "run_manifest_ledger")
+        before = ledger.read_bytes()
+        _copy_bundle(populated["outputs"], "backup/bundle.json", target)
+
+        _fail_ledger_reads_after(monkeypatch, "run_manifest_ledger.json", allowed=1)
+        result = B.import_bundle("incoming.json", str(target), dry_run=False)
+        monkeypatch.undo()
+        assert result["refused"] is True
+        assert result["reason"] == "target_ledger_unreadable"
+        assert "run_manifest_ledger: reader failed (OSError)" in result["target_errors"]
+        assert result["written_members"] == []
+        assert ledger.read_bytes() == before
 
     def test_concurrent_modification_stops_the_write(self, populated, monkeypatch) -> None:
         _export(populated["outputs"])

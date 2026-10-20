@@ -1293,7 +1293,9 @@ def get_output_lineage(
           sorted by origin (registry, provenance, fingerprint), then
           locator.
         - ``run``: ``None`` when no run is linked, else ``{run_id, found,
-          phase, manifest_hash, command, inputs}``.
+          phase, manifest_hash, command, inputs}``. The run ledger is read
+          strictly: when it cannot be read, ``found`` is ``None`` (unknown)
+          and the gap is ``store_unreadable``, never ``run_manifest_not_found``.
         - ``complete``: True only when ``sources`` is non-empty and
           ``unresolved`` is empty (fail closed).
         - ``unresolved``: one dict per gap: an unresolved source, an
@@ -1516,18 +1518,25 @@ def get_output_lineage(
     run: dict[str, Any] | None = None
     run_id = artifact.get("run_id") if artifact is not None else None
     if isinstance(run_id, str) and run_id.strip():
+        manifest = None
+        store_unreadable = False
         try:
-            manifest = run_manifest_mod.get_run_manifest(outputs_dir, run_id)
+            # Strict: get_run_manifest reads a damaged ledger as empty, which
+            # would report this run as not found instead of a store gap.
+            manifest = run_manifest_mod._read_ledger_strict(outputs_dir).get(run_id.strip())
         except Exception as exc:  # noqa: BLE001
-            manifest = None
+            store_unreadable = True
             unresolved.append({
                 "kind": "store", "store": "run_manifest",
                 "reason": "store_unreadable", "error_type": type(exc).__name__,
             })
         if manifest is None:
-            run = {"run_id": run_id, "found": False, "phase": None,
-                   "manifest_hash": None, "command": None, "inputs": []}
-            unresolved.append({"kind": "run", "run_id": run_id, "reason": "run_manifest_not_found"})
+            # An unreadable ledger leaves the run unknown (found None), not
+            # absent: only a readable ledger without it is run_manifest_not_found.
+            run = {"run_id": run_id, "found": None if store_unreadable else False,
+                   "phase": None, "manifest_hash": None, "command": None, "inputs": []}
+            if not store_unreadable:
+                unresolved.append({"kind": "run", "run_id": run_id, "reason": "run_manifest_not_found"})
         else:
             file_hashes = (manifest.get("input_identity") or {}).get("file_hashes") or {}
             inputs = [
