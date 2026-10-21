@@ -63,6 +63,13 @@ DEFAULT_SSH_OPTIONS: tuple[str, ...] = (
 # remote result, not ssh's own failure code).
 _SSH_CONNECT_FAILURE_RETURNCODE = 255
 
+# ``SSHResult.error`` value for the local per-call timeout (the ssh child was
+# still running when ``timeout`` expired). Exposed so the launch path in
+# :mod:`meridian.db.remote_tasks` can tell "the call ran out of time" (the job
+# may already be running -- recorded as launch_unconfirmed) apart from "ssh
+# never connected" (recorded as unknown).
+SSH_TIMEOUT_ERROR = "timeout"
+
 
 @dataclass(frozen=True)
 class SSHResult:
@@ -110,13 +117,17 @@ async def run_ssh_command(
     def _blocking_run() -> SSHResult:
         argv = ["ssh", *DEFAULT_SSH_OPTIONS, host, remote_command]
         try:
+            # stdin=DEVNULL: ssh must never inherit this process's stdin. For
+            # the stdio MCP transport that stdin is the JSON-RPC channel, and
+            # a child reading it could swallow protocol bytes.
             completed = subprocess.run(  # noqa: S603 -- argv list, no shell=True
-                argv, capture_output=True, timeout=timeout, text=True,
+                argv, stdin=subprocess.DEVNULL, capture_output=True,
+                timeout=timeout, text=True,
             )
         except subprocess.TimeoutExpired:
             return SSHResult(
                 connected=False, returncode=None, stdout="", stderr="",
-                error="timeout",
+                error=SSH_TIMEOUT_ERROR,
             )
         except FileNotFoundError as exc:
             return SSHResult(

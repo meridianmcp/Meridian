@@ -990,6 +990,10 @@ from .routes.zotero import router as _zotero_router  # noqa: E402 — Zotero con
 
 app.include_router(_zotero_router)
 
+from .routes.compute import router as _compute_router  # noqa: E402 — RunPod key check and pod list (GET /compute/runpod/*)
+
+app.include_router(_compute_router)
+
 # ---------------------------------------------------------------------------
 # Password gate middleware
 # ---------------------------------------------------------------------------
@@ -3627,12 +3631,14 @@ async def _regenerate_claude_md(
     project_id: str,
     repo_root: Path,
 ) -> None:
-    """Append/replace the MERIDIAN STATE section at the bottom of CLAUDE.md.
+    """Append/replace the MERIDIAN STATE section at the bottom of CLAUDE.local.md.
 
-    The human-written content above the marker is preserved exactly.  Only
-    the section below the marker is overwritten.  If CLAUDE.md does not yet
-    have the marker it is appended.  Silently no-ops on any I/O error so a
-    failing write never blocks the caller.
+    CLAUDE.local.md is gitignored, so the regenerated block never dirties the
+    tracked CLAUDE.md (session start used to rewrite it on every run).  The
+    human-written content above the marker is preserved exactly.  Only the
+    section below the marker is overwritten.  If the file does not yet have the
+    marker the block is appended.  Silently no-ops on any I/O error so a failing
+    write never blocks the caller.
     """
     try:
         from datetime import datetime, timezone
@@ -3669,7 +3675,7 @@ async def _regenerate_claude_md(
         lines += [
             "**Key Files:**",
             "- `meridian/server.py` — FastAPI app + MCP handlers",
-            "- `meridian/db.py` — all DB functions (SQLite + Postgres)",
+            "- `meridian/db/__init__.py` — all DB functions (SQLite + Postgres)",
             "- `meridian/static/dashboard.ts` — dashboard UI",
             "- `tests/test_core.py` — full test suite",
             "- `data/meridian-build_handoff.md` — session handoff",
@@ -3677,14 +3683,17 @@ async def _regenerate_claude_md(
         ]
         new_state_section = _CLAUDE_MD_STATE_MARKER + "\n".join(lines)
 
-        claude_md_path = repo_root / "CLAUDE.md"
-        existing = claude_md_path.read_text(encoding="utf-8") if claude_md_path.exists() else ""
+        # Written to the gitignored CLAUDE.local.md, never the tracked CLAUDE.md:
+        # this block is regenerated on every session start, and writing it into
+        # a tracked file left every worktree dirty. The marker logic is unchanged.
+        state_path = repo_root / "CLAUDE.local.md"
+        existing = state_path.read_text(encoding="utf-8") if state_path.exists() else ""
         if _CLAUDE_MD_STATE_MARKER.strip() in existing:
             base = existing.split(_CLAUDE_MD_STATE_MARKER.strip())[0].rstrip()
             updated = base + new_state_section
         else:
             updated = existing.rstrip() + new_state_section
-        claude_md_path.write_text(updated, encoding="utf-8")
+        state_path.write_text(updated, encoding="utf-8")
     except Exception:
         pass  # never block the caller on a write failure
 
@@ -4777,6 +4786,9 @@ async def mcp_tools_doc() -> str:
         "Read-only: Fetch one project note's full body by its per-project `slug` (the `slug` field "
         "from `get_notes`). The pull half of the list→read model.")
     lines += _render_tool("delete_note")
+    lines += ["## Compute\n"]
+    lines += _render_tool("runpod_check_key")
+    lines += _render_tool("runpod_list_pods")
     lines += ["## Projects\n"]
     lines += _render_tool("create_project")
     lines += _render_tool("merge_project")

@@ -3418,7 +3418,7 @@ async def _handle_project_tools(
     _mcp_tenant_id: Any,
 ) -> Any:
     """Dispatch group: create_project, set_parent_project, rename_project,
-    set_project_execution_mode, set_project_use_mode, register_session, start_session, list_projects, get_project_by_name,
+    set_project_execution_mode, set_project_use_mode, check_image_rights, register_session, start_session, list_projects, get_project_by_name,
     get_goal, set_goal, set_north_star, merge_project, add_custom_hook,
     get_custom_hooks, delete_custom_hook, get_capability_manifest,
     set_capability_manifest, set_capability_profile, clear_capability_profile,
@@ -3443,6 +3443,7 @@ async def _handle_project_tools(
         handle_rename_project,
         handle_set_project_execution_mode,
         handle_set_project_use_mode,
+        handle_check_image_rights,
         handle_register_session,
         handle_start_session,
         handle_list_projects,
@@ -3477,6 +3478,7 @@ async def _handle_project_tools(
         "rename_project": handle_rename_project,
         "set_project_execution_mode": handle_set_project_execution_mode,
         "set_project_use_mode": handle_set_project_use_mode,
+        "check_image_rights": handle_check_image_rights,
         "register_session": handle_register_session,
         "list_projects": handle_list_projects,
         "get_project_by_name": handle_get_project_by_name,
@@ -7459,6 +7461,29 @@ async def _handle_paper_contract_tools(
     return _MISS
 
 
+async def _handle_runpod_tools(
+    name: str,
+    args: dict[str, Any],
+    db: Any,
+    data_dir: str,
+    tenant: dict[str, Any] | None,
+    _mcp_tenant_id: Any,
+) -> Any:
+    """Dispatch group: runpod_check_key and runpod_list_pods, the local-only RunPod key
+    check and pod listing (meridian/mcp/handlers/runpod_tools.py). They resolve their own
+    credential and take no project, so the database, tenant and data dir are unused."""
+    from .handlers.runpod_tools import (  # noqa: PLC0415
+        handle_runpod_check_key,
+        handle_runpod_list_pods,
+    )
+
+    if name == "runpod_check_key":
+        return await handle_runpod_check_key(args)
+    if name == "runpod_list_pods":
+        return await handle_runpod_list_pods(args)
+    return _MISS
+
+
 # a2a027cf — bounded dispatch-level budget for complete_sprint_item,
 # comfortably under the ~60s client-side timeouts observed in the field
 # (HTTP, stdio, and connector/mcp-remote transports all funnel through this
@@ -7859,6 +7884,7 @@ async def _dispatch_mcp_tool(
         _handle_experiment_tools,
         _handle_docx_derivative_tools,
         _handle_paper_contract_tools,
+        _handle_runpod_tools,
     )
     # a2a027cf — complete_sprint_item timeout-safety at the dispatch layer.
     # Repeated live reports: an MCP client (HTTP/stdio/connector — this

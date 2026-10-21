@@ -9443,7 +9443,10 @@ def test_roadmap_auto_update_replaces_existing_entry(client, tmp_path, monkeypat
 
 @pytest.mark.asyncio
 async def test_expire_regenerates_claude_md(db, tmp_path, monkeypatch):
-    """_expire_and_generate_handoffs regenerates CLAUDE.md for each project."""
+    """_expire_and_generate_handoffs writes the state block to CLAUDE.local.md.
+
+    The tracked CLAUDE.md must not be created or rewritten (gh-claude-md-state-untracked).
+    """
     from meridian import server as srv
     monkeypatch.setattr(srv, "_REPO_ROOT", tmp_path)
 
@@ -9456,10 +9459,59 @@ async def test_expire_regenerates_claude_md(db, tmp_path, monkeypatch):
     await db.commit()
 
     await srv._expire_and_generate_handoffs(db, str(tmp_path))
-    claude_md = tmp_path / "CLAUDE.md"
-    assert claude_md.exists(), "CLAUDE.md should have been written after session expiry"
-    content = claude_md.read_text(encoding="utf-8")
-    assert "MERIDIAN STATE" in content
+    assert not (tmp_path / "CLAUDE.md").exists(), "tracked CLAUDE.md must not be written on session expiry"
+    local = tmp_path / "CLAUDE.local.md"
+    assert local.exists(), "CLAUDE.local.md should have been written after session expiry"
+    assert "MERIDIAN STATE" in local.read_text(encoding="utf-8")
+
+
+@pytest.mark.asyncio
+async def test_regenerate_claude_md_leaves_tracked_claude_md_bytes_unchanged(db, tmp_path):
+    """Regeneration never rewrites the tracked CLAUDE.md bytes.
+
+    The generated block goes to the gitignored CLAUDE.local.md. The tracked file,
+    with its legacy MERIDIAN STATE marker and human content above it, must come
+    back byte-for-byte identical. The key-files block must name meridian/db/__init__.py.
+    """
+    from meridian import server as srv
+
+    p = await db_module.create_project(db, "untracked-state")
+    tracked = tmp_path / "CLAUDE.md"
+    original = (
+        "# Project notes\n\nHuman-written guidance.\n"
+        + srv._CLAUDE_MD_STATE_MARKER
+        + "## stale legacy state\n"
+    ).encode("utf-8")
+    tracked.write_bytes(original)
+
+    await srv._regenerate_claude_md(db, p["id"], tmp_path)
+
+    assert tracked.read_bytes() == original
+    local = (tmp_path / "CLAUDE.local.md").read_text(encoding="utf-8")
+    assert "MERIDIAN STATE" in local
+    assert "`meridian/db/__init__.py`" in local
+    assert "`meridian/db.py`" not in local
+
+
+@pytest.mark.asyncio
+async def test_regenerate_claude_md_preserves_human_content_in_claude_local(db, tmp_path):
+    """Human content above the marker in CLAUDE.local.md survives regeneration."""
+    from meridian import server as srv
+
+    p = await db_module.create_project(db, "local-human-content")
+    local = tmp_path / "CLAUDE.local.md"
+    local.write_text(
+        "Project ID: 1234\n" + srv._CLAUDE_MD_STATE_MARKER + "## old generated\n",
+        encoding="utf-8",
+    )
+
+    await srv._regenerate_claude_md(db, p["id"], tmp_path)
+    await srv._regenerate_claude_md(db, p["id"], tmp_path)
+
+    content = local.read_text(encoding="utf-8")
+    assert content.startswith("Project ID: 1234\n")
+    assert "## old generated" not in content
+    assert content.count("MERIDIAN STATE") == 1
 
 
 # ---------------------------------------------------------------------------
@@ -16364,6 +16416,16 @@ async def test_claim_sprint_item_returns_worktree_fields_when_isolation_set(db):
     assert "git worktree add" in result["worktree_setup_cmd"]
     assert "git worktree remove" in result["worktree_cleanup_cmd"]
     assert "git merge" in result["worktree_merge_cmd"]
+    # The cleanup command must never force-remove: it gates removal on a clean
+    # `git -C <path> status --porcelain` before `git worktree remove`, and
+    # neither handed-out command may carry --force (it discards uncommitted work).
+    assert "git -C" in result["worktree_cleanup_cmd"]
+    assert "status --porcelain" in result["worktree_cleanup_cmd"]
+    assert "--force" not in result["worktree_cleanup_cmd"]
+    assert "--force" not in result["worktree_merge_cmd"]
+    # Merge cleanup keeps the safe branch delete (-d), never the forced -D.
+    assert "git branch -d " in result["worktree_merge_cmd"]
+    assert "git branch -D" not in result["worktree_merge_cmd"]
     # eb2e44f8 — the claim response also names the base branch the worktree
     # is expected to be created from, matching worktree_merge_cmd's target,
     # so an executor can pass it straight to POST /worktrees' base_branch

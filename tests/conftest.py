@@ -44,6 +44,25 @@ if TYPE_CHECKING:
 
 
 # ---------------------------------------------------------------------------
+# Import psutil once, before any test can patch the platform
+# (test_local_runner gate failures, 2026-10-18 diagnostic run)
+# ---------------------------------------------------------------------------
+#
+# Many tests monkeypatch ``<module>.sys.platform`` to "linux" to reach POSIX
+# branches. That is the global ``sys.platform``, so a psutil import that
+# happens inside one of them takes psutil's Linux path, which needs the POSIX-only
+# ``resource`` module and fails. A failed import leaves psutil unimportable for
+# the rest of the worker process, so every later create_time lookup returns None,
+# and the runner treats its own child as unverifiable (refusing to start, or
+# reporting UNKNOWN). A successful import is cached, so a later platform patch
+# cannot affect it.
+try:
+    import psutil  # noqa: F401
+except ImportError:  # psutil is optional on some code paths
+    pass
+
+
+# ---------------------------------------------------------------------------
 # Windows-only: disable stdlib platform's WMI-backed queries for this process
 # (test-runner reliability investigation, 2026-09-27)
 # ---------------------------------------------------------------------------

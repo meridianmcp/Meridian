@@ -2507,10 +2507,40 @@ async def _run_connection_lazy(
                         answer.add_done_callback(background.discard)
                         continue
                     if msg.get("type") == "run_cmd":
-                        # Remote shell strings are refused. The server no longer sends them; this refuses any that
-                        # arrive, so a remote caller cannot run an arbitrary command through this client.
+                        # 0e973e52 — run_verification: spawn test_cmd as a real local
+                        # process and send the structured result back to the server.
+                        # Only the FS slot handles this; other slots ignore it.
+                        # 189fde6b (RT-LEAD-004) — the hosted server can send run_cmd to
+                        # any connected client, so spawning one needs LOCAL consent: the
+                        # user must set MERIDIAN_TUNNEL_ALLOW_RUN_CMD=1 in the tunnel
+                        # client's own environment. Without it nothing is spawned and the
+                        # server gets an explicit refusal instead.
                         req_id = msg.get("id", "")
-                        run_result = _run_refused()
+                        cmd_val = msg.get("cmd") or ""
+                        cwd_val = (msg.get("cwd") or "").strip() or None
+                        _run_cmd_consent = os.environ.get("MERIDIAN_TUNNEL_ALLOW_RUN_CMD", "")
+                        if _run_cmd_consent.strip().lower() in ("1", "true", "yes", "on"):
+                            run_result = await _handle_run_cmd(cmd_val, cwd_val)
+                        else:
+                            print(
+                                f"tunnel:{label}: refused run_cmd from server (no local consent; "
+                                "set MERIDIAN_TUNNEL_ALLOW_RUN_CMD=1 to allow)",
+                                flush=True,
+                            )
+                            run_result = {
+                                "status": "error",
+                                "refused": True,
+                                "message": (
+                                    "run_cmd refused: this tunnel client has no local consent to "
+                                    "run commands from the hosted server (set "
+                                    "MERIDIAN_TUNNEL_ALLOW_RUN_CMD=1 in the client's environment)"
+                                ),
+                                "exit_code": None,
+                                "passed": None,
+                                "failed": None,
+                                "stdout_tail": "",
+                                "stderr_tail": "",
+                            }
                         run_result["type"] = "run_cmd_result"
                         run_result["id"] = req_id
                         await ws.send(json.dumps(run_result))
@@ -6303,10 +6333,6 @@ def _shell_subprocess_env() -> "dict[str, str] | None":
 
 VERIFICATION_PINS_FILENAME = "verification_commands.json"
 _PIN_COMMAND_MAX = 2000
-_RUN_REFUSED_MESSAGE = (
-    "Remote shell commands are disabled. Pin the test command for this project in "
-    f"{VERIFICATION_PINS_FILENAME} in your Meridian local-runner folder on this machine."
-)
 _NOT_PINNED_MESSAGE = (
     "No test command is pinned for this project on this machine. Add the project to "
     f"{VERIFICATION_PINS_FILENAME} in your Meridian local-runner folder, then run it again."
@@ -6467,11 +6493,6 @@ def _not_run_result(status: str, message: str) -> dict:
         "stdout_tail": "",
         "stderr_tail": "",
     }
-
-
-def _run_refused() -> dict:
-    """The answer to a remote shell string. Nothing runs."""
-    return _not_run_result("refused", _RUN_REFUSED_MESSAGE)
 
 
 async def _answer_run_verification(ws: Any, req_id: str, project_id: str) -> None:

@@ -107,6 +107,16 @@ is_under() {
     shopt -u nocasematch
     return $r
 }
+# Scratch space any session may write outside its checkout: the OS temp dirs (the
+# session scratchpad lives under '<temp>/claude', see the 55d48d69 note above the
+# worktree check) and Claude Code's plan files (~/.claude/plans).
+is_scratch() {
+    local d
+    for d in "${TEMP:+$TEMP/claude}" "${TMP:+$TMP/claude}" "${TMPDIR:+$TMPDIR/claude}" "/tmp/claude" "${HOME:+$HOME/.claude/plans}" "${USERPROFILE:+$USERPROFILE/.claude/plans}" "${CLAUDE_CONFIG_DIR:+$CLAUDE_CONFIG_DIR/plans}"; do
+        [ -n "$d" ] && is_under "$1" "$d" && return 0
+    done
+    return 1
+}
 
 # CLAUDE_PROJECT_DIR is set by Claude Code to the session's project root.
 # Fail open if the env var is absent (unknown execution context).
@@ -158,12 +168,24 @@ if [ "$is_worktree" = "1" ] && [ "$inside_project_dir" != "1" ]; then
     # scratch file) silently bypassed the worktree boundary block entirely.
     # Scoped to '<temp>/claude' to match the session scratchpad's real shape
     # (see the harness environment block: "<TEMP>\claude\<project>\<session>\scratchpad").
-    for d in "${TEMP:+$TEMP/claude}" "${TMP:+$TMP/claude}" "${TMPDIR:+$TMPDIR/claude}" "/tmp/claude" "${HOME:+$HOME/.claude/plans}" "${USERPROFILE:+$USERPROFILE/.claude/plans}" "${CLAUDE_CONFIG_DIR:+$CLAUDE_CONFIG_DIR/plans}"; do
-        [ -n "$d" ] && is_under "$norm_file" "$d" && exit 0
-    done
+    is_scratch "$norm_file" && exit 0
     # The file is outside this session's worktree. Block it.
     # exit 2 blocks the tool call; stderr is fed back to Claude as the reason.
     stop_call "Meridian worktree guard (a3984d96): $tool target '$file_path' is OUTSIDE this session's worktree ('$project_dir'). Edit only files under your own worktree (the temp dir / session scratchpad and ~/.claude/plans are fine). If you need to affect the main tree or a different worktree, coordinate via request_hitl or complete this session first."
+fi
+
+# 9486c983 -- an executor (MERIDIAN_SESSION_ROLE=executor, set only by the worktree
+# launcher) must never edit repo files in the PRIMARY checkout: run each session in its
+# own worktree (AGENTS.md "Parallel sessions" rule). Scratch (temp dir / plan files)
+# stays allowed. A file outside the checkout is not a repo file and falls through.
+session_role="${MERIDIAN_SESSION_ROLE:-}"
+session_role="${session_role//[[:space:]]/}"
+is_executor=0
+shopt -s nocasematch
+[[ $session_role == executor ]] && is_executor=1
+shopt -u nocasematch
+if [ "$is_executor" = "1" ] && [ "$is_worktree" != "1" ] && [ "$inside_project_dir" = "1" ] && ! is_scratch "$norm_file"; then
+    stop_call "Meridian worktree guard (9486c983): $tool target '$file_path' is inside the PRIMARY checkout ('$project_dir'), and this session declares role=executor (MERIDIAN_SESSION_ROLE). Executors must not edit the primary checkout: run each session in its own worktree (AGENTS.md, 'Parallel sessions' rule), then edit only under that worktree."
 fi
 
 if [ "$inside_project_dir" != "1" ]; then

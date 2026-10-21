@@ -1,7 +1,6 @@
 """Pinned verification commands and the served-root denylist (tunnel client).
 
 Covers the tunnel's remote-shell exposure fix:
-  - A remote shell string (run_cmd) is refused; nothing is spawned.
   - run_verification runs only the command pinned in this machine's pins file,
     and the server supplies nothing but the project id.
   - A served root that is, contains, or sits inside a credential or token
@@ -47,17 +46,6 @@ def _write_pins(data) -> None:
 
 async def _must_not_run(cmd, cwd):
     raise AssertionError(f"a command must not run here, got {cmd!r}")
-
-
-# ---------------------------------------------------------------------------
-# run_cmd: a remote shell string is refused
-# ---------------------------------------------------------------------------
-
-def test_run_cmd_is_refused_with_a_structured_status():
-    result = tc._run_refused()
-    assert result["status"] == "refused"
-    assert result["exit_code"] is None
-    assert tc.VERIFICATION_PINS_FILENAME in result["message"]
 
 
 # ---------------------------------------------------------------------------
