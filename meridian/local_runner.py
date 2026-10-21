@@ -127,6 +127,7 @@ from . import process_registry
 from . import tunnel_lifecycle
 from . import tunnel_preflight
 from .capability_manifest import _SECRET_LIKE_RE
+from .secret_redaction import redact as _redact_secret_shapes
 
 # fcntl only exists on POSIX -- guarded exactly like process_lifecycle.py
 # guards os.killpg/signal.SIGKILL, so this module stays importable (and its
@@ -782,6 +783,11 @@ def _redact_for_shared_state(value: "str | None") -> "str | None":
         return None
     redacted = _ABSOLUTE_PATH_SCAN_RE.sub("[redacted-local-path]", value)
     redacted = _SECRET_LIKE_RE.sub("[redacted-secret]", redacted)
+    # RT-SFS-006: the capability-manifest shape above misses modern provider
+    # keys (sk-proj-/sk-ant-, with underscores) and GitHub tokens. Also run the
+    # shared registry in secret_redaction so the shared projection covers
+    # every shape the DB write path and the log pass cover.
+    redacted = _redact_secret_shapes(redacted)
     return redacted
 
 
