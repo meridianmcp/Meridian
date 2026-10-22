@@ -8,10 +8,15 @@
 #              the intended release and not a stale cached binary.
 #   73b65117 -- acquires an sk_meridian_ API token via the RFC 8628 device
 #              authorization grant (reusing the SAME /oauth/device + /oauth/token
-#              infra as hooks_install.ps1) and passes it to the binary with
-#              --token. That lets `irm ... | iex` complete end-to-end without a
-#              TTY to paste a token into -- the old flow dead-ended on hosted
-#              because meridian-connect's paste prompt needs an interactive stdin.
+#              infra as hooks_install.ps1) and hands it to the binary. That lets
+#              `irm ... | iex` complete end-to-end without a TTY to paste a token
+#              into -- the old flow dead-ended on hosted because meridian-connect's
+#              paste prompt needs an interactive stdin.
+#   9784f8ef -- the token is handed to the binary through the MERIDIAN_TOKEN
+#              environment variable of the child process, never on its command
+#              line (a --token argument is visible in process listings). A
+#              --token passed to this script is lifted off the command line too.
+#              MERIDIAN_API_KEY / BEARER_TOKEN are accepted as legacy aliases.
 #   5fb084fe -- COMPONENT SELECTION. The installer no longer forces the full
 #              stack on every run. -Component picks what to install:
 #                  binary  -- only download + run the meridian-connect tunnel binary
@@ -250,6 +255,107 @@ function Get-MeridianCachedToken {
     return $tok
 }
 
+# ---- 9784f8ef: token env var names, unified with the tunnel client ------------
+function Get-MeridianEnvToken {
+    <#
+      .SYNOPSIS
+      Return an sk_meridian_ token from the process environment, or $null.
+      Checks MERIDIAN_TOKEN (canonical), then the legacy aliases MERIDIAN_API_KEY
+      and BEARER_TOKEN -- the same names and precedence as
+      meridian.tunnel_client.TOKEN_ENV_VARS, so a token exported for one Meridian
+      component is visible to all of them. A leading "Bearer " is stripped.
+    #>
+    foreach ($name in @('MERIDIAN_TOKEN', 'MERIDIAN_API_KEY', 'BEARER_TOKEN')) {
+        $v = [Environment]::GetEnvironmentVariable($name)
+        if ([string]::IsNullOrWhiteSpace($v)) { continue }
+        $v = $v.Trim()
+        # -match / -replace are case-insensitive by default in PowerShell.
+        if ($v -match '^bearer\s+') { $v = ($v -replace '^bearer\s+', '').Trim() }
+        if ($v -match '^sk_meridian_') { return $v }
+    }
+    return $null
+}
+
+# ---- f66e8f23: SHA-256 verification of the downloaded binary -----------------
+# release.yml publishes a SHA256SUMS file with every release (one "<hex>  <asset
+# name>" line per asset). The binary is only kept -- and only ever run -- if its
+# hash equals the entry for its asset name. This fails CLOSED: a missing
+# SHA256SUMS, a missing entry or a mismatch deletes the download and aborts the
+# install. The only escape hatch is an explicit $env:MERIDIAN_INSTALL_ALLOW_UNVERIFIED
+# = '1' (loudly warned), meant for a release that predates SHA256SUMS.
+function Get-MeridianSumsEntry {
+    <#
+      .SYNOPSIS
+      Return the lower-case SHA-256 hex digest listed for $AssetName in the text of
+      a SHA256SUMS file ("<hex>  <name>" or "<hex> *<name>" per line), or $null.
+    #>
+    param(
+        [string]$SumsText,
+        [string]$AssetName
+    )
+    foreach ($line in ($SumsText -split '\r?\n')) {
+        if ($line -match '^\s*([0-9a-fA-F]{64})\s+\*?(\S.*?)\s*$') {
+            if ($Matches[2] -ceq $AssetName) { return $Matches[1].ToLowerInvariant() }
+        }
+    }
+    return $null
+}
+
+function Test-MeridianDownloadIntegrity {
+    <#
+      .SYNOPSIS
+      Verify the file at $Path against the SHA256SUMS published at $SumsUrl.
+      Returns $true only when the hash matches (or the explicit opt-out is set).
+      On any failure the downloaded file is DELETED and $false is returned.
+    #>
+    param(
+        [Parameter(Mandatory = $true)][string]$Path,
+        [Parameter(Mandatory = $true)][string]$AssetName,
+        [Parameter(Mandatory = $true)][string]$SumsUrl
+    )
+
+    if ($env:MERIDIAN_INSTALL_ALLOW_UNVERIFIED -eq '1') {
+        Write-Warning "MERIDIAN_INSTALL_ALLOW_UNVERIFIED=1 -- SKIPPING SHA-256 verification of $AssetName."
+        Write-Warning "The downloaded binary will be installed and run WITHOUT any integrity check."
+        return $true
+    }
+
+    $sumsText = $null
+    $tmpSums = "$Path.sha256sums"
+    try {
+        Invoke-WebRequest $SumsUrl -OutFile $tmpSums -UseBasicParsing -ErrorAction Stop
+        $sumsText = Get-Content -Raw -LiteralPath $tmpSums -ErrorAction Stop
+    } catch {
+        Write-Host ("  Could not download SHA256SUMS from {0}: {1}" -f $SumsUrl, $_.Exception.Message) -ForegroundColor Red
+    } finally {
+        Remove-Item -LiteralPath $tmpSums -Force -ErrorAction SilentlyContinue
+    }
+
+    $expected = $null
+    if ($sumsText) { $expected = Get-MeridianSumsEntry -SumsText $sumsText -AssetName $AssetName }
+    if (-not $expected) {
+        Write-Host "  No SHA-256 checksum could be found for $AssetName, so the download cannot be verified." -ForegroundColor Red
+        Write-Host "  (Set MERIDIAN_INSTALL_ALLOW_UNVERIFIED=1 to skip verification at your own risk.)" -ForegroundColor Red
+        Remove-Item -LiteralPath $Path -Force -ErrorAction SilentlyContinue
+        return $false
+    }
+
+    $actual = $null
+    try {
+        $actual = (Get-FileHash -LiteralPath $Path -Algorithm SHA256 -ErrorAction Stop).Hash.ToLowerInvariant()
+    } catch {
+        Write-Host ("  Could not hash the download: {0}" -f $_.Exception.Message) -ForegroundColor Red
+    }
+    if ($actual -ne $expected) {
+        Write-Host ("  SHA-256 MISMATCH for {0}: expected {1}, got {2}." -f $AssetName, $expected, $actual) -ForegroundColor Red
+        Write-Host "  The download was deleted and nothing was installed." -ForegroundColor Red
+        Remove-Item -LiteralPath $Path -Force -ErrorAction SilentlyContinue
+        return $false
+    }
+    Write-Host "  Checksum verified (sha256 $actual)."
+    return $true
+}
+
 # =============================================================================
 # COMPONENT: binary -- download + run the meridian-connect tunnel binary.
 # Skipped entirely for -Component hooks (5fb084fe).
@@ -300,6 +406,16 @@ if (-not $downloaded) {
         "named '$binary' exists, then re-run this installer.")
     exit 1
 }
+
+# f66e8f23 -- verify the download BEFORE it is put on PATH or run. On a missing or
+# mismatching SHA-256 the file is deleted and the install aborts non-zero.
+$sumsUrl = "https://github.com/$repo/releases/latest/download/SHA256SUMS"
+if (-not (Test-MeridianDownloadIntegrity -Path $dest -AssetName $binary -SumsUrl $sumsUrl)) {
+    if (Test-Path $dest) { Remove-Item $dest -Force -ErrorAction SilentlyContinue }
+    Write-Error ("Aborting install - could not verify the SHA-256 of '$binary' against {0}. " -f $sumsUrl +
+        "The download was deleted and nothing was installed or run.")
+    exit 1
+}
 $sizeKB = [math]::Round((Get-Item $dest).Length / 1KB, 1)
 if ($releaseTag) {
     Write-Host "Downloaded meridian-connect $releaseTag ($sizeKB KB)."
@@ -317,21 +433,42 @@ if ($userPath -notlike "*$meridianDir*") {
 
 # ---- Keyless auth: acquire a token via the device flow (73b65117) ------------
 # Copy the passthrough args, then decide whether we need to mint a token. We skip
-# the device flow when: the caller already passed --token, a MERIDIAN_TOKEN is in
+# the device flow when: the caller already passed a token, a Meridian token is in
 # the environment, or the target is a local/self-hosted server (no auth needed).
-$binaryArgs = @($passthroughArgs)
+#
+# 9784f8ef -- the token is NEVER put on the binary's command line. A --token value
+# is visible to every other process in a process listing (Get-CimInstance
+# Win32_Process / Task Manager "Command line"), so any token we hold -- passed by
+# the caller, taken from the environment, cached, or minted by the device flow --
+# is handed to the binary through the MERIDIAN_TOKEN environment variable of the
+# child process only (set just before launch, restored right after).
+$binaryArgs = @()
+$childToken = $null
 # $targetUrl was already resolved from the passthrough args near the top.
-$hasToken = $false
-for ($i = 0; $i -lt $binaryArgs.Count; $i++) {
-    $a = "$($binaryArgs[$i])"
-    if ($a -eq '--token' -and ($i + 1) -lt $binaryArgs.Count) { $hasToken = $true }
+for ($i = 0; $i -lt $passthroughArgs.Count; $i++) {
+    $a = "$($passthroughArgs[$i])"
+    if ($a -eq '--token') {
+        # Lift a caller-supplied `--token <value>` off the command line.
+        if (($i + 1) -lt $passthroughArgs.Count) {
+            $childToken = "$($passthroughArgs[$i + 1])"
+            $i++
+        }
+        continue
+    }
+    if ($a -like '--token=*') {
+        $childToken = $a.Substring('--token='.Length)
+        continue
+    }
+    $binaryArgs += $a
 }
-if (-not $hasToken `
-        -and -not [string]::IsNullOrWhiteSpace($env:MERIDIAN_TOKEN) `
-        -and $env:MERIDIAN_TOKEN -match '^sk_meridian_') {
-    Write-Host "Using existing MERIDIAN_TOKEN from the environment."
-    $binaryArgs += @('--token', $env:MERIDIAN_TOKEN)
-    $hasToken = $true
+$hasToken = -not [string]::IsNullOrWhiteSpace($childToken)
+if (-not $hasToken) {
+    $envToken = Get-MeridianEnvToken
+    if (-not [string]::IsNullOrWhiteSpace($envToken)) {
+        Write-Host "Using existing MERIDIAN_TOKEN (or legacy MERIDIAN_API_KEY / BEARER_TOKEN) from the environment."
+        $childToken = $envToken
+        $hasToken = $true
+    }
 }
 
 $isLocal = $targetUrl -match '^https?://(localhost|127\.0\.0\.1)(:\d+)?(/|$)'
@@ -343,7 +480,7 @@ if (-not $hasToken -and -not $isLocal) {
     $cachedToken = Get-MeridianCachedToken -MeridianUrl $targetUrl
     if (-not [string]::IsNullOrWhiteSpace($cachedToken)) {
         Write-Host "Using an existing valid Meridian token from ~/.meridian/config.json (no auth needed)."
-        $binaryArgs += @('--token', $cachedToken)
+        $childToken = $cachedToken
         $hasToken = $true
     }
 }
@@ -353,14 +490,32 @@ if (-not $hasToken -and -not $isLocal) {
     Write-Host "Authenticating with Meridian (no token to paste -- approve in your browser)..."
     $deviceToken = Get-MeridianDeviceToken -MeridianUrl $targetUrl
     if (-not [string]::IsNullOrWhiteSpace($deviceToken)) {
-        $binaryArgs += @('--token', $deviceToken)
+        $childToken = $deviceToken
+        $hasToken = $true
     } else {
         Write-Warning "Device authorization did not complete; the installer will fall back to its own token prompt."
     }
 }
 
 Write-Host "Running installer..."
-& $dest @binaryArgs
+# Env-var hand-off: MERIDIAN_TOKEN has the highest precedence in the binary's token
+# resolution (see meridian.tunnel_client.TOKEN_ENV_VARS), so it wins over any legacy
+# alias already exported. The previous value is restored afterwards so this
+# installer never leaves a token behind in the caller's session.
+$prevMeridianToken = [Environment]::GetEnvironmentVariable('MERIDIAN_TOKEN')
+try {
+    if ($hasToken) { $env:MERIDIAN_TOKEN = $childToken }
+    & $dest @binaryArgs
+} finally {
+    if ($hasToken) {
+        if ($null -eq $prevMeridianToken) {
+            Remove-Item Env:\MERIDIAN_TOKEN -ErrorAction SilentlyContinue
+        } else {
+            $env:MERIDIAN_TOKEN = $prevMeridianToken
+        }
+    }
+    $childToken = $null
+}
 
 } # end if ($installBinary)
 
@@ -388,10 +543,11 @@ if ($installHooks) {
     Write-Host "Installing Meridian session hooks (keyless device auth)..." -ForegroundColor Cyan
 
     $hooksToken = $null
-    if (-not [string]::IsNullOrWhiteSpace($env:MERIDIAN_TOKEN) `
-            -and $env:MERIDIAN_TOKEN -match '^sk_meridian_') {
+    # 9784f8ef: MERIDIAN_TOKEN, else the legacy MERIDIAN_API_KEY / BEARER_TOKEN.
+    $envHooksToken = Get-MeridianEnvToken
+    if (-not [string]::IsNullOrWhiteSpace($envHooksToken)) {
         Write-Host "Using existing MERIDIAN_TOKEN from the environment." -ForegroundColor Green
-        $hooksToken = $env:MERIDIAN_TOKEN
+        $hooksToken = $envHooksToken
     } else {
         # Honour a still-valid token already cached on this machine before any
         # browser auth (mirrors the binary component's cee295bd behaviour).

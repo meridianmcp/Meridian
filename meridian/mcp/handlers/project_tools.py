@@ -21,7 +21,14 @@ from meridian import capability_manifest as _capability_manifest
 from meridian import db as db_module
 from meridian import profile_contract as _profile_contract
 from meridian._deps import _hosted_mode
+from meridian.mcp.scope_guard import WORKSPACE_SCOPED_ARG
 from meridian.mcp_tools import _select_active_tool_set
+from meridian.rights_policy import (
+    COMMERCIALIZED,
+    STANDARD_PUBLICATION,
+    RightsPolicyError,
+    decide_image_storage,
+)
 
 if TYPE_CHECKING:
     pass
@@ -72,6 +79,17 @@ async def handle_set_parent_project(
         _pid = (_p or {}).get("id", "") if _p else ""
     if not _pid:
         return {"error": "project_id (or project_name) is required"}
+    from ... import member_policy  # noqa: PLC0415
+
+    authorized = args.pop(member_policy.MEMBER_POLICY_AUTHORIZED_PARENT_ARG, None)
+    compare_and_set: dict[str, Any] = {}
+    if isinstance(authorized, member_policy.AuthorizedParentSnapshot):
+        if authorized.project_id != _pid:
+            return {"error": "project authorization snapshot does not match"}
+        compare_and_set = {
+            "expect_parent": authorized.parent_project_id,
+            "expect_parent_exists": authorized.parent_exists,
+        }
     _parent = args.get("parent_project_id")
     if not _parent and args.get("parent_project_name"):
         _pp = await db_module.get_project_by_name(db, str(args["parent_project_name"]))
@@ -79,7 +97,9 @@ async def handle_set_parent_project(
     if not _parent:  # "" / missing -> detach
         _parent = None
     try:
-        updated = await db_module.set_parent_project(db, _pid, _parent)
+        updated = await db_module.set_parent_project(
+            db, _pid, _parent, **compare_and_set,
+        )
     except ValueError as exc:
         return {"error": str(exc)}
     if updated is None:
@@ -145,6 +165,106 @@ async def handle_set_project_execution_mode(
     if updated is None:
         return {"error": f"project '{_pid}' not found"}
     return updated
+
+
+async def handle_set_project_use_mode(
+    args: dict[str, Any],
+    db: Any,
+    data_dir: str,
+    tenant: dict[str, Any] | None,
+    _mcp_tenant_id: Any,
+) -> Any:
+    """MCP tool: set_project_use_mode.
+
+    MCP wrapper over the strict db.set_project_use_mode, the rights gate's
+    per-project input. A value other than standard_publication or commercialized
+    returns {error} and changes nothing. An unknown project returns {error}. The
+    change is audited with the actor ``mcp:set_project_use_mode``.
+    """
+    _pid = (args.get("project_id") or "").strip()
+    if not _pid and args.get("project_name"):
+        _p = await db_module.get_project_by_name(db, str(args["project_name"]))
+        _pid = (_p or {}).get("id", "") if _p else ""
+    if not _pid:
+        return {"error": "project_id (or project_name) is required"}
+    if args.get("use_mode") is None:
+        return {"error": "use_mode is required"}
+    try:
+        current = await db_module.get_project_use_mode(db, _pid)
+    except ValueError as exc:
+        return {"error": str(exc)}
+    # Downgrading a commercialized project would unlock restricted images with
+    # no human in the loop, so it is refused over MCP. The owner makes that change
+    # in the dashboard, where it is audited the same way.
+    if current == COMMERCIALIZED and args["use_mode"] == STANDARD_PUBLICATION:
+        return {
+            "error": (
+                "a commercialized project cannot be moved back to standard_publication "
+                "over MCP; the owner must make that change in the dashboard"
+            ),
+        }
+    try:
+        return await db_module.set_project_use_mode(
+            db, _pid, args["use_mode"],
+            actor="mcp:set_project_use_mode",
+            reason=args.get("reason"),
+        )
+    except ValueError as exc:
+        return {"error": str(exc)}
+
+
+async def handle_check_image_rights(
+    args: dict[str, Any],
+    db: Any,
+    data_dir: str,
+    tenant: dict[str, Any] | None,
+    _mcp_tenant_id: Any,
+) -> Any:
+    """MCP tool: check_image_rights (read-only).
+
+    Previews how the image-storage rights policy classifies one source image for
+    this project: its tier, its flags, the project's effective use mode, and
+    whether image bytes would be refused without a human-approved override.
+
+    Read-only by construction. The decision is the pure
+    ``decide_image_storage``, the use mode is one SELECT through the same
+    fail-closed helper the gate uses, and nothing here reaches the override path
+    (``request_rights_override`` / ``authorize_image_storage``). So no approval
+    request is filed, no approval is spent and no audit row is written. A missing
+    or unknown license is LINK_ONLY.
+    """
+    # Lazy import: rights_override pulls in gate_override, so keep it off the
+    # module import path of this handler module.
+    from meridian import rights_override as _rights_override  # noqa: PLC0415
+
+    _pid = (args.get("project_id") or "").strip()
+    if not _pid and args.get("project_name"):
+        _p = await db_module.get_project_by_name(db, str(args["project_name"]))
+        _pid = (_p or {}).get("id", "") if _p else ""
+    if not _pid:
+        return {"error": "project_id (or project_name) is required"}
+    try:
+        use_mode = await _rights_override._effective_use_mode(db, _pid, None)
+    except RightsPolicyError as exc:
+        return {"error": str(exc), "code": exc.code}
+    decision = decide_image_storage(
+        args.get("license"),
+        derived=bool(args.get("derived", False)),
+        redrawn=bool(args.get("redrawn", False)),
+        use_mode=use_mode,
+    )
+    return {
+        "project_id": _pid,
+        "use_mode": use_mode,
+        "license": decision.license,
+        "tier": decision.tier,
+        "flags": list(decision.flags),
+        "jurisdiction": decision.jurisdiction,
+        "derived": decision.derived,
+        "redrawn": decision.redrawn,
+        "override_required": not decision.allowed,
+        "reason": decision.reason,
+    }
 
 
 async def handle_register_session(
@@ -241,6 +361,7 @@ async def handle_start_session(
         compact=args.get("compact", True),
         version=args.get("version"),
         mode=args.get("mode"),
+        include_workspace=not args.get(WORKSPACE_SCOPED_ARG),
     )
     # bf51b12e — register executor sessions in-memory so the planner
     # context-refresh hook skips them (the nudge is planner-only). Best-effort:
@@ -365,9 +486,49 @@ async def handle_start_session(
             # for THIS project never reaches the session that resolved via
             # the default-project fallback, even though the session itself
             # was correctly created under that project.
+            # 0527f636 — pending_goal is ONE read-once slot per project; before
+            # this, ANY sibling start_session popped it, so a handoff written
+            # for one session was silently consumed by whichever parallel
+            # session (another executor, a verifier subagent, a resumed
+            # session) started first. Identify THIS caller (the name it is
+            # registering under, its role, its cwd) so an ADDRESSED handoff
+            # (generate_handoff(receiver=...)) is delivered — and cleared —
+            # only to its intended receiver. An UNADDRESSED handoff (the
+            # default) is still delivered to whoever starts first, exactly as
+            # before.
+            _pg_claimant = {
+                "session_name": _sname,
+                "role": args.get("role"),
+                "cwd": args.get("cwd"),
+            }
             _pg_meta = await db_module.pop_pending_goal_with_meta(
-                db, _pid
+                db, _pid, claimant=_pg_claimant,
             )
+            if not _pg_meta:
+                # Nothing was delivered. If a goal is still pending it is
+                # addressed to a DIFFERENT receiver: leave it untouched
+                # (NOT consumed) and say so, so this session neither loses
+                # nor steals it and can read it via the idempotent
+                # load_handoff if it is in fact the intended receiver.
+                _pg_receiver = await db_module.get_pending_goal_receiver(db, _pid)
+                if _pg_receiver:
+                    result["pending_goal_withheld"] = {
+                        "reason": "addressed_to_other_receiver",
+                        "receiver": _pg_receiver,
+                        "mismatched_fields": (
+                            db_module.pending_goal_receiver_mismatches(
+                                _pg_receiver, _pg_claimant,
+                            )
+                        ),
+                        "consumed": False,
+                        "message": (
+                            "A handoff /goal is pending for this project but is "
+                            "addressed to a different receiver than this session, "
+                            "so it was NOT delivered or consumed. If it is yours, "
+                            "call load_handoff() (read-only) or start_session "
+                            "again with the matching session_name/role/cwd."
+                        ),
+                    }
             if _pg_meta:
                 result["pending_goal"] = _pg_meta["goal"]
                 # 22f2604d — explicit, machine-readable trust marker
@@ -569,7 +730,15 @@ async def handle_list_projects(
     _mcp_tenant_id: Any,
 ) -> Any:
     """MCP tool: list_projects."""
-    return await db_module.list_project_summaries(db)
+    projects = await db_module.list_project_summaries(db)
+    # RT-TI-006 — a project-scoped caller only discovers the projects in scope
+    # (the dispatcher injects the caller's scope; HTTP GET /projects filters the
+    # same way). Absent / None means the caller is not scoped.
+    scoped = args.get("_scoped_project_ids")
+    if scoped is not None:
+        allowed = set(scoped)
+        projects = [p for p in projects if p.get("id") in allowed]
+    return projects
 
 
 async def handle_get_project_by_name(
@@ -581,6 +750,11 @@ async def handle_get_project_by_name(
 ) -> Any:
     """MCP tool: get_project_by_name."""
     project = await db_module.get_project_by_name(db, args["name"])
+    # RT-TI-006 — an out-of-scope project is reported exactly like a missing one,
+    # so discovery by name cannot confirm that it exists.
+    scoped = args.get("_scoped_project_ids")
+    if project is not None and scoped is not None and project["id"] not in set(scoped):
+        project = None
     if project is None:
         raise ValueError(f"no project found matching '{args['name']}'")
     return {
@@ -601,6 +775,10 @@ async def handle_get_goal(
     goal = await db_module.get_goal(db, args["project_id"])
     if goal and goal.get("decisions") and len(goal["decisions"]) > 3000:
         goal["decisions"] = goal["decisions"][-3000:]
+    if goal:
+        # fc779141 — the stamps set_goal / set_north_star / set_sprint accept
+        # back as ``expected_updated_at`` for an optimistic-concurrency write.
+        goal["field_updated_at"] = db_module.goal_field_stamps(goal)
     return goal
 
 
@@ -612,7 +790,17 @@ async def handle_set_goal(
     _mcp_tenant_id: Any,
 ) -> Any:
     """MCP tool: set_goal."""
-    return await db_module.set_goal(db, args["project_id"], args["content"])
+    expected = args.get("expected_updated_at")
+    try:
+        return await db_module.set_goal(
+            db, args["project_id"], args["content"],
+            expected_updated_at=(
+                {"version_goal": expected} if expected is not None else None
+            ),
+            actor=db_module.goal_actor("mcp"),
+        )
+    except db_module.GoalConflict as exc:
+        return db_module.goal_conflict_detail(exc)
 
 
 async def handle_set_north_star(
@@ -623,7 +811,14 @@ async def handle_set_north_star(
     _mcp_tenant_id: Any,
 ) -> Any:
     """MCP tool: set_north_star."""
-    return await db_module.set_north_star(db, args["project_id"], args["north_star"])
+    try:
+        return await db_module.set_north_star(
+            db, args["project_id"], args["north_star"],
+            expected_updated_at=args.get("expected_updated_at"),
+            actor=db_module.goal_actor("mcp"),
+        )
+    except db_module.GoalConflict as exc:
+        return db_module.goal_conflict_detail(exc)
 
 
 async def handle_merge_project(

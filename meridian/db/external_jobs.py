@@ -103,7 +103,7 @@ async def get_external_job(
     async with db.execute(
         "SELECT id, session_id, event_kind, status, phase, detail, snapshot_json, created_at "
         "FROM external_job_events WHERE project_id = ? AND external_job_id = ? "
-        "ORDER BY created_at ASC, id ASC LIMIT 200",
+        "ORDER BY created_at ASC, event_order ASC NULLS FIRST, id ASC LIMIT 200",
         (project_id, job["id"]),
     ) as cur:
         rows = await cur.fetchall()

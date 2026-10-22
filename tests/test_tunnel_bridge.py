@@ -963,6 +963,7 @@ def test_tunnel_status_reports_active_sockets():
         "zotero_active": False,
         "outputs_active": False,
         "debug_active": False,
+        "latex_active": False,
         "slot_health": {},  # d71ba2e7 — no slots reported unhealthy
         "slot_status": {},  # 9a8645c1 — no slot diagnostics
         # 02dbd8b4 — runtime config generation + drain-safety reporting; empty

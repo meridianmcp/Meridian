@@ -98,7 +98,7 @@ async def _seed_handoff(db, name: str, tmp_path):
     tests/test_cov_handoff.py."""
     pid = await _project(db, name)
     await db_module.set_goal(db, pid, "ship it", sprint="s1")
-    await handoff_module.generate_handoff(db, pid, str(tmp_path), skip_ai_summary=True)
+    await handoff_module.generate_handoff(db, pid, str(tmp_path), skip_ai_summary=True, mode="full")
     rows = await db_module.get_handoffs(db, pid, limit=1)
     return pid, rows[0]
 
@@ -387,8 +387,7 @@ def test_real_mcp_dispatch_survives_simulated_ai_log_storage_timeout(client, mon
     assert r.status_code == 200
     assert _result(r)["session_id"]  # the real boundary result is intact
 
-    import asyncio
-    rows = asyncio.run(_events(client.app.state.db, pid))
+    rows = client.portal.call(_events, client.app.state.db, pid)
     assert rows == []  # the simulated write failure left no partial row
 
 

@@ -497,8 +497,12 @@ async def test_gate_after_and_gate_blocking_are_explicit(db):
     assert contract_w2["executable"] is False
     assert any("wave_gate_pending:wave-1" in r for r in contract_w2["executable_reasons"])
 
+    _run = await db_module.create_verification_run(db, project["id"], "pixi run test")
+    _run = await db_module.complete_verification_run(
+        db, _run["id"], status="ok", exit_code=0, passed=1, failed=0,
+    )
     await db_module.complete_wave_gate(
-        db, project["id"], "wave-1", {"status": "ok", "exit_code": 0},
+        db, project["id"], "wave-1", verification_run_id=_run["id"],
     )
     fresh_w1 = await db_module.get_sprint_item(db, item_w1["id"])
     fresh_w2 = await db_module.get_sprint_item(db, item_w2["id"])

@@ -1,0 +1,32 @@
+{
+  "meta": {
+    "journal": "rsc",
+    "display_name": "Royal Society of Chemistry journals (RSC Advances as representative title)",
+    "publisher": "Royal Society of Chemistry",
+    "status": "populated",
+    "status_detail": "Mechanically migrated 2026-09-18 from the JOURNAL_STYLE_PRESETS dict literal in docs_intel.py (round 2, proposal 64266f13, dated 2026-09-11) as part of the JSON-preset externalization work (proposal 3b93b7ef) -- values and evidence carried over verbatim from the real in-code comment, not regenerated. emphasis_style and the caption-punctuation keys are left unspecified/absent -- not addressed by the page checked in this pass, matching proposal 64266f13's own note that RSC's source didn't state these and the keys were left unset rather than guessed.",
+    "last_verified": "2026-09-11"
+  },
+  "fields": {
+    "citation_style": {
+      "value": "numbered_superscript",
+      "tier": 2,
+      "source": {
+        "type": "live_guidelines_page",
+        "citation": "rsc.org/publishing/publish-with-us/publish-a-journal-article/rsc-advances",
+        "note": "references use the RSC style -- numbered sequentially, cited as superscript numbers."
+      },
+      "verified_date": "2026-09-11"
+    },
+    "figure_dpi_minimum_general": {
+      "value": 600,
+      "tier": 2,
+      "source": {
+        "type": "live_guidelines_page",
+        "citation": "rsc.org/publishing/publish-with-us/publish-a-journal-article/rsc-advances",
+        "note": "TIFF, blanket floor of at least 600 dpi."
+      },
+      "verified_date": "2026-09-11"
+    }
+  }
+}

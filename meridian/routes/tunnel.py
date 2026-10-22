@@ -41,7 +41,11 @@ from .. import db as db_module
 from .. import process_registry as process_registry_module
 from .. import profile_contract as profile_contract_module
 from .. import redis_bridge as _redis_bridge  # 2cf57fde — runtime diagnostics
-from .._deps import _hosted_mode, _get_tenant_from_request, _db
+from .._deps import (
+    _hosted_mode, _get_tenant_from_request, _db, _authentication_required,
+    _projects_in_scope,
+)
+from ..plans import tenant_entitlement_plan
 from ..tunnel_plugins import (
     normalize_plugins_config, resolve_plugins, resolve_custom_plugins, builtin_names,
     migrate_retired_overrides, config_fingerprint,
@@ -181,6 +185,89 @@ _tunnel_outputs_sockets: dict[str, WebSocket] = {}
 
 # 121e6a27 — mcp-debugger slot (7-language DAP debugger via @debugmcp/mcp-debugger).
 _tunnel_debug_sockets: dict[str, WebSocket] = {}
+_tunnel_latex_sockets: dict[str, WebSocket] = {}
+
+# e37187f3 — per-host coexistence bookkeeping: (tenant_id, slot_label) ->
+# {host_id: WebSocket}. Keyed by (tenant_id, slot_label) rather than bare
+# tenant_id because _serve_tunnel_ws below is ONE function shared by 7
+# different slots (ppt/word/dc/docs/zotero/outputs/debug), each with its own
+# separate `sockets` dict — the SAME host legitimately holds one live
+# connection per slot at once (e.g. both its ppt and word sockets), and
+# those must not be mistaken for each other's "same host reconnecting".
+# Purely ADDITIVE alongside the single-socket-per-tenant registries above
+# (_tunnel_sockets &c. stay the "active routing target" that every existing
+# proxy/dispatch call site already reads via plain `sockets[tenant_id]` —
+# unchanged). This lets a genuinely DIFFERENT host's still-open connection
+# survive a new connection from ANOTHER host, instead of being forcibly
+# closed the way the pre-fix code closed ANY existing socket for the tenant
+# regardless of which machine it belonged to (the two-machines-evict-each-
+# other bug). A same-host reconnect (the legitimate "local binary restarted"
+# case the original code comment described) still evicts its own prior
+# connection exactly as before. See _register_tunnel_socket_multi_host /
+# _unregister_tunnel_socket_multi_host below, used by every WS handler in
+# this module. Full multi-host REQUEST ROUTING (choosing which specific
+# connected host serves a given proxied call when 2+ are up) is explicitly
+# NOT built by this — the active-routing pointer just follows whichever
+# host connected most recently, same single-target semantics every
+# existing caller already assumes. A real per-request host selector is a
+# natural follow-up but a much bigger, separate change (it would need the
+# HTTP proxy routes themselves to carry a host selector, e.g. ?host=).
+_tunnel_sockets_by_host: dict[tuple[str, str], dict[str, WebSocket]] = {}
+
+
+def _tunnel_ws_host_id(ws: "WebSocket") -> str:
+    """The connecting client's self-reported host id (``?host=``), or a
+    shared ``"unknown"`` bucket for older clients that don't send one
+    (e37187f3). Clients sharing the "unknown" bucket keep the exact legacy
+    mutual-eviction behavior — we can't tell them apart, so we can't safely
+    let them coexist either.
+    """
+    try:
+        return (ws.query_params.get("host") or "").strip() or "unknown"
+    except Exception:
+        return "unknown"
+
+
+def _register_tunnel_socket_multi_host(
+    tenant_id: str, slot_label: str, host_id: str, ws: "WebSocket",
+    sockets: dict[str, WebSocket],
+) -> "WebSocket | None":
+    """Register *ws* as *tenant_id*'s active socket in *sockets* (unchanged
+    routing semantics for every existing caller), while only flagging for
+    eviction a PRIOR connection from the SAME (*slot_label*, *host_id*) —
+    a genuine same-machine reconnect on this same slot (e.g. the local
+    binary restarted). A different host's live socket — or this SAME host's
+    socket on a DIFFERENT slot — is left completely alone: registering this
+    new connection does not close it. Returns the same-slot-same-host socket
+    the caller should close (or ``None`` if there wasn't one / it's this
+    same object).
+    """
+    by_host = _tunnel_sockets_by_host.setdefault((tenant_id, slot_label), {})
+    same_host_old = by_host.get(host_id)
+    by_host[host_id] = ws
+    sockets[tenant_id] = ws
+    return same_host_old if same_host_old is not ws else None
+
+
+def _unregister_tunnel_socket_multi_host(
+    tenant_id: str, slot_label: str, host_id: str, ws: "WebSocket",
+    sockets: dict[str, WebSocket],
+) -> None:
+    """Clean up *ws* from both registries on disconnect (e37187f3).
+
+    Only clears the shared ACTIVE routing pointer (``sockets[tenant_id]``)
+    if it still points at THIS socket — a different host may since have
+    taken over as active on this slot while this connection was still open,
+    and this (now-closing) connection must not clobber that.
+    """
+    by_host = _tunnel_sockets_by_host.get((tenant_id, slot_label))
+    if by_host is not None and by_host.get(host_id) is ws:
+        by_host.pop(host_id, None)
+        if not by_host:
+            _tunnel_sockets_by_host.pop((tenant_id, slot_label), None)
+    if sockets.get(tenant_id) is ws:
+        sockets.pop(tenant_id, None)
+
 
 # 4d9ad87b — active repo per tenant, updated whenever set_active_repo is called.
 # Enables call_tunnel_tool to inject X-Meridian-Repo-Path so the SerenaDaemonPool
@@ -199,6 +286,7 @@ _pending_docs_reqs: dict[str, asyncio.Future[dict]] = {}
 _pending_zotero_reqs: dict[str, asyncio.Future[dict]] = {}
 _pending_outputs_reqs: dict[str, asyncio.Future[dict]] = {}
 _pending_debug_reqs: dict[str, asyncio.Future[dict]] = {}
+_pending_latex_reqs: dict[str, asyncio.Future[dict]] = {}
 
 # ab956c80 follow-up — Streamable HTTP MCP servers such as persistent
 # ``mcp-proxy`` require initialize/initialized before real tools traffic. Keep
@@ -643,8 +731,8 @@ def _clear_slot_health(tenant_id: str, slot: "str | None" = None) -> None:
 
 
 def _is_tunnel_allowed(tenant: dict) -> bool:
-    """Return True for Pro, admin, and internal tenants."""
-    plan = tenant.get("plan") or "free"
+    """Return True for Pro, admin, and internal tenants (a playtester shares Pro's entitlement)."""
+    plan = tenant_entitlement_plan(tenant, default="free")
     return plan in ("pro", "admin") or bool(tenant.get("is_internal"))
 
 
@@ -766,15 +854,17 @@ async def tunnel_ws(ws: WebSocket, tenant_id: str) -> None:
 
     _log_ws_legacy_auth("fs", tenant_id, used_query_fallback)
 
-    # Evict any stale socket for this tenant (e.g. binary restarted)
-    old_ws = _tunnel_sockets.pop(tenant_id, None)
+    # e37187f3 — evict only a stale SAME-HOST socket (e.g. binary restarted
+    # on this machine); a different host's live connection is left running.
+    # See _register_tunnel_socket_multi_host's docstring.
+    host_id = _tunnel_ws_host_id(ws)
+    old_ws = _register_tunnel_socket_multi_host(tenant_id, "fs", host_id, ws, _tunnel_sockets)
     if old_ws is not None:
         try:
-            await old_ws.close(code=4000, reason="replaced by new connection")
+            await old_ws.close(code=4000, reason="replaced by new connection from the same host")
         except Exception:
             pass
 
-    _tunnel_sockets[tenant_id] = ws
     _clear_tunnel_mcp_session(tenant_id, "fs")
     _invalidate_tunnel_manifest(tenant_id)  # 4331f9cd / 49d8244d — reconnect: rebuild tool routes
     # af5b5739 — record THIS Fly instance as the socket owner so a request that
@@ -838,7 +928,9 @@ async def tunnel_ws(ws: WebSocket, tenant_id: str) -> None:
     except Exception as exc:
         _log.debug("tunnel: tenant %s disconnected: %s", tenant_id[:8], exc)
     finally:
-        _tunnel_sockets.pop(tenant_id, None)
+        # e37187f3 — only clears the active-routing pointer if it's still
+        # THIS socket; a different host may have taken over in the meantime.
+        _unregister_tunnel_socket_multi_host(tenant_id, "fs", host_id, ws, _tunnel_sockets)
         _clear_tunnel_mcp_session(tenant_id, "fs", socket=ws)
         _clear_slot_health(tenant_id, "fs")
         # af5b5739 — forget our ownership claim only if it's still ours (a newer
@@ -890,14 +982,15 @@ async def tunnel_code_ws(ws: WebSocket, tenant_id: str) -> None:
         await ws.close(code=4403, reason="tunnel requires Pro plan")
         return
 
-    old_ws = _tunnel_code_sockets.pop(tenant_id, None)
+    # e37187f3 — evict only a stale SAME-HOST socket; see tunnel_ws above.
+    host_id = _tunnel_ws_host_id(ws)
+    old_ws = _register_tunnel_socket_multi_host(tenant_id, "code", host_id, ws, _tunnel_code_sockets)
     if old_ws is not None:
         try:
-            await old_ws.close(code=4000, reason="replaced by new connection")
+            await old_ws.close(code=4000, reason="replaced by new connection from the same host")
         except Exception:
             pass
 
-    _tunnel_code_sockets[tenant_id] = ws
     _clear_tunnel_mcp_session(tenant_id, "code")
     # af5b5739 / 5f02a21c — record THIS Fly instance as the owner so a sibling
     # instance that misses can Fly-replay to us (no-op off Fly). af5b5739 wired
@@ -942,7 +1035,7 @@ async def tunnel_code_ws(ws: WebSocket, tenant_id: str) -> None:
     except Exception as exc:
         _log.debug("tunnel-code: tenant %s disconnected: %s", tenant_id[:8], exc)
     finally:
-        _tunnel_code_sockets.pop(tenant_id, None)
+        _unregister_tunnel_socket_multi_host(tenant_id, "code", host_id, ws, _tunnel_code_sockets)
         _clear_tunnel_mcp_session(tenant_id, "code", socket=ws)
         _clear_slot_health(tenant_id, "code")
         # af5b5739 / 5f02a21c — release ownership only if still ours.
@@ -981,14 +1074,15 @@ async def tunnel_extract_ws(ws: WebSocket, tenant_id: str) -> None:
         await ws.close(code=4403, reason="tunnel requires Pro plan")
         return
 
-    old_ws = _tunnel_extract_sockets.pop(tenant_id, None)
+    # e37187f3 — evict only a stale SAME-HOST socket; see tunnel_ws above.
+    host_id = _tunnel_ws_host_id(ws)
+    old_ws = _register_tunnel_socket_multi_host(tenant_id, "extract", host_id, ws, _tunnel_extract_sockets)
     if old_ws is not None:
         try:
-            await old_ws.close(code=4000, reason="replaced by new connection")
+            await old_ws.close(code=4000, reason="replaced by new connection from the same host")
         except Exception:
             pass
 
-    _tunnel_extract_sockets[tenant_id] = ws
     _clear_tunnel_mcp_session(tenant_id, "extract")
     # af5b5739 / 5f02a21c — record THIS Fly instance as the owner so a sibling
     # instance that misses an extract request can Fly-replay to us (no-op off
@@ -1033,7 +1127,7 @@ async def tunnel_extract_ws(ws: WebSocket, tenant_id: str) -> None:
     except Exception as exc:
         _log.debug("tunnel-extract: tenant %s disconnected: %s", tenant_id[:8], exc)
     finally:
-        _tunnel_extract_sockets.pop(tenant_id, None)
+        _unregister_tunnel_socket_multi_host(tenant_id, "extract", host_id, ws, _tunnel_extract_sockets)
         _clear_tunnel_mcp_session(tenant_id, "extract", socket=ws)
         _clear_slot_health(tenant_id, "extract")
         # af5b5739 / 5f02a21c — release ownership only if still ours.
@@ -1081,14 +1175,15 @@ async def _serve_tunnel_ws(
         await ws.close(code=4403, reason="tunnel requires Pro plan")
         return
 
-    old_ws = sockets.pop(tenant_id, None)
+    # e37187f3 — evict only a stale SAME-HOST socket; see tunnel_ws above.
+    host_id = _tunnel_ws_host_id(ws)
+    old_ws = _register_tunnel_socket_multi_host(tenant_id, label, host_id, ws, sockets)
     if old_ws is not None:
         try:
-            await old_ws.close(code=4000, reason="replaced by new connection")
+            await old_ws.close(code=4000, reason="replaced by new connection from the same host")
         except Exception:
             pass
 
-    sockets[tenant_id] = ws
     _clear_tunnel_mcp_session(tenant_id, label)
     # 4331f9cd / 49d8244d — a (re)connect may change the slot's tool set; drop the
     # cached routes (+ manifest timestamp, atomically) so the next tools/list
@@ -1141,7 +1236,7 @@ async def _serve_tunnel_ws(
     except Exception as exc:
         _log.debug("tunnel-%s: tenant %s disconnected: %s", label, tenant_id[:8], exc)
     finally:
-        sockets.pop(tenant_id, None)
+        _unregister_tunnel_socket_multi_host(tenant_id, label, host_id, ws, sockets)
         _clear_tunnel_mcp_session(tenant_id, label, socket=ws)
         _clear_slot_health(tenant_id, label)
         # 4331f9cd / 49d8244d — slot dropped; if no tunnel remains, drop cached
@@ -1196,6 +1291,12 @@ async def tunnel_outputs_ws(ws: WebSocket, tenant_id: str) -> None:
 async def tunnel_debug_ws(ws: WebSocket, tenant_id: str) -> None:
     """121e6a27 — Hold open a WebSocket for one tenant's mcp-debugger proxy."""
     await _serve_tunnel_ws(ws, tenant_id, _tunnel_debug_sockets, _pending_debug_reqs, "debug")
+
+
+@router.websocket("/tunnel-latex/{tenant_id}")
+async def tunnel_latex_ws(ws: WebSocket, tenant_id: str) -> None:
+    """Hold open a WebSocket for one tenant's meridian-latex proxy."""
+    await _serve_tunnel_ws(ws, tenant_id, _tunnel_latex_sockets, _pending_latex_reqs, "latex")
 
 
 # 8fb69d54 — register the 4 custom-slot WebSocket routes (/tunnel-p0 … /tunnel-p3)
@@ -1413,13 +1514,32 @@ async def _authorize_tunnel_proxy_caller(tenant_id: str, request: "Request") -> 
 
     Returns an error ``Response`` (401) when the caller does not own
     ``tenant_id``, or ``None`` when verified and proxying may proceed.
+
+    5fe96405 — this 401 used to carry no ``WWW-Authenticate`` header at all,
+    so an OAuth-capable MCP client hitting a slot URL with no (or a stale)
+    credential had no standard way to discover where to authenticate — it
+    just saw a bare 401 with no next step. Mirrors the header shape
+    ``server.py``'s own ``/mcp`` auth-failure path already sends (same
+    ``resource_metadata`` well-known URL), so both entry points give a
+    client the same discovery hint. The primary fix for the reported 401s is
+    ``_tunnel_mcp_entries`` now attaching the bearer token directly (see its
+    docstring) — this header is the belt-and-suspenders half for a caller
+    that reaches this route without one.
     """
     tenant = await _get_tenant_from_request(request)
     if tenant is None or tenant.get("id") != tenant_id:
+        _base = str(request.base_url).rstrip("/")
         return Response(
             content='{"error":"invalid or mismatched tenant credential"}',
             status_code=401,
             media_type="application/json",
+            headers={
+                "WWW-Authenticate": (
+                    f'Bearer realm="MCP",'
+                    f' error="invalid_token",'
+                    f' resource_metadata="{_base}/.well-known/oauth-protected-resource"'
+                ),
+            },
         )
     return None
 
@@ -1919,6 +2039,26 @@ async def outputs_mcp_proxy_subpath(tenant_id: str, rest: str, request: Request)
                                _tunnel_outputs_sockets, _pending_outputs_reqs, "outputs")
 
 
+@router.get("/latex/mcp/{tenant_id}")
+@router.post("/latex/mcp/{tenant_id}")
+@router.options("/latex/mcp/{tenant_id}")
+async def latex_mcp_proxy(tenant_id: str, request: Request) -> Response:
+    """Proxy requests to the tenant's meridian-latex server over the latex tunnel."""
+    prefix = f"/latex/mcp/{tenant_id}"
+    local_path = request.url.path[len(prefix):] or "/"
+    return await _office_proxy(tenant_id, local_path, request,
+                               _tunnel_latex_sockets, _pending_latex_reqs, "latex")
+
+
+@router.get("/latex/mcp/{tenant_id}/{rest:path}")
+@router.post("/latex/mcp/{tenant_id}/{rest:path}")
+@router.options("/latex/mcp/{tenant_id}/{rest:path}")
+async def latex_mcp_proxy_subpath(tenant_id: str, rest: str, request: Request) -> Response:
+    """Proxy sub-path requests to the tenant's meridian-latex server."""
+    return await _office_proxy(tenant_id, "/" + rest, request,
+                               _tunnel_latex_sockets, _pending_latex_reqs, "latex")
+
+
 @router.get("/debug/mcp/{tenant_id}")
 @router.post("/debug/mcp/{tenant_id}")
 @router.options("/debug/mcp/{tenant_id}")
@@ -2018,6 +2158,7 @@ async def tunnel_status(tenant_id: str, request: Request = None) -> dict:  # typ
         "zotero_active": tenant_id in _tunnel_zotero_sockets,
         "outputs_active": tenant_id in _tunnel_outputs_sockets,
         "debug_active": tenant_id in _tunnel_debug_sockets,
+        "latex_active": tenant_id in _tunnel_latex_sockets,
         # d71ba2e7 — slots the client reported unhealthy (pre-flight tools/list
         # failed / watchdog gave up). Absent slot ⇒ assumed healthy. Dashboard
         # renders these as a degraded status dot.
@@ -2088,12 +2229,23 @@ async def openai_tunnel_diagnostics(tenant_id: str, request: Request) -> Respons
     reported_status = body.get("reported_status")
     if reported_status is not None and not isinstance(reported_status, dict):
         reported_status = None
+    # RT-TI-007 — the route stays public (the adapter diagnostics describe only
+    # what the caller itself supplies), but whether THIS tenant's Meridian tunnel
+    # socket is up is tenant state: GET /tunnel/status/{tenant_id} was hardened
+    # (4bea8629 / 5de3d422) to hide it from anyone but that tenant, so do the
+    # same here. In hosted mode an anonymous or foreign caller gets ``null``
+    # ("unknown", which combined_diagnostics never guesses), not the live flag.
+    meridian_active: "bool | None" = tenant_id in _tunnel_sockets
+    if _hosted_mode():
+        caller = await _get_tenant_from_request(request)
+        if caller is None or caller.get("id") != tenant_id:
+            meridian_active = None
     try:
         diagnostics = combined_diagnostics(
             tenant_id,
             openai_config=openai_config,
             reported_status=reported_status,
-            meridian_tunnel_active=tenant_id in _tunnel_sockets,
+            meridian_tunnel_active=meridian_active,
         )
     except OpenAITunnelAdapterError as exc:
         return _json_response({"error": str(exc)}, status_code=400)
@@ -2132,11 +2284,19 @@ async def get_tunnel_plugins(request: Request) -> Response:
     # 8660d701 — per-machine config. ?hostname=X scopes to that machine's config
     # (from tunnel_plugins_by_host), falling back to the per-tenant default. No
     # hostname → the default config (back-compat with the single-machine dashboard).
-    from ..tunnel_plugins import select_host_config, parse_plugins_by_host
+    from ..tunnel_plugins import (
+        select_host_config,
+        parse_plugins_by_host,
+        sanitize_plugin_config_secrets,
+    )
     hostname = (request.query_params.get("hostname") or "").strip() or None
 
-    default_cfg = _parse_plugins_json(tenant.get("tunnel_plugins"))
-    by_host = parse_plugins_by_host(tenant.get("tunnel_plugins_by_host"))
+    default_cfg_raw = _parse_plugins_json(tenant.get("tunnel_plugins"))
+    default_cfg = sanitize_plugin_config_secrets(default_cfg_raw)
+    default_secret_changed = default_cfg != default_cfg_raw
+    by_host_raw = parse_plugins_by_host(tenant.get("tunnel_plugins_by_host"))
+    by_host = sanitize_plugin_config_secrets(by_host_raw)
+    by_host_secret_changed = by_host != by_host_raw
 
     # 4b26c2ef — self-heal a stale `word: {enabled: true}` override left over
     # from before the word slot was retired. Covers BOTH the tenant's default
@@ -2150,16 +2310,17 @@ async def get_tunnel_plugins(request: Request) -> Response:
         if host_changed:
             by_host[host_key] = migrated_host
             by_host_changed = True
-    if default_changed or by_host_changed:
+    secret_scrub_failed = False
+    if default_changed or default_secret_changed or by_host_changed or by_host_secret_changed:
         _update_fields: dict[str, Any] = {}
-        if default_changed:
+        if default_changed or default_secret_changed:
             _update_fields["tunnel_plugins"] = json.dumps(default_cfg) if default_cfg else None
-        if by_host_changed:
+        if by_host_changed or by_host_secret_changed:
             _update_fields["tunnel_plugins_by_host"] = json.dumps(by_host) if by_host else None
         try:
             await db_module.update_tenant(request.app.state.db, tenant["id"], **_update_fields)
         except Exception:  # noqa: BLE001 — self-heal is best-effort, never blocks the GET
-            pass
+            secret_scrub_failed = default_secret_changed or by_host_secret_changed
 
     parsed = select_host_config(default_cfg, by_host, hostname)
     tid = tenant.get("id")
@@ -2198,11 +2359,14 @@ async def get_tunnel_plugins(request: Request) -> Response:
             "zotero": tid in _tunnel_zotero_sockets,
             "outputs": tid in _tunnel_outputs_sockets,
             "debug": tid in _tunnel_debug_sockets,
+            "latex": tid in _tunnel_latex_sockets,
             **{s: tid in _tunnel_custom_sockets[s] for s in _CUSTOM_SLOTS},
         },
         # The tunnel (and thus this section) is Pro/admin-only; the dashboard
-        # uses this to gate the Tunnel Plugins card.
-        "plan": tenant.get("plan") or "free",
+        # uses this to gate the Tunnel Plugins card, so it reports the plan
+        # whose entitlements apply (a playtester reads as 'pro', a lapsed one
+        # as 'free'), the same verdict _is_tunnel_allowed gives.
+        "plan": tenant_entitlement_plan(tenant, default="free"),
         "is_admin": bool(tenant.get("is_internal")),
         # 9a8645c1 — per-slot health + diagnostic so the dashboard can render a
         # warning badge (e.g. Serena access-denied) on a degraded slot's row.
@@ -2220,6 +2384,8 @@ async def get_tunnel_plugins(request: Request) -> Response:
         # /tunnel/status/{tenant_id} attaches. See pinned decision ee7bccc9
         # for why this is workspace-scoped only (no project/session layers).
         "profile_binding": await _build_tunnel_profile_binding(request.app.state.db),
+        **({"credential_scrub_warning": "Legacy Zotero credentials could not be removed from stored plugin settings."}
+           if secret_scrub_failed else {}),
     })
 
 
@@ -2839,8 +3005,13 @@ async def tunnel_diagnostics(tenant_id: str, request: Request) -> Response:
     ``tenant_id`` in the path is documentary only (matches the sibling
     ``/tunnel/status/{tenant_id}`` route's shape); the actual tenant is
     resolved from the request's own auth, same as ``/tunnel/plugins``.
+
+    ece2ac0a — hosted callers must be authenticated: with no tenant this used
+    to return the process-wide (untenanted) diagnostics snapshot to anyone.
     """
     tenant = await _get_tenant_from_request(request)
+    if tenant is None and _hosted_mode():
+        raise _authentication_required()
     hostname = (request.query_params.get("hostname") or "").strip() or None
     return _json_response(build_tunnel_diagnostics(tenant, hostname))
 
@@ -2856,12 +3027,21 @@ async def tunnel_launch_matrix(tenant_id: str, request: Request) -> Response:
     degrades to an empty project set (diagnostics-only response) rather than
     failing the request — matches ``get_tunnel_filesystem_roots``'s existing
     best-effort convention for this same tenant/project join.
+
+    ece2ac0a — hosted callers must be authenticated. The ``_db`` call below is
+    wrapped in a broad ``except`` (best-effort project listing), so it cannot
+    be relied on to refuse an anonymous caller; refuse explicitly first.
     """
     tenant = await _get_tenant_from_request(request)
+    if tenant is None and _hosted_mode():
+        raise _authentication_required()
     hostname = (request.query_params.get("hostname") or "").strip() or None
     try:
         db = await _db(request)
-        projects = await db_module.list_projects(db)
+        # RT-TI-005 (pass 3, F-D3) -- only the projects in the caller's scope: the matrix
+        # carries every project's id, name and executor config. A scope-resolution error
+        # degrades to the empty project set below (fails closed, never unfiltered).
+        projects = await _projects_in_scope(request, db)
     except Exception:  # noqa: BLE001 — unprovisioned/unreachable DB → diagnostics-only
         projects = []
     return _json_response(build_launch_matrix(tenant, hostname, projects))
@@ -3033,10 +3213,23 @@ async def install_plugin(request: Request) -> Response:
     Validates that the command starts with uvx or npx to prevent arbitrary
     execution. Returns {"ok": bool, "output": str}.
 
-    In hosted mode the server and user machine are different — this endpoint
-    still runs but installs on the server (not the user's machine). The
-    dashboard shows a copy-to-clipboard fallback for hosted users.
+    ece2ac0a — refused outright in hosted mode. It used to "still run" there,
+    unauthenticated: ``npx -y <pkg> --help`` / ``uvx <pkg> --help`` download
+    AND execute the named package's code, so anyone could run arbitrary code
+    on the hosted server. A hosted user's plugins run on their own machine via
+    the tunnel, so there is nothing legitimate to install server-side; the
+    dashboard already shows a copy-to-clipboard fallback for hosted users.
     """
+    if _hosted_mode():
+        return _json_response(
+            {
+                "ok": False,
+                "error": "Plugin install runs on the machine hosting Meridian and is "
+                         "disabled on hosted Meridian. Run the command on your own "
+                         "machine instead.",
+            },
+            status_code=403,
+        )
     import asyncio
     import sys
     try:
@@ -3308,7 +3501,10 @@ async def get_tunnel_filesystem_roots(request: Request) -> Response:
         })
     try:
         db = await _db(request)
-        projects = await db_module.list_projects(db)
+        # RT-TI-005 (pass 3, F-D3) -- the unions below are built from executor configs
+        # (repo paths, filesystem roots): a project-scoped member only gets their own
+        # projects' paths. Scope errors fall to the empty defaults (fail closed).
+        projects = await _projects_in_scope(request, db)
     except Exception:  # noqa: BLE001 — unprovisioned/unreachable DB → defaults
         projects = []
     return _json_response({
@@ -3594,10 +3790,28 @@ async def add_tunnel_filesystem_root(request: Request) -> Response:
     path = _normalize_root(body.get("path") if body.get("path") is not None else body.get("root"))
     if not path:
         return _json_response({"error": "path is required"}, status_code=400)
+    # Keep the capability check inside this route so it runs before either
+    # project configuration or the live tunnel is changed. The resolved scope
+    # object must stay intact for fail-closed policy evaluation.
+    from .. import _deps as policy_deps
+
     try:
         db = await _db(request)
-        projects = await db_module.list_projects(db)
+        await policy_deps._require_capability(
+            request, policy_deps.member_policy.WRITE_PROJECT
+        )
+        # RT-TI-005 (pass 3, F-D3) -- the root is written into a project's executor_config
+        # (the newest one handed to the helper): for a project-scoped member that must be
+        # one of THEIR projects, never another project of the workspace.
+        projects = await _projects_in_scope(request, db)
         roots = await _persist_add_filesystem_root(db, projects, path)
+    except policy_deps.member_policy.MemberPolicyDenied as exc:
+        return _json_response(exc.body(), status_code=exc.status_code)
+    except policy_deps.member_policy.MemberPolicyUnavailable as exc:
+        return _json_response(
+            {"error": "member_policy_unavailable", "detail": exc.detail},
+            status_code=exc.status_code,
+        )
     except Exception as exc:  # noqa: BLE001
         return _json_response({"error": f"could not persist root: {exc}"}, status_code=500)
     live = await send_add_fs_roots_control(tenant["id"], [path])
@@ -3630,10 +3844,25 @@ async def remove_tunnel_filesystem_root(request: Request) -> Response:
             pass
     if not path:
         return _json_response({"error": "path is required"}, status_code=400)
+    # Authorize the whole scoped operation before any persisted or live change.
+    from .. import _deps as policy_deps
+
     try:
         db = await _db(request)
-        projects = await db_module.list_projects(db)
+        await policy_deps._require_capability(
+            request, policy_deps.member_policy.WRITE_PROJECT
+        )
+        # RT-TI-005 (pass 3, F-D3) -- strip the root only from the caller's in-scope
+        # projects (see the POST route above).
+        projects = await _projects_in_scope(request, db)
         roots = await _persist_remove_filesystem_root(db, projects, path)
+    except policy_deps.member_policy.MemberPolicyDenied as exc:
+        return _json_response(exc.body(), status_code=exc.status_code)
+    except policy_deps.member_policy.MemberPolicyUnavailable as exc:
+        return _json_response(
+            {"error": "member_policy_unavailable", "detail": exc.detail},
+            status_code=exc.status_code,
+        )
     except Exception as exc:  # noqa: BLE001
         return _json_response({"error": f"could not persist removal: {exc}"}, status_code=500)
     live = await send_set_fs_roots_control(tenant["id"], roots)
@@ -3654,7 +3883,7 @@ async def remove_tunnel_filesystem_root(request: Request) -> Response:
 # so a stateless ``tools/call`` can find the owning tunnel without re-listing.
 # Cold/missing entries trigger a one-shot re-discovery via ``list_tunnel_tools``.
 
-_TUNNEL_LABELS = ("fs", "code", "extract", "ppt", "word", "dc", "docs", "zotero", "outputs", "debug") + _CUSTOM_SLOTS
+_TUNNEL_LABELS = ("fs", "code", "extract", "ppt", "word", "dc", "docs", "zotero", "outputs", "debug", "latex") + _CUSTOM_SLOTS
 
 # Human-readable connector prefix shown to Claude in tool names (e.g.
 # "filesystem:read_file" instead of "fs:read_file"). The routing cache still
@@ -3673,6 +3902,7 @@ SLOT_DISPLAY_NAMES = {
     "outputs": "meridian-outputs",
     # 121e6a27 — debug slot: tools namespaced as "mcp-debugger__set_breakpoint" etc.
     "debug": "mcp-debugger",
+    "latex": "meridian-latex",
     "p0": "custom-p0",
     "p1": "custom-p1",
     "p2": "custom-p2",
@@ -3878,6 +4108,8 @@ def _label_maps(label: str) -> "tuple[dict[str, WebSocket], dict[str, asyncio.Fu
         return _tunnel_outputs_sockets, _pending_outputs_reqs
     if label == "debug":
         return _tunnel_debug_sockets, _pending_debug_reqs
+    if label == "latex":
+        return _tunnel_latex_sockets, _pending_latex_reqs
     if label in _tunnel_custom_sockets:  # 8fb69d54 — custom slots p0-p3
         return _tunnel_custom_sockets[label], _pending_custom_reqs[label]
     return _tunnel_extract_sockets, _pending_extract_reqs
@@ -3896,6 +4128,7 @@ def has_active_tunnel(tenant_id: str) -> bool:
         or tenant_id in _tunnel_zotero_sockets
         or tenant_id in _tunnel_outputs_sockets
         or tenant_id in _tunnel_debug_sockets
+        or tenant_id in _tunnel_latex_sockets
         or any(tenant_id in s for s in _tunnel_custom_sockets.values())
     )
 
@@ -4082,6 +4315,7 @@ def active_tunnel_tenant_ids() -> "set[str]":
     ids.update(_tunnel_zotero_sockets)
     ids.update(_tunnel_outputs_sockets)
     ids.update(_tunnel_debug_sockets)
+    ids.update(_tunnel_latex_sockets)
     for s in _tunnel_custom_sockets.values():
         ids.update(s)
     return ids

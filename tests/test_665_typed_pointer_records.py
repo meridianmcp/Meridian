@@ -471,7 +471,7 @@ async def test_legacy_compact_pointer_rendering_unaffected_by_typed_clause(db, t
     )
 
     _, content, _ = await handoff_module.generate_handoff(
-        db, p["id"], str(tmp_path), skip_ai_summary=True,
+        db, p["id"], str(tmp_path), skip_ai_summary=True, mode="full",
     )
     # Legacy markdown rendering (36fea6ca) still present, unchanged.
     assert "Resolved pointers:" in content

@@ -14,11 +14,16 @@ that state as explicit keyword arguments to keep the import graph acyclic.
 from __future__ import annotations
 
 import asyncio
+import html
 from typing import Any, TYPE_CHECKING
 
 import meridian.server as _server
 from meridian import db as db_module
-from meridian._deps import validate_input_size
+from meridian import session_brief as session_brief_module
+from meridian._deps import _build_workspace_context_block, validate_input_size
+from meridian.mcp.scope_guard import WORKSPACE_SCOPED_ARG
+
+_ITEM_RECOVERY_XML_MAX_BYTES = 1800
 
 if TYPE_CHECKING:
     from collections.abc import Callable
@@ -298,7 +303,63 @@ async def handle_checkpoint(
             "in_progress / fail_sprint_item(item_id, reason) if not done. "
             "These are NOT auto-reconciled from git — you must mark them."
         )
+    # Deep project-state snapshots are separate from the small, replaceable
+    # checkpoint_data above. Routine checkpoints stay unchanged unless the
+    # caller declares a material transition or reports risk signals.
+    if (
+        args.get("milestone_trigger")
+        or args.get("risk_signals")
+        or args.get("artifact_manifest") is not None
+    ):
+        from meridian.session_milestones import (  # noqa: PLC0415
+            maybe_capture_project_state_milestone,
+        )
+
+        try:
+            _milestone_result = await maybe_capture_project_state_milestone(
+                db,
+                project_id,
+                session_id,
+                version=_ckpt_version,
+                milestone_trigger=args.get("milestone_trigger"),
+                risk_signals=args.get("risk_signals"),
+                artifact_manifest=args.get("artifact_manifest"),
+            )
+            _ckpt_resp["milestone_escalation"] = _milestone_result.get("escalation")
+            if _milestone_result.get("captured"):
+                _ckpt_resp["project_state_milestone"] = _milestone_result.get("milestone")
+                _ckpt_resp["milestone_pointer"] = _milestone_result.get("pointer")
+        except ValueError:
+            raise
+        except Exception as exc:  # noqa: BLE001 — never lose the routine checkpoint
+            _ckpt_resp["milestone_error"] = type(exc).__name__
     return _ckpt_resp
+
+
+async def handle_get_project_state_milestones(
+    args: dict[str, Any],
+    db: Any,
+    data_dir: str,
+    tenant: dict[str, Any] | None,
+    _mcp_tenant_id: Any,
+) -> dict[str, Any]:
+    """Read project-scoped immutable milestones with content-hash status."""
+    project_id = args.get("project_id")
+    if not isinstance(project_id, str) or not project_id.strip():
+        raise ValueError("project_id is required")
+    limit = args.get("limit", 20)
+    before_sequence = args.get("before_sequence")
+    rows = await db_module.list_project_state_milestones(
+        db,
+        project_id.strip(),
+        limit=limit,
+        before_sequence=before_sequence,
+    )
+    return {
+        "project_id": project_id.strip(),
+        "milestones": rows,
+        "next_before_sequence": min((int(row["sequence"]) for row in rows), default=None),
+    }
 
 
 async def handle_register_external_job(
@@ -509,9 +570,15 @@ async def handle_get_context_block(
     )
     # v3.1 — workspace decisions + notes apply across all projects; surface
     # them at the very top so a fresh session sees org-wide truth first.
-    ws_decisions = await db_module.get_workspace_decisions(db, tenant_id=_mcp_tenant_id)
-    ws_notes = await db_module.get_workspace_notes(db, tenant_id=_mcp_tenant_id)
-    ws_block = _server._render_workspace_block(ws_decisions, ws_notes)
+    # 0b0b24d8 — a bounded index by default, full text only when
+    # include_workspace_context is on (see _build_workspace_context_block).
+    # A project-scoped caller (flag set by the dispatcher) gets no workspace section: the
+    # owner's workspace rows are not project data, and the tenant filter alone would still
+    # pass the pre-isolation (NULL tenant) rows through.
+    ws_block = await _build_workspace_context_block(
+        db, tenant_id=_mcp_tenant_id,
+        include_workspace=not args.get(WORKSPACE_SCOPED_ARG),
+    )
     if ws_block:
         text = f"{ws_block}\n\n{text}"
     xml_text = f'<meridian_context project_id="{project_id}" mode="{mode}">\n{text}\n</meridian_context>'
@@ -1127,6 +1194,33 @@ async def handle_social_search(
     )
 
 
+async def handle_zotero_search(
+    args: dict[str, Any],
+    db: Any,
+    data_dir: str,
+    tenant: dict[str, Any] | None,
+    _mcp_tenant_id: Any,
+) -> Any:
+    """MCP tool: zotero_search.
+
+    7273d2fa — Zotero library search sibling to paper_search/social_search/
+    github_search (811881c6/f65f6111/d58000c6), following the identical
+    per-source pattern, but over the caller's OWN Zotero library rather than
+    a public corpus. A public group library needs no credential; a private
+    user library needs a Zotero API key. This hosted tool accepts no key;
+    private user libraries must use the local Zotero MCP connection so the
+    credential stays on the workstation.
+    """
+    from meridian.zotero_search import zotero_search  # noqa: PLC0415
+    return await zotero_search(
+        args.get("query", ""),
+        library_type=args.get("library_type", "user"),
+        library_id=args.get("library_id", ""),
+        limit=args.get("limit", 10),
+        sort_by=args.get("sort_by", "relevance"),
+    )
+
+
 async def handle_get_session_brief(
     args: dict[str, Any],
     db: Any,
@@ -1137,6 +1231,11 @@ async def handle_get_session_brief(
     """MCP tool: get_session_brief.
 
     v2.5 — single-call orientation, <500 tokens, XML output.
+
+    Cache-stable layout (sprint 9cbaf379 W1): static project facts come first,
+    then session_brief_module.VOLATILE_BOUNDARY, then live board state (counts,
+    pending items, claims, HITL, the new-items counter). Pending items use the
+    shared stable_item_order, so the output does not depend on insertion order.
     """
     project_id = args["project_id"]
     role = args.get("role", "worker")
@@ -1145,7 +1244,9 @@ async def handle_get_session_brief(
     tasks = await db_module.get_tasks(db, project_id, limit=5)
     # dcf1e428 — use 'recent' to surface pending + answered last 24h for planning sessions
     hitl_rows = await db_module.list_hitl_requests(db, project_id, status="recent")
-    sprint_items = await db_module.get_sprint_items(db, project_id, status="pending")
+    sprint_items = session_brief_module.stable_item_order(
+        await db_module.get_sprint_items(db, project_id, status="pending")
+    )
     # 0507f4a1 — sprint progress summary for session brief
     _all_items_for_progress = await db_module.get_sprint_items(db, project_id)
     _done_count = sum(1 for it in _all_items_for_progress if it.get("status") == "done")
@@ -1213,7 +1314,29 @@ async def handle_get_session_brief(
     # v2.6 — include session scratch-pad notes at top of brief
     notes_xml = ""
     new_items_xml = ""
+    item_recovery_xml = ""
     if session_id_for_notes:
+        try:
+            recovery = await session_brief_module.get_item_recovery_context(
+                db, project_id, session_id_for_notes
+            )
+            recovery_lines = session_brief_module.build_item_recovery_lines(
+                recovery, max_bytes=1200
+            )
+            opening = '<item_recovery trust="untrusted" source="Meridian sprint board">\n'
+            entries: list[str] = []
+            used = len(opening.encode("utf-8")) + len("\n</item_recovery>\n".encode("utf-8"))
+            for line in recovery_lines:
+                entry = f"  <entry>{html.escape(line, quote=False)}</entry>\n"
+                cost = len(entry.encode("utf-8"))
+                if used + cost > _ITEM_RECOVERY_XML_MAX_BYTES:
+                    break
+                entries.append(entry)
+                used += cost
+            if entries:
+                item_recovery_xml = opening + "".join(entries) + "</item_recovery>\n"
+        except Exception:
+            item_recovery_xml = ""
         try:
             session_notes = await db_module.get_session_notes(db, session_id_for_notes)
             if session_notes:
@@ -1248,14 +1371,15 @@ async def handle_get_session_brief(
         if _total_count else ""
     )
     # Sprint-4: planner role gets richer context — all decisions + all notes + active sessions.
-    planner_extra_xml = ""
+    planner_static_xml = ""  # decisions and project notes: static project facts
+    planner_live_xml = ""  # active sessions: live
     if role == "planner":
         try:
             _decisions = await db_module.get_pinned_decisions(db, project_id, include_superseded=False)
             if _decisions:
                 # 366317e9 — already ordered urgent → normal → low by the DB
                 # layer; surface the priority so the planner weights them.
-                planner_extra_xml += "<decisions>\n" + "\n".join(
+                planner_static_xml += "<decisions>\n" + "\n".join(
                     f'  <decision priority="{d.get("priority","normal")}" category="{d.get("category","")}">{(d.get("title") or "")}: {(d.get("body") or "")[:120]}</decision>'
                     for d in _decisions[:20]
                 ) + "\n</decisions>\n"
@@ -1267,7 +1391,7 @@ async def handle_get_session_brief(
             # High-priority notes first
             _wiki_notes = sorted(_wiki_notes, key=lambda n: {"high": 0, "normal": 1, "low": 2}.get(n.get("priority", "normal"), 1))
             if _wiki_notes:
-                planner_extra_xml += "<project_notes>\n" + "\n".join(
+                planner_static_xml += "<project_notes>\n" + "\n".join(
                     f'  <note priority="{n.get("priority","normal")}" kind="{n.get("note_kind","wiki")}" tags="{n.get("tags","")}">'
                     f'{(n.get("title") or "")}: {(n.get("body") or "")[:120]}</note>'
                     for n in _wiki_notes[:30]
@@ -1277,14 +1401,15 @@ async def handle_get_session_brief(
         try:
             _active_sessions = await db_module.get_sessions(db, project_id, active_only=True)
             if _active_sessions:
-                planner_extra_xml += "<active_sessions>\n" + "\n".join(
+                planner_live_xml += "<active_sessions>\n" + "\n".join(
                     f'  <session id="{s.get("id","")}" name="{s.get("name","")}" human="{s.get("human_id","")}" last_seen="{s.get("last_seen","")[:19]}"/>'
                     for s in _active_sessions[:10]
                 ) + "\n</active_sessions>\n"
         except Exception:
             pass
     # 1750dccf — role-specific enrichment so executor and planner briefs differ.
-    role_extra_xml = ""
+    role_static_xml = ""  # planner: decisions needing revisit, from pinned decisions
+    role_live_xml = ""  # claims, version scope, last session, relevant decisions for held files
     if role == "executor":
         # Version-scoped pending items + this session's file claims + the
         # decisions code-anchored to the files it holds.
@@ -1300,7 +1425,7 @@ async def handle_get_session_brief(
         _ver = (_sess_row or {}).get("sprint_version")
         if _ver:
             _scoped = [it for it in sprint_items if it.get("version") == _ver]
-            role_extra_xml += (
+            role_live_xml += (
                 f'<version_scope version="{_ver}" pending="{len(_scoped)}">\n'
                 + "\n".join(
                     f'  <item>{(it.get("title") or "")[:80]}</item>'
@@ -1316,7 +1441,7 @@ async def handle_get_session_brief(
             except Exception:
                 _claimed = []
             if _claimed:
-                role_extra_xml += (
+                role_live_xml += (
                     "<my_file_claims>\n"
                     + "\n".join(f"  <file>{c}</file>" for c in _claimed[:20])
                     + "\n</my_file_claims>\n"
@@ -1334,7 +1459,7 @@ async def handle_get_session_brief(
                     except Exception:
                         pass
                 if _rel:
-                    role_extra_xml += (
+                    role_live_xml += (
                         "<relevant_decisions>\n"
                         + "\n".join(
                             f'  <decision anchor="{d.get("code_anchor","")}">'
@@ -1354,7 +1479,7 @@ async def handle_get_session_brief(
         except Exception:
             _ls = None
         if _ls:
-            role_extra_xml += (
+            role_live_xml += (
                 f'<last_session name="{_ls.get("name","")}" '
                 f'status="{_ls.get("status","")}">\n'
                 + "".join(
@@ -1371,7 +1496,7 @@ async def handle_get_session_brief(
                 and d.get("assumption_status") != "confirmed"
             ]
             if _revisit:
-                role_extra_xml += (
+                role_static_xml += (
                     "<decisions_needing_revisit>\n"
                     + "\n".join(
                         f'  <decision status="{d.get("assumption_status")}">'
@@ -1383,19 +1508,31 @@ async def handle_get_session_brief(
                 )
         except Exception:
             pass
-    brief = (
-        f'<session_brief project_id="{project_id}" role="{role}">\n'
+    # Static part: identical across calls for the same project and role.
+    static_xml = (
+        f'<sprint>{sprint_str[:200]}</sprint>\n'
+        f'{planner_static_xml}'
+        f'{role_static_xml}'
+    )
+    # Volatile part: live board state, claims, HITL and the new-items counter.
+    volatile_xml = (
+        f'{item_recovery_xml}'
         f'{notes_xml}'
         f'{new_items_xml}'
         f'{_progress_xml}'
-        f'<sprint>{sprint_str[:200]}</sprint>\n'
         f'<pending_items>\n{sprint_items_xml}\n</pending_items>\n'
         f'<last_tasks>\n{tasks_xml}\n</last_tasks>\n'
         f'{blocking_xml}\n'
         f'{hitl_xml}\n'
         f'{external_jobs_xml}'
-        f'{planner_extra_xml}'
-        f'{role_extra_xml}'
+        f'{planner_live_xml}'
+        f'{role_live_xml}'
+    )
+    brief = (
+        f'<session_brief project_id="{project_id}" role="{role}">\n'
+        f'{static_xml}'
+        f'{session_brief_module.VOLATILE_BOUNDARY}\n'
+        f'{volatile_xml}'
         f'</session_brief>'
     )
     return {"text": brief, "project_id": project_id, "role": role}

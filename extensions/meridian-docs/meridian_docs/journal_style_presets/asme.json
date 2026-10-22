@@ -1,0 +1,22 @@
+{
+  "meta": {
+    "journal": "asme",
+    "display_name": "American Society of Mechanical Engineers journals",
+    "publisher": "American Society of Mechanical Engineers",
+    "status": "populated",
+    "status_detail": "Mechanically migrated 2026-09-18 from the JOURNAL_STYLE_PRESETS dict literal in docs_intel.py (round 2, proposal 64266f13, dated 2026-09-11) as part of the JSON-preset externalization work (proposal 3b93b7ef) -- values and evidence carried over verbatim from the real in-code comment, not regenerated. NOTE (flagged in proposal 64266f13's review section for extra scrutiny -- NOT a substitution caveat, so status stays 'populated' rather than 'partially_populated'): ASME is the other of the two publishers (with asce) called out as directly relevant to the JCSHM thesis domain this preset mechanism originated from. Figure DPI is left unspecified/absent -- the guidance found states figures 'must have sufficient resolution to ensure text readability' without a specific numeric floor.",
+    "last_verified": "2026-09-11"
+  },
+  "fields": {
+    "citation_style": {
+      "value": "numbered_bracket",
+      "tier": 2,
+      "source": {
+        "type": "live_guidelines_page",
+        "citation": "asme.org/publications-submissions/journals/information-for-authors/journal-guidelines/writing-a-research-paper; asme.org/publications-submissions/journals/information-for-authors/journal-guidelines/references",
+        "note": "references are cited in numerical order with the numbered citation enclosed in brackets (bibliographic-entry formatting itself follows Chicago Manual of Style, but the in-text convention is numbered-bracket)."
+      },
+      "verified_date": "2026-09-11"
+    }
+  }
+}

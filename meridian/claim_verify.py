@@ -57,6 +57,8 @@ import os
 import sys
 import urllib.error
 import urllib.request
+
+from .hook_auth import bearer_headers_from_env
 from typing import Any, Callable
 
 logger = logging.getLogger(__name__)
@@ -206,7 +208,8 @@ def fetch_sprint_item_live(
     """
     url = f"{base_url.rstrip('/')}/projects/{project_id}/sprint-items/{item_id}"
     try:
-        with urllib.request.urlopen(url, timeout=timeout) as resp:  # noqa: S310 — trusted, own MERIDIAN_URL
+        request = urllib.request.Request(url, headers=bearer_headers_from_env())
+        with urllib.request.urlopen(request, timeout=timeout) as resp:  # noqa: S310 — trusted, own MERIDIAN_URL
             data = json.loads(resp.read().decode("utf-8"))
     except (urllib.error.URLError, TimeoutError, ValueError, OSError):
         return None

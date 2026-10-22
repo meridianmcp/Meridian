@@ -568,26 +568,29 @@ def test_settings_wires_pkg_install_guard_pretooluse():
 
 
 def test_settings_pkg_guard_matcher_includes_bash():
-    """The pkg_install_guard hook entry must match Bash tool calls."""
+    """The pkg_install_guard hook entry must match Bash and (55d48d69) PowerShell
+    tool calls -- the PowerShell tool runs the same install commands."""
     cfg = json.loads(_SETTINGS.read_text(encoding="utf-8"))
     pre = cfg.get("hooks", {}).get("PreToolUse", [])
-    for entry in pre:
-        if "pkg_install_guard" in json.dumps(entry.get("hooks", [])):
-            matcher = entry.get("matcher", "")
-            assert "Bash" in matcher, (
-                f"pkg_install_guard matcher must include Bash, got: {matcher!r}"
-            )
-            break
+    entries = [e for e in pre if "pkg_install_guard" in json.dumps(e.get("hooks", []))]
+    assert entries, "PreToolUse must include a pkg_install_guard hook entry"
+    matcher = entries[0].get("matcher", "")
+    for tool in ("Bash", "PowerShell"):
+        assert tool in matcher.split("|"), (
+            f"pkg_install_guard matcher must include {tool}, got: {matcher!r}"
+        )
 
 
 def test_settings_existing_hooks_preserved():
-    """Adding pkg_install_guard must not remove any pre-existing hooks."""
+    """Adding pkg_install_guard must not remove any pre-existing hooks.
+    code_intel_guard was superseded by the Meridian guard (55d48d69)."""
     cfg = json.loads(_SETTINGS.read_text(encoding="utf-8"))
     hooks = cfg.get("hooks", {})
     pre = json.dumps(hooks.get("PreToolUse", []))
     assert "hitl_guard" in pre, "hitl_guard PreToolUse hook must still be wired"
     assert "secret_guard" in pre, "secret_guard PreToolUse hook must still be wired"
-    assert "code_intel_guard" in pre, "code_intel_guard PreToolUse hook must still be wired"
+    assert "meridian_guard" in pre, "the meridian_guard PreToolUse dispatcher must be wired"
+    assert "code_intel_guard" not in pre, "code_intel_guard is superseded and must stay unregistered"
     stop = json.dumps(hooks.get("Stop", []))
     assert "sprint_guard" in stop, "sprint_guard Stop hook must still be wired"
 

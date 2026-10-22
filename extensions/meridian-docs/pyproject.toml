@@ -49,7 +49,7 @@ meridian-docs-mcp = "meridian_docs.server:main"
 
 [project.urls]
 Homepage = "https://usemeridian.us"
-Source = "https://github.com/meridianmcp/meridian-docs"
+Source = "https://github.com/meridianmcp/Meridian/tree/main/extensions/meridian-docs"
 
 [tool.hatch.build.targets.wheel]
 packages = ["meridian_docs"]

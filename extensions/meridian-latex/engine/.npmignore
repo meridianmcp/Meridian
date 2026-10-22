@@ -1,0 +1,26 @@
+# dist/ ships in the published tarball (see "files" in package.json), but
+# the test files compiled into it alongside real source do not -- they're
+# built into the same dist/ tree as everything else (see build.mjs's
+# header comment: one esbuild pass over all of src/**/*.ts, tests included,
+# so `node --test dist/**/*.test.js` exercises the literal shipped
+# artifact). This excludes every compiled test-file variant (transpiled JS,
+# its sourcemap, its declaration file, and the declaration's sourcemap) so
+# none of them leak into what `npm publish`/`npm pack` actually ships.
+#
+# VERIFIED GAP (spot-checked in the final-cutover batch via a real
+# `npm pack --dry-run`, as the migration plan flagged as unconfirmed): with
+# this repo's npm (8.15.0), listing a bare directory ("dist") in package.json's
+# "files" includes it WHOLESALE -- .npmignore has NO effect on paths inside
+# it; a dry-run with only this file in place still packed every
+# dist/**/*.test.* variant. The actual, verified-working exclusion is the
+# negated glob entries in package.json's own "files" array
+# (!dist/**/*.test.js etc.), which npm's own "files" matching (not a
+# separate ignore file) does honor. This .npmignore is kept anyway, with
+# the same patterns, as harmless defense-in-depth in case a different npm
+# version's precedence between "files" and .npmignore differs -- but do
+# not assume this file alone does the job; the "files" array is what's
+# load-bearing.
+dist/**/*.test.js
+dist/**/*.test.js.map
+dist/**/*.test.d.ts
+dist/**/*.test.d.ts.map

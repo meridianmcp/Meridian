@@ -677,3 +677,29 @@ def test_infer_generating_script_hint_no_marker_returns_none():
 def test_infer_generating_script_hint_blank_returns_none():
     assert oi.infer_generating_script_hint("") is None
     assert oi.infer_generating_script_hint(None) is None
+
+
+
+def test_outputs_fts_convergence_exposes_canonical_scope_and_resolves_path_aliases(tmp_path):
+    from meridian.outputs_indexer import OutputsFtsIndex
+
+    root = tmp_path / "outputs"
+    root.mkdir()
+    alias_parent = tmp_path / "alias"
+    alias_parent.mkdir()
+    alias = alias_parent / ".." / "outputs"
+
+    first = OutputsFtsIndex(str(root))
+    second = OutputsFtsIndex(str(alias))
+    try:
+        first_state = first.get_convergence_state()
+        second_state = second.get_convergence_state()
+        expected_root = str(root.resolve()).replace("\\", "/").casefold()
+        assert first.canonical_root.casefold() == expected_root
+        assert second.canonical_root.casefold() == expected_root
+        assert first_state["canonical_root"].casefold() == expected_root
+        assert first_state["scope_id"] == second_state["scope_id"]
+        assert first_state["scope_id"].startswith("outputs:")
+    finally:
+        first.close()
+        second.close()

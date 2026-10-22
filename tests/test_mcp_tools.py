@@ -120,6 +120,12 @@ def _full_tool_text(tool: dict) -> str:
     return " ".join(parts).lower()
 
 
+def test_zotero_search_tool_does_not_expose_api_key_input():
+    tool = next(t for t in _MCP_TOOLS_LIST if t["name"] == "zotero_search")
+    assert "api_key" not in tool["inputSchema"]["properties"]
+    assert "ZOTERO_API_KEY" not in _full_tool_text(tool)
+
+
 def test_doc_store_tools_name_ingest_document_as_prerequisite():
     """832d67af — the doc-store tools resolve their target via
     get_document(doc_documents). Ground truth (handler.py: the post-ingest

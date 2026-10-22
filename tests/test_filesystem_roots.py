@@ -511,17 +511,22 @@ def test_get_tunnel_filesystem_roots_no_tenant_returns_empty(monkeypatch):
     }
 
 
-def test_fetch_filesystem_roots_parses_new_fields(monkeypatch):
-    """b970fe07 — the client fetch returns the 4-tuple, parsing/sanitising the
-    two new fields from the route JSON."""
+def test_fetch_filesystem_roots_parses_new_fields(monkeypatch, tmp_path):
+    """Remote root aliases collapse to one canonical identity for all slots."""
+    root = tmp_path / "repo"
+    root.mkdir()
+    alias_parent = tmp_path / "alias"
+    alias_parent.mkdir()
+    alias = alias_parent / ".." / "repo"
+
     class _FakeResp:
         status_code = 200
         def json(self):
             return {
-                "filesystem_roots": ["/a", " ", 5],
-                "known_repo_paths": ["/repo"],
-                "serena_repo_path": "  /serena  ",
-                "codebase_code_dirs": ["/c1", "", "/c2 "],
+                "filesystem_roots": [str(alias), str(root), " ", 5],
+                "known_repo_paths": [str(root)],
+                "serena_repo_path": f"  {alias}  ",
+                "codebase_code_dirs": [str(alias), "", str(root)],
             }
 
     class _FakeClient:
@@ -535,10 +540,13 @@ def test_fetch_filesystem_roots_parses_new_fields(monkeypatch):
     fs, known, serena, code = asyncio.run(
         tc._fetch_filesystem_roots("https://x", "sk_tok")
     )
-    assert fs == ["/a"]
-    assert known == ["/repo"]
-    assert serena == "/serena"
-    assert code == ["/c1", "/c2"]
+    canonical = tc.os.path.normcase(
+        tc.os.path.realpath(tc.os.path.abspath(str(root)))
+    )
+    assert fs == [canonical]
+    assert known == [canonical]
+    assert serena == canonical
+    assert code == [canonical]
 
 
 def test_fetch_filesystem_roots_defaults_on_error(monkeypatch):
@@ -946,3 +954,147 @@ def test_add_then_delete_route_roundtrip_real_db(monkeypatch):
     assert del_data["roots"] == ["/new/dir"]
     assert after_del["filesystem_roots"] == ["/new/dir"]
     set_spy.assert_awaited_once_with("t1", ["/new/dir"])
+
+
+def _patch_filesystem_member_policy(
+    monkeypatch, *, allows_write, project_ids=("p1",), unavailable=False
+):
+    """Return a real policy-bearing scope through the route's scope resolver."""
+    from meridian import _deps, member_policy
+
+    if unavailable:
+
+        async def resolve_scope(_request):
+            raise member_policy.MemberPolicyUnavailable("policy table unavailable")
+
+    else:
+        caps = {member_policy.WRITE_PROJECT} if allows_write else set()
+        policy = member_policy.EffectivePolicy(caps=frozenset(caps), role="member")
+        scoped = member_policy.ScopedProjectIds(
+            project_ids, policy=policy, role="member", email="member@example.test"
+        )
+
+        async def resolve_scope(_request):
+            return scoped
+
+    monkeypatch.setattr(_deps, "_scoped_project_ids_for_request", resolve_scope)
+
+
+def test_add_route_denies_scoped_member_without_write_project_before_any_changes(monkeypatch):
+    projects = [
+        {"id": "p1", "executor_config": json.dumps({"filesystem_roots": ["/one"]})},
+        {"id": "p2", "executor_config": json.dumps({"filesystem_roots": ["/two"]})},
+    ]
+    _patch_route_db(monkeypatch, projects)
+    _patch_filesystem_member_policy(monkeypatch, allows_write=False, project_ids=("p1", "p2"))
+    persisted = AsyncMock(return_value=["/one", "/two", "/new"])
+    live = AsyncMock(return_value={"status": "ok"})
+    monkeypatch.setattr(tn, "_persist_add_filesystem_root", persisted)
+    monkeypatch.setattr(tn, "send_add_fs_roots_control", live)
+
+    resp = asyncio.run(tn.add_tunnel_filesystem_root(_FakeReq(body={"path": "/new"})))
+
+    data = _decode_route_body(resp)
+    assert resp.status_code == 403
+    assert data["error"] == "capability_required"
+    assert data["capability"] == "write_project"
+    persisted.assert_not_awaited()
+    live.assert_not_awaited()
+
+
+def test_delete_route_denies_scoped_member_without_write_project_before_any_changes(monkeypatch):
+    projects = [
+        {"id": "p1", "executor_config": json.dumps({"filesystem_roots": ["/one"]})},
+        {"id": "p2", "executor_config": json.dumps({"filesystem_roots": ["/two"]})},
+    ]
+    _patch_route_db(monkeypatch, projects)
+    _patch_filesystem_member_policy(monkeypatch, allows_write=False, project_ids=("p1", "p2"))
+    persisted = AsyncMock(return_value=["/two"])
+    live = AsyncMock(return_value={"status": "ok"})
+    monkeypatch.setattr(tn, "_persist_remove_filesystem_root", persisted)
+    monkeypatch.setattr(tn, "send_set_fs_roots_control", live)
+
+    resp = asyncio.run(tn.remove_tunnel_filesystem_root(_FakeReq(body={"path": "/one"})))
+
+    data = _decode_route_body(resp)
+    assert resp.status_code == 403
+    assert data["error"] == "capability_required"
+    assert data["capability"] == "write_project"
+    persisted.assert_not_awaited()
+    live.assert_not_awaited()
+
+
+def test_add_route_allows_write_project_but_excludes_out_of_scope_projects(monkeypatch):
+    projects = [
+        {"id": "p1", "executor_config": json.dumps({"filesystem_roots": ["/one"]})},
+        {"id": "outside", "executor_config": json.dumps({"filesystem_roots": ["/private"]})},
+    ]
+    _patch_route_db(monkeypatch, projects)
+    _patch_filesystem_member_policy(monkeypatch, allows_write=True, project_ids=("p1",))
+    persisted = AsyncMock(return_value=["/one", "/new"])
+    live = AsyncMock(return_value={"status": "ok"})
+    monkeypatch.setattr(tn, "_persist_add_filesystem_root", persisted)
+    monkeypatch.setattr(tn, "send_add_fs_roots_control", live)
+
+    resp = asyncio.run(tn.add_tunnel_filesystem_root(_FakeReq(body={"path": "/new"})))
+
+    assert resp.status_code == 200
+    assert [project["id"] for project in persisted.await_args.args[1]] == ["p1"]
+    persisted.assert_awaited_once()
+    live.assert_awaited_once_with("t1", ["/new"])
+    assert projects[1]["executor_config"] == json.dumps({"filesystem_roots": ["/private"]})
+
+
+def test_delete_route_allows_write_project_but_excludes_out_of_scope_projects(monkeypatch):
+    projects = [
+        {"id": "p1", "executor_config": json.dumps({"filesystem_roots": ["/shared"]})},
+        {"id": "outside", "executor_config": json.dumps({"filesystem_roots": ["/shared"]})},
+    ]
+    _patch_route_db(monkeypatch, projects)
+    _patch_filesystem_member_policy(monkeypatch, allows_write=True, project_ids=("p1",))
+    persisted = AsyncMock(return_value=[])
+    live = AsyncMock(return_value={"status": "ok"})
+    monkeypatch.setattr(tn, "_persist_remove_filesystem_root", persisted)
+    monkeypatch.setattr(tn, "send_set_fs_roots_control", live)
+
+    resp = asyncio.run(tn.remove_tunnel_filesystem_root(_FakeReq(body={"path": "/shared"})))
+
+    assert resp.status_code == 200
+    assert [project["id"] for project in persisted.await_args.args[1]] == ["p1"]
+    persisted.assert_awaited_once()
+    live.assert_awaited_once_with("t1", [])
+    assert projects[1]["executor_config"] == json.dumps({"filesystem_roots": ["/shared"]})
+
+
+def test_add_route_fails_closed_when_member_policy_is_unavailable(monkeypatch):
+    projects = [{"id": "p1", "executor_config": json.dumps({"filesystem_roots": []})}]
+    _patch_route_db(monkeypatch, projects)
+    _patch_filesystem_member_policy(monkeypatch, allows_write=False, unavailable=True)
+    persisted = AsyncMock(return_value=["/new"])
+    live = AsyncMock(return_value={"status": "ok"})
+    monkeypatch.setattr(tn, "_persist_add_filesystem_root", persisted)
+    monkeypatch.setattr(tn, "send_add_fs_roots_control", live)
+
+    resp = asyncio.run(tn.add_tunnel_filesystem_root(_FakeReq(body={"path": "/new"})))
+
+    assert resp.status_code == 503
+    assert _decode_route_body(resp)["error"] == "member_policy_unavailable"
+    persisted.assert_not_awaited()
+    live.assert_not_awaited()
+
+
+def test_delete_route_fails_closed_when_member_policy_is_unavailable(monkeypatch):
+    projects = [{"id": "p1", "executor_config": json.dumps({"filesystem_roots": ["/old"]})}]
+    _patch_route_db(monkeypatch, projects)
+    _patch_filesystem_member_policy(monkeypatch, allows_write=False, unavailable=True)
+    persisted = AsyncMock(return_value=[])
+    live = AsyncMock(return_value={"status": "ok"})
+    monkeypatch.setattr(tn, "_persist_remove_filesystem_root", persisted)
+    monkeypatch.setattr(tn, "send_set_fs_roots_control", live)
+
+    resp = asyncio.run(tn.remove_tunnel_filesystem_root(_FakeReq(body={"path": "/old"})))
+
+    assert resp.status_code == 503
+    assert _decode_route_body(resp)["error"] == "member_policy_unavailable"
+    persisted.assert_not_awaited()
+    live.assert_not_awaited()

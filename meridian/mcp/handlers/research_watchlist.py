@@ -407,10 +407,21 @@ async def handle_run_watchlist_query(
         saved_note = saved.get("note") or {}
         note_id = saved_note.get("id")
         if note_id:
-            existing_tags = saved_note.get("tags") or ""
-            merged_tags = f"{existing_tags},watchlist:{watchlist_id},item:{key}"
-            await db_module.update_project_note(db, note_id, tags=merged_tags)
-        captured.append({"item_key": key, "title": title, "note_id": note_id})
+            # Add only the watchlist/item tags the note lacks. fe0b0331: when the
+            # project already held a finding for this source, save_finding
+            # returned THAT note instead of a copy; tagging it here is what keeps
+            # this watchlist's next run from reporting the same result as new.
+            merged = [
+                t.strip() for t in (saved_note.get("tags") or "").split(",") if t.strip()
+            ]
+            for watch_tag in (f"watchlist:{watchlist_id}", f"item:{key}"):
+                if watch_tag not in merged:
+                    merged.append(watch_tag)
+            await db_module.update_project_note(db, note_id, tags=",".join(merged))
+        entry: dict[str, Any] = {"item_key": key, "title": title, "note_id": note_id}
+        if saved.get("duplicate"):
+            entry["existing_note_id"] = saved.get("existing_note_id")
+        captured.append(entry)
 
     return {
         "watchlist_id": watchlist_id,

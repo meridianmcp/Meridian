@@ -1,3 +1,11 @@
+# DEPRECATED (55d48d69): superseded by meridian_guard.ps1 and no longer registered
+# in .claude/settings.json. The guard covers the same ground without a
+# network call: G1 denies Grep code search in a fresh own index, G2 advises
+# on stale indexes and code Globs, G3/G4 cover shell and dc searches. Kept
+# one release for installs that still register it; delete it after that.
+# Do not re-register it: it probes localhost:7878 on every Grep/Glob and
+# hangs 4-5 s when nothing listens there.
+#
 # aeba8a80 -- PreToolUse code-intel guard (structural, not text).
 # 81b10dec -- extended: proactive slot warmup + visible fallback logging.
 #

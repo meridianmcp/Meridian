@@ -286,6 +286,37 @@ def test_index_docx_chunks_idempotent(tmp_path):
     assert len(hits) == 1
 
 
+
+def test_index_docx_sidecar_records_canonical_source_and_rejects_mixing(tmp_path):
+    source_path = tmp_path / "source.docx"
+    source_path.write_bytes(_basic_docx())
+    db = str(tmp_path / "source.idx.sqlite")
+
+    first = docs_intel.index_docx(str(source_path), db)
+    assert first["canonical_source"].casefold() == str(source_path.resolve()).casefold()
+    assert first["scope_id"] == f"source:{first['canonical_source']}"
+
+    alias_dir = tmp_path / "alias"
+    alias_dir.mkdir()
+    alias_path = alias_dir / ".." / source_path.name
+    same_source = docs_intel.index_docx(str(alias_path), db)
+    assert same_source["scope_id"] == first["scope_id"]
+    assert same_source["delta"]["unchanged"] == first["paragraph_count"]
+
+    other_path = tmp_path / "other.docx"
+    other_path.write_bytes(_basic_docx())
+    try:
+        docs_intel.index_docx(str(other_path), db)
+    except ValueError as exc:
+        assert "different DOCX source" in str(exc)
+    else:
+        raise AssertionError("a DOCX sidecar must not accept a second source")
+
+    still_scoped = docs_intel.index_docx(str(source_path), db)
+    assert still_scoped["scope_id"] == first["scope_id"]
+    assert still_scoped["delta"]["unchanged"] == first["paragraph_count"]
+
+
 def test_fts5_search_chunks_heading_match_outranks_body_match(tmp_path):
     """A term in a heading ranks above the same term appearing only in body prose.
 

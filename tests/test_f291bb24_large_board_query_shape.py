@@ -122,9 +122,17 @@ async def test_count_new_sprint_items_since_matches_ground_truth(db):
     ]
     assert new_count == len(ground_truth_new)
     assert urgent_count == len(ground_truth_urgent)
-    # Sanity: the board actually has urgent items in the tail (i % 37 == 0
-    # guarantees at least one urgent item beyond index 100 for count=150).
-    assert urgent_count > 0
+    # Seeded rows can share a timestamp when the batch runs within one clock
+    # tick, so the index-100 cutoff may not leave any rows strictly after it.
+    # A pre-ISO sentinel independently exercises the urgent aggregate across
+    # the whole board and keeps that sanity check deterministic.
+    all_count, all_urgent_count = await db_module.count_new_sprint_items_since(
+        db, p["id"], ""
+    )
+    assert all_count == len(all_before)
+    assert all_urgent_count == sum(
+        1 for item in all_before if item.get("priority") == "urgent"
+    )
 
 
 @pytest.mark.asyncio

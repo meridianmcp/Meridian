@@ -234,10 +234,9 @@ async def handle_add_sprint_item(
     # a8550238 — surface code-prospecting context INLINE at add time, so the
     # planner sees which real files/symbols the item touches (and can prospect
     # them) while the sprint is still being shaped — not only later at claim
-    # time. 926bf221 — always report an explicit prospecting_status so the
-    # caller can distinguish prospected / no-targets / skipped / errored.
+    # time. 926bf221 / 19aa84a7 — report an explicit status, with "prospected"
+    # reserved for items that satisfy the durable executable-gate predicate.
     _pc_ctx, _pc_status = _prospecting_result(_new_item)
-    _extra["prospecting_status"] = _pc_status
     if _pc_ctx:
         _extra["code_context"] = _pc_ctx
     # 691f4e1c — persist a DURABLE symbol pointer (not just the inline hint) when
@@ -249,6 +248,15 @@ async def handle_add_sprint_item(
     )
     if _ptr:
         _extra["prospected_pointer"] = _ptr
+    # 19aa84a7 — "prospected" must mean the same thing in this response as
+    # it does in generate_handoff's executable gate.  _prospecting_result
+    # reports transient code context; only a durable pointer lets the shared
+    # predicate below pass for an item that declares resources.
+    if _pc_status == "prospected" and not db_module.is_item_claim_prospected(
+        _new_item, has_pointer_evidence=bool(_ptr),
+    ):
+        _pc_status = "unprospected"
+    _extra["prospecting_status"] = _pc_status
     # 7fe57cea — when the caller declared explicit touches_resources at file-only
     # granularity (file:path.py, no :symbol), emit a non-blocking informational
     # hint suggesting symbol-scoped form instead.  Only fires for explicit caller
@@ -508,6 +516,72 @@ async def handle_update_sprint_item(
     # an unprospected item through the goal-generation and claim safety gates);
     # False/0/null clears it (re-enables the structural gate).
     if "prospect_bypass" in args:
+        if bool(args.get("prospect_bypass")):
+            # 0ff5e59f — setting the bypass switches OFF the structural
+            # prospecting gate, so it needs a stated reason AND a human-bound
+            # approval. Clearing it re-enables the gate and needs neither.
+            _pb_reason = (args.get("override_reason") or "").strip()
+            if not _pb_reason:
+                return {
+                    "error": "OVERRIDE_REASON_REQUIRED",
+                    "item_id": args["item_id"],
+                    "message": (
+                        "prospect_bypass=true switches off the prospecting safety "
+                        "gate for this item and requires a non-empty "
+                        "override_reason (why this item may be claimed without "
+                        "prospecting evidence). The bypass was NOT applied."
+                    ),
+                }
+            from meridian import gate_override as _gate_override_mod  # noqa: PLC0415
+            _pb_hitl_id = (args.get("override_hitl_id") or "").strip() or None
+            if _pb_hitl_id is None:
+                try:
+                    _pb_hitl = await _gate_override_mod.request_gate_override_hitl(
+                        db, args["project_id"],
+                        gate=_gate_override_mod.PROSPECT_BYPASS_OVERRIDE_EVENT_TYPE,
+                        subject_id=args["item_id"], reason=_pb_reason,
+                        description=(
+                            f"An executor wants to set prospect_bypass=true for "
+                            f"sprint item {args['item_id']!r}, allowing it through "
+                            "the structural prospecting gate without evidence."
+                        ),
+                        session_id=args.get("session_id"),
+                        requested_by=args.get("actor") or args.get("session_id"),
+                    )
+                except ValueError as hitl_exc:
+                    return {"error": str(hitl_exc), "item_id": args["item_id"]}
+                return {
+                    "error": "HUMAN_APPROVAL_REQUIRED",
+                    "item_id": args["item_id"],
+                    "hitl_id": _pb_hitl.get("id"),
+                    "gate": _gate_override_mod.PROSPECT_BYPASS_OVERRIDE_EVENT_TYPE,
+                    "message": (
+                        "Setting prospect_bypass=true needs a human's approval. "
+                        f"A require_human HITL ({_pb_hitl.get('id')}) was filed; "
+                        "it cannot be auto-answered. After a human answers Yes, "
+                        "retry update_sprint_item with override_hitl_id=<that id>."
+                    ),
+                }
+            try:
+                _pb_approval = await _gate_override_mod.consume_gate_override_approval(
+                    db, args["project_id"], _pb_hitl_id,
+                    gate=_gate_override_mod.PROSPECT_BYPASS_OVERRIDE_EVENT_TYPE,
+                    subject_id=args["item_id"],
+                    consumed_by=args.get("actor") or args.get("session_id") or None,
+                )
+            except _gate_override_mod.GateOverrideError as approval_exc:
+                return {
+                    "error": approval_exc.code,
+                    "item_id": args["item_id"],
+                    "message": str(approval_exc),
+                }
+            await _gate_override_mod.record_override_audit(
+                db, _gate_override_mod.PROSPECT_BYPASS_OVERRIDE_EVENT_TYPE,
+                args["project_id"], subject_id=args["item_id"],
+                actor=args.get("actor") or args.get("session_id") or None,
+                reason=_pb_reason, tenant_id=(tenant or {}).get("id"),
+                extra={"hitl_id": _pb_approval["hitl_id"]},
+            )
         _patch_kwargs["prospect_bypass"] = args.get("prospect_bypass")
     # 56f607ec — set/clear depends_on. Only forward when the caller supplied the
     # key (_UNSET sentinel), so omitting it leaves the stored value untouched;
@@ -627,7 +701,15 @@ async def handle_set_sprint(
                 "unstarted_ids": [it["id"] for it in _unstarted],
                 "sprint_not_updated": True,
             }
-    result = await db_module.set_sprint(db, args["project_id"], args["sprint"])
+    try:
+        result = await db_module.set_sprint(
+            db, args["project_id"], args["sprint"],
+            expected_updated_at=args.get("expected_updated_at"),
+            actor=db_module.goal_actor("mcp"),
+        )
+    except db_module.GoalConflict as exc:
+        # fc779141 — stale expected_updated_at: nothing was written.
+        return db_module.goal_conflict_detail(exc)
     await goal_md_module.sync_db_to_goal_md(db, args["project_id"])
     return result
 
@@ -1289,7 +1371,14 @@ async def handle_claim_sprint_item(
             # persisted for later merge-time validation.
             "worktree_base_branch": "dev",
             "worktree_setup_cmd": f"git worktree add {wt_path} -b {wt_branch}",
-            "worktree_cleanup_cmd": f"git worktree remove {wt_path} --force",
+            # No --force: `git worktree remove --force` discards modified and
+            # untracked files. Step 1 gates removal on a clean status (the
+            # `test -z` exits non-zero when status prints anything, so the
+            # remove never runs on a dirty tree); step 2 removes the clean tree.
+            "worktree_cleanup_cmd": (
+                f'test -z "$(git -C {wt_path} status --porcelain)" '
+                f"&& git worktree remove {wt_path}"
+            ),
             "worktree_merge_cmd": (
                 f"git checkout dev && git merge {wt_branch} --no-edit "
                 f"&& git branch -d {wt_branch}"
@@ -1632,6 +1721,8 @@ async def handle_complete_sprint_item(
         _board_change_for_session,
         _close_or_propose_github_issue,
     )
+    from ... import gate_override as _gate_override_mod  # noqa: PLC0415
+    from ...db import sprint_items as _sprint_items_mod  # noqa: PLC0415
     # a2a027cf — correlation id: caller-supplied (threaded down from the
     # dispatch layer / an HTTP request id when available) or freshly minted
     # here so it exists even when this handler is invoked directly (tests,
@@ -1658,6 +1749,10 @@ async def handle_complete_sprint_item(
     # was advisory-only regardless of configuration; that was the bug.
     _complete_session_id = args.get("session_id") or ""
     _complete_actor = args.get("actor") or _complete_session_id or None
+    # Completion overrides are accumulated and approved as one exact bundle.
+    # That lets a human review every failing gate in one request and prevents
+    # one single-use approval from being spent before a later gate blocks.
+    _completion_override_requests: list[dict[str, Any]] = []
     _merge_warning: dict[str, Any] | None = None
     if _complete_session_id:
         try:
@@ -1735,10 +1830,7 @@ async def handle_complete_sprint_item(
                     # e7548587 — STRICT merge-approval gate (mode 2 only).
                     # Blocks unless the caller passes BOTH
                     # override_merge_approval=true AND a non-empty
-                    # override_merge_approval_reason in the SAME call —
-                    # record_merge_approval_override then writes an
-                    # auditable action_audit_log row (who/when/why), mirroring
-                    # 5fe3502e's record_strict_evidence_override exactly. Mode
+                    # override_merge_approval_reason in the SAME call. Mode
                     # 1 (advisory, the pre-existing default) never enters this
                     # branch — it falls straight through to the unconditional
                     # HITL-reminder-only behavior below, byte-for-byte
@@ -1751,15 +1843,20 @@ async def handle_complete_sprint_item(
                         ).strip()
                         if _mrg_override_requested and _mrg_override_reason:
                             from meridian.worktree_merge_guard import (  # noqa: PLC0415
-                                record_merge_approval_override,
+                                MERGE_APPROVAL_OVERRIDE_EVENT_TYPE,
                             )
-                            _merge_approval_override = await record_merge_approval_override(
-                                db, args["project_id"], args["item_id"],
-                                actor=_complete_actor,
-                                reason=_mrg_override_reason,
-                                worktree=_wt,
-                                tenant_id=(tenant or {}).get("id"),
-                            )
+                            _merge_approval_override = {
+                                "reason": _mrg_override_reason,
+                                "worktree_id": _wt["id"],
+                                "branch": _wt["branch"],
+                            }
+                            _completion_override_requests.append({
+                                "gate": "strict_merge_approval",
+                                "event_type": MERGE_APPROVAL_OVERRIDE_EVENT_TYPE,
+                                "reason": _mrg_override_reason,
+                                "result": _merge_approval_override,
+                                "extra": {"worktree_id": _wt["id"], "branch": _wt["branch"]},
+                            })
                         else:
                             return {
                                 "error": "MERGE_APPROVAL_REQUIRED",
@@ -1874,28 +1971,55 @@ async def handle_complete_sprint_item(
     #     check-runs yet, self-hosted / no-GitHub) and "pending" (CI still
     #     running — the normal push-then-complete race) are ALWAYS allowed
     #     through, so this never blocks on absent/unknown CI.
-    #   * Escape hatch consistent with existing force= patterns: pass
-    #     override_ci=true to complete anyway (records that the failing CI was
-    #     acknowledged). The result is cached so the advisory block below reuses
-    #     it without a second GitHub round-trip.
-    if (
-        not _override_ci
-        and _ci_pre is not None
-        and _ci_pre.get("state") == "failure"
-    ):
-        return {
-            "error": "CI_FAILING",
-            "item_id": args["item_id"],
-            "ci_verification": _ci_pre,
-            "message": (
-                f"Refusing to complete {args['item_id']}: GitHub Actions CI "
-                f"is FAILING for commit {_ci_pre.get('sha')} "
-                f"({_ci_pre.get('failed')}/{_ci_pre.get('total')} checks failed). "
-                "Fix CI and re-push, or pass override_ci=true to acknowledge "
-                "and complete anyway. (Unknown/pending CI is never blocked — "
-                "only a real failing status.)"
-            ),
+    #   * An override_ci=true request with a reason is queued for the
+    #     require_human completion-override approval below. The result is
+    #     cached so the advisory block below reuses it without a second
+    #     GitHub round-trip.
+    _ci_failure_override: dict[str, Any] | None = None
+    if _ci_pre is not None and _ci_pre.get("state") == "failure":
+        if not _override_ci:
+            return {
+                "error": "CI_FAILING",
+                "item_id": args["item_id"],
+                "ci_verification": _ci_pre,
+                "message": (
+                    f"Refusing to complete {args['item_id']}: GitHub Actions CI "
+                    f"is FAILING for commit {_ci_pre.get('sha')} "
+                    f"({_ci_pre.get('failed')}/{_ci_pre.get('total')} checks failed). "
+                    "Fix CI and re-push, or pass override_ci=true with a "
+                    "non-empty override_reason and then obtain human approval "
+                    "for the exact failing-gate bundle. (Unknown/pending CI is never blocked — "
+                    "only a real failing status.)"
+                ),
+            }
+        # 0ff5e59f — the reason and audit are necessary but not sufficient:
+        # this override joins the human-approved completion bundle below.
+        _ci_override_reason_text = (args.get("override_reason") or "").strip()
+        if not _ci_override_reason_text:
+            return {
+                "error": "OVERRIDE_REASON_REQUIRED",
+                "item_id": args["item_id"],
+                "ci_verification": _ci_pre,
+                "message": (
+                    f"Refusing to complete {args['item_id']}: CI is FAILING for "
+                    f"commit {_ci_pre.get('sha')} and override_ci=true was passed "
+                    "without a non-empty override_reason. State why the failing "
+                    "CI is being overridden — an override with no reason is not "
+                    "auditable."
+                ),
+            }
+        _ci_failure_override = {
+            "reason": _ci_override_reason_text,
+            "sha": _ci_pre.get("sha"),
         }
+        _completion_override_requests.append({
+            "gate": "ci_failure",
+            "event_type": _gate_override_mod.CI_OVERRIDE_EVENT_TYPE,
+            "reason": _ci_override_reason_text,
+            "result": _ci_failure_override,
+            "extra": {"sha": _ci_pre.get("sha"), "failed": _ci_pre.get("failed"),
+                      "total": _ci_pre.get("total")},
+        })
 
     # e7548587 — _complete_actor is now computed up top (alongside
     # _complete_session_id), before the merge-approval block that needs it
@@ -1916,9 +2040,9 @@ async def handle_complete_sprint_item(
     )
     _strict_evidence_override: dict[str, Any] | None = None
     if _strict_evidence and _pre_item is not None and _pre_item.get("project_id") == args["project_id"]:
-        from meridian.sprint_evidence_guard import (  # noqa: PLC0415
-            verify_strict_completion_evidence,
-            record_strict_evidence_override,
+        from meridian import sprint_evidence_guard as _sprint_evidence_guard  # noqa: PLC0415
+        verify_strict_completion_evidence = (
+            _sprint_evidence_guard.verify_strict_completion_evidence
         )
         _evidence_check = await verify_strict_completion_evidence(
             db, _server._REPO_ROOT, args["project_id"], args["item_id"], _pre_item,
@@ -1929,21 +2053,21 @@ async def handle_complete_sprint_item(
             _override_requested = bool(args.get("override_strict_evidence"))
             _override_reason = (args.get("override_reason") or "").strip()
             if _override_requested and _override_reason:
-                # 5fe3502e point 3 — an explicit override is auditable (who/
-                # when/why) and can never be the silent default: it requires
-                # BOTH override_strict_evidence=true AND a non-empty
-                # override_reason in the SAME call. record_strict_evidence_
-                # override raises ValueError if reason is empty (belt and
-                # suspenders — already guarded by the `and _override_reason`
-                # check above, but the module itself never trusts a caller
-                # to have checked).
-                _strict_evidence_override = await record_strict_evidence_override(
-                    db, args["project_id"], args["item_id"],
-                    actor=_complete_actor,
-                    reason=_override_reason,
-                    errors=_evidence_check.get("errors", []),
-                    tenant_id=(tenant or {}).get("id"),
-                )
+                # 5fe3502e / 0ff5e59f — queue this explicit override only with
+                # its stated reason. A human must approve the exact set of
+                # failing gates in the completion bundle below before the
+                # audit row is written or this override is applied.
+                _strict_evidence_override = {
+                    "reason": _override_reason,
+                    "errors": _evidence_check.get("errors", []),
+                }
+                _completion_override_requests.append({
+                    "gate": "strict_evidence",
+                    "event_type": _sprint_evidence_guard.OVERRIDE_EVENT_TYPE,
+                    "reason": _override_reason,
+                    "result": _strict_evidence_override,
+                    "extra": {"errors": _evidence_check.get("errors", [])},
+                })
             else:
                 return {
                     "error": "STRICT_EVIDENCE_BLOCKED",
@@ -1982,22 +2106,20 @@ async def handle_complete_sprint_item(
     # gate against that pre-computed result now, same condition as before.
     if _code_intel_check is not None:
         from meridian.code_intel_receipt import (  # noqa: PLC0415
-            record_prospect_receipt_override,
+            OVERRIDE_EVENT_TYPE,
         )
         if _code_intel_check.get("applicable") and not _code_intel_check.get("ok"):
             _ci_override_requested = bool(args.get("override_code_intel_receipt"))
             _ci_override_reason = (args.get("override_reason") or "").strip()
             if _ci_override_requested and _ci_override_reason:
-                # Same auditable-override contract as strict evidence / merge
-                # approval above: BOTH the explicit flag AND a non-empty
-                # reason are required in the SAME call, or it is refused.
-                _code_intel_override = await record_prospect_receipt_override(
-                    db, args["project_id"], args["item_id"],
-                    actor=_complete_actor,
-                    reason=_ci_override_reason,
-                    check=_code_intel_check,
-                    tenant_id=(tenant or {}).get("id"),
-                )
+                _code_intel_override = {"reason": _ci_override_reason}
+                _completion_override_requests.append({
+                    "gate": "code_intel_receipt",
+                    "event_type": OVERRIDE_EVENT_TYPE,
+                    "reason": _ci_override_reason,
+                    "result": _code_intel_override,
+                    "extra": {"check": _code_intel_check},
+                })
             else:
                 return {
                     "error": _code_intel_check.get("code") or "CODE_INTEL_RECEIPT_BLOCKED",
@@ -2028,9 +2150,8 @@ async def handle_complete_sprint_item(
     #      non-terminal, crashed, timed-out, cancelled, or an
     #      insufficiently-evidenced "passed" record are ALL refused, never
     #      silently treated as success. override_test_run_receipt=true with a
-    #      non-empty override_reason acknowledges and completes anyway
-    #      (audited via record_test_run_receipt_override), same pattern as
-    #      override_strict_evidence / override_code_intel_receipt.
+    #      non-empty override_reason queues the gate for human approval in the
+    #      completion bundle below; the audit row is written only after approval.
     # f291bb24 — _test_run_evidence (the always-best-effort surfacing half of
     # this gate) was already computed concurrently above, alongside the CI
     # and code-intel checks; only the opt-in strict gate below still runs its
@@ -2052,13 +2173,17 @@ async def handle_complete_sprint_item(
             _tr_override_requested = bool(args.get("override_test_run_receipt"))
             _tr_override_reason = (args.get("override_reason") or "").strip()
             if _tr_override_requested and _tr_override_reason:
-                _test_run_receipt_override = await test_run_receipt_module.record_test_run_receipt_override(
-                    db, args["project_id"], args["item_id"],
-                    actor=_complete_actor,
-                    reason=_tr_override_reason,
-                    evidence=_tr_check.get("evidence") or {},
-                    tenant_id=(tenant or {}).get("id"),
-                )
+                _test_run_receipt_override = {
+                    "reason": _tr_override_reason,
+                    "evidence": _tr_check.get("evidence") or {},
+                }
+                _completion_override_requests.append({
+                    "gate": "test_run_receipt",
+                    "event_type": test_run_receipt_module.OVERRIDE_EVENT_TYPE,
+                    "reason": _tr_override_reason,
+                    "result": _test_run_receipt_override,
+                    "extra": {"evidence": _tr_check.get("evidence") or {}},
+                })
             else:
                 return {
                     "error": _tr_check.get("code") or "TEST_RUN_RECEIPT_BLOCKED",
@@ -2066,6 +2191,109 @@ async def handle_complete_sprint_item(
                     "test_run_receipt": _tr_check.get("evidence"),
                     "message": _tr_check.get("message"),
                 }
+
+    # 275a8631 — the artifact-pointer gate (opt-in per item) is enforced inside
+    # db.complete_sprint_item; the only way past it is a HUMAN-approved override.
+    # Parse the request here: reason is mandatory, and the approval (a
+    # require_human gate-override HITL a human answered Yes) is verified, spent
+    # and audited by the DB layer only if the gate actually blocks this item.
+    _ap_override_requested = bool(args.get("override_artifact_pointer"))
+    _ap_override_reason = (args.get("override_reason") or "").strip()
+    _ap_override_hitl_id = (args.get("override_hitl_id") or "").strip() or None
+    _ap_override: dict[str, Any] | None = None
+    if _ap_override_requested:
+        if not _ap_override_reason:
+            return {
+                "error": "OVERRIDE_REASON_REQUIRED",
+                "item_id": args["item_id"],
+                "message": (
+                    "override_artifact_pointer=true requires a non-empty "
+                    "override_reason — an override with no stated reason is not "
+                    "auditable and is refused."
+                ),
+            }
+        if _ap_override_hitl_id is not None:
+            _ap_override = {"reason": _ap_override_reason, "hitl_id": _ap_override_hitl_id}
+
+    # 0ff5e59f — reason + audit alone are self-attestable. Bind one
+    # require_human approval to the exact set of failing completion gates and
+    # reasons. The approval is requested only after every handler-level
+    # override condition has been identified, so one human review covers the
+    # exact bundle requested in this completion attempt.
+    if _completion_override_requests:
+        _bundle = [
+            {"gate": r["gate"], "reason": r["reason"]}
+            for r in _completion_override_requests
+        ]
+        _bundle_text = json.dumps(_bundle, sort_keys=True, separators=(",", ":"))
+        _bundle_subject = (
+            f"{args['item_id']}:completion-overrides:"
+            f"{uuid.uuid5(uuid.NAMESPACE_URL, _bundle_text).hex}"
+        )
+        _bundle_reason = "; ".join(
+            f"{entry['gate']}: {entry['reason']}" for entry in _bundle
+        )
+        _bundle_hitl_id = (
+            str(args.get("completion_override_hitl_id") or "").strip() or None
+        )
+        if _bundle_hitl_id is None:
+            try:
+                _bundle_hitl = await _gate_override_mod.request_gate_override_hitl(
+                    db, args["project_id"],
+                    gate="sprint_item_completion_overrides",
+                    subject_id=_bundle_subject,
+                    reason=_bundle_reason,
+                    description=(
+                        f"An executor requested completion of sprint item "
+                        f"{args['item_id']!r} while overriding these failing gates: "
+                        + "; ".join(entry["gate"] for entry in _bundle)
+                        + ". Review each failure and its stated reason before approval."
+                    ),
+                    session_id=_complete_session_id or None,
+                    requested_by=_complete_actor,
+                )
+            except ValueError as hitl_exc:
+                return {"error": str(hitl_exc), "item_id": args["item_id"]}
+            return {
+                "error": "HUMAN_APPROVAL_REQUIRED",
+                "item_id": args["item_id"],
+                "hitl_id": _bundle_hitl.get("id"),
+                "gate": "sprint_item_completion_overrides",
+                "override_gates": _bundle,
+                "message": (
+                    "These completion overrides need a human's approval. A "
+                    f"require_human HITL ({_bundle_hitl.get('id')}) was filed and "
+                    "cannot be auto-answered. After a human answers Yes, retry "
+                    "with completion_override_hitl_id=<that id>."
+                ),
+            }
+        try:
+            _bundle_approval = await _gate_override_mod.consume_gate_override_approval(
+                db, args["project_id"], _bundle_hitl_id,
+                gate="sprint_item_completion_overrides",
+                subject_id=_bundle_subject,
+                consumed_by=_complete_actor,
+            )
+        except _gate_override_mod.GateOverrideError as approval_exc:
+            return {
+                "error": approval_exc.code,
+                "item_id": args["item_id"],
+                "gate": "sprint_item_completion_overrides",
+                "message": str(approval_exc),
+            }
+        for _override in _completion_override_requests:
+            _audit = await _gate_override_mod.record_override_audit(
+                db, _override["event_type"], args["project_id"],
+                subject_id=args["item_id"], actor=_complete_actor,
+                reason=_override["reason"], tenant_id=(tenant or {}).get("id"),
+                extra={
+                    **(_override.get("extra") or {}),
+                    "hitl_id": _bundle_approval["hitl_id"],
+                    "approval_subject_id": _bundle_subject,
+                },
+            )
+            _override["result"]["audit_id"] = (_audit or {}).get("id")
+            _override["result"]["hitl_id"] = _bundle_approval["hitl_id"]
 
     # 5823db0b — quality gate + actor attribution. Pass evidence notes and
     # the completing actor; surface the required_notes gate as a clean error.
@@ -2086,10 +2314,108 @@ async def handle_complete_sprint_item(
             # acknowledgement that the caller is completing a DIFFERENT,
             # NON-stale session's live claim. Never inferred/defaulted true.
             force_foreign_claim=bool(args.get("force_foreign_claim")),
+            # 0ff5e59f — force_foreign_claim is a human-approved, audited
+            # override when it is what lets the completion through.
+            override_reason=args.get("override_reason"),
+            foreign_claim_override_hitl_id=args.get("foreign_claim_override_hitl_id"),
+            tenant_id=(tenant or {}).get("id"),
+            artifact_pointer_override=_ap_override,
             # a2a027cf — threaded through so DB-level phase timings/logs and
             # this handler's response agree on one id for the whole call.
             correlation_id=_correlation_id,
         )
+    except _sprint_items_mod.SprintItemArtifactPointerRequired as exc:
+        _ap_verdict = exc.verdict or {}
+        _ap_detail = {
+            "triggers": _ap_verdict.get("triggers"),
+            "warning_code": _ap_verdict.get("warning_code"),
+            "required_remediation": _ap_verdict.get("required_remediation"),
+            "classification": (_ap_verdict.get("classification") or {}).get("classification"),
+            "policy": _ap_verdict.get("policy"),
+        }
+        if _ap_override_requested and _ap_override is None:
+            # Override asked for but no approval yet: file the require_human
+            # approval request (cannot be auto-answered) and say how to proceed.
+            try:
+                _ap_hitl = await _gate_override_mod.request_gate_override_hitl(
+                    db, args["project_id"],
+                    gate=_gate_override_mod.GATE_ARTIFACT_POINTER,
+                    subject_id=args["item_id"], reason=_ap_override_reason,
+                    description=(
+                        f"An executor wants to complete sprint item {args['item_id']!r} "
+                        "without the exact output pointer its artifact policy "
+                        f"requires ({', '.join(_ap_detail['triggers'] or [])}; "
+                        f"{_ap_detail['warning_code']})."
+                    ),
+                    session_id=_complete_session_id or None,
+                    requested_by=_complete_actor,
+                )
+            except ValueError as hitl_exc:
+                return {"error": str(hitl_exc), "item_id": args["item_id"]}
+            return {
+                "error": "HUMAN_APPROVAL_REQUIRED",
+                "item_id": args["item_id"],
+                "hitl_id": _ap_hitl.get("id"),
+                "gate": _gate_override_mod.GATE_ARTIFACT_POINTER,
+                "artifact_pointer": _ap_detail,
+                "correlation_id": _correlation_id,
+                "message": (
+                    "Completing this item without its required output pointer "
+                    "needs a human's approval. A require_human HITL "
+                    f"({_ap_hitl.get('id')}) was filed — it cannot be "
+                    "auto-answered. Once a human answers it Yes, retry "
+                    "complete_sprint_item with the same arguments plus "
+                    "override_hitl_id=<that id>. Preferred: attach the exact "
+                    "output pointer instead."
+                ),
+            }
+        return {
+            "error": "ARTIFACT_POINTER_REQUIRED",
+            "item_id": args["item_id"],
+            "artifact_pointer": _ap_detail,
+            "correlation_id": _correlation_id,
+            "message": str(exc),
+        }
+    except _gate_override_mod.GateOverrideError as exc:
+        if (
+            exc.code == "HUMAN_APPROVAL_REQUIRED"
+            and bool(args.get("force_foreign_claim"))
+            and not (args.get("foreign_claim_override_hitl_id") or "").strip()
+            and (args.get("override_reason") or "").strip()
+        ):
+            try:
+                _foreign_hitl = await _gate_override_mod.request_gate_override_hitl(
+                    db, args["project_id"],
+                    gate=_gate_override_mod.FOREIGN_CLAIM_OVERRIDE_EVENT_TYPE,
+                    subject_id=args["item_id"],
+                    reason=args["override_reason"],
+                    description=(
+                        f"An executor wants to complete sprint item {args['item_id']!r} "
+                        "despite another live session's claim."
+                    ),
+                    session_id=_complete_session_id or None,
+                    requested_by=_complete_actor,
+                )
+            except ValueError as hitl_exc:
+                return {"error": str(hitl_exc), "item_id": args["item_id"]}
+            return {
+                "error": "HUMAN_APPROVAL_REQUIRED",
+                "item_id": args["item_id"],
+                "hitl_id": _foreign_hitl.get("id"),
+                "gate": _gate_override_mod.FOREIGN_CLAIM_OVERRIDE_EVENT_TYPE,
+                "message": (
+                    "Completing another live session's claim needs a human's approval. "
+                    f"A require_human HITL ({_foreign_hitl.get('id')}) was filed and "
+                    "cannot be auto-answered. After a human answers Yes, retry with "
+                    "foreign_claim_override_hitl_id=<that id>."
+                ),
+            }
+        return {
+            "error": exc.code,
+            "item_id": args["item_id"],
+            "correlation_id": _correlation_id,
+            "message": str(exc),
+        }
     except db_module.SprintItemEvidenceRequired as exc:
         return {
             "error": "EVIDENCE_REQUIRED",
@@ -2139,6 +2465,10 @@ async def handle_complete_sprint_item(
     if _merge_warning:
         item = dict(item)
         item["merge_warning"] = _merge_warning
+    if _ci_failure_override:
+        # 0ff5e59f — same visibility contract as the other audited overrides.
+        item = dict(item)
+        item["ci_override"] = _ci_failure_override
     if _strict_evidence_override:
         # 5fe3502e point 3 — surface the audited override on the response so
         # the completion is never silently "cleaner" than what actually
@@ -2525,7 +2855,12 @@ async def handle_resolve_sprint_item_pointers(
         if _ptr_store is None:
             return None
         try:
-            return await _ptr_store.get_element_by_id(element_id)
+            # 6f7ce9d6 — scope the element lookup to THIS item's project (the
+            # one verified above): another project's doc element id resolves
+            # as not-found, never as that project's element body.
+            return await _ptr_store.get_element_by_id(
+                element_id, project_id=args["project_id"]
+            )
         except Exception:  # noqa: BLE001 — resolver seam must never raise
             return None
 
@@ -2567,10 +2902,25 @@ async def handle_delete_sprint_item_pointer(
     MCP tool wrapped it — a pointer could be created / listed / resolved yet
     never removed. Idempotent: {deleted:false} when no pointer had that id,
     rather than an error.
+
+    6f7ce9d6 — cross-project isolation: ``project_id`` is now REQUIRED (or pass
+    ``project_name``, which the dispatch layer folds into ``project_id``) and is
+    enforced in the DELETE itself (``WHERE id = ? AND project_id = ?``), like
+    ``add`` / ``get`` / ``resolve`` / ``relocate_sprint_item_pointer``. Before
+    this the handler took only ``pointer_id`` and deleted by bare id, so a
+    caller scoped to one project could delete ANOTHER project's pointer by
+    knowing or guessing its id. A pointer id that belongs to a different
+    project is reported exactly like a nonexistent one
+    (``{deleted:false}``) — never distinguished — so this can't be used to
+    probe for foreign pointer ids.
     """
     if not args.get("pointer_id"):
         return {"error": "pointer_id is required"}
-    removed = await db_module.delete_sprint_item_pointer(db, args["pointer_id"])
+    if not args.get("project_id"):
+        return {"error": "project_id is required (or pass project_name)"}
+    removed = await db_module.delete_sprint_item_pointer(
+        db, args["project_id"], args["pointer_id"]
+    )
     return {"pointer_id": args["pointer_id"], "deleted": removed}
 
 
@@ -2789,13 +3139,22 @@ async def handle_complete_wave_gate(
     list (e.g. push, deploy, wait, run_verification) to signal that the gate has
     passed and the next wave's items may now be claimed.
 
-    The REAL structured result from run_verification MUST be passed as
-    verification_payload.  The server validates it server-side (status=='ok',
-    exit_code==0).  A plain self-report or a fabricated payload is rejected.
+    0ff5e59f — the unlock is bound to a STORED run_verification record: pass the
+    ``verification_run_id`` that run_verification returned, and the recorded
+    run's own status/exit_code decide (a hand-typed ``verification_payload`` is
+    a self-report and is refused). The one escape hatch is a human's decision:
+    ``override_unbound_payload=true`` + ``override_reason``; the first such call
+    files a ``require_human`` gate-override HITL (cannot be auto-answered) and
+    returns HUMAN_APPROVAL_REQUIRED with its id, and once a human answers Yes the
+    retry passes ``override_hitl_id``. The approval is spent, and the override
+    audited to action_audit_log, only when the gate is actually unlocked.
 
     Returns {gate_completed, wave_label, next_wave_label, next_wave_item_count,
-    next_wave_item_ids, gate_id} on success, or raises ValueError on bad evidence.
+    next_wave_item_ids, gate_id, evidence_source} on success, or an ``{error}``
+    dict on bad evidence.
     """
+    from ... import gate_override as gate_override_module  # noqa: PLC0415
+    from ...db import sprint_items as sprint_items_module  # noqa: PLC0415
     project_id = str(args.get("project_id") or "").strip()
     project_name = str(args.get("project_name") or "").strip()
     if not project_id and project_name:
@@ -2810,13 +3169,15 @@ async def handle_complete_wave_gate(
         return {"error": "wave_label is required (e.g. 'wave-1')"}
 
     verification_payload = args.get("verification_payload")
-    if verification_payload is None:
+    verification_run_id = str(args.get("verification_run_id") or "").strip() or None
+    if verification_payload is None and verification_run_id is None:
         return {
-            "error": "verification_payload is required",
+            "error": "verification_run_id is required (a bare verification_payload is a self-report)",
             "hint": (
-                "Pass the full dict returned by run_verification. "
-                "Only a genuine run_verification result with status='ok' and "
-                "exit_code=0 satisfies the gate — a self-report is rejected."
+                "Call run_verification and pass the verification_run_id it returns. "
+                "Only a recorded run_verification run with status='ok' and "
+                "exit_code=0 satisfies the gate — a hand-typed verification_payload "
+                "is rejected."
             ),
         }
 
@@ -2838,11 +3199,73 @@ async def handle_complete_wave_gate(
             db, session_id
         )
 
+    _tenant_id = (tenant or {}).get("id")
+    _override_requested = bool(args.get("override_unbound_payload"))
+    _override_reason = str(args.get("override_reason") or "").strip()
+    _override_hitl_id = str(args.get("override_hitl_id") or "").strip() or None
+    _unbound_override: dict[str, Any] | None = None
+    if verification_run_id is None and _override_requested:
+        # The human-approved escape hatch (see the docstring). A run id, when
+        # given, always wins and makes any override flag irrelevant.
+        if not _override_reason:
+            return {
+                "error": "OVERRIDE_REASON_REQUIRED",
+                "message": (
+                    "override_unbound_payload=true requires a non-empty "
+                    "override_reason — an override with no stated reason is "
+                    "not auditable and is refused."
+                ),
+            }
+        if _override_hitl_id is not None:
+            _unbound_override = {"reason": _override_reason, "hitl_id": _override_hitl_id}
+            actor = actor or session_id
+
     try:
         result = await db_module.complete_wave_gate(
             db, project_id, wave_label, verification_payload, actor=actor,
-            version=version,
+            version=version, verification_run_id=verification_run_id,
+            unbound_payload_override=_unbound_override, tenant_id=_tenant_id,
         )
+    except sprint_items_module.WaveGateUnboundPayload as exc:
+        if not (_override_requested and _override_hitl_id is None):
+            return {"error": str(exc)}
+        # Valid-but-unbound payload with an override requested and no approval
+        # yet: file the require_human approval request (cannot be auto-answered)
+        # and tell the executor exactly how to proceed once a human answers.
+        _subject = gate_override_module.wave_gate_subject(wave_label, version)
+        try:
+            _hitl = await gate_override_module.request_gate_override_hitl(
+                db, project_id,
+                gate=gate_override_module.GATE_WAVE_GATE_UNBOUND_PAYLOAD,
+                subject_id=_subject, reason=_override_reason,
+                description=(
+                    f"An executor wants to unlock wave gate {wave_label!r}"
+                    + (f" (version {version!r})" if version else "")
+                    + " with a hand-typed verification result "
+                    f"(status={verification_payload.get('status')!r}, "
+                    f"exit_code={verification_payload.get('exit_code')!r}) that is "
+                    "NOT backed by a recorded run_verification run."
+                ),
+                session_id=session_id, requested_by=actor or session_id,
+            )
+        except ValueError as hitl_exc:
+            return {"error": str(hitl_exc)}
+        return {
+            "error": "HUMAN_APPROVAL_REQUIRED",
+            "hitl_id": _hitl.get("id"),
+            "gate": gate_override_module.GATE_WAVE_GATE_UNBOUND_PAYLOAD,
+            "message": (
+                "A hand-typed verification_payload can only unlock a wave gate "
+                "with a human's approval. A require_human HITL "
+                f"({_hitl.get('id')}) was filed — it cannot be auto-answered. "
+                "Once a human answers it Yes, retry complete_wave_gate with the "
+                "same arguments plus override_hitl_id=<that id>. Preferred: fix "
+                "the tunnel, call run_verification, and pass its "
+                "verification_run_id instead."
+            ),
+        }
+    except gate_override_module.GateOverrideError as exc:
+        return {"error": exc.code, "message": str(exc)}
     except ValueError as exc:
         return {"error": str(exc)}
 

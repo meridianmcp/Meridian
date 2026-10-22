@@ -44,6 +44,86 @@ if TYPE_CHECKING:
 
 
 # ---------------------------------------------------------------------------
+# Import psutil once, before any test can patch the platform
+# (test_local_runner gate failures, 2026-10-18 diagnostic run)
+# ---------------------------------------------------------------------------
+#
+# Many tests monkeypatch ``<module>.sys.platform`` to "linux" to reach POSIX
+# branches. That is the global ``sys.platform``, so a psutil import that
+# happens inside one of them takes psutil's Linux path, which needs the POSIX-only
+# ``resource`` module and fails. A failed import leaves psutil unimportable for
+# the rest of the worker process, so every later create_time lookup returns None,
+# and the runner treats its own child as unverifiable (refusing to start, or
+# reporting UNKNOWN). A successful import is cached, so a later platform patch
+# cannot affect it.
+try:
+    import psutil  # noqa: F401
+except ImportError:  # psutil is optional on some code paths
+    pass
+
+
+# ---------------------------------------------------------------------------
+# Windows-only: disable stdlib platform's WMI-backed queries for this process
+# (test-runner reliability investigation, 2026-09-27)
+# ---------------------------------------------------------------------------
+#
+# CPython's ``platform.py`` (confirmed live against this repo's pinned
+# interpreter, 3.12.13/conda-forge) added a ``_wmi`` C-extension-backed
+# ``_wmi_query()`` as the "canonical source" for ``platform.win32_ver()`` and
+# ``platform.processor()`` -- see ``_win32_ver``/``processor`` in the
+# installed ``Lib/platform.py``, both trying ``_wmi_query(...)`` first and
+# only falling back (registry / ``sys.getwindowsversion()`` / env vars) on a
+# caught ``OSError``.
+#
+# pytest-xdist's worker bootstrap (``xdist/remote.py::getinfodict``, called
+# from ``WorkerInteractor.pytest_sessionstart`` the instant a worker process
+# starts) calls ``platform.platform()`` unconditionally to report the
+# worker's environment back to the controller -- there is no xdist config
+# flag to skip this. Under real, reproduced local conditions (many workers
+# starting concurrently while the host is under heavy memory pressure from an
+# unrelated process), the underlying WMI/COM call inside ``_wmi.exec_query``
+# has crashed multiple worker processes outright with
+# ``Windows fatal exception: code 0x8007000e`` (E_OUTOFMEMORY) -- a fatal
+# fault below Python's own exception handling, NOT a catchable ``OSError``,
+# so the existing try/except fallback in ``platform.py`` never gets a chance
+# to run.
+#
+# Fix: force ``platform._wmi_query`` to fail fast with the exact ``OSError``
+# CPython's own code already expects and handles gracefully (this is
+# literally what ``platform.py`` does itself when the ``_wmi`` extension
+# module is unavailable at all -- see the ``except ImportError`` branch a few
+# lines above ``_wmi_query``'s real definition). This never touches WMI/COM,
+# so it eliminates the crash risk entirely, and every caller already has a
+# tested, working non-WMI fallback path -- confirmed no test in this suite
+# asserts on the real WMI-sourced value (``test_host_memory_diagnostics.py``
+# always injects fake data sources or forces ``sys.platform`` to a non-win32
+# value; ``temp_artifacts.py``'s use of ``platform.platform()`` is only
+# checked for truthiness in tests, never an exact string). Applied at conftest
+# import time -- for BOTH the controller and every xdist worker, since each
+# worker is a fresh interpreter that re-imports this file during
+# ``_prepareconfig`` well before ``pytest_sessionstart`` fires -- so the real
+# WMI code path is never reached at all during this test suite's run, on
+# either process kind.
+if sys.platform == "win32":
+    def _disable_platform_wmi_queries() -> None:
+        try:
+            import platform as _platform_mod
+        except Exception:  # noqa: BLE001 -- must never block test collection
+            return
+
+        def _wmi_query_disabled(*_args: object, **_kwargs: object):
+            raise OSError(
+                "platform._wmi_query disabled during tests (see tests/conftest.py) "
+                "-- avoids a real WMI/COM call that has crashed xdist workers under "
+                "memory pressure with a non-catchable Windows fatal exception"
+            )
+
+        _platform_mod._wmi_query = _wmi_query_disabled
+
+    _disable_platform_wmi_queries()
+
+
+# ---------------------------------------------------------------------------
 # Backend selection helpers
 # ---------------------------------------------------------------------------
 
@@ -205,6 +285,11 @@ async def _reset_pg_schema(url: str) -> None:
 _pg_schema_ready: set[str] = set()
 
 
+# Savepoint control statements a caller issues through the adapter (see
+# _SavepointCursor.execute): these must reach the connection unwrapped.
+_SAVEPOINT_CONTROL_PREFIXES = ("SAVEPOINT ", "RELEASE ", "ROLLBACK TO ")
+
+
 class _SavepointCursor:
     """Cursor wrapper: each execute() runs inside its own SAVEPOINT, serialized
     by a per-connection lock (8a52dd26).
@@ -241,8 +326,17 @@ class _SavepointCursor:
         self._cursor = cursor
 
     async def execute(self, *args, **kwargs):
-        async with self._lock, self._conn.transaction():
-            return await self._cursor.execute(*args, **kwargs)
+        sql = args[0] if args else ""
+        async with self._lock:
+            if isinstance(sql, str) and sql.lstrip().upper().startswith(_SAVEPOINT_CONTROL_PREFIXES):
+                # A caller's own SAVEPOINT must outlive this statement. Wrapping
+                # it makes psycopg's savepoint its parent, and that wrapper's
+                # RELEASE also destroys the caller's savepoint, so the caller's
+                # later RELEASE fails with InvalidSavepointSpecification. A pinned
+                # production connection runs these verbs with no such wrapper.
+                return await self._cursor.execute(*args, **kwargs)
+            async with self._conn.transaction():
+                return await self._cursor.execute(*args, **kwargs)
 
     def __getattr__(self, name):
         return getattr(self._cursor, name)
@@ -558,6 +652,49 @@ def _isolate_md_root(monkeypatch, tmp_path):
     uses.
     """
     monkeypatch.setenv("MERIDIAN_MD_ROOT", str(tmp_path))
+
+
+@pytest.fixture(autouse=True)
+def _isolate_tunnel_log(monkeypatch, tmp_path_factory):
+    """4d6e87dd -- point ``MERIDIAN_TUNNEL_LOG`` at a per-test temp file for
+    EVERY test.
+
+    ``tunnel_client.run_tunnel`` calls ``_install_tunnel_log_tee()``, which
+    mirrors stdout/stderr into ``tunnel_client._tunnel_log_path()`` --
+    ``~/.meridian/tunnel.log`` unless overridden. Dozens of tests drive
+    ``run_tunnel`` (early-exit and happy paths alike), so before this fixture
+    every test run appended to the developer's REAL tunnel log: confirmed live
+    at 22.1 MB / 11,003 ``meridian tunnel: serving`` lines from pytest, none
+    timestamped, burying the real indexing-worker crash lines a live tunnel
+    wrote to the same file. Same pattern as ``_isolate_md_root`` above: an
+    env override (so it also reaches child processes tests spawn), applied
+    autouse so no current or future test can forget it.
+
+    The log lives in its own ``tmp_path_factory`` dir, NOT inside the test's
+    ``tmp_path`` -- tests that list or assert on their own ``tmp_path``
+    contents must not see a stray log file in it.
+    """
+    log_dir = tmp_path_factory.mktemp("tunnel_log")
+    monkeypatch.setenv("MERIDIAN_TUNNEL_LOG", str(log_dir / "tunnel.log"))
+
+
+@pytest.fixture(autouse=True)
+def _isolate_zotero_plugin(monkeypatch, tmp_path_factory):
+    """Keep the Zotero bridge plugin auto-install away from real machine state.
+
+    The launcher's pre-launch install hook and the tray's first-run prompt read
+    the per-user Meridian state dir and the Zotero data root. For EVERY test,
+    point the state dir at a temp folder, point the Zotero data root at a folder
+    with no profiles.ini (so no real Zotero profile can be found), and force
+    auto-install off. The close override is pinned unset, so the saved close
+    choice governs unless a test sets the variable itself. A test that wants the
+    install path opts in with monkeypatch.setenv / monkeypatch.delenv on its own.
+    """
+    state_dir = tmp_path_factory.mktemp("meridian_state")
+    monkeypatch.setenv("MERIDIAN_LOCAL_RUNNER_STATE_DIR", str(state_dir))
+    monkeypatch.setenv("MERIDIAN_ZOTERO_DATA_DIR", str(state_dir / "no-zotero-profile"))
+    monkeypatch.setenv("MERIDIAN_ZOTERO_PLUGIN_AUTOINSTALL", "0")
+    monkeypatch.delenv("MERIDIAN_ZOTERO_CLOSE_ON_INSTALL", raising=False)
 
 
 @pytest_asyncio.fixture

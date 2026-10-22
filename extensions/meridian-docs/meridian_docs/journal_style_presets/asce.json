@@ -1,0 +1,33 @@
+{
+  "meta": {
+    "journal": "asce",
+    "display_name": "American Society of Civil Engineers journals",
+    "publisher": "American Society of Civil Engineers",
+    "status": "populated",
+    "status_detail": "Mechanically migrated 2026-09-18 from the JOURNAL_STYLE_PRESETS dict literal in docs_intel.py (round 2, proposal 64266f13, dated 2026-09-11) as part of the JSON-preset externalization work (proposal 3b93b7ef) -- values and evidence carried over verbatim from the real in-code comment, not regenerated. NOTE (flagged in proposal 64266f13's review section for extra scrutiny -- NOT a substitution caveat, so status stays 'populated' rather than 'partially_populated'): ASCE is one of the two publishers (with asme) called out as directly relevant to the JCSHM thesis domain this preset mechanism originated from. This pass's search corroborated citation style and figure DPI directly from the cited PDF but did not find emphasis-style or caption-punctuation facts, which are left unspecified/absent rather than guessed.",
+    "last_verified": "2026-09-11"
+  },
+  "fields": {
+    "citation_style": {
+      "value": "author_date",
+      "tier": 2,
+      "source": {
+        "type": "live_guidelines_page",
+        "citation": "ASCE 'Publishing in ASCE Journals: A Guide for Authors' PDF (peer.berkeley.edu/sites/default/files/ascejournalformat.pdf -- the same PEER-hosted PDF proposal 64266f13 cited)",
+        "quote": "Smith 2004; Smith and Jones 2004",
+        "note": "in-text citations use the author-date method, no comma between author and year."
+      },
+      "verified_date": "2026-09-11"
+    },
+    "figure_dpi_minimum_general": {
+      "value": 300,
+      "tier": 2,
+      "source": {
+        "type": "live_guidelines_page",
+        "citation": "ASCE 'Publishing in ASCE Journals: A Guide for Authors' PDF (peer.berkeley.edu/sites/default/files/ascejournalformat.pdf -- the same PEER-hosted PDF proposal 64266f13 cited)",
+        "note": "figures need at least 300 dpi (blanket)."
+      },
+      "verified_date": "2026-09-11"
+    }
+  }
+}

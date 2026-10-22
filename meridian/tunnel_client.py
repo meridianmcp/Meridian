@@ -31,9 +31,11 @@ import shutil
 import signal
 import subprocess
 import sys
+import threading
 import time
 import uuid
 from dataclasses import dataclass, field
+from datetime import datetime
 from enum import Enum
 from pathlib import Path
 
@@ -102,6 +104,24 @@ def _tunnel_connect_timeout() -> float:
 # clean 1012 exactly like a repeated real failure. Reused by all three
 # reconnect loops via _is_clean_server_close() below.
 _CLEAN_RECONNECT_CLOSE_CODES = frozenset({1012})
+# c7604ed7 — close codes the SERVER sends that mean "retrying with this same
+# credential/connection will never succeed" rather than a transient network
+# blip. Before this fix EVERY exception (including these) fell into the
+# generic backoff-and-retry branch below, so a revoked/mismatched token or a
+# tenant evicted by a second socket looped forever with no indication to the
+# user anything was actually, permanently wrong.
+#   4401 — invalid/expired/mismatched token (routes/tunnel.py's WS auth checks
+#          — tunnel_ws/_serve_tunnel_ws close with this on a bad credential).
+#   4403 — plan/entitlement rejection (e.g. "tunnel requires Pro plan").
+# Retrying either of these with the SAME token can never succeed — the server
+# has already told us why it rejected the credential.
+_AUTH_REJECTED_CLOSE_CODES = frozenset({4401, 4403})
+# 4000 — this tenant's socket was replaced by a newer connection (see
+# routes/tunnel.py's per-slot WS handlers / _serve_tunnel_ws). Usually a
+# harmless same-host restart that will reconnect and stay up; kept distinct
+# from the generic branch purely so the log message tells the user what's
+# actually happening instead of a bare "disconnected".
+_EVICTED_CLOSE_CODE = 4000
 # Crash isolation: how many times the watchdog relaunches a slot's proxy that
 # keeps exiting (e.g. ENOENT on a missing binary) before backing off to the
 # long-cooldown retry cadence below.
@@ -130,6 +150,98 @@ _STALENESS_CHECK_INTERVAL_SECONDS = 5 * 60.0
 _SLOT_REPROBE_INTERVAL = 60.0
 
 
+# 4d6e87dd — where the tunnel mirrors its stdout/stderr, and when it rotates.
+# ``MERIDIAN_TUNNEL_LOG`` (a FILE path) overrides the default
+# ``~/.meridian/tunnel.log``. tests/conftest.py's autouse ``_isolate_tunnel_log``
+# fixture sets it to a per-test temp file for every test — before this, every
+# test that drove ``run_tunnel`` appended to the developer's REAL log (22.1 MB /
+# 11,003 pytest "serving" lines, burying the real indexing-worker crash lines).
+_TUNNEL_LOG_ENV = "MERIDIAN_TUNNEL_LOG"
+# Minimal size-based rotation: when the log already exceeds this at tunnel
+# start, it is moved to ``<log>.1`` (replacing any older backup) and a fresh log
+# is started. Checked once per start, not per write — one backup, no cron.
+_TUNNEL_LOG_ROTATE_BYTES = 5 * 1024 * 1024
+
+
+def _tunnel_log_path() -> Path:
+    """Path of the persistent tunnel log: ``$MERIDIAN_TUNNEL_LOG`` when set and
+    non-blank, else ``~/.meridian/tunnel.log``."""
+    override = os.environ.get(_TUNNEL_LOG_ENV, "").strip()
+    if override:
+        return Path(override).expanduser()
+    return Path.home() / ".meridian" / "tunnel.log"
+
+
+def _iso_timestamp_now() -> str:
+    """Local wall-clock time as ISO-8601 with millisecond precision and a UTC
+    offset, e.g. ``2026-09-28T05:54:12.123-05:00`` (unambiguous across DST and
+    machines, and lexicographically sortable within one machine's log)."""
+    return datetime.now().astimezone().isoformat(timespec="milliseconds")
+
+
+def _rotate_tunnel_log_if_large(log_path: Path, max_bytes: int | None = None) -> None:
+    """Move *log_path* to ``<name>.1`` (replacing an older backup) when it is
+    larger than *max_bytes* (default ``_TUNNEL_LOG_ROTATE_BYTES``). Best-effort:
+    a missing file, or a rename that fails (e.g. another tunnel process on
+    Windows still holds the log open), leaves the log where it is."""
+    limit = _TUNNEL_LOG_ROTATE_BYTES if max_bytes is None else max_bytes
+    try:
+        if log_path.stat().st_size > limit:
+            os.replace(log_path, log_path.with_name(log_path.name + ".1"))
+    except OSError:
+        pass
+
+
+class _TimestampedLogFile:
+    """4d6e87dd — file-like sink that puts an ISO-8601 timestamp at the start of
+    every LINE written to the underlying file (the tunnel's own diagnostics
+    carried no timestamps at all, so "when did this slot die?" meant guessing
+    from process start times).
+
+    ``print()`` emits its text and the trailing newline as separate ``write``
+    calls, and stdout and stderr (two ``_TeeStream`` s) share one sink, so line
+    state — "is the next character the start of a line?" — lives here, guarded
+    by a lock, not in the callers: a line split across several writes gets ONE
+    timestamp, and concurrent writers from the watchdog threads and the event
+    loop can never tear or double-stamp a line.
+    """
+
+    def __init__(self, raw, clock=_iso_timestamp_now) -> None:
+        self._raw = raw
+        self._clock = clock
+        self._lock = threading.Lock()
+        self._at_line_start = True
+
+    def write(self, data: str) -> int:
+        if not data:
+            return 0
+        pieces: list[str] = []
+        with self._lock:
+            parts = data.split("\n")
+            last = len(parts) - 1
+            for i, part in enumerate(parts):
+                if i == last and part == "":
+                    break  # data ended with "\n": nothing pending on a new line
+                if self._at_line_start:
+                    pieces.append(self._clock() + " ")
+                pieces.append(part)
+                if i < last:
+                    pieces.append("\n")
+                    self._at_line_start = True
+                else:
+                    self._at_line_start = False
+            self._raw.write("".join(pieces))
+        return len(data)
+
+    def flush(self) -> None:
+        with self._lock:
+            self._raw.flush()
+
+    def close(self) -> None:
+        with self._lock:
+            self._raw.close()
+
+
 class _TeeStream:
     """2026-07-19 — mirror writes to the original stream AND a persistent log
     file, so tunnel diagnostics (watchdog retries, TAR_ENTRY_ERROR detection,
@@ -140,6 +252,10 @@ class _TeeStream:
     directories, because none of the tunnel's own diagnostic trail was ever
     persisted anywhere. Never raises — a broken log file must not take down the
     tunnel's real stdout/stderr.
+
+    The console side is passed through untouched; only the log file (a
+    :class:`_TimestampedLogFile` when installed by
+    :func:`_install_tunnel_log_tee`) gets timestamps.
     """
 
     def __init__(self, original, log_file) -> None:
@@ -166,27 +282,31 @@ class _TeeStream:
         return getattr(self._original, name)
 
 
-def _install_tunnel_log_tee() -> None:
-    """Mirror stdout/stderr to ~/.meridian/tunnel.log (append mode, one line
-    header per run) so the watchdog/spawn-retry diagnostics that normally only
-    ever reach an attached console are recoverable after the fact — pairs with
-    1662873f's lightweight log-search tool. Best-effort: any failure to open
-    the log file silently skips teeing rather than blocking tunnel startup.
+def _install_tunnel_log_tee() -> "Path | None":
+    """Mirror stdout/stderr to the tunnel log (:func:`_tunnel_log_path`,
+    default ~/.meridian/tunnel.log; append mode, one timestamped header line per
+    run, every line ISO-timestamped) so the watchdog/spawn-retry diagnostics that
+    normally only ever reach an attached console are recoverable after the fact
+    — pairs with 1662873f's lightweight log-search tool. An oversized existing
+    log is rotated to ``<log>.1`` first (:func:`_rotate_tunnel_log_if_large`).
+    Best-effort: any failure to open the log file silently skips teeing rather
+    than blocking tunnel startup. Returns the log path in use, or ``None`` when
+    teeing was skipped.
     """
     try:
-        log_dir = Path.home() / ".meridian"
-        log_dir.mkdir(parents=True, exist_ok=True)
-        log_path = log_dir / "tunnel.log"
-        log_file = open(log_path, "a", encoding="utf-8", errors="replace")
-        log_file.write(
-            f"\n=== tunnel started {time.strftime('%Y-%m-%d %H:%M:%S')} "
-            f"(pid={os.getpid()}) ===\n"
+        log_path = _tunnel_log_path()
+        log_path.parent.mkdir(parents=True, exist_ok=True)
+        _rotate_tunnel_log_if_large(log_path)
+        log_file = _TimestampedLogFile(
+            open(log_path, "a", encoding="utf-8", errors="replace")
         )
+        log_file.write(f"=== tunnel started (pid={os.getpid()}) ===\n")
         log_file.flush()
         sys.stdout = _TeeStream(sys.stdout, log_file)
         sys.stderr = _TeeStream(sys.stderr, log_file)
+        return log_path
     except Exception:  # noqa: BLE001 — logging must never block tunnel startup
-        pass
+        return None
 
 # 089a936a — the DEFAULT first-spawn pre-flight probe budget (attempts, delay):
 # attempts=2 × delay=3s with a 10s per-attempt httpx timeout ≈ up to ~23s. Fine
@@ -1840,6 +1960,66 @@ def _is_clean_server_close(exc: BaseException) -> bool:
     return code in _CLEAN_RECONNECT_CLOSE_CODES
 
 
+class TunnelAuthRejectedError(RuntimeError):
+    """Raised out of a reconnect loop when the server closes the socket with
+    an auth-rejection code (4401/4403 — see ``_AUTH_REJECTED_CLOSE_CODES``).
+
+    c7604ed7: every exception used to fall into the same generic
+    infinite-backoff retry branch, so a revoked/mismatched token looped
+    forever instead of ever surfacing. Retrying with the SAME rejected
+    credential can never succeed, so this is raised instead of swallowed.
+    It propagates through the owning ``asyncio.gather(*tasks)`` in
+    :func:`run_tunnel` (which only catches ``KeyboardInterrupt`` /
+    ``CancelledError`` around that call, deliberately NOT a bare
+    ``Exception``) so the whole tunnel process exits with a clear,
+    actionable message instead of quietly limping along on N-1 working
+    slots and one silently-dead one — every slot shares the same token, so
+    if the server rejected it, none of them can work either.
+    """
+
+
+def _close_code_of(exc: BaseException) -> "int | None":
+    """The numeric WS close code carried by *exc*, or ``None`` if *exc*
+    isn't a ``websockets`` ``ConnectionClosed`` (c7604ed7). Shared by the
+    reconnect loops' close-code branches so the auth-rejection /
+    eviction / clean-restart checks all agree on how to read the code.
+    """
+    import websockets.exceptions
+
+    if not isinstance(exc, websockets.exceptions.ConnectionClosed):
+        return None
+    rcvd = getattr(exc, "rcvd", None)
+    return rcvd.code if rcvd is not None else None
+
+
+def _invalidate_cached_token(base_url: str) -> None:
+    """Drop the cached tunnel token for *base_url* (c7604ed7).
+
+    Called when the server has just told us (via a 4401/4403 WS close) that
+    this exact token is rejected, so the NEXT ``meridian --tunnel`` run
+    doesn't read the same known-bad token back out of
+    ``~/.meridian/config.json`` and repeat the failure — it falls through to
+    the browser device-code flow instead. Best-effort: any I/O error is
+    swallowed, matching :func:`_read_cached_token`/:func:`_write_cached_token`'s
+    own fail-soft contract; worst case the user re-runs the device flow
+    manually the same way they would have anyway.
+    """
+    path = _config_path()
+    if not path.exists():
+        return
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+        entry = data.get("tunnel_token")
+        if not isinstance(entry, dict) or entry.get("base_url") != base_url:
+            return
+        data.pop("tunnel_token", None)
+        tmp = path.with_suffix(".tmp")
+        tmp.write_text(json.dumps(data, indent=2), encoding="utf-8")
+        tmp.replace(path)
+    except Exception:
+        pass
+
+
 def _safe_disconnect_reason(exc: BaseException) -> str:
     """Stringify a reconnect-loop exception for a stderr print, with any
     embedded bearer token scrubbed first (ff9d2963).
@@ -2085,10 +2265,37 @@ async def _run_connection_lazy(
                         # 0e973e52 — run_verification: spawn test_cmd as a real local
                         # process and send the structured result back to the server.
                         # Only the FS slot handles this; other slots ignore it.
+                        # 189fde6b (RT-LEAD-004) — the hosted server can send run_cmd to
+                        # any connected client, so spawning one needs LOCAL consent: the
+                        # user must set MERIDIAN_TUNNEL_ALLOW_RUN_CMD=1 in the tunnel
+                        # client's own environment. Without it nothing is spawned and the
+                        # server gets an explicit refusal instead.
                         req_id = msg.get("id", "")
                         cmd_val = msg.get("cmd") or ""
                         cwd_val = (msg.get("cwd") or "").strip() or None
-                        run_result = await _handle_run_cmd(cmd_val, cwd_val)
+                        _run_cmd_consent = os.environ.get("MERIDIAN_TUNNEL_ALLOW_RUN_CMD", "")
+                        if _run_cmd_consent.strip().lower() in ("1", "true", "yes", "on"):
+                            run_result = await _handle_run_cmd(cmd_val, cwd_val)
+                        else:
+                            print(
+                                f"tunnel:{label}: refused run_cmd from server (no local consent; "
+                                "set MERIDIAN_TUNNEL_ALLOW_RUN_CMD=1 to allow)",
+                                flush=True,
+                            )
+                            run_result = {
+                                "status": "error",
+                                "refused": True,
+                                "message": (
+                                    "run_cmd refused: this tunnel client has no local consent to "
+                                    "run commands from the hosted server (set "
+                                    "MERIDIAN_TUNNEL_ALLOW_RUN_CMD=1 in the client's environment)"
+                                ),
+                                "exit_code": None,
+                                "passed": None,
+                                "failed": None,
+                                "stdout_tail": "",
+                                "stderr_tail": "",
+                            }
                         run_result["type"] = "run_cmd_result"
                         run_result["id"] = req_id
                         await ws.send(json.dumps(run_result))
@@ -2116,6 +2323,21 @@ async def _run_connection_lazy(
                             }))
                             continue
                         _spawn_failures = 0
+                        # b47a7456 — a RESPAWN (idle-kill / re-probe restart: the
+                        # per-connection preflight already ran) whose own cold-spawn
+                        # readiness probe, run inside ensure_running(), missed its
+                        # window. The process is alive but has not answered tools/list,
+                        # so the slot must not stay advertised as healthy. Report it
+                        # unhealthy (the server suppresses its tools) and start the
+                        # background re-probe, which re-advertises on recovery.
+                        # The request is still relayed, matching the first-spawn
+                        # contract pinned by test_run_connection_lazy_preflight_reports_unhealthy.
+                        if (
+                            _preflight_done
+                            and not _was_running
+                            and proxy.diagnostics.state is SlotState.STARTUP_TIMEOUT
+                        ):
+                            await _mark_unhealthy()
                         # Pre-flight the proxy once, the first time we bring it up.
                         if not _preflight_done and not _was_running:
                             _preflight_done = True
@@ -2196,8 +2418,15 @@ async def _reconnect_loop_lazy(
     label: str,
     tool_prefix: str | None = None,
     known_repo_paths: "list[str] | None" = None,
+    base_url: str | None = None,
 ) -> None:
-    """Keep one lazy-spawn tunnel alive, reconnecting with exponential backoff."""
+    """Keep one lazy-spawn tunnel alive, reconnecting with exponential backoff.
+
+    c7604ed7 — *base_url* (when given) lets an auth-rejection close code
+    (4401/4403) invalidate the cached token for that server before this
+    raises :class:`TunnelAuthRejectedError`; see that class's docstring for
+    why raising (rather than retrying forever) is correct here.
+    """
     backoff = 1.0
     while True:
         try:
@@ -2210,7 +2439,35 @@ async def _reconnect_loop_lazy(
         except asyncio.CancelledError:
             raise
         except Exception as exc:
-            if _is_clean_server_close(exc):
+            _code = _close_code_of(exc)
+            if _code in _AUTH_REJECTED_CLOSE_CODES:
+                # c7604ed7 — retrying with this same rejected credential can
+                # never succeed; surface it instead of looping forever.
+                if base_url:
+                    _invalidate_cached_token(base_url)
+                print(
+                    f"tunnel:{label}: credential rejected by server "
+                    f"(close code {_code}); this will not succeed on retry. "
+                    f"Run `meridian --tunnel` again to re-authenticate.",
+                    file=sys.stderr,
+                    flush=True,
+                )
+                raise TunnelAuthRejectedError(
+                    f"{label}: server rejected credential (close code {_code})"
+                ) from exc
+            if _code == _EVICTED_CLOSE_CODE:
+                # c7604ed7 — usually a harmless same-host restart; back off
+                # normally (below) but say clearly what happened rather than
+                # a bare "disconnected".
+                print(
+                    f"tunnel:{label}: connection replaced by a newer one "
+                    f"(close code {_code}) — if that wasn't you, another "
+                    f"machine or process may be using this tenant's tunnel; "
+                    f"reconnecting in {backoff:.0f}s",
+                    file=sys.stderr,
+                    flush=True,
+                )
+            elif _is_clean_server_close(exc):
                 # 13161001 — server-initiated clean close (e.g. 1012 service
                 # restart) is not a failure signal: reset backoff the same as
                 # a successful connection instead of climbing it, mirroring
@@ -2386,8 +2643,14 @@ async def _reconnect_loop_extract_pool(
     default_repo_path: str,
     label: str = "extract",
     tool_prefix: str | None = None,
+    base_url: str | None = None,
 ) -> None:
-    """Keep the pooled code-extractor tunnel alive, reconnecting with backoff."""
+    """Keep the pooled code-extractor tunnel alive, reconnecting with backoff.
+
+    c7604ed7 — see :func:`_reconnect_loop_lazy`'s docstring: *base_url* lets
+    an auth-rejection close code invalidate the cached token before this
+    raises :class:`TunnelAuthRejectedError` instead of retrying forever.
+    """
     backoff = 1.0
     while True:
         try:
@@ -2398,7 +2661,31 @@ async def _reconnect_loop_extract_pool(
         except asyncio.CancelledError:
             raise
         except Exception as exc:
-            if _is_clean_server_close(exc):
+            _code = _close_code_of(exc)
+            if _code in _AUTH_REJECTED_CLOSE_CODES:
+                # c7604ed7 — see _reconnect_loop_lazy.
+                if base_url:
+                    _invalidate_cached_token(base_url)
+                print(
+                    f"tunnel:{label}: credential rejected by server "
+                    f"(close code {_code}); this will not succeed on retry. "
+                    f"Run `meridian --tunnel` again to re-authenticate.",
+                    file=sys.stderr,
+                    flush=True,
+                )
+                raise TunnelAuthRejectedError(
+                    f"{label}: server rejected credential (close code {_code})"
+                ) from exc
+            if _code == _EVICTED_CLOSE_CODE:
+                print(
+                    f"tunnel:{label}: connection replaced by a newer one "
+                    f"(close code {_code}) — if that wasn't you, another "
+                    f"machine or process may be using this tenant's tunnel; "
+                    f"reconnecting in {backoff:.0f}s",
+                    file=sys.stderr,
+                    flush=True,
+                )
+            elif _is_clean_server_close(exc):
                 # 13161001 — see _reconnect_loop_lazy: a clean server-initiated
                 # close (e.g. 1012 service restart) resets backoff instead of
                 # climbing it, mirroring _proc_watchdog's healthy-tick reset.
@@ -3707,6 +3994,29 @@ def _office_slot_spawn_env(env: object) -> "dict[str, str]":
     return merged
 
 
+def _zotero_slot_spawn_env(env: object) -> "dict[str, str]":
+    """Spawn env for Zotero with credentials sourced only from the local OS vault."""
+    merged = _office_slot_spawn_env(env)
+    # The server-configured env and the parent process may both contain stale or
+    # legacy copies. Never let either cross into the Zotero child process.
+    for name in tuple(merged):
+        if name.casefold() in {"zotero_api_key", "zotero_library_id", "zotero_library_type"}:
+            merged.pop(name, None)
+    from .tunnel_config import (  # noqa: PLC0415 — local-only, lazy
+        get_zotero_api_key,
+        get_zotero_library_id,
+    )
+
+    local_key = get_zotero_api_key()
+    if local_key:
+        merged["ZOTERO_API_KEY"] = local_key
+    local_library_id = get_zotero_library_id()
+    if local_library_id:
+        merged["ZOTERO_LIBRARY_ID"] = local_library_id
+        merged["ZOTERO_LIBRARY_TYPE"] = "user"
+    return merged
+
+
 def _terminate_proc_tree(proc: "subprocess.Popen | None") -> None:
     """Stop a spawned proxy *and its whole child tree*. Best-effort; never raises.
 
@@ -4373,17 +4683,34 @@ def _force_utf8_io() -> None:
 # Config resolution (pure — unit tested)
 # ---------------------------------------------------------------------------
 
-def _resolve_token(arg_token: str | None = None) -> str:
-    """Resolve the API token: CLI arg > MERIDIAN_API_KEY > BEARER_TOKEN.
+# 9784f8ef — the token env var names the installers, the tunnel client and the
+# MCP client configs historically disagreed on (install.ps1 -> MERIDIAN_TOKEN,
+# install_tunnel.* -> MERIDIAN_API_KEY, mcp-remote configs -> BEARER_TOKEN), so a
+# token exported for one component was silently invisible to the others.
+# Precedence, highest first; the CLI ``--token`` value always beats all of them.
+# ``MERIDIAN_TOKEN`` is the canonical name; ``MERIDIAN_API_KEY`` and
+# ``BEARER_TOKEN`` are kept as legacy aliases so existing launchers/configs keep
+# working. scripts/meridian_connect.py carries an identical tuple (it is a
+# dependency-free PyInstaller entry point and cannot import this module); a test
+# pins the two together.
+TOKEN_ENV_VARS: tuple[str, ...] = ("MERIDIAN_TOKEN", "MERIDIAN_API_KEY", "BEARER_TOKEN")
 
-    A leading ``Bearer `` prefix (e.g. copied from a header) is stripped.
+
+def _resolve_token(arg_token: str | None = None) -> str:
+    """Resolve the API token: CLI arg > MERIDIAN_TOKEN > MERIDIAN_API_KEY > BEARER_TOKEN.
+
+    Env vars are the preferred way to hand a token to the tunnel: unlike
+    ``--token`` they never appear in a process listing's command line. The
+    first non-blank source wins. A leading ``Bearer `` prefix (e.g. copied from
+    a header) is stripped.
     """
-    token = (
-        arg_token
-        or os.environ.get("MERIDIAN_API_KEY")
-        or os.environ.get("BEARER_TOKEN")
-        or ""
-    ).strip()
+    token = (arg_token or "").strip()
+    if not token:
+        for name in TOKEN_ENV_VARS:
+            candidate = (os.environ.get(name) or "").strip()
+            if candidate:
+                token = candidate
+                break
     if token.lower().startswith("bearer "):
         token = token[7:].strip()
     return token
@@ -4552,7 +4879,17 @@ def _read_cached_token(base_url: str) -> str | None:
 
 
 def _write_cached_token(base_url: str, token: str) -> None:
-    """Persist *token* to ``~/.meridian/config.json`` with a 30-day expiry."""
+    """Persist *token* to ``~/.meridian/config.json`` with a 90-day expiry.
+
+    c7604ed7 — was 30 days, which meant the CLIENT would silently treat a
+    still-server-valid token as expired and force a needless re-auth (or,
+    worse, in the other direction masked nothing but was simply wrong): the
+    device token this caches actually lives 90 days server-side
+    (``routes/oauth.py``'s ``_oauth_device``/RFC 8628 token grant, ``exp":
+    int(_tm.time() + 86400 * 90)``). Aligning the two means the local cache
+    expires the token at the same time the server would actually reject it,
+    not a third of the way through its real lifetime.
+    """
     path = _config_path()
     path.parent.mkdir(parents=True, exist_ok=True)
     data: dict = {}
@@ -4564,7 +4901,7 @@ def _write_cached_token(base_url: str, token: str) -> None:
     data["tunnel_token"] = {
         "token": token,
         "base_url": base_url,
-        "expires_at": int(time.time()) + 30 * 24 * 3600,
+        "expires_at": int(time.time()) + 90 * 24 * 3600,
     }
     tmp = path.with_suffix(".tmp")
     tmp.write_text(json.dumps(data, indent=2), encoding="utf-8")
@@ -4581,12 +4918,25 @@ async def _browser_auth_flow(base_url: str) -> str:
     Returns the raw API token on success, or an empty string on failure/cancel.
     The token is never written to shell history or passed via the process list —
     it lives only in memory until the caller caches it to disk.
+
+    e37187f3 — this machine's hostname is passed through so the server mints
+    a per-host tunnel-cli token (see ``server.py``'s ``tunnel_connect_page``/
+    ``tunnel_connect_authorize``) instead of the old shared per-tenant one
+    that a second machine's install would silently revoke.
     """
     import uuid as _uuid
     import webbrowser
+    from urllib.parse import quote as _quote
 
     device_code = str(_uuid.uuid4())
+    try:
+        import socket as _socket
+        _hostname = _socket.gethostname() or ""
+    except Exception:  # noqa: BLE001
+        _hostname = ""
     connect_url = f"{base_url}/auth/tunnel-connect?device_code={device_code}"
+    if _hostname:
+        connect_url += f"&hostname={_quote(_hostname, safe='')}"
     poll_url = f"{base_url}/auth/tunnel-poll"
 
     print("", flush=True)
@@ -4624,6 +4974,25 @@ async def _browser_auth_flow(base_url: str) -> str:
     return ""
 
 
+def _local_host_id() -> str:
+    """This machine's self-reported host id for the tunnel WS ``?host=``
+    query param (e37187f3) — lets the server tell "this same machine
+    reconnected" apart from "a different machine connected", so it only
+    evicts a genuine same-host stale socket instead of any prior connection
+    for the tenant (see routes/tunnel.py's ``_register_tunnel_socket_multi_host``).
+    Reuses ``socket.gethostname()``, the same identifier the codebase already
+    sends as ``X-Meridian-Hostname`` for per-machine tunnel-plugin config
+    (8660d701). Best-effort: an empty/failed lookup just means the server
+    buckets this connection under its shared "unknown" host — the original
+    (pre-fix) mutual-eviction behavior — never a hard failure.
+    """
+    try:
+        import socket as _socket
+        return _socket.gethostname() or ""
+    except Exception:  # noqa: BLE001
+        return ""
+
+
 def _ws_url(base_url: str, tenant_id: str, token: str) -> str:
     """Build the tunnel WebSocket URL with the token as a query param.
 
@@ -4636,6 +5005,10 @@ def _ws_url(base_url: str, tenant_id: str, token: str) -> str:
     only ``websockets>=12.0``, open-ended). Any code that stringifies a
     connection exception built from this URL (e.g. reconnect-loop logging)
     MUST redact it first — see :func:`_safe_disconnect_reason`.
+
+    e37187f3 — also carries ``&host=`` (this machine's hostname) so the
+    server can register this connection per-host instead of evicting
+    whatever else is connected for this tenant.
     """
     base = base_url.rstrip("/")
     if base.startswith("https://"):
@@ -4645,7 +5018,11 @@ def _ws_url(base_url: str, tenant_id: str, token: str) -> str:
     else:
         ws_base = base
     from urllib.parse import quote
-    return f"{ws_base}/tunnel/{tenant_id}?token={quote(token, safe='')}"
+    url = f"{ws_base}/tunnel/{tenant_id}?token={quote(token, safe='')}"
+    _host = _local_host_id()
+    if _host:
+        url += f"&host={quote(_host, safe='')}"
+    return url
 
 
 def _permanent_url(base_url: str, tenant_id: str) -> str:
@@ -4665,7 +5042,10 @@ def _sse_url(base_url: str, tenant_id: str) -> str:
 
 
 def _ws_code_url(base_url: str, tenant_id: str, token: str) -> str:
-    """Build the codebase-memory-mcp tunnel WebSocket URL."""
+    """Build the codebase-memory-mcp tunnel WebSocket URL.
+
+    e37187f3 — carries ``&host=``; see :func:`_ws_url`.
+    """
     base = base_url.rstrip("/")
     if base.startswith("https://"):
         ws_base = "wss://" + base[len("https://"):]
@@ -4674,7 +5054,11 @@ def _ws_code_url(base_url: str, tenant_id: str, token: str) -> str:
     else:
         ws_base = base
     from urllib.parse import quote
-    return f"{ws_base}/tunnel-code/{tenant_id}?token={quote(token, safe='')}"
+    url = f"{ws_base}/tunnel-code/{tenant_id}?token={quote(token, safe='')}"
+    _host = _local_host_id()
+    if _host:
+        url += f"&host={quote(_host, safe='')}"
+    return url
 
 
 def _permanent_code_url(base_url: str, tenant_id: str) -> str:
@@ -4683,7 +5067,10 @@ def _permanent_code_url(base_url: str, tenant_id: str) -> str:
 
 
 def _ws_extract_url(base_url: str, tenant_id: str, token: str) -> str:
-    """Build the mcp-server-code-extractor tunnel WebSocket URL."""
+    """Build the mcp-server-code-extractor tunnel WebSocket URL.
+
+    e37187f3 — carries ``&host=``; see :func:`_ws_url`.
+    """
     base = base_url.rstrip("/")
     if base.startswith("https://"):
         ws_base = "wss://" + base[len("https://"):]
@@ -4692,7 +5079,11 @@ def _ws_extract_url(base_url: str, tenant_id: str, token: str) -> str:
     else:
         ws_base = base
     from urllib.parse import quote
-    return f"{ws_base}/tunnel-extract/{tenant_id}?token={quote(token, safe='')}"
+    url = f"{ws_base}/tunnel-extract/{tenant_id}?token={quote(token, safe='')}"
+    _host = _local_host_id()
+    if _host:
+        url += f"&host={quote(_host, safe='')}"
+    return url
 
 
 def _permanent_extract_url(base_url: str, tenant_id: str) -> str:
@@ -4717,7 +5108,11 @@ def _meridian_server_url(base_url: str) -> str:
 
 
 def _ws_office_url(base_url: str, tenant_id: str, token: str, slot: str) -> str:
-    """Build the WebSocket URL for an Office tunnel slot (ppt/word)."""
+    """Build the WebSocket URL for an Office-family tunnel slot (ppt/word/
+    dc/docs/zotero/outputs/debug — all served by ``_serve_tunnel_ws``).
+
+    e37187f3 — carries ``&host=``; see :func:`_ws_url`.
+    """
     base = base_url.rstrip("/")
     if base.startswith("https://"):
         ws_base = "wss://" + base[len("https://"):]
@@ -4726,7 +5121,11 @@ def _ws_office_url(base_url: str, tenant_id: str, token: str, slot: str) -> str:
     else:
         ws_base = base
     from urllib.parse import quote
-    return f"{ws_base}/tunnel-{slot}/{tenant_id}?token={quote(token, safe='')}"
+    url = f"{ws_base}/tunnel-{slot}/{tenant_id}?token={quote(token, safe='')}"
+    _host = _local_host_id()
+    if _host:
+        url += f"&host={quote(_host, safe='')}"
+    return url
 
 
 def _permanent_office_url(base_url: str, tenant_id: str, slot: str) -> str:
@@ -5132,125 +5531,240 @@ def _find_codebase_memory_mcp() -> str | None:
     return None
 
 
-def _pick_release_asset(assets: list[dict]) -> "dict | None":
-    """Pick the best GitHub release asset for the current platform and arch.
+# ---------------------------------------------------------------------------
+# codebase-memory-mcp auto-download: pinned release + SHA-256 verification
+# (f66e8f23)
+# ---------------------------------------------------------------------------
+# This used to fetch DeusData's *latest* release through the GitHub API, pick an
+# asset by filename heuristics, write the bytes to ~/.meridian/bin and later run
+# them -- with no integrity check of any kind, so whatever the latest release (or
+# a hijacked one) contained ran on the user's machine. It now downloads exactly
+# one fixed asset per platform (same tag, hard-coded name) and refuses to touch
+# the bytes unless their SHA-256 equals the pin below. Verification happens on the
+# archive as downloaded, BEFORE anything is extracted, written to disk or run, and
+# it fails closed: a mismatch, an unsupported platform, or a missing table entry
+# means no download is installed. There is deliberately NO "unpinned latest"
+# fallback; anyone who wants a different build installs codebase-memory-mcp
+# themselves (PATH or npm global), which _find_codebase_memory_mcp() honours first.
+#
+# WHERE THE PINS CAME FROM (re-derive the same way when bumping the tag):
+#   gh api repos/DeusData/codebase-memory-mcp/releases/tags/<tag> \
+#       --jq '.assets[] | "\(.digest) \(.name)"'
+# `digest` is the SHA-256 GitHub itself computed over the uploaded asset bytes.
+# v0.11.0 was published 2026-09-15 as a non-prerelease *immutable* release (its
+# assets cannot be swapped after publication). The hashes were read from that
+# API metadata only -- no release asset was downloaded, unpacked or executed to
+# produce them. Linux uses the "-portable" (fully static) archives because they
+# do not depend on the host's libc; the other platforms only ship one build.
+_CBM_REPO = "DeusData/codebase-memory-mcp"
+_CBM_PINNED_TAG = "v0.11.0"
+# (os, arch) -> (release asset name, sha256 hex digest of that archive)
+_CBM_PINNED_ASSETS: "dict[tuple[str, str], tuple[str, str]]" = {
+    ("windows", "amd64"): (
+        "codebase-memory-mcp-windows-amd64.zip",
+        "6eb6beaf261b19e419766e78baf93cbc3cf1c6338cff8fb7c0234859f96d1685",
+    ),
+    ("windows", "arm64"): (
+        "codebase-memory-mcp-windows-arm64.zip",
+        "52b29881214fce47d529e098308b1de77c40f6812e20a34d588ee4c25b84fd1a",
+    ),
+    ("darwin", "amd64"): (
+        "codebase-memory-mcp-darwin-amd64.tar.gz",
+        "dbf1c73bfcbde64e7dde4cd1320da7afc02e2c972ee1789ae039521411f5132e",
+    ),
+    ("darwin", "arm64"): (
+        "codebase-memory-mcp-darwin-arm64.tar.gz",
+        "4dee7f38b63740e6751d7a7ed7eb10291c1f2a3ea2415f599dc68370ca0a2d18",
+    ),
+    ("linux", "amd64"): (
+        "codebase-memory-mcp-linux-amd64-portable.tar.gz",
+        "1f9e8293eb2bc5c05cfa27a7e8fc033da6d729ffad525ccfcdaa3fd606306683",
+    ),
+    ("linux", "arm64"): (
+        "codebase-memory-mcp-linux-arm64-portable.tar.gz",
+        "d62eeb224d5ee3eba3070938ec62cf1033f10b041ec1c4b2fb67f7aef390cc7b",
+    ),
+}
+# Upper bound for the executable pulled out of a (hash-verified) archive.
+_CBM_MAX_BINARY_BYTES = 512 * 1024 * 1024
 
-    Hard-excludes assets for other platforms before scoring so an arch-only
-    match can never cause a cross-platform download (e.g. darwin-amd64 on
-    Windows when no windows asset is present).
-    """
+
+def _cbm_platform_key() -> "tuple[str, str] | None":
+    """Return the ``(os, arch)`` key of this machine in the pin table's
+    vocabulary, or None when the OS or CPU architecture is not one we pin."""
     import platform as _platform
 
-    machine = _platform.machine().lower()
-    is_arm = machine in ("arm64", "aarch64")
-
     if sys.platform == "win32":
-        os_kws = ["win", "windows"]
-        os_exclude = ["linux", "darwin", "macos", "mac", "apple"]
+        os_key = "windows"
     elif sys.platform == "darwin":
-        os_kws = ["darwin", "macos", "mac", "apple"]
-        # "win" is a substring of "darwin" — never use it as an exclusion keyword here
-        os_exclude = ["linux", "windows", "msvc"]
+        os_key = "darwin"
+    elif sys.platform.startswith("linux"):
+        os_key = "linux"
     else:
-        os_kws = ["linux"]
-        os_exclude = ["darwin", "macos", "mac", "apple", "windows", "win"]
-
-    arch_kws = ["aarch64", "arm64"] if is_arm else ["x86_64", "amd64", "x64"]
-
-    def _score(name: str) -> int:
-        n = name.lower()
-        # Hard-exclude wrong-platform assets — never download a binary that
-        # won't run on this OS, even if the arch matches.
-        if any(kw in n for kw in os_exclude):
-            return -100
-        s = 0
-        for kw in os_kws:
-            if kw in n:
-                s += 10
-                break
-        for kw in arch_kws:
-            if kw in n:
-                s += 5
-                break
-        if sys.platform == "win32" and n.endswith(".exe"):
-            s += 3
-        elif sys.platform != "win32" and not any(n.endswith(e) for e in (".exe", ".zip", ".tar.gz", ".tgz")):
-            s += 1
-        if any(n.endswith(e) for e in (".tar.gz", ".tgz", ".zip")):
-            s -= 5
-        return s
-
-    candidates = [
-        (a, _score(a["name"]))
-        for a in assets
-        if a.get("name") and a.get("browser_download_url")
-    ]
-    candidates.sort(key=lambda x: x[1], reverse=True)
-    if not candidates or candidates[0][1] <= 0:
         return None
-    return candidates[0][0]
+    machine = _platform.machine().lower()
+    if machine in ("arm64", "aarch64"):
+        arch_key = "arm64"
+    elif machine in ("x86_64", "amd64", "x64"):
+        arch_key = "amd64"
+    else:
+        return None
+    return os_key, arch_key
+
+
+def _cbm_sha256_matches(data: bytes, expected_hex: str) -> bool:
+    """Constant-time comparison of ``sha256(data)`` against a pinned hex digest."""
+    import hashlib
+    import hmac
+
+    return hmac.compare_digest(
+        hashlib.sha256(data).hexdigest(), str(expected_hex).strip().lower()
+    )
+
+
+def _extract_cbm_binary(archive: bytes, asset_name: str, bin_name: str) -> "bytes | None":
+    """Return the bytes of the ``bin_name`` executable inside *archive*, or None.
+
+    Only call this on an archive whose SHA-256 already matched its pin. Every
+    other member (the release ships install scripts and docs next to the
+    executable) is ignored, and no member name is ever used to build a
+    filesystem path, so a crafted archive cannot write outside ``dest`` (no
+    path traversal, no symlink/hardlink following, nothing is extracted to disk
+    here at all). Directory, link and device members are skipped, and the
+    executable's size is capped so the in-memory read stays bounded.
+    """
+    import io
+    import posixpath
+
+    limit = _CBM_MAX_BINARY_BYTES
+    if asset_name.endswith(".zip"):
+        import zipfile
+
+        with zipfile.ZipFile(io.BytesIO(archive)) as zf:
+            for info in zf.infolist():
+                if info.is_dir():
+                    continue
+                if posixpath.basename(info.filename.replace("\\", "/")) != bin_name:
+                    continue
+                if info.file_size > limit:
+                    return None
+                with zf.open(info) as fh:
+                    data = fh.read(limit + 1)
+                return data if len(data) <= limit else None
+        return None
+    if asset_name.endswith((".tar.gz", ".tgz")):
+        import tarfile
+
+        with tarfile.open(fileobj=io.BytesIO(archive), mode="r:gz") as tf:
+            for member in tf:
+                if not member.isfile():
+                    continue
+                if posixpath.basename(member.name) != bin_name:
+                    continue
+                if member.size > limit:
+                    return None
+                fh = tf.extractfile(member)
+                if fh is None:
+                    return None
+                data = fh.read(limit + 1)
+                return data if len(data) <= limit else None
+        return None
+    return None
 
 
 async def _download_codebase_memory_mcp() -> "str | None":
-    """Download the latest codebase-memory-mcp release for this platform.
+    """Download the *pinned* codebase-memory-mcp release for this platform.
 
-    Saves to ~/.meridian/bin/ and makes the file executable. Returns the path
-    on success, None on failure (error printed to stderr).
+    f66e8f23 -- fetches the fixed asset from ``_CBM_PINNED_ASSETS``, verifies its
+    SHA-256 against the pin BEFORE extracting or writing anything, then installs
+    only the executable to ~/.meridian/bin/ (atomically) and marks it
+    executable. Returns the path on success, None on any failure (error printed
+    to stderr). Fails closed: an unsupported platform, a download error, a hash
+    mismatch, or an archive without the executable all leave nothing installed.
     """
+    import platform as _platform
+
     import httpx
 
-    bin_dir = _managed_bin_dir()
-    bin_dir.mkdir(parents=True, exist_ok=True)
     bin_name = "codebase-memory-mcp.exe" if sys.platform == "win32" else "codebase-memory-mcp"
-    dest = bin_dir / bin_name
+
+    key = _cbm_platform_key()
+    pin = _CBM_PINNED_ASSETS.get(key) if key is not None else None
+    if pin is None:
+        print(
+            "  code-intel: no verified codebase-memory-mcp build is pinned for this "
+            f"platform ({sys.platform}/{_platform.machine() or 'unknown'}) -- refusing to "
+            "download an unverified binary. Install codebase-memory-mcp manually "
+            "(e.g. `npm install -g codebase-memory-mcp`) and re-run `meridian --tunnel`.",
+            file=sys.stderr, flush=True,
+        )
+        return None
+    asset_name, expected_sha256 = pin
 
     print("  code-intel: codebase-memory-mcp not found — downloading from GitHub...", flush=True)
 
-    api_url = "https://api.github.com/repos/DeusData/codebase-memory-mcp/releases/latest"
+    url = f"https://github.com/{_CBM_REPO}/releases/download/{_CBM_PINNED_TAG}/{asset_name}"
+    tmp: "Path | None" = None
     try:
-        async with httpx.AsyncClient(timeout=30.0, follow_redirects=True) as client:
-            r = await client.get(api_url, headers={"Accept": "application/vnd.github+json"})
-            r.raise_for_status()
-            release = r.json()
-
-        assets = release.get("assets", [])
-        asset = _pick_release_asset(assets)
-        if asset is None:
-            print(
-                "  code-intel: no suitable binary found in the GitHub release — "
-                "install codebase-memory-mcp manually and re-run `meridian --tunnel`.",
-                file=sys.stderr, flush=True,
-            )
-            return None
-
-        version = release.get("tag_name", "unknown")
-        print(f"  code-intel: downloading {asset['name']} ({version})...", flush=True)
-
+        print(f"  code-intel: downloading {asset_name} ({_CBM_PINNED_TAG})...", flush=True)
         async with httpx.AsyncClient(timeout=120.0, follow_redirects=True) as client:
-            r = await client.get(asset["browser_download_url"])
+            r = await client.get(url)
             r.raise_for_status()
-            dest.write_bytes(r.content)
+            archive = r.content
 
-        # Sanity-check: a real binary should be well over 1 MB. A redirect page
-        # or partial download will be tiny — reject it so we don't silently cache
-        # a broken file that produces "path not found" on every tunnel start.
-        if dest.stat().st_size < 1_000_000:
-            dest.unlink(missing_ok=True)
+        # Integrity gate: nothing below runs unless the bytes are exactly the
+        # pinned release asset. (Constant-time compare; never extract first.)
+        if not _cbm_sha256_matches(archive, expected_sha256):
+            import hashlib
+
             print(
-                f"  code-intel: downloaded file is too small ({dest.stat().st_size if dest.exists() else 0} bytes) "
-                "— likely a corrupt download. Try: npm install -g codebase-memory-mcp",
+                f"  code-intel: SHA-256 MISMATCH for {asset_name} ({_CBM_PINNED_TAG}): "
+                f"expected {expected_sha256}, got {hashlib.sha256(archive).hexdigest()}. "
+                "Refusing to install or run it. Install codebase-memory-mcp manually "
+                "and re-run `meridian --tunnel`.",
                 file=sys.stderr, flush=True,
             )
             return None
 
+        binary = _extract_cbm_binary(archive, asset_name, bin_name)
+        if binary is None:
+            print(
+                f"  code-intel: verified archive {asset_name} does not contain a usable "
+                f"'{bin_name}' executable -- refusing to install.",
+                file=sys.stderr, flush=True,
+            )
+            return None
+
+        # Sanity-check: a real binary should be well over 1 MB. Cheap defence
+        # against a wrongly-pinned (e.g. checksums-only) asset.
+        if len(binary) < 1_000_000:
+            print(
+                f"  code-intel: extracted executable is too small ({len(binary)} bytes) "
+                "— likely the wrong file. Try: npm install -g codebase-memory-mcp",
+                file=sys.stderr, flush=True,
+            )
+            return None
+
+        bin_dir = _managed_bin_dir()
+        bin_dir.mkdir(parents=True, exist_ok=True)
+        dest = bin_dir / bin_name
+        # Write next to the destination then rename, so a crash mid-write can
+        # never leave a truncated file where _find_codebase_memory_mcp() looks.
+        tmp = bin_dir / f"{bin_name}.{os.getpid()}.part"
+        tmp.write_bytes(binary)
         if sys.platform != "win32":
-            dest.chmod(dest.stat().st_mode | 0o111)  # make executable
+            tmp.chmod(tmp.stat().st_mode | 0o111)  # make executable
+        os.replace(tmp, dest)
+        tmp = None
 
         print(f"  code-intel: installed to {dest}", flush=True)
         return str(dest)
     except Exception as exc:
         print(f"  code-intel: download failed ({exc})", file=sys.stderr, flush=True)
         return None
+    finally:
+        if tmp is not None:
+            tmp.unlink(missing_ok=True)
 
 
 async def _ensure_codebase_memory_mcp() -> "str | None":
@@ -5831,6 +6345,27 @@ async def _fetch_filesystem_roots(
     """
     import httpx
 
+    def canonical_root(value: str) -> str:
+        normalized = _normalize_path_arg(value)
+        if not normalized:
+            return ""
+        try:
+            return os.path.normcase(os.path.realpath(os.path.abspath(normalized)))
+        except (OSError, ValueError):
+            return normalized
+
+    def canonical_roots(values: Any) -> list[str]:
+        result: list[str] = []
+        seen: set[str] = set()
+        for value in values if isinstance(values, (list, tuple)) else []:
+            if not isinstance(value, str):
+                continue
+            path = canonical_root(value)
+            if path and path not in seen:
+                result.append(path)
+                seen.add(path)
+        return result
+
     try:
         async with httpx.AsyncClient(timeout=15.0) as client:
             r = await client.get(
@@ -5844,10 +6379,10 @@ async def _fetch_filesystem_roots(
                 serena_repo = data.get("serena_repo_path") or ""
                 code_dirs = data.get("codebase_code_dirs") or []
                 return (
-                    [_normalize_path_arg(x) for x in roots if isinstance(x, str) and _normalize_path_arg(x)],
-                    [_normalize_path_arg(x) for x in known if isinstance(x, str) and _normalize_path_arg(x)],
-                    _normalize_path_arg(serena_repo) if isinstance(serena_repo, str) else "",
-                    [_normalize_path_arg(x) for x in code_dirs if isinstance(x, str) and _normalize_path_arg(x)],
+                    canonical_roots(roots),
+                    canonical_roots(known),
+                    canonical_root(serena_repo) if isinstance(serena_repo, str) else "",
+                    canonical_roots(code_dirs),
                 )
     except Exception:  # noqa: BLE001 — network/parse error → defaults
         pass
@@ -6541,9 +7076,15 @@ async def _run_connection(
 # ---------------------------------------------------------------------------
 
 async def _reconnect_loop(
-    ws_url: str, port: int, label: str, tool_prefix: str | None = None
+    ws_url: str, port: int, label: str, tool_prefix: str | None = None,
+    base_url: str | None = None,
 ) -> None:
-    """Keep one tunnel alive, reconnecting with exponential backoff."""
+    """Keep one tunnel alive, reconnecting with exponential backoff.
+
+    c7604ed7 — see :func:`_reconnect_loop_lazy`'s docstring: *base_url* lets
+    an auth-rejection close code invalidate the cached token before this
+    raises :class:`TunnelAuthRejectedError` instead of retrying forever.
+    """
     backoff = 1.0
     while True:
         try:
@@ -6552,7 +7093,31 @@ async def _reconnect_loop(
         except asyncio.CancelledError:
             raise
         except Exception as exc:
-            if _is_clean_server_close(exc):
+            _code = _close_code_of(exc)
+            if _code in _AUTH_REJECTED_CLOSE_CODES:
+                # c7604ed7 — see _reconnect_loop_lazy.
+                if base_url:
+                    _invalidate_cached_token(base_url)
+                print(
+                    f"tunnel:{label}: credential rejected by server "
+                    f"(close code {_code}); this will not succeed on retry. "
+                    f"Run `meridian --tunnel` again to re-authenticate.",
+                    file=sys.stderr,
+                    flush=True,
+                )
+                raise TunnelAuthRejectedError(
+                    f"{label}: server rejected credential (close code {_code})"
+                ) from exc
+            if _code == _EVICTED_CLOSE_CODE:
+                print(
+                    f"tunnel:{label}: connection replaced by a newer one "
+                    f"(close code {_code}) — if that wasn't you, another "
+                    f"machine or process may be using this tenant's tunnel; "
+                    f"reconnecting in {backoff:.0f}s",
+                    file=sys.stderr,
+                    flush=True,
+                )
+            elif _is_clean_server_close(exc):
                 # 13161001 — see _reconnect_loop_lazy: a clean server-initiated
                 # close (e.g. 1012 service restart) resets backoff instead of
                 # climbing it, mirroring _proc_watchdog's healthy-tick reset.
@@ -6833,6 +7398,23 @@ def _tunnel_mcp_entries(
     (start_session, get_sprint_items, generate_handoff, …) even though the three
     tool-slot connectors are present.
 
+    5fe96405 — the three slot entries (fs/code/extract) now carry the SAME
+    ``Authorization: Bearer <token>`` header as the ``meridian`` entry above
+    when *token* is provided. Before this fix these entries had no credential
+    at all: the slot routes (``_authorize_tunnel_proxy_caller`` in
+    routes/tunnel.py) started hard-requiring a matching tenant credential
+    (4cbb1cea) and every generated slot entry 401'd immediately —
+    "invalid or mismatched tenant credential" — regardless of whether the
+    caller had a valid token, because none was ever attached. Adding the
+    header here (rather than dropping the per-slot entries in favour of the
+    tools that ``/mcp`` now aggregates) is the smaller, additive fix: it
+    mirrors the already-working ``meridian`` entry exactly, and a client that
+    still wants a direct per-slot connector (bypassing the aggregated-tools
+    routing) keeps working. See ``_authorize_tunnel_proxy_caller``'s
+    WWW-Authenticate header (same commit) for the discovery-side half of this
+    fix, kept for any OAuth-capable client that still hits a slot URL with no
+    credential at all.
+
     Collision handling and legacy-key migration happen in
     :func:`_inject_mcp_entries`, which sees the existing config; this function is
     a pure name→url map and stays trivially unit-testable.
@@ -6841,17 +7423,22 @@ def _tunnel_mcp_entries(
     # bf31787c — the main Meridian server entry MUST come first so it is the
     # first thing an agent sees in the merged mcpServers dict. The three slot
     # connectors follow.
+    _auth_headers = {"Authorization": f"Bearer {token}"} if token else None
     if token:
         entries["meridian"] = {
             "type": "http",
             "url": _meridian_server_url(base_url),
-            "headers": {"Authorization": f"Bearer {token}"},
+            "headers": _auth_headers,
         }
-    entries.update({
-        _TUNNEL_MCP_SLOT_NAMES["fs"]: {"type": "http", "url": _permanent_url(base_url, tenant_id)},
-        _TUNNEL_MCP_SLOT_NAMES["code"]: {"type": "http", "url": _permanent_code_url(base_url, tenant_id)},
-        _TUNNEL_MCP_SLOT_NAMES["extract"]: {"type": "http", "url": _permanent_extract_url(base_url, tenant_id)},
-    })
+    for _slot_key, _slot_url in (
+        ("fs", _permanent_url(base_url, tenant_id)),
+        ("code", _permanent_code_url(base_url, tenant_id)),
+        ("extract", _permanent_extract_url(base_url, tenant_id)),
+    ):
+        _entry: dict[str, Any] = {"type": "http", "url": _slot_url}
+        if _auth_headers:
+            _entry["headers"] = dict(_auth_headers)
+        entries[_TUNNEL_MCP_SLOT_NAMES[_slot_key]] = _entry
     for cp in custom or []:
         name = cp.get("name")
         port = cp.get("port")
@@ -7155,7 +7742,13 @@ async def run_tunnel(
         return 1
 
     plan = me.get("plan") or "free"
-    if plan not in ("pro", "admin") and not me.get("is_internal"):
+    # /me reports the server's own entitlement verdict (a playtester reads as
+    # 'pro' until its optional end date); an older server omits it, so fall
+    # back to the local alias map.
+    from .plans import effective_entitlement_plan  # noqa: PLC0415
+
+    entitlement = me.get("entitlement_plan") or effective_entitlement_plan(plan)
+    if entitlement not in ("pro", "admin") and not me.get("is_internal"):
         print(
             f"error: the tunnel is a Pro feature; your plan is '{plan}'. "
             "Upgrade at " + base_url + "/pricing",
@@ -7192,7 +7785,7 @@ async def run_tunnel(
     from .tunnel_plugins import (
         resolve_plugins, resolve_custom_plugins, detect_office_binaries,
         expand_command, SERENA_EXTRACT_COMMAND,
-        DEFAULT_OUTPUTS_PORT, DEFAULT_DEBUG_PORT,
+        DEFAULT_OUTPUTS_PORT, DEFAULT_DEBUG_PORT, DEFAULT_LATEX_PORT,
     )
     # Auto-enable Office slots whose launcher is installed on this machine, unless
     # the user explicitly configured them. Resolve locally from the raw config
@@ -7219,6 +7812,7 @@ async def run_tunnel(
     # reconnect loop for them — enabling either from the dashboard had zero effect.
     outputs_plugin = by_slot.get("outputs") or {}
     debug_plugin = by_slot.get("debug") or {}
+    latex_plugin = by_slot.get("latex") or {}
     # Per-slot effective ports (override > the run_tunnel arg default).
     fs_port = int(fs_plugin.get("port") or port)
     code_port = int(code_plugin.get("port") or code_port)
@@ -7237,6 +7831,7 @@ async def run_tunnel(
     # same function, so there's no circular-import concern to work around here.
     outputs_port = int(outputs_plugin.get("port") or DEFAULT_OUTPUTS_PORT)
     debug_port = int(debug_plugin.get("port") or DEFAULT_DEBUG_PORT)
+    latex_port = int(latex_plugin.get("port") or DEFAULT_LATEX_PORT)
 
     # Filesystem connector roots (executor_config.filesystem_roots, unioned across
     # the tenant's projects). Empty → fall back to the home dir (repo_path).
@@ -7363,7 +7958,8 @@ async def run_tunnel(
                     "docs": docs_port, "zotero": zotero_port,
                     # 12afe021 — outputs/debug now share the office-family lazy-spawn
                     # + reconnect-loop wiring below instead of being silently dropped.
-                    "outputs": outputs_port, "debug": debug_port}
+                    "outputs": outputs_port, "debug": debug_port,
+                    "latex": latex_port}
     # 4ea1b9d5 — slots whose session_mode is "persistent" (e.g. Desktop
     # Commander): they keep a stateful inner process, so they skip the
     # idle-killer that would otherwise tear the session down after 30min.
@@ -7570,7 +8166,8 @@ async def run_tunnel(
                                 ("docs", docs_plugin, "meridian-docs"),
                                 ("zotero", zotero_plugin, "zotero-mcp"),
                                 ("outputs", outputs_plugin, "meridian-outputs"),
-                                ("debug", debug_plugin, "mcp-debugger")):
+                                ("debug", debug_plugin, "mcp-debugger"),
+                                ("latex", latex_plugin, "meridian-latex")):
         if not plugin.get("enabled", False):
             continue
         cmd = _office_slot_command(slot, plugin)
@@ -7589,7 +8186,11 @@ async def run_tunnel(
         # 2b04a361 — Office slots spawn third-party Python MCP servers (docx-mcp,
         # powerpoint-mcp) that log non-ASCII; force UTF-8 stdio in the child env
         # so their own loggers can't crash on Windows' cp1252 console encoding.
-        spawn_env = _office_slot_spawn_env(plugin.get("env"))
+        spawn_env = (
+            _zotero_slot_spawn_env(plugin.get("env"))
+            if slot == "zotero"
+            else _office_slot_spawn_env(plugin.get("env"))
+        )
         # 4ea1b9d5 — persistent slots omit --stateless so their inner process
         # keeps state across requests (DC terminal sessions).
         _persistent = plugin.get("session_mode") == "persistent"
@@ -7777,7 +8378,7 @@ async def run_tunnel(
     slot_prefixes = {
         s: (by_slot.get(s) or {}).get("prefix")
         for s in ("fs", "code", "extract", "ppt", "word", "dc", "docs", "zotero",
-                   "outputs", "debug")
+                   "outputs", "debug", "latex")
     }
     ws_fs = _ws_url(base_url, tenant_id, token)
     ws_code = _ws_code_url(base_url, tenant_id, token)
@@ -7789,6 +8390,7 @@ async def run_tunnel(
                 ws_fs, proxy_fs, "fs",
                 tool_prefix=slot_prefixes.get("fs"),
                 known_repo_paths=known_repo_paths,
+                base_url=base_url,
             )
         ))
         tasks.append(asyncio.ensure_future(_idle_killer(proxy_fs)))
@@ -7799,13 +8401,13 @@ async def run_tunnel(
         tasks.append(asyncio.ensure_future(_budget_watchdog(proxy_fs)))
     if proxy_code is not None:
         tasks.append(asyncio.ensure_future(
-            _reconnect_loop_lazy(ws_code, proxy_code, "code", tool_prefix=slot_prefixes.get("code"))
+            _reconnect_loop_lazy(ws_code, proxy_code, "code", tool_prefix=slot_prefixes.get("code"), base_url=base_url)
         ))
         tasks.append(asyncio.ensure_future(_idle_killer(proxy_code)))
         tasks.append(asyncio.ensure_future(_budget_watchdog(proxy_code)))
     if proxy_extract is not None:
         tasks.append(asyncio.ensure_future(
-            _reconnect_loop_lazy(ws_extract, proxy_extract, "extract", tool_prefix=slot_prefixes.get("extract"))
+            _reconnect_loop_lazy(ws_extract, proxy_extract, "extract", tool_prefix=slot_prefixes.get("extract"), base_url=base_url)
         ))
         tasks.append(asyncio.ensure_future(_idle_killer(proxy_extract)))
         tasks.append(asyncio.ensure_future(_budget_watchdog(proxy_extract)))
@@ -7818,13 +8420,14 @@ async def run_tunnel(
                 # which is the CLI repo_path unless a dashboard config overrode it).
                 ws_extract, serena_pool, serena_repo_path, "extract",
                 tool_prefix=slot_prefixes.get("extract"),
+                base_url=base_url,
             )
         ))
         tasks.append(asyncio.ensure_future(_pool_idle_reaper(serena_pool)))
     for slot, oproxy in office_proxies.items():
         ws_office = _ws_office_url(base_url, tenant_id, token, slot)
         tasks.append(asyncio.ensure_future(
-            _reconnect_loop_lazy(ws_office, oproxy, slot, tool_prefix=slot_prefixes.get(slot))
+            _reconnect_loop_lazy(ws_office, oproxy, slot, tool_prefix=slot_prefixes.get(slot), base_url=base_url)
         ))
         # 4ea1b9d5 — persistent slots keep their inner process alive; don't
         # attach the idle-killer that would reset their session after 30min.
@@ -7868,6 +8471,17 @@ async def run_tunnel(
 
     try:
         await asyncio.gather(*tasks)
+    except TunnelAuthRejectedError as exc:
+        # c7604ed7 — a reconnect loop already invalidated the cached token
+        # and printed the per-slot reason; every OTHER slot shares this same
+        # rejected credential, so there's nothing to gain from letting them
+        # keep retrying — stop the whole tunnel with a clear, actionable exit
+        # rather than limping along on partially-dead slots.
+        print(f"\ntunnel: stopping — {exc}", file=sys.stderr, flush=True)
+        for t in tasks:
+            if not t.done():
+                t.cancel()
+        return 2
     except (KeyboardInterrupt, asyncio.CancelledError):
         print("\ntunnel: shutting down", flush=True)
         return 0

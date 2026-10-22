@@ -10,6 +10,7 @@ import json
 from fastapi import APIRouter, HTTPException, Request
 from fastapi.responses import JSONResponse, Response
 
+from .. import _deps
 from .._deps import _db, _hosted_mode, _is_demo_request, _rate_limit
 from .. import db as db_module
 
@@ -32,8 +33,17 @@ async def export_my_data(request: Request) -> Response:
     # Account rows (tenant/tokens/members) live in the auth DB; the tenant's
     # project data lives in its own per-tenant DB. Pass both so the export
     # actually contains projects (hosted mode previously exported empty arrays).
+    #
+    # RT-TI-005 (pass 3, F-D2) -- ``_db`` honours X-Workspace-Tenant-Id, so a PROJECT-SCOPED
+    # member of someone else's workspace used to download every project of that workspace
+    # (goals, decisions, sessions, tasks, notes). A scoped caller now gets only the projects
+    # in their scope (and no workspace-global notes/decisions); owners, workspace-wide
+    # members, self-hosted and demo callers get ``None`` here and the export is unchanged.
+    # A failure resolving the scope propagates (500) rather than exporting everything.
+    scoped = await _deps._scoped_project_ids_for_request(request)
     data = await db_module.export_tenant_data(
         request.app.state.db, tenant["id"], project_db=await _db(request),
+        project_ids=scoped,
     )
     payload = json.dumps(data, indent=2, default=str).encode()
     email_slug = (tenant.get("email") or "user").split("@")[0][:20]
@@ -71,7 +81,8 @@ async def delete_account(request: Request) -> Response:
         await cancel_stripe_subscription(stripe_id)
 
     if tenant.get("neon_project_id"):
-        asyncio.create_task(_drop_tenant_neon_database(tenant))
+        # db: the drop picks its Neon key from the pool registry, not the plan.
+        asyncio.create_task(_drop_tenant_neon_database(tenant, request.app.state.db))
 
     email = tenant.get("email", "")
     await db_module.delete_tenant_records(request.app.state.db, tenant["id"])

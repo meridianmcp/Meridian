@@ -382,16 +382,12 @@ async def test_promote_research_run_creates_a_finding(db):
     result = await run_db.promote_research_run(db, project["id"], session["id"], run_id=run["id"])
     assert result["run_id"] == run["id"]
     finding_note = result["finding"]["note"]
-    # NOTE (drift found, not introduced here): save_finding's own docstring
-    # calls this a "kind='finding' note", but add_project_note's closed
-    # kind vocabulary (wiki|insight|reference|code|document) does not
-    # include "finding" -- the value is silently coerced to NULL at write
-    # time. The note remains fully discoverable via its TAGS
-    # ("finding,<source_type>"), which is the actual mechanism
-    # get_notes(tag='finding') (and AGENTS.md's own documented convention)
-    # relies on -- asserted below instead of a "kind" field that does not
-    # survive the write.
-    assert finding_note["note_kind"] is None
+    # fe0b0331: this used to assert ``note_kind is None`` -- it documented the
+    # drift where add_project_note's kind allow-list omitted "finding" and
+    # coerced the value to NULL. 'finding' is now in the allow-list, so the kind
+    # survives the write; the note is ALSO still discoverable via its
+    # "finding,<source_type>" tags (get_notes(tag='finding')).
+    assert finding_note["note_kind"] == "finding"
     assert "finding" in (finding_note["tags"] or "")
     assert "LIKE-pattern escaper" in finding_note["body"]
 

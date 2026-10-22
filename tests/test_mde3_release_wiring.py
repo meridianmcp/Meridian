@@ -148,7 +148,7 @@ class TestStandardModeHandoffCarriesEvidence:
         )
 
         _path, content, _amended = await handoff_module.generate_handoff(
-            db, project["id"], str(tmp_path), skip_ai_summary=True,
+            db, project["id"], str(tmp_path), skip_ai_summary=True, mode="full",
         )
         assert "## Release Transactions" in content
         assert "<release_transactions" in content
@@ -161,7 +161,7 @@ class TestStandardModeHandoffCarriesEvidence:
         await db_module.set_goal(db, project["id"], "ship it", sprint="v1")
         await db_module.add_sprint_item(db, project["id"], "v1", "do the thing")
         _path, content, _amended = await handoff_module.generate_handoff(
-            db, project["id"], str(tmp_path), skip_ai_summary=True,
+            db, project["id"], str(tmp_path), skip_ai_summary=True, mode="full",
         )
         assert "## Release Transactions" not in content
         assert "<release_transactions" not in content

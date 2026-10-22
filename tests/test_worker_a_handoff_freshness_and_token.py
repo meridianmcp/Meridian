@@ -141,7 +141,7 @@ async def test_pending_list_excludes_item_claimed_mid_generation(db, tmp_path, m
     monkeypatch.setattr(db_module, "get_sprint_items", _side_effect)
 
     _path, content, _amended = await handoff_module.generate_handoff(
-        db, p["id"], str(tmp_path), skip_ai_summary=True
+        db, p["id"], str(tmp_path), skip_ai_summary=True, mode="full"
     )
 
     assert call_count["n"] >= 2, (
@@ -245,7 +245,7 @@ async def test_backburner_track_item_excluded_from_claimable_batch(db, tmp_path)
     )
 
     _path, content, _amended = await handoff_module.generate_handoff(
-        db, p["id"], str(tmp_path), skip_ai_summary=True
+        db, p["id"], str(tmp_path), skip_ai_summary=True, mode="full"
     )
 
     goal_section = content.split("<goal_token>")[-1]
@@ -304,7 +304,7 @@ async def test_force_include_ids_still_overrides_deferred_exclusion(db, tmp_path
 
     _path, content, _amended = await handoff_module.generate_handoff(
         db, p["id"], str(tmp_path),
-        skip_ai_summary=True, force_include_ids=[deferred["id"]],
+        skip_ai_summary=True, force_include_ids=[deferred["id"]], mode="full",
     )
 
     assert deferred["id"] in content.split("<goal_token>")[-1].split(

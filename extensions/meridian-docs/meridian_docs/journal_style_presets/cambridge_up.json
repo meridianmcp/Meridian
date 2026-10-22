@@ -1,0 +1,42 @@
+{
+  "meta": {
+    "journal": "cambridge_up",
+    "display_name": "Cambridge University Press journals",
+    "publisher": "Cambridge University Press",
+    "status": "populated",
+    "status_detail": "Mechanically migrated 2026-09-18 from the JOURNAL_STYLE_PRESETS dict literal in docs_intel.py (round 2, proposal 64266f13, dated 2026-09-11) as part of the JSON-preset externalization work (proposal 3b93b7ef) -- values and evidence carried over verbatim from the real in-code comment, not regenerated. General CUP policy plus a representative per-journal example (Philosophy of Science / Language in Society).",
+    "last_verified": "2026-09-11"
+  },
+  "fields": {
+    "citation_style": {
+      "value": "not_fixed",
+      "tier": 2,
+      "source": {
+        "type": "live_guidelines_page",
+        "citation": "cambridge.org/core/journals/philosophy-of-science/information/author-guidelines; cambridge.org/core/journals/language-in-society/information/author-instructions/preparing-your-materials",
+        "note": "citation style varies by journal (author-date for some, e.g. Chicago-style Philosophy of Science; numeric for others) -- an explicit defers-to-the-individual-journal fact, hence not_fixed."
+      },
+      "verified_date": "2026-09-11"
+    },
+    "figure_dpi_minimum_halftone": {
+      "value": 300,
+      "tier": 2,
+      "source": {
+        "type": "live_guidelines_page",
+        "citation": "cambridge.org/core/journals/philosophy-of-science/information/author-guidelines; cambridge.org/core/journals/language-in-society/information/author-instructions/preparing-your-materials",
+        "note": "images need at least 300 dpi for submission."
+      },
+      "verified_date": "2026-09-11"
+    },
+    "figure_dpi_minimum_line_art": {
+      "value": 1200,
+      "tier": 2,
+      "source": {
+        "type": "live_guidelines_page",
+        "citation": "cambridge.org/core/journals/philosophy-of-science/information/author-guidelines; cambridge.org/core/journals/language-in-society/information/author-instructions/preparing-your-materials",
+        "note": "1200 dpi for line drawings once accepted."
+      },
+      "verified_date": "2026-09-11"
+    }
+  }
+}

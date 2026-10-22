@@ -21,15 +21,11 @@ async def handle_register_session_recovery(
 ) -> Any:
     """MCP tool: register_session_recovery (cdd0ef6c).
 
-    ``local_identity`` (optional) carries HOST-LOCAL identity only --
-    ``local_session_id`` / ``bridge_id`` / ``environment_id`` / ``argv`` /
-    ``local_transcript_path``. It is used ONLY to (a) compute
-    ``verified_resumable`` and a resume recipe locally
-    (:func:`meridian.session_recovery.build_resume_recipe`) and (b) refresh
-    the host-local snapshot file. None of it is passed to the DB layer --
-    ``meridian.db.session_recovery.register_session_recovery`` has no
-    parameter for any of it, so there is no code path by which it could
-    reach the hosted ``session_recovery_registry`` table even by mistake.
+    On a self-hosted process, ``local_identity`` may update its machine-local
+    snapshot. On hosted Meridian, the caller-local hook must store and redact
+    that value before this handler is reached. A hosted request that still
+    includes it is rejected because Fly's ``data_dir`` is not the caller's
+    workstation.
     """
     from meridian.db import session_recovery as recovery_db  # noqa: PLC0415
     from meridian import session_recovery as model  # noqa: PLC0415
@@ -40,10 +36,27 @@ async def handle_register_session_recovery(
     client_type = args.get("client_type")
     local_identity = args.get("local_identity") or {}
 
-    resume_recipe, blocked_reason = model.build_resume_recipe(
-        transport, client_type, local_identity
-    )
-    verified_resumable = resume_recipe is not None
+    hosted = tenant is not None or _mcp_tenant_id is not None
+    if hosted and local_identity:
+        return {
+            "error": (
+                "local_identity must be captured by the caller-local recovery hook "
+                "before a hosted registration; omit it when that hook is unavailable"
+            ),
+            "code": "CALLER_LOCAL_IDENTITY_REQUIRED",
+        }
+
+    if hosted:
+        # The bool and opaque reference are safe to store, but are client hints.
+        # The provider identity that justifies them stays on the caller.
+        resume_recipe = None
+        blocked_reason = None
+        verified_resumable = bool(args.get("verified_resumable", False))
+    else:
+        resume_recipe, blocked_reason = model.build_resume_recipe(
+            transport, client_type, local_identity
+        )
+        verified_resumable = resume_recipe is not None
 
     record = await recovery_db.register_session_recovery(
         db, project_id, session_id,
@@ -57,26 +70,26 @@ async def handle_register_session_recovery(
         metadata=args.get("metadata"),
     )
 
-    # Refresh the host-local snapshot with the sensitive identity + resolved
-    # recipe, keyed by the same opaque local_ref_id now stored (safely) on
-    # the hosted row. read-modify-write: other sessions' entries in the same
-    # project snapshot are preserved.
-    snapshot = model.read_local_recovery_snapshot(data_dir, project_id) or {}
-    local_records: dict[str, Any] = dict(snapshot.get("records") or {})
-    local_records[record["local_ref_id"]] = {
-        **local_identity,
-        "meridian_session_id": session_id,
-        "transport": transport,
-        "resume_recipe": resume_recipe,
-        "resume_blocked_reason": blocked_reason,
-        "updated_at": model.utcnow_iso(),
-    }
-    snapshot_write = model.write_local_recovery_snapshot(data_dir, project_id, local_records)
+    snapshot_write = {"ok": True, "scope": "caller_local"} if hosted else None
+    if not hosted:
+        # Self-hosted data_dir is on the same machine as the caller.
+        snapshot = model.read_local_recovery_snapshot(data_dir, project_id) or {}
+        local_records: dict[str, Any] = dict(snapshot.get("records") or {})
+        local_records[record["local_ref_id"]] = {
+            **local_identity,
+            "meridian_session_id": session_id,
+            "transport": transport,
+            "resume_recipe": resume_recipe,
+            "resume_blocked_reason": blocked_reason,
+            "updated_at": model.utcnow_iso(),
+        }
+        snapshot_write = model.write_local_recovery_snapshot(data_dir, project_id, local_records)
 
     return {
         "recovery": record,
         "resume_recipe": resume_recipe,
         "resume_blocked_reason": blocked_reason,
+        "resume_recipe_scope": "caller_local" if hosted else "server_local",
         "task_log": {"description": model.build_log_description("registered", record)},
         "local_snapshot": snapshot_write,
     }
@@ -119,12 +132,10 @@ async def handle_get_session_recovery(
     ``continuation`` (default on) re-derives the LIVE board and this
     session's own active file claims via
     :func:`meridian.db.session_recovery.build_recovery_continuation` --
-    never a stored ``/goal`` body. ``resume_recipe`` is resolved from the
-    CALLING PROCESS's own host-local snapshot file (never from the hosted
-    row) and is ``None`` whenever this machine's snapshot has no matching
-    entry -- e.g. a fresh machine that never registered this session locally
-    sees the hosted classification/metadata but no recipe, which is the
-    correct, safe default rather than a guess.
+    never a stored ``/goal`` body. Self-hosted calls can read the same-machine
+    snapshot. Hosted calls never read ``data_dir`` for local identity; their
+    caller-local PostToolUse hook adds a recipe only after matching the opaque
+    ref and Meridian session id.
     """
     from meridian.db import session_recovery as recovery_db  # noqa: PLC0415
     from meridian import session_recovery as model  # noqa: PLC0415
@@ -150,15 +161,18 @@ async def handle_get_session_recovery(
         except Exception as exc:  # noqa: BLE001 -- continuation is best-effort enrichment
             continuation = {"error": str(exc)}
 
+    hosted = tenant is not None or _mcp_tenant_id is not None
     resume_recipe = None
-    snapshot = model.read_local_recovery_snapshot(data_dir, project_id)
-    if snapshot:
-        entry = (snapshot.get("records") or {}).get(record.get("local_ref_id"))
-        if entry:
-            resume_recipe = entry.get("resume_recipe")
+    if not hosted:
+        snapshot = model.read_local_recovery_snapshot(data_dir, project_id)
+        if snapshot:
+            entry = (snapshot.get("records") or {}).get(record.get("local_ref_id"))
+            if entry:
+                resume_recipe = entry.get("resume_recipe")
 
     return {
         "recovery": record,
         "resume_recipe": resume_recipe,
+        "resume_recipe_scope": "caller_local" if hosted else "server_local",
         "continuation": continuation,
     }

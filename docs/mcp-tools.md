@@ -1,6 +1,6 @@
 # MCP Tool Reference
 
-Meridian exposes **235 tools** over MCP.
+Meridian exposes **249 tools** over MCP.
 
 They fall into two usage patterns:
 
@@ -149,6 +149,7 @@ get_goal(project_id="abc-123")
 | `project_id` | string | optional |  |
 | `project_name` | string | optional | Project name — an alternative to project_id; resolved to the id internally. project_id wins if both are given. |
 | `content` | string | required |  |
+| `expected_updated_at` | string | optional | Optional optimistic-concurrency stamp: field_updated_at.version_goal from get_goal. If the version goal changed since, returns a goal_conflict error with the current value and writes nothing. Omit for last-write-wins. |
 
 **Example:**
 ```
@@ -476,6 +477,7 @@ Read-only: Generate a context handoff document. `mode='full'` writes the complet
 | `checkpoint` | boolean | optional | (ecc8b280) Mark THIS call as a mid-run progress report rather than a final, session-ending handoff. Applies to full/delta modes only. A checkpoint=true call is never refused by strict_continuation below, regardless of how much actionable work remains — it changes nothing about what gets rendered, only whether the continuation gate can engage. |
 | `strict_continuation` | boolean | optional | (ecc8b280) Opt-in, off by default — mirrors strict_evidence's shape. When true and checkpoint is not set, refuses to render/persist this handoff (full/delta modes only) if actionable pending/in_progress items remain on the live board with no recorded blocker_kind while execution_mode=autonomous, returning {error: HANDOFF_CONTINUATION_BLOCKED, continuation_status, message} instead. Leave false/omitted for today's behavior (continuation_status is still always returned either way). |
 | `emit_manifest` | boolean | optional | (acf6f51a) Opt-in, off by default. mode='goal' only (for now): when true, embeds a canonical <handoff_manifest> XML block — schema_version, board_revision (a deterministic digest of every item's id/status/depends_on), project/tenant origin identity, generated_at, the selected/closure item ids, the full item id/status/depends_on/resources list, and the wave plan — into the rendered /goal text BEFORE the goal token is minted, so verify_handoff_token's existing body_hash check also covers the manifest; no separate verification path. A receiver re-fetches the live board and compares against board_revision (see handoff.verify_board_revision) to detect drift before acting. Other modes are unaffected by this flag for now. |
+| `receiver` | object | optional | (0527f636) Optional. Address the persisted handoff /goal to the session it is FOR, so a SIBLING start_session cannot silently consume it. projects.pending_goal is a single read-once slot per project; without this, whichever session calls start_session first pops it, even if the handoff was written for another session, leaving the intended receiver with nothing. When given (any subset of session_name/role/worktree), the goal is delivered as start_session's pending_goal — and cleared — ONLY to a start_session whose session_name/role/cwd match EVERY field given; a non-matching start_session leaves it untouched (it reports pending_goal_withheld instead) and the stored handoff stays readable through the idempotent load_handoff, which also reports the address as pending_goal_receiver. A field the receiver constrains but the caller did not supply counts as a mismatch. Omit (default) for the unchanged behaviour: an unaddressed handoff goes to whichever start_session pops it first. Applies to the modes that persist to the trusted channel (full/delta/goal); ignored by planner/starter/compact. A malformed value (non-object, unknown key, non-string field) is rejected up front rather than silently producing an unaddressed handoff. |
 
 **Example:**
 ```
@@ -773,6 +775,37 @@ read_note(project_id="abc-123", slug="deploy-note")
 | Parameter | Type | Required | Description |
 |-----------|------|----------|-------------|
 | `note_id` | string | required |  |
+
+---
+
+## Compute
+
+### `runpod_check_key`
+[SUPPORT] RunPod key check. Resolves a RunPod API key on this machine and confirms it works with two read-only calls to the RunPod API: one billing call and one pod listing. Returns ok, credential_source (the source kind only: env, keyring or runpodctl), pod_count (pods on the first page, up to 1000), billing_available and error. The key itself is never returned, logged or echoed. Omit credential_ref to try env:RUNPOD_API_KEY, then keyring:meridian-desktop/runpod-api-key, then runpodctl:default. Pass credential_ref to use one reference only; store a reference, never the key. Local only: refused on hosted Meridian.
+
+| Parameter | Type | Required | Description |
+|-----------|------|----------|-------------|
+| `credential_ref` | string | optional | Optional credential reference: env:NAME, keyring:SERVICE/ACCOUNT or runpodctl:default. Give a reference, never the key itself; a raw key is rejected without being echoed. |
+
+**Example:**
+```
+runpod_check_key(credential_ref="env:RUNPOD_API_KEY")
+```
+
+---
+
+
+### `runpod_list_pods`
+[SUPPORT] RunPod pod list. Resolves a RunPod API key on this machine (the same sources as runpod_check_key) and lists one page (up to 1000) of the account's pods as summaries. Each summary has these keys, all always present, with null for a value RunPod does not supply: id (Pod.id); name (Pod.name); status (Pod.status: PROVISIONING, STARTING, RUNNING, EXITED, ERROR or TERMINATED); gpu (Pod.gpu as {id, count}, or null for a CPU pod); costPerHour (Pod.cost, the current cost in USD per hour, 0 when EXITED or TERMINATED); uptimeSeconds (Pod.runtime.uptime, seconds since the container started, null unless the pod is RUNNING). Cluster member pods are not listed: RunPod's includeClusterPods parameter defaults to false and this client never sends it. has_more_pods is true when more pods exist. Raw pod payloads are never returned, so pod environment variables are not exposed. Reads only: it does not create, stop or terminate a pod. Local only: refused on hosted Meridian.
+
+| Parameter | Type | Required | Description |
+|-----------|------|----------|-------------|
+| `credential_ref` | string | optional | Optional credential reference: env:NAME, keyring:SERVICE/ACCOUNT or runpodctl:default. Give a reference, never the key itself; a raw key is rejected without being echoed. |
+
+**Example:**
+```
+runpod_list_pods(credential_ref="keyring:meridian-desktop/runpod-api-key")
+```
 
 ---
 

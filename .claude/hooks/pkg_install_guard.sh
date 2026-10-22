@@ -12,9 +12,25 @@
 #
 # Fails OPEN (exit 0) on any parse/network/logic error.
 # NOT hooks.sh (the token-rotation installer).
+# 55d48d69 fix round 1: curl gets a 1 s connect timeout (a down server -- the
+# default state -- no longer costs seconds per matching command) and the owner
+# kill switch (MERIDIAN_GUARD=off, guard.off, MERIDIAN_GUARD_DISABLE=pkg_install_guard)
+# covers this hook too.
 set -uo pipefail
 
 MERIDIAN_URL="${MERIDIAN_URL:-http://localhost:7878}"
+
+_off=0
+[ "$(printf '%s' "${MERIDIAN_GUARD:-}" | tr '[:upper:]' '[:lower:]' | tr -d '[:space:]')" = "off" ] && _off=1
+for _tok in $(printf '%s' "${MERIDIAN_GUARD_DISABLE:-}" | tr ',;' '  ' | tr '[:upper:]' '[:lower:]'); do
+    [ "$_tok" = "pkg_install_guard" ] && _off=1
+done
+if [ -n "${LOCALAPPDATA:-}" ]; then _gd="$LOCALAPPDATA/meridian/guard"
+elif [ -n "${USERPROFILE:-}" ]; then _gd="$USERPROFILE/AppData/Local/meridian/guard"
+else _gd="${XDG_STATE_HOME:-${HOME:-/nonexistent}/.local/state}/meridian/guard"
+fi
+[ -f "$_gd/guard.off" ] && _off=1
+[ "$_off" = 1 ] && exit 0
 
 # Read the JSON payload from stdin.
 payload="$(cat 2>/dev/null || true)"
@@ -22,7 +38,8 @@ payload="$(cat 2>/dev/null || true)"
 
 # Extract tool_name; fail open if absent.
 tool="$(printf '%s' "$payload" | grep -oE '"tool_name"[[:space:]]*:[[:space:]]*"[^"]*"' | head -1 | sed -E 's/.*:[[:space:]]*"([^"]*)"/\1/' || true)"
-[ "$tool" != "Bash" ] && exit 0
+# 55d48d69: the PowerShell tool runs the same install commands (pip/npm/...).
+case "$tool" in Bash|PowerShell) ;; *) exit 0 ;; esac
 
 # Extract the command string (tolerant extraction -- no jq dependency).
 cmd="$(printf '%s' "$payload" | grep -oE '"command"[[:space:]]*:[[:space:]]*"[^"]*"' | head -1 | sed -E 's/.*:[[:space:]]*"([^"]*)"/\1/' || true)"
@@ -39,7 +56,7 @@ cmd_json="$(printf '%s' "$cmd" | python3 -c 'import sys,json;print(json.dumps(sy
 body="{\"command\": $cmd_json}"
 
 # Call the Meridian endpoint.
-resp="$(curl -sf --max-time 12 -X POST "$MERIDIAN_URL/pkg-guard/check" \
+resp="$(curl -sf --connect-timeout 1 --max-time 12 -X POST "$MERIDIAN_URL/pkg-guard/check" \
     -H "Content-Type: application/json" \
     -d "$body" 2>/dev/null || true)"
 

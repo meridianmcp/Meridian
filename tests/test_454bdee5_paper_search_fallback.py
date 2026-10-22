@@ -283,6 +283,7 @@ async def test_arxiv_refusal_falls_back_to_openalex_with_arxiv_ids(net, no_sleep
 
     assert "error" not in out
     assert out["fallback_source"] == "openalex"
+    assert out["openalex_query_stage"] == "loose"
     assert out["sources_tried"] == ["arxiv", "openalex"]
     assert f"HTTP {status}" in out["warning"] and "OpenAlex" in out["warning"]
     assert out["count"] == 2
@@ -478,16 +479,147 @@ _PLAIN_OPENALEX = {"results": [{"id": "https://openalex.org/W1", "title": "T", "
 
 
 async def test_openalex_search_sends_mailto_and_retries_429(net, no_sleep):
-    net.route(ps._OPENALEX_API, _openalex(429), _openalex(200, _PLAIN_OPENALEX))
+    net.route(
+        ps._OPENALEX_API,
+        _openalex(429),
+        _openalex(200, _PLAIN_OPENALEX),
+        _openalex(200, _PLAIN_OPENALEX),
+        _openalex(200, _PLAIN_OPENALEX),
+    )
     out = await ps.openalex_search("graph neural networks", limit=7)
     assert out["count"] == 1 and out["results"][0]["openalex_id"] == "W1"
-    assert net.urls() == [ps._OPENALEX_API, ps._OPENALEX_API]
+    assert out["openalex_query_stage"] == "loose"
+    assert net.urls() == [ps._OPENALEX_API] * 4
     assert no_sleep == [ps._RETRY_DELAYS[0]]
     call = net.calls[0]
-    assert call["params"] == {"search": "graph neural networks", "per-page": "7", "mailto": ps._CONTACT_EMAIL}
+    assert call["params"] == {
+        "search": '"graph neural" AND networks',
+        "per-page": "7",
+        "mailto": ps._CONTACT_EMAIL,
+    }
     assert f"mailto:{ps._CONTACT_EMAIL}" in call["headers"]["User-Agent"]
     assert "Authorization" not in call["headers"]
     assert net.clients[0]["follow_redirects"] is True
+
+
+async def test_openalex_search_relaxes_queries_and_keeps_strict_results_first(monkeypatch):
+    calls = []
+
+    def work(work_id, title):
+        return {"id": f"https://openalex.org/{work_id}", "title": title}
+
+    payloads = [
+        {"results": [work("W1", "")]},
+        {"results": [work("W1", "Coding agent memory"), work("W2", "Rules for agents")]},
+        {"results": [work("W2", "Rules for agents"), work("W3", "Hook compliance") ]},
+    ]
+
+    async def get_works(query, limit, sort_by, **kwargs):
+        calls.append(query)
+        return payloads[len(calls) - 1]
+
+    monkeypatch.setattr(ps, "_openalex_get_works", get_works)
+    out = await ps.openalex_search("coding agent memory rule compliance hooks", limit=3)
+
+    assert calls == [
+        '"coding agent" AND memory AND rule AND compliance AND hooks',
+        "coding AND agent AND memory AND rule AND compliance AND hooks",
+        "coding agent memory rule compliance hooks",
+    ]
+    assert out["openalex_query_stage"] == "loose"
+    assert [row["openalex_id"] for row in out["results"]] == ["W1", "W2", "W3"]
+    assert out["results"][0]["title"] == "Coding agent memory"
+    from meridian import mcp_tools
+
+    paper_search = next(t for t in mcp_tools._MCP_TOOLS_LIST if t["name"] == "paper_search")
+    assert "openalex_query_stage" in paper_search["description"]
+
+
+async def test_openalex_search_relaxes_after_a_failed_strict_stage_and_keeps_never_raise(monkeypatch):
+    calls = []
+
+    async def get_works(query, limit, sort_by, **kwargs):
+        calls.append(query)
+        if len(calls) == 1:
+            raise ValueError("strict query rejected")
+        return {"results": [{"id": "https://openalex.org/W9", "title": "Relevant result"}]}
+
+    monkeypatch.setattr(ps, "_openalex_get_works", get_works)
+    out = await ps.openalex_search("coding agent memory rule compliance hooks", limit=1)
+
+    assert len(calls) == 2
+    assert out["openalex_query_stage"] == "and"
+    assert out["results"][0]["openalex_id"] == "W9"
+    assert ps._openalex_query_stages('"quoted phrase" AND tail') == [
+        ("loose", '"quoted phrase" AND tail')
+    ]
+    assert ps._openalex_query_stages("one OR two three") == [("loose", "one OR two three")]
+
+
+def test_openalex_query_stage_and_row_identity_fallbacks():
+    assert ps._openalex_query_stages("one two") == [("loose", "one two")]
+    assert ps._openalex_row_identity({"doi": " https://doi.org/10.1234/A "}, 0) == (
+        "doi:https://doi.org/10.1234/a"
+    )
+    assert ps._openalex_row_identity({"title": "  A   Title "}, 0) == "title:a title"
+    assert ps._openalex_row_identity({}, 4) == "anonymous:4"
+
+
+@pytest.mark.asyncio
+async def test_openalex_arxiv_rows_compatibility_wrapper(monkeypatch):
+    rows = [{"arxiv_id": "2401.12345"}]
+
+    async def staged(*args):
+        return rows, "phrase_and"
+
+    monkeypatch.setattr(ps, "_openalex_arxiv_rows_staged", staged)
+    assert await ps._openalex_arxiv_rows("query", 5, "relevance") == rows
+
+
+@pytest.mark.asyncio
+async def test_openalex_search_respects_shared_stage_deadline(monkeypatch):
+    async def should_not_call(*args, **kwargs):
+        raise AssertionError("expired search budget must not start a request")
+
+    monkeypatch.setattr(ps, "_OPENALEX_STAGED_SEARCH_BUDGET_SECONDS", 0)
+    monkeypatch.setattr(ps, "_openalex_get_works", should_not_call)
+    out = await ps.openalex_search("three word query")
+
+    assert "error" in out
+    assert "latency budget" in out["error"]
+
+
+@pytest.mark.asyncio
+async def test_openalex_search_stops_relaxing_on_rate_limit(monkeypatch):
+    calls = []
+
+    class RateLimited(Exception):
+        response = type("Response", (), {"status_code": 429})()
+
+    async def get_works(query, limit, sort_by, **kwargs):
+        calls.append(query)
+        raise RateLimited("rate limited")
+
+    monkeypatch.setattr(ps, "_openalex_get_works", get_works)
+    out = await ps.openalex_search("coding agent memory rules")
+
+    assert len(calls) == 1
+    assert out["error"].startswith("openalex search failed: rate limited")
+
+
+@pytest.mark.asyncio
+async def test_openalex_search_returns_error_when_every_stage_fails(monkeypatch):
+    calls = []
+
+    async def get_works(query, limit, sort_by, **kwargs):
+        calls.append(query)
+        raise ValueError("search unavailable")
+
+    monkeypatch.setattr(ps, "_openalex_get_works", get_works)
+    out = await ps.openalex_search("coding agent memory rules")
+
+    assert len(calls) == 3
+    assert out["error"].startswith("openalex search failed: search unavailable")
 
 
 async def test_openalex_search_retries_5xx(net, no_sleep):

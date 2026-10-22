@@ -112,7 +112,7 @@ meridian-outputs-mcp = "meridian_outputs.server:main"
 
 [project.urls]
 Homepage = "https://usemeridian.us"
-Source = "https://github.com/meridianmcp/meridian"
+Source = "https://github.com/meridianmcp/Meridian/tree/main/extensions/meridian-outputs"
 
 [tool.hatch.build.targets.wheel]
 packages = ["meridian_outputs"]

@@ -25,8 +25,26 @@ tests/
 extensions/*
 !extensions/meridian-codeindex
 !extensions/meridian-codeindex/**
+# c11c5117 -- packages/ is deliberately NOT excluded: the Dockerfile installs
+# ./packages/docparse (meridian/docs_intel.py + latex_intel.py import it), and
+# `uv pip install` needs its pyproject.toml, README.md and docparse/ package dir
+# present in the build context. Do not add a `packages/` (or `packages/*`) line
+# here without a matching `!packages/docparse` + `!packages/docparse/**` pair;
+# tests/test_c11c5117_dockerfile_docparse.py pins this.
 npm/
-scripts/
+# scripts/* (not "scripts/") + explicit negation below: same directory-vs-entry
+# exclusion distinction as extensions/* above. meridian/routes/hooks.py serves
+# these specific scripts to installer clients by reading them from disk at
+# request time (_watcher_script_path: <repo_root>/scripts/<filename>), so they
+# must survive into the image; the rest of scripts/ (dev/release tooling) does
+# not need to ship and stays excluded.
+scripts/*
+!scripts/install-windows.ps1
+!scripts/install_tunnel.sh
+!scripts/install_tunnel.ps1
+!scripts/install_watcher.sh
+!scripts/install_watcher.ps1
+!scripts/hooks_install.ps1
 site/
 *.spec
 *.bat

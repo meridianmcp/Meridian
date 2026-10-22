@@ -1,0 +1,54 @@
+{
+  "meta": {
+    "journal": "wiley",
+    "display_name": "Wiley Online Library journals (general author guidelines)",
+    "publisher": "Wiley",
+    "status": "populated",
+    "status_detail": "Round 1 (workspace proposal 3674c0c1) migration. Verified 2026-09-11 against onlinelibrary.wiley.com author-guidelines pages, general policy plus a representative per-journal figure example (Annals of the New York Academy of Sciences) for the line-art DPI floor -- Wiley journals vary their own artwork instructions per title, so figure_dpi_minimum_line_art is representative, not universal, rather than a blanket cross-Wiley figure.",
+    "last_verified": "2026-09-11"
+  },
+  "fields": {
+    "citation_style": {
+      "value": "not_fixed",
+      "tier": 2,
+      "source": {
+        "type": "live_guidelines_page",
+        "citation": "onlinelibrary.wiley.com author-guidelines pages",
+        "quote": "references may be submitted in any style or format, as long as it is consistent throughout",
+        "note": "An explicit defers-to-the-individual-journal fact for most Wiley journals -- some journal families (e.g. chemistry/materials science) do have a house numbered style, but that is the exception this pass found, not the general rule."
+      },
+      "verified_date": "2026-09-11"
+    },
+    "si_reformatting_policy": {
+      "value": "as_received",
+      "tier": 2,
+      "source": {
+        "type": "live_guidelines_page",
+        "citation": "onlinelibrary.wiley.com author-guidelines pages",
+        "quote": "appears without editing or typesetting",
+        "note": "Applies to Supporting Information once posted online."
+      },
+      "verified_date": "2026-09-11"
+    },
+    "figure_dpi_minimum_halftone": {
+      "value": 300,
+      "tier": 2,
+      "source": {
+        "type": "live_guidelines_page",
+        "citation": "onlinelibrary.wiley.com author-guidelines pages",
+        "note": "Bitmap/photographic figures at least 300 dpi."
+      },
+      "verified_date": "2026-09-11"
+    },
+    "figure_dpi_minimum_line_art": {
+      "value": 600,
+      "tier": 2,
+      "source": {
+        "type": "live_guidelines_page",
+        "citation": "Annals of the New York Academy of Sciences (a representative single Wiley journal's artwork guidance page, not a blanket cross-Wiley page)",
+        "note": "Drawn from one representative journal's guidance rather than a blanket cross-Wiley figure -- Wiley journals vary their own artwork instructions per title, so this floor is representative, not universal."
+      },
+      "verified_date": "2026-09-11"
+    }
+  }
+}

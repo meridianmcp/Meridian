@@ -119,8 +119,10 @@ async def test_complete_succeeds_with_independent_pass_on_file(db):
     item = await db_module.add_sprint_item(db, p["id"], "v1", "genuinely fixed")
     await db_module.patch_sprint_item(db, p["id"], item["id"], require_verification=True)
     await db_module.claim_sprint_item(db, p["id"], item["id"], actor="implementer-session")
+    # 0ff5e59f — the verifier must be a REAL session of this project.
+    verifier = await db_module.register_session(db, p["id"], "fresh-verifier")
     await db_module.record_sprint_item_verification(
-        db, p["id"], item["id"], "fresh-verifier-session", "pass",
+        db, p["id"], item["id"], verifier["id"], "pass",
         notes="re-read the diff and confirmed the function exists and is called",
     )
 
@@ -136,11 +138,12 @@ async def test_complete_files_and_checks_verdict_in_same_call(db):
     item = await db_module.add_sprint_item(db, p["id"], "v1", "inline verdict")
     await db_module.patch_sprint_item(db, p["id"], item["id"], require_verification=True)
     await db_module.claim_sprint_item(db, p["id"], item["id"], actor="implementer-session")
+    verifier = await db_module.register_session(db, p["id"], "fresh-verifier-2")
 
     result = await db_module.complete_sprint_item(
         db, p["id"], item["id"],
         actor="implementer-session",
-        verifier_session_id="fresh-verifier-session-2",
+        verifier_session_id=verifier["id"],
         verification_verdict="pass",
         verification_notes="independently confirmed via read-only inspection",
     )
@@ -150,7 +153,7 @@ async def test_complete_files_and_checks_verdict_in_same_call(db):
         db, p["id"], item["id"]
     )
     assert verification["verdict"] == "pass"
-    assert verification["verifier_session_id"] == "fresh-verifier-session-2"
+    assert verification["verifier_session_id"] == verifier["id"]
 
 
 @pytest.mark.asyncio
@@ -254,8 +257,9 @@ async def test_require_verification_and_strict_evidence_gates_compose():
         # anything (db.complete_sprint_item never reaches its write on that
         # path), so notes= must be supplied again here to keep strict_evidence
         # satisfied on this final, successful call.
+        _verifier = await db_module.register_session(db_conn, p["id"], "fresh-verifier")
         await db_module.record_sprint_item_verification(
-            db_conn, p["id"], item["id"], "fresh-verifier-session", "pass",
+            db_conn, p["id"], item["id"], _verifier["id"], "pass",
         )
         done = await mh._dispatch_mcp_tool(
             "complete_sprint_item",

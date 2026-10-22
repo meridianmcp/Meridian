@@ -311,7 +311,7 @@ async def test_generate_handoff_no_family_default_call_unaffected(db, tmp_path):
     await db_module.set_goal(db, p["id"], "ship it", sprint="s1")
 
     path, content, amended = await handoff_module.generate_handoff(
-        db, p["id"], str(tmp_path), skip_ai_summary=True,
+        db, p["id"], str(tmp_path), skip_ai_summary=True, mode="full",
     )
 
     assert amended is False, "first call for a fresh project must be a fresh insert"

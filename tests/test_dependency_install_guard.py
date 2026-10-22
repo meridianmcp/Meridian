@@ -378,17 +378,27 @@ def test_dependency_install_guard_ps1_is_pure_ascii():
     )
 
 
+def _matches_shell_tools(entry: dict) -> bool:
+    """55d48d69 widened the matcher from ``Bash`` to ``Bash|PowerShell``: the
+    PowerShell tool runs the same pip/npm/... install commands."""
+    tools = str(entry.get("matcher") or "").split("|")
+    return "Bash" in tools and "PowerShell" in tools
+
+
 def test_settings_json_registers_bash_hook():
     settings = json.loads(_SETTINGS.read_text(encoding="utf-8"))
     pre_tool_use = settings["hooks"]["PreToolUse"]
     matches = [
         entry
         for entry in pre_tool_use
-        if entry.get("matcher") == "Bash"
+        if _matches_shell_tools(entry)
         for hook in entry.get("hooks", [])
         if "dependency_install_guard.ps1" in hook.get("command", "")
     ]
-    assert matches, "settings.json must register dependency_install_guard.ps1 under PreToolUse matcher 'Bash'"
+    assert matches, (
+        "settings.json must register dependency_install_guard.ps1 under a PreToolUse "
+        "matcher covering both Bash and PowerShell"
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -408,7 +418,7 @@ def test_dependency_install_guard_command_is_project_scoped_required_hook():
     command = next(
         hook.get("command", "")
         for entry in settings["hooks"]["PreToolUse"]
-        if entry.get("matcher") == "Bash"
+        if _matches_shell_tools(entry)
         for hook in entry.get("hooks", [])
         if "dependency_install_guard.ps1" in hook.get("command", "")
     )
@@ -426,7 +436,7 @@ def test_dependency_install_guard_command_resolves_ok_against_real_repo_root():
     command = next(
         hook.get("command", "")
         for entry in settings["hooks"]["PreToolUse"]
-        if entry.get("matcher") == "Bash"
+        if _matches_shell_tools(entry)
         for hook in entry.get("hooks", [])
         if "dependency_install_guard.ps1" in hook.get("command", "")
     )

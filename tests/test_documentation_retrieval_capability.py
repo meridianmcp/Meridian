@@ -196,7 +196,18 @@ def test_version_constant_and_embedded_marker_agree():
     # the RESEARCH ROUTING PROTOCOL. Verified via `git log -- meridian/agent_defaults.py`
     # and the changelog comment above AGENT_INSTRUCTIONS_STANDARD_VERSION in
     # agent_defaults.py, which already documents both bumps in full.
-    assert agent_defaults.AGENT_INSTRUCTIONS_STANDARD_VERSION == 19
+    # 20, not 19 -- aff4440f ("docs(research): add deep/multi-step research
+    # routing, bump instructions v20") added a RESEARCH ROUTING PROTOCOL bullet
+    # telling the calling agent to use its own native multi-turn research
+    # capability for deep/multi-step questions, with paper_search/github_search/
+    # social_search/zotero_search + capture_research_finding as the source+record
+    # layer (Meridian deliberately isn't a deep-research orchestrator, decision
+    # caf1a346). Both the constant and the embedded `<!-- meridian-executor-
+    # standard: v20 -->` marker were bumped together in that commit (see the
+    # `embedded == AGENT_INSTRUCTIONS_STANDARD_VERSION` assertion above, which
+    # already covers marker/constant drift) -- this is a real, intentional bump,
+    # not a hardcoded-number omission.
+    assert agent_defaults.AGENT_INSTRUCTIONS_STANDARD_VERSION == 20
 
 
 def test_fresh_default_instructions_are_not_stale():

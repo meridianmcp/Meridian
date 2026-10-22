@@ -213,13 +213,68 @@ def _seed_tree(tmp_path):
 
 
 def test_merkle_only_indexes_source_files(tmp_path):
+    import subprocess
+
     _seed_tree(tmp_path)
+    for dirname in (
+        ".codex/worktrees", ".claude/worktrees", ".serena/cache", "OneDrive",
+    ):
+        (tmp_path / dirname).mkdir(parents=True, exist_ok=True)
+    _write(tmp_path / ".codex" / "worktrees" / "copy.py", "def codex_copy():\n    return 1\n")
+    _write(tmp_path / ".claude" / "worktrees" / "copy.py", "def claude_copy():\n    return 1\n")
+    _write(tmp_path / ".serena" / "cache" / "copy.py", "def serena_copy():\n    return 1\n")
+    _write(tmp_path / "OneDrive" / "copy.py", "def cloud_copy():\n    return 1\n")
     tree = ci.build_merkle_tree(str(tmp_path))
-    files = set(tree.files().keys())
+    files = set(tree.files())
     assert files == {"root_mod.py", "pkg/a.py", "pkg/sub/b.ts"}
-    # node_modules / README.md are excluded
-    assert not any("node_modules" in f for f in files)
-    assert not any(f.endswith(".md") for f in files)
+    assert tree.scan_info["canonical_root"] == ci.normalize_root_dir(str(tmp_path))
+    assert tree.scan_info["scope_id"]
+    assert tree.scan_info["scan_complete"] is True
+    assert tree.scan_info["scope_mode"] == "bounded_walk"
+    assert not any("node_modules" in path for path in files)
+    assert not any(path.endswith(".md") for path in files)
+
+    git_root = tmp_path / "git-root"
+    git_root.mkdir()
+    subprocess.run(["git", "-C", str(git_root), "init", "-q"], check=True)
+    subprocess.run(["git", "-C", str(git_root), "config", "user.email", "pytest@example.invalid"], check=True)
+    subprocess.run(["git", "-C", str(git_root), "config", "user.name", "Pytest"], check=True)
+    _write(git_root / ".gitignore", "ignored.py\n")
+    _write(git_root / "tracked.py", "def tracked_marker():\n    return 1\n")
+    _write(git_root / "ignored.py", "def ignored_marker():\n    return 1\n")
+    _write(git_root / "untracked.py", "def untracked_marker():\n    return 1\n")
+    subprocess.run(["git", "-C", str(git_root), "add", ".gitignore", "tracked.py"], check=True)
+    subprocess.run(["git", "-C", str(git_root), "add", "-f", "ignored.py"], check=True)
+    subprocess.run(["git", "-C", str(git_root), "commit", "-qm", "fixture"], check=True)
+    git_tree = ci.build_merkle_tree(str(git_root))
+    assert set(git_tree.files()) == {"tracked.py"}
+    assert git_tree.scan_info["scope_mode"] == "git_tracked"
+    assert git_tree.scan_info["is_git_worktree"] is False
+
+    linked = tmp_path / "linked-worktree"
+    subprocess.run(
+        ["git", "-C", str(git_root), "worktree", "add", "--detach", "-q", str(linked), "HEAD"],
+        check=True,
+    )
+    linked_tree = ci.build_merkle_tree(str(linked))
+    assert linked_tree.scan_info["canonical_root"] == ci.normalize_root_dir(str(linked))
+    assert linked_tree.scan_info["is_git_worktree"] is True
+    assert linked_tree.scan_info["git_common_dir"] == ci.normalize_root_dir(str(git_root / ".git"))
+    assert set(linked_tree.files()) == {"tracked.py"}
+
+    broad = tmp_path / "broad-root"
+    for number in range(129):
+        child = broad / f"child-{number:03d}"
+        child.mkdir(parents=True, exist_ok=True)
+        _write(child / "copy.py", "def broad_copy():\n    return 1\n")
+    refused = ci.build_merkle_tree(str(broad))
+    assert refused.files() == {}
+    assert refused.scan_info["scan_complete"] is False
+    assert refused.scan_info["scan_reason"] == "broad_root_refused"
+    allowed = ci.build_merkle_tree(str(broad), allow_broad_root=True, max_files=1)
+    assert len(allowed.files()) == 1
+    assert allowed.scan_info["scan_complete"] is False
+    assert allowed.scan_info["scan_reason"] == "file_count_budget_exceeded"
 
 
 def test_merkle_identical_tree_diffs_empty(tmp_path):
@@ -437,24 +492,430 @@ def test_reindex_removes_deleted_file_chunks(tmp_path):
     finally:
         idx.close()
 
+def test_unreadable_file_hash_keeps_last_complete_index(tmp_path):
+    root = tmp_path / "repo"
+    root.mkdir()
+    source = root / "svc.py"
+    _write(source, "def oldmarker():\n    return 'retaineduniquetoken'\n")
+    fail_hash = False
+
+    def hasher(path):
+        if fail_hash:
+            return None
+        return ci._hash_file_bytes(path)
+
+    idx = ci.CodeIndex(str(root), db_path=str(tmp_path / "cache.duckdb"), hasher=hasher)
+    try:
+        first = idx.reindex()
+        assert first["scan_complete"] is True
+        assert idx.search("retaineduniquetoken")
+
+        _write(source, "def newmarker():\n    return 'newuniquetoken'\n")
+        fail_hash = True
+        partial = idx.reindex()
+
+        assert partial["partial"] is True
+        assert partial["scan_complete"] is False
+        assert partial["scan_reason"] == "file_hash_failed"
+        assert partial["unreadable_file_count"] == 1
+        assert idx.search("retaineduniquetoken")
+        assert not idx.search("newuniquetoken")
+    finally:
+        idx.close()
+
+
+def test_reindex_snapshot_read_failure_preserves_last_complete_index(tmp_path, monkeypatch):
+    import builtins
+
+    root = tmp_path / "repo"
+    root.mkdir()
+    source = root / "svc.py"
+    _write(source, "def oldmarker():\n    return 'retaineduniquetoken'\n")
+    arm_failure = False
+    fail_next_read = False
+
+    def hasher(path):
+        nonlocal fail_next_read
+        digest = ci._hash_file_bytes(path)
+        if arm_failure:
+            fail_next_read = True
+        return digest
+
+    original_open = builtins.open
+
+    def fail_snapshot_read(path, mode="r", *args, **kwargs):
+        nonlocal fail_next_read
+        if (
+            fail_next_read
+            and os.path.realpath(os.fspath(path)) == os.path.realpath(source)
+            and mode == "rb"
+        ):
+            fail_next_read = False
+            raise OSError("simulated transient chunk read failure")
+        return original_open(path, mode, *args, **kwargs)
+
+    idx = ci.CodeIndex(str(root), db_path=str(tmp_path / "cache.duckdb"), hasher=hasher)
+    try:
+        first = idx.reindex()
+        before = idx.get_convergence_state()
+        assert first["scan_complete"] is True
+        assert idx.search("retaineduniquetoken")
+
+        _write(source, "def newmarker():\n    return 'newuniquetoken'\n")
+        arm_failure = True
+        monkeypatch.setattr(builtins, "open", fail_snapshot_read)
+        partial = idx.reindex()
+
+        assert partial["scan_complete"] is False
+        assert partial["scan_reason"] == "file_read_failed"
+        assert partial["partial"] is True
+        after = idx.get_convergence_state()
+        assert after.source_fingerprint == before.source_fingerprint
+        assert after.index_revision == before.index_revision
+        assert idx.search("retaineduniquetoken")
+        assert not idx.search("newuniquetoken")
+
+        monkeypatch.setattr(builtins, "open", original_open)
+        recovered = idx.reindex()
+        assert recovered["scan_complete"] is True
+        assert idx.search("newuniquetoken")
+    finally:
+        idx.close()
+
+
+def test_reindex_source_change_between_hash_and_chunk_keeps_previous_snapshot(tmp_path):
+    root = tmp_path / "repo"
+    root.mkdir()
+    source = root / "svc.py"
+    _write(source, "def oldmarker():\n    return 'retaineduniquetoken'\n")
+    replace_after_hash = False
+
+    def racing_hasher(path):
+        nonlocal replace_after_hash
+        digest = ci._hash_file_bytes(path)
+        if replace_after_hash:
+            replace_after_hash = False
+            _write(source, "def latestmarker():\n    return 'latestuniquetoken'\n")
+        return digest
+
+    idx = ci.CodeIndex(str(root), db_path=str(tmp_path / "cache.duckdb"), hasher=racing_hasher)
+    try:
+        first = idx.reindex()
+        before = idx.get_convergence_state()
+        assert first["scan_complete"] is True
+
+        _write(source, "def middlemarker():\n    return 'middleuniquetoken'\n")
+        replace_after_hash = True
+        partial = idx.reindex()
+
+        assert partial["scan_complete"] is False
+        assert partial["scan_reason"] == "file_changed_during_chunk"
+        assert partial["partial"] is True
+        after = idx.get_convergence_state()
+        assert after.source_fingerprint == before.source_fingerprint
+        assert after.index_revision == before.index_revision
+        assert idx.search("retaineduniquetoken")
+        assert not idx.search("middleuniquetoken")
+        assert not idx.search("latestuniquetoken")
+
+        recovered = idx.reindex()
+        assert recovered["scan_complete"] is True
+        assert idx.search("latestuniquetoken")
+    finally:
+        idx.close()
+
+
+def test_reindex_write_failure_rolls_back_rows_and_merkle_baseline(tmp_path, monkeypatch):
+    root = tmp_path / "repo"
+    root.mkdir()
+    source = root / "svc.py"
+    _write(source, "def oldmarker():\n    return 'retaineduniquetoken'\n")
+    idx = ci.CodeIndex(str(root), db_path=str(tmp_path / "cache.duckdb"))
+    try:
+        idx.reindex()
+        before = idx.get_convergence_state()
+        _write(source, "def newmarker():\n    return 'newuniquetoken'\n")
+
+        def fail_insert(_con, _chunks):
+            raise RuntimeError("simulated insert failure")
+
+        monkeypatch.setattr(idx, "_insert_chunks", fail_insert)
+        failed = idx.reindex()
+
+        assert failed["error"] == "index_write_failed"
+        assert failed["partial"] is True
+        after = idx.get_convergence_state()
+        assert after.source_fingerprint == before.source_fingerprint
+        assert after.index_revision == before.index_revision
+        assert idx.search("retaineduniquetoken")
+        assert not idx.search("newuniquetoken")
+    finally:
+        idx.close()
+
+
+def test_reindex_rollback_restores_search_feature_flags(tmp_path, monkeypatch):
+    root = tmp_path / "repo"
+    root.mkdir()
+    source = root / "svc.py"
+    db_path = str(tmp_path / "cache.duckdb")
+    _write(source, "def oldmarker():\n    return 'retaineduniquetoken'\n")
+    original = ci.CodeIndex(str(root), db_path=db_path)
+    try:
+        original.reindex()
+    finally:
+        original.close()
+
+    # A reopened persistent index starts with conservative instance flags even
+    # though the database already has its prior FTS state.
+    idx = ci.CodeIndex(str(root), db_path=db_path)
+    assert idx._fts_built is False
+    _write(source, "def newmarker():\n    return 'newuniquetoken'\n")
+
+    def fail_meta(*_args, **_kwargs):
+        raise RuntimeError("simulated metadata publication failure")
+
+    monkeypatch.setattr(idx, "_store_meta", fail_meta)
+    try:
+        result = idx.reindex()
+
+        assert result["error"] == "index_write_failed"
+        assert idx._fts_built is False
+        assert idx._vss_ready is False
+        assert idx._vss_dim is None
+        state = idx.get_convergence_state()
+        assert state.indexed_file_count == 1
+    finally:
+        idx.close()
+
+
+def test_index_paths_read_failure_preserves_existing_rows_and_baseline(tmp_path, monkeypatch):
+    root = tmp_path / "repo"
+    root.mkdir()
+    source = root / "svc.py"
+    _write(source, "def oldmarker():\n    return 'retaineduniquetoken'\n")
+    idx = ci.CodeIndex(str(root), db_path=str(tmp_path / "cache.duckdb"))
+    try:
+        idx.reindex()
+        before = idx.get_convergence_state()
+        _write(source, "def newmarker():\n    return 'newuniquetoken'\n")
+        monkeypatch.setattr(
+            idx,
+            "_chunk_snapshot",
+            lambda _path, **_kwargs: (None, "file_read_failed"),
+        )
+
+        result = idx.index_paths([str(source)])
+
+        assert result["error"] == "file_read_failed"
+        after = idx.get_convergence_state()
+        assert after.source_fingerprint == before.source_fingerprint
+        assert after.index_revision == before.index_revision
+        assert idx.search("retaineduniquetoken")
+        assert not idx.search("newuniquetoken")
+    finally:
+        idx.close()
+
+
+def test_index_paths_rejects_targets_outside_prune_scope_before_mutation(
+    tmp_path, monkeypatch,
+):
+    root = tmp_path / "repo"
+    subtree = root / "subtree"
+    subtree.mkdir(parents=True)
+    outside_dir = root / "elsewhere"
+    outside_dir.mkdir()
+    inside = subtree / "inside.py"
+    outside = outside_dir / "outside.py"
+    _write(inside, "def subtree_marker():\n    return 'prunescopemarker'")
+    _write(outside, "def outside_marker():\n    return 'outsideprunescope'")
+
+    idx = ci.CodeIndex(str(root), db_path=str(tmp_path / "cache.duckdb"))
+    try:
+        idx.reindex()
+        assert idx.search("prunescopemarker")
+        assert idx.search("outsideprunescope")
+
+        original_connect = idx._connect
+        connect_calls = 0
+
+        def track_connect():
+            nonlocal connect_calls
+            connect_calls += 1
+            return original_connect()
+
+        monkeypatch.setattr(idx, "_connect", track_connect)
+        result = idx.index_paths([str(outside)], prune_root=str(subtree))
+        assert result["error"] == "path_outside_prune_scope"
+        assert connect_calls == 0
+
+        monkeypatch.setattr(idx, "_connect", original_connect)
+        assert idx.search("prunescopemarker")
+        assert idx.search("outsideprunescope")
+    finally:
+        idx.close()
+
+
+def test_full_reindex_prunes_deleted_file_chunks(tmp_path):
+    root = tmp_path / "repo"
+    root.mkdir()
+    deleted = root / "gone.py"
+    kept = root / "keep.py"
+    _write(deleted, "def doomedmarker():\n    return 'doomeduniquetoken'\n")
+    _write(kept, "def survivormarker():\n    return 'survivoruniquetoken'\n")
+    idx = ci.CodeIndex(str(root), db_path=str(tmp_path / "cache.duckdb"))
+    try:
+        idx.reindex()
+        assert idx.search("doomeduniquetoken")
+        deleted.unlink()
+
+        summary = idx.reindex(full=True)
+
+        assert summary["scan_complete"] is True
+        assert not idx.search("doomeduniquetoken")
+        assert idx.search("survivoruniquetoken")
+    finally:
+        idx.close()
+
+
+def test_incremental_reindex_inserts_with_vss_embedding_column(tmp_path):
+    root = tmp_path / "repo"
+    root.mkdir()
+    source = root / "svc.py"
+    _write(source, "def oldmarker():\n    return 'oldembeddingmarker'\n")
+
+    class DisabledEmbedder:
+        model_name = "disabled-test-embedder"
+
+        @staticmethod
+        def available():
+            return False
+
+    idx = ci.CodeIndex(
+        str(root),
+        db_path=str(tmp_path / "cache.duckdb"),
+        embedder=DisabledEmbedder(),
+    )
+    try:
+        first = idx.reindex()
+        assert first["scan_complete"] is True
+        assert idx.search("oldembeddingmarker")
+
+        # VSS adds this nullable schema column to the persisted chunk table.
+        # Simulate that schema safely without depending on model/VSS availability.
+        con = idx._connect()
+        con.execute("ALTER TABLE code_chunks ADD COLUMN embedding FLOAT[2]")
+        _write(source, "def newmarker():\n    return 'newembeddingmarker'\n")
+
+        updated = idx.reindex()
+
+        assert updated["scan_complete"] is True
+        assert updated["rebuilt"] is True
+        assert idx.search("newembeddingmarker")
+        assert not idx.search("oldembeddingmarker")
+        embeddings = con.execute("SELECT embedding FROM code_chunks").fetchall()
+        assert embeddings
+        assert all(row[0] is None for row in embeddings)
+    finally:
+        idx.close()
+
+
+def test_bounded_git_path_reader_stops_at_entry_limit():
+    import sys
+    import time
+
+    paths, reason = ci._run_bounded_nul_list(
+        [
+            sys.executable,
+            "-c",
+            "import sys; sys.stdout.buffer.write(bytes([112, 0]) * 10000)",
+        ],
+        max_entries=8,
+        max_bytes=1024 * 1024,
+        deadline=time.monotonic() + 5,
+    )
+
+    assert paths == [b"p"] * 8
+    assert reason == "file_list_entry_budget_exceeded"
+
+
+def test_default_and_broad_opt_in_use_separate_persistent_indexes(tmp_path):
+    root = tmp_path / "broad-root"
+    root.mkdir()
+    for index in range(129):
+        _write(
+            root / f"module_{index:03}.py",
+            "def broad_cache_scope_marker():\n    return 'broadcachetoken'\n",
+        )
+
+    shared_path = str(tmp_path / "shared.duckdb")
+    broad = ci.CodeIndex(str(root), db_path=shared_path, allow_broad_root=True)
+    default = ci.CodeIndex(str(root), db_path=shared_path)
+    try:
+        assert broad._db_path != default._db_path
+        indexed = broad.reindex()
+        assert indexed["scan_complete"] is True
+        assert broad.search("broadcachetoken")
+
+        refused = default.reindex()
+        assert refused["scope_mode"] == "refused_broad_root"
+        assert refused["partial"] is True
+        assert not default.search("broadcachetoken")
+    finally:
+        broad.close()
+        default.close()
+
 
 def test_reindex_persists_across_reopen(tmp_path):
-    """A file-backed sidecar keeps chunks + Merkle tree, so the FIRST reindex
-    after reopening is incremental (no changes → zero writes)."""
-    _write(tmp_path / "svc.py", "def hello():\n    return 1\n")
-    db_path = str(tmp_path / "code_index.duckdb")
-    idx1 = ci.CodeIndex(str(tmp_path), db_path=db_path)
-    idx1.reindex()
-    idx1.close()
+    """Persistent indexes survive restart and remain isolated per canonical root."""
+    shared_data = tmp_path / "shared-index-data"
+    shared_data.mkdir()
+    db_path = str(shared_data / "code_index.duckdb")
+    root_a = tmp_path / "repo-a"
+    root_b = tmp_path / "repo-b"
+    root_a.mkdir()
+    root_b.mkdir()
+    _write(root_a / "alpha.py", "def alpha_only_marker():\n    return 'alpha_only_marker'\n")
+    _write(root_b / "beta.py", "def beta_only_marker():\n    return 'beta_only_marker'\n")
 
-    idx2 = ci.CodeIndex(str(tmp_path), db_path=db_path)
+    idx_a = ci.CodeIndex(str(root_a), db_path=db_path)
+    idx_b = ci.CodeIndex(str(root_b), db_path=db_path)
+    assert idx_a._db_path != idx_b._db_path
     try:
-        summary = idx2.reindex()
-        assert summary["changed_files"] == []
-        assert summary["chunks_written"] == 0
-        assert idx2.count() > 0
+        summary_a = idx_a.reindex()
+        summary_b = idx_b.reindex()
+        assert summary_a["scan_complete"] is True
+        assert summary_b["scan_complete"] is True
+        state_a = idx_a.get_convergence_state().to_dict()
+        state_b = idx_b.get_convergence_state().to_dict()
+        assert state_a["canonical_root"] == ci.normalize_root_dir(str(root_a))
+        assert state_b["canonical_root"] == ci.normalize_root_dir(str(root_b))
+        assert state_a["scope_id"] != state_b["scope_id"]
+        assert state_a["scan_complete"] is True
+        assert state_b["scan_complete"] is True
+        assert any(hit["name"] == "alpha_only_marker" for hit in idx_a.search("alpha_only_marker"))
+        assert all(not hit["path"].endswith("beta.py") for hit in idx_a.search("beta_only_marker"))
+        assert any(hit["name"] == "beta_only_marker" for hit in idx_b.search("beta_only_marker"))
+        assert all(not hit["path"].endswith("alpha.py") for hit in idx_b.search("alpha_only_marker"))
     finally:
-        idx2.close()
+        idx_a.close()
+        idx_b.close()
+
+    reopened_a = ci.CodeIndex(str(root_a), db_path=db_path)
+    reopened_b = ci.CodeIndex(str(root_b), db_path=db_path)
+    try:
+        summary_a = reopened_a.reindex()
+        summary_b = reopened_b.reindex()
+        assert summary_a["changed_files"] == []
+        assert summary_a["chunks_written"] == 0
+        assert summary_b["changed_files"] == []
+        assert summary_b["chunks_written"] == 0
+        assert any(hit["name"] == "alpha_only_marker" for hit in reopened_a.search("alpha_only_marker"))
+        assert all(not hit["path"].endswith("beta.py") for hit in reopened_a.search("beta_only_marker"))
+        assert any(hit["name"] == "beta_only_marker" for hit in reopened_b.search("beta_only_marker"))
+        assert all(not hit["path"].endswith("alpha.py") for hit in reopened_b.search("alpha_only_marker"))
+    finally:
+        reopened_a.close()
+        reopened_b.close()
 
 
 # ===========================================================================
@@ -508,11 +969,12 @@ def test_search_code_semantic_missing_dir():
 # ===========================================================================
 
 def test_normalize_root_dir_strips_quotes_and_whitespace():
-    """Surrounding quotes + whitespace (a JSON/shell round-trip artifact) are
-    stripped so the path resolves; result is an absolute path."""
+    """Normalize shell quoting and collapse relative/symlink path aliases."""
     raw = '  "' + os.getcwd() + '"  '
     out = ci.normalize_root_dir(raw)
-    assert out == os.path.abspath(os.getcwd())
+    assert out == os.path.realpath(os.getcwd())
+    alias = os.path.join(os.getcwd(), ".", "temporary", "..")
+    assert ci.normalize_root_dir(alias) == os.path.realpath(os.getcwd())
     assert '"' not in out
 
 
@@ -898,15 +1360,28 @@ def test_index_paths_before_any_reindex_still_indexes(tmp_path):
 def test_index_paths_skips_unsupported_and_outside_root(tmp_path):
     outside = tmp_path.parent / "outside_e631d54f_test.py"
     _write(outside, "def nope():\n    return 1\n")
+    ignored = tmp_path / ".codex" / "explicit.py"
+    ignored.parent.mkdir(parents=True, exist_ok=True)
+    _write(ignored, "def explicit_allowlisted_marker():\n    return 1\n")
     idx = ci.CodeIndex(str(tmp_path))
     try:
         result = idx.index_paths([
-            str(tmp_path / "notes.md"),   # unsupported extension
-            str(outside),                  # outside root_dir
-            "",                             # falsy
+            str(tmp_path / "notes.md"),
+            str(outside),
+            "",
         ])
         assert result["indexed"] == 0
         assert result["skipped"] == 3
+
+        allowed = idx.index_paths([str(ignored)])
+        assert allowed["indexed"] == 1
+        assert allowed["scope_mode"] == "explicit_allowlist"
+        assert allowed["canonical_root"] == ci.normalize_root_dir(str(tmp_path))
+        assert allowed["allowlisted_paths"] == [".codex/explicit.py"]
+        assert any(
+            hit["name"] == "explicit_allowlisted_marker"
+            for hit in idx.search("explicit_allowlisted_marker")
+        )
     finally:
         idx.close()
         try:

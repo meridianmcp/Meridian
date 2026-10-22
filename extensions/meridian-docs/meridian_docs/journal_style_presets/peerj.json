@@ -1,0 +1,32 @@
+{
+  "meta": {
+    "journal": "peerj",
+    "display_name": "PeerJ",
+    "publisher": "PeerJ",
+    "status": "populated",
+    "status_detail": "Mechanically migrated 2026-09-18 from the JOURNAL_STYLE_PRESETS dict literal in docs_intel.py (round 2, proposal 64266f13, dated 2026-09-11) as part of the JSON-preset externalization work (proposal 3b93b7ef) -- values and evidence carried over verbatim from the real in-code comment, not regenerated.",
+    "last_verified": "2026-09-11"
+  },
+  "fields": {
+    "citation_style": {
+      "value": "author_date",
+      "tier": 2,
+      "source": {
+        "type": "live_guidelines_page",
+        "citation": "peerj.com/about/author-instructions/",
+        "note": "PeerJ uses an author-date citation format with an alphabetical bibliography."
+      },
+      "verified_date": "2026-09-11"
+    },
+    "figure_dpi_minimum_general": {
+      "value": 300,
+      "tier": 2,
+      "source": {
+        "type": "live_guidelines_page",
+        "citation": "peerj.com/about/author-instructions/",
+        "note": "figures need 300 dpi on resubmission (blanket; vector images have no minimum since they don't degrade when scaled)."
+      },
+      "verified_date": "2026-09-11"
+    }
+  }
+}

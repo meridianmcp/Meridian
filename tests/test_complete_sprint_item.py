@@ -168,10 +168,13 @@ async def test_verifier_evidence_survives_interrupted_transition_and_retry(db, m
     monkeypatch.setattr(db_module, "_update_sprint_item_status", _interrupt_once)
     monkeypatch.setattr(_sprint_items_mod, "_update_sprint_item_status", _interrupt_once)
 
+    # 0ff5e59f — the verifier must be a REAL session of this project.
+    verifier = await db_module.register_session(db, p["id"], "fresh-verifier")
+
     with pytest.raises(asyncio.CancelledError):
         await db_module.complete_sprint_item(
             db, p["id"], item["id"], actor="implementer-session",
-            verifier_session_id="fresh-verifier-session",
+            verifier_session_id=verifier["id"],
             verification_verdict="pass",
             verification_notes="reviewed the diff independently",
         )
@@ -180,7 +183,7 @@ async def test_verifier_evidence_survives_interrupted_transition_and_retry(db, m
     on_file = await db_module.get_latest_sprint_item_verification(db, p["id"], item["id"])
     assert on_file is not None
     assert on_file["verdict"] == "pass"
-    assert on_file["verifier_session_id"] == "fresh-verifier-session"
+    assert on_file["verifier_session_id"] == verifier["id"]
 
     # The item itself never flipped to done.
     still = await db_module.get_sprint_item(db, item["id"])
@@ -215,10 +218,12 @@ async def test_verifier_evidence_retry_does_not_duplicate_verification_rows(db, 
     monkeypatch.setattr(db_module, "_update_sprint_item_status", _interrupt_once)
     monkeypatch.setattr(_sprint_items_mod, "_update_sprint_item_status", _interrupt_once)
 
+    verifier = await db_module.register_session(db, p["id"], "fresh-verifier")
+
     with pytest.raises(asyncio.CancelledError):
         await db_module.complete_sprint_item(
             db, p["id"], item["id"], actor="implementer-session",
-            verifier_session_id="fresh-verifier-session",
+            verifier_session_id=verifier["id"],
             verification_verdict="pass",
         )
 

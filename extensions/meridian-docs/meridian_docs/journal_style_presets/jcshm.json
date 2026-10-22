@@ -1,0 +1,331 @@
+{
+  "meta": {
+    "journal": "jcshm",
+    "display_name": "Journal of Civil Structural Health Monitoring",
+    "publisher": "Springer",
+    "publisher_journal_id": "13349",
+    "status": "populated",
+    "status_detail": "Deeply verified -- this is the actual thesis submission target. Sourced across three sessions (2026-09-11 schema-expansion pass, 2026-09-14 Springer submission-guidelines pass, 2026-09-17/18 heading-spacing/body-font/abstract-keyword passes) using live browser fetch (WebFetch auth-loops on link.springer.com; interactive browser does not -- see feedback_webfetch_vs_springer note), direct PDF-baseline measurement of a real manuscript/SI pair, a live JCSHM article's own CSS, and Springer Nature's own sn-jnl.cls LaTeX class source. One field (table_caption_bold) is a deliberately open, unresolved question -- see its entry below -- not silently omitted.",
+    "last_verified": "2026-09-18"
+  },
+  "fields": {
+    "caption_centered": {
+      "value": true,
+      "tier": 4,
+      "source": {
+        "type": "unsourced",
+        "citation": "pre-existing value, module history before the 4d0ca929/df716454 evidence-capture convention began",
+        "note": "No per-key citation found in the current in-code comments for this key specifically (only the general 'representative academic-journal convention bundle' framing at the top of the jcshm dict entry, which is not a verification citation). Needs a dedicated backfill pass before this file can honestly claim tier 2/3 for it."
+      },
+      "verified_date": null
+    },
+    "equation_alignment": {
+      "value": "center",
+      "tier": 4,
+      "source": {
+        "type": "unsourced",
+        "citation": "restates the resolve_style_policy() schema default (_style_policy_defaults, docs_intel.py:9009); not independently verified for JCSHM specifically",
+        "note": "Explicitly restated in the jcshm preset rather than left unset, but no JCSHM-specific source was found for it."
+      },
+      "verified_date": null
+    },
+    "equation_punctuation_required": {
+      "value": true,
+      "tier": 4,
+      "source": {
+        "type": "unsourced",
+        "citation": "restates the resolve_style_policy() schema default (_style_policy_defaults, docs_intel.py:9010)",
+        "note": "Same as equation_alignment -- explicitly restated, no JCSHM-specific citation found."
+      },
+      "verified_date": null
+    },
+    "equation_punctuation_chars": {
+      "value": ".,;",
+      "tier": 4,
+      "source": {
+        "type": "unsourced",
+        "citation": "pre-existing value; differs from the schema default '.,;:' (drops the colon) but no citation explaining the difference was found",
+        "note": "Needs backfill verification against a real JCSHM equation sample."
+      },
+      "verified_date": null
+    },
+    "heading_terminal_punctuation": {
+      "value": "",
+      "tier": 4,
+      "source": {
+        "type": "unsourced",
+        "citation": "pre-existing value, no per-key citation found",
+        "note": "Needs backfill verification."
+      },
+      "verified_date": null
+    },
+    "table_label_column_alignment": {
+      "value": "left",
+      "tier": 4,
+      "source": {
+        "type": "unsourced",
+        "citation": "pre-existing value, no per-key citation found",
+        "note": "Needs backfill verification (distinct from table_alignment below, which IS verified)."
+      },
+      "verified_date": null
+    },
+    "table_data_column_alignment": {
+      "value": "center",
+      "tier": 4,
+      "source": {
+        "type": "unsourced",
+        "citation": "pre-existing value, no per-key citation found",
+        "note": "Needs backfill verification (distinct from table_alignment below, which IS verified)."
+      },
+      "verified_date": null
+    },
+    "table_alignment": {
+      "value": "center",
+      "tier": 3,
+      "source": {
+        "type": "corroboration",
+        "citation": "_style_policy_defaults docstring, docs_intel.py:8954-8965 (9c1a3fd2)",
+        "quote": "a real JCSHM manuscript/SI pair where the overwhelming majority of tables (38/42 and 48/76 respectively) turned out to be genuinely left-aligned ... verified against every pre-existing, already-correct content table in both real documents (100% used 'center', 0% used any other value)",
+        "note": "Real-document sampling across two full documents, not a guideline-page claim."
+      },
+      "verified_date": "2026-09-11"
+    },
+    "figure_caption_bold": {
+      "value": true,
+      "tier": 2,
+      "source": {
+        "type": "live_guidelines_page",
+        "citation": "https://link.springer.com/journal/13349/submission-guidelines -- section 'Figure Captions'",
+        "note": "Fetched via an interactive browser session (persistent cookies); a stateless WebFetch-style single request loops forever through idp.springer.com's auth-cookie redirect even though the page is genuinely public. See feedback_webfetch_vs_browser_for_gated_publisher_pages memory and workspace proposal cb7bd76e."
+      },
+      "verified_date": "2026-09-14"
+    },
+    "figure_caption_label_punctuation": {
+      "value": "none",
+      "tier": 2,
+      "source": {
+        "type": "live_guidelines_page",
+        "citation": "https://link.springer.com/journal/13349/submission-guidelines -- section 'Figure Captions'"
+      },
+      "verified_date": "2026-09-14"
+    },
+    "figure_caption_terminal_punctuation": {
+      "value": "",
+      "tier": 4,
+      "source": {
+        "type": "unsourced",
+        "citation": "not explicitly named in the 2026-09-14 citation list (which named figure_caption_bold / figure_caption_label_punctuation / heading_numbering_visible / heading_levels_max / citation_style specifically -- this key was not among them)",
+        "note": "Adjacent to figure_caption_label_punctuation and plausibly covered by the same 'Figure Captions' section, but not independently confirmed. Flag for a dedicated re-check rather than assuming it inherited the same tier 2 status."
+      },
+      "verified_date": null
+    },
+    "table_caption_label_punctuation": {
+      "value": "none",
+      "tier": 3,
+      "source": {
+        "type": "corroboration",
+        "citation": "22 real published JCSHM-article table captions sampled this session, 2026-09-18",
+        "note": "22/22 zero exceptions -- no terminal period, no punctuation after the number label. JCSHM's own author-facing submission guidelines do not state a table-caption punctuation rule (only a figure one), so this is corroboration-by-sampling rather than a guideline-page citation."
+      },
+      "verified_date": "2026-09-18"
+    },
+    "table_caption_terminal_punctuation": {
+      "value": "",
+      "tier": 3,
+      "source": {
+        "type": "corroboration",
+        "citation": "same 22-caption sample as table_caption_label_punctuation, plus this session's own pre-submission QA sweep",
+        "quote": "this session's own pre-submission QA sweep catching 2/37 real table captions in this project's own manuscript+SI with a stray trailing period that the other 35 did not carry",
+        "note": "The QA-sweep finding is a real-document consistency check, not itself the source of the rule -- the rule comes from the 22-caption external sample; the QA catch is corroborating evidence that JCSHM's own norm (no trailing period) was violated by 2 outliers."
+      },
+      "verified_date": "2026-09-18"
+    },
+    "table_caption_bold": {
+      "value": null,
+      "tier": 4,
+      "status": "open_question",
+      "source": {
+        "type": "unsourced",
+        "citation": "genuinely unresolved -- not merely 'not yet researched'",
+        "note": "Real published JCSHM articles bold the ENTIRE table caption (label + description), a DIFFERENT convention from figures (label-only bold, see figure_caption_bold above), but JCSHM's own author-facing submission guidelines never state a table-caption bold rule the way they explicitly do for figures. Whether 'bold the whole caption' is an author-submission-time requirement or a copyediting-stage transformation applied after acceptance is genuinely unknown from anything sourced this session. Even if resolved, audit_caption_style's caption_label_not_bold check only examines the LABEL run(s), not the full caption text, so a real 'bold the whole caption' rule would need a second, differently-scoped check too, not just this value. Do not guess a value here -- this field intentionally stays value:null/tier:4 until a future pass resolves both the sourcing gap and the detection-scope gap together."
+      },
+      "verified_date": null
+    },
+    "heading_numbering_visible": {
+      "value": true,
+      "tier": 2,
+      "source": {
+        "type": "live_guidelines_page",
+        "citation": "https://link.springer.com/journal/13349/submission-guidelines -- section 'Headings'"
+      },
+      "verified_date": "2026-09-14"
+    },
+    "heading_levels_max": {
+      "value": 3,
+      "tier": 2,
+      "source": {
+        "type": "live_guidelines_page",
+        "citation": "https://link.springer.com/journal/13349/submission-guidelines -- section 'Headings'"
+      },
+      "verified_date": "2026-09-14"
+    },
+    "citation_style": {
+      "value": "numbered_bracket",
+      "tier": 2,
+      "source": {
+        "type": "live_guidelines_page",
+        "citation": "https://link.springer.com/journal/13349/submission-guidelines -- section 'Citation'"
+      },
+      "verified_date": "2026-09-14"
+    },
+    "heading_spacing_before_h1_twips": {
+      "value": 480,
+      "tier": 3,
+      "source": {
+        "type": "corroboration",
+        "citation": "direct line-count measurement against the real JCSHM manuscript/SI PDF baseline, this session",
+        "note": "H1 = 2 body-lines before, converted via OOXML's font-size-independent '1 line = 240 twips' convention (2*240=480). 'Before' values are not exposed to the rendered-spacing-collapse ambiguity that affected the 'after' values (see heading_spacing_after_h1_twips)."
+      },
+      "verified_date": "2026-09-17"
+    },
+    "heading_spacing_after_h1_twips": {
+      "value": 240,
+      "tier": 3,
+      "source": {
+        "type": "corroboration",
+        "citations": [
+          {
+            "citation": "direct PDF-baseline line-count measurement, this session (1 body-line after = 240 twips)"
+          },
+          {
+            "citation": "https://link.springer.com/article/10.1007/s13349-024-00789-7 (live JCSHM article CSS)",
+            "quote": ".c-article-section__title{margin-bottom:16px} == 240 twips (16px)"
+          }
+        ],
+        "note": "This H1 value is the calibration point that establishes the live-article-CSS source as transferable to the H2/H3 correction below -- sn-jnl.cls' own \\section afterskip (9pt) does NOT match this docx value, so only the CSS agrees here, not the class file (unlike H2/H3-after, see below)."
+      },
+      "verified_date": "2026-09-17"
+    },
+    "heading_spacing_before_h2_twips": {
+      "value": 240,
+      "tier": 3,
+      "source": {
+        "type": "corroboration",
+        "citation": "direct PDF-baseline line-count measurement, this session -- H2 and H3 measured IDENTICAL to each other, both 1 body-line before"
+      },
+      "verified_date": "2026-09-17"
+    },
+    "heading_spacing_after_h2_twips": {
+      "value": 120,
+      "tier": 1,
+      "source": {
+        "type": "official_template",
+        "citations": [
+          {
+            "type": "official_template",
+            "citation": "Springer Nature's sn-jnl.cls, \\@startsection afterskip argument for \\subsection",
+            "quote": "\\subsection ... afterskip = 6pt"
+          },
+          {
+            "type": "corroboration",
+            "citation": "https://link.springer.com/article/10.1007/s13349-024-00789-7 (live JCSHM article CSS)",
+            "quote": ".c-article__sub-heading{margin:24px 0 8px} -- the 8px bottom margin == 120 twips"
+          }
+        ],
+        "note": "2026-09-17 correction from an earlier stale 240 -- the original PDF-baseline line-count measurement could not cleanly separate a heading's own after-spacing from the following paragraph's before-spacing under rendered spacing collapse. Two independent, non-rendering sources (the real LaTeX class file AND a live article's own CSS) converge exactly on 6pt=120 twips, re-verified live in this session rather than re-read from a prior report. Both real submission documents already in production (staging/jcshm_v58_section2_refs_indent_ooxml_safe_20260904, review44/review63 candidates, 107 headings) already carry 120 twips -- the preset default was the stale artifact, not the documents."
+      },
+      "verified_date": "2026-09-17"
+    },
+    "heading_spacing_before_h3_twips": {
+      "value": 240,
+      "tier": 3,
+      "source": {
+        "type": "corroboration",
+        "citation": "direct PDF-baseline line-count measurement, this session -- H3 measured identical to H2 (NOT half of H2, a plausible but wrong guess this measurement explicitly ruled out)"
+      },
+      "verified_date": "2026-09-17"
+    },
+    "heading_spacing_after_h3_twips": {
+      "value": 120,
+      "tier": 1,
+      "source": {
+        "type": "official_template",
+        "citations": [
+          {
+            "type": "official_template",
+            "citation": "Springer Nature's sn-jnl.cls, \\@startsection afterskip argument for \\subsubsection",
+            "quote": "\\subsubsection ... afterskip = 6pt"
+          },
+          {
+            "type": "corroboration",
+            "citation": "https://link.springer.com/article/10.1007/s13349-024-00789-7 (live JCSHM article CSS) -- same .c-article__sub-heading rule as H2"
+          }
+        ],
+        "note": "Same 2026-09-17 correction and same two-source convergence as heading_spacing_after_h2_twips."
+      },
+      "verified_date": "2026-09-17"
+    },
+    "body_text_font_family": {
+      "value": "Times New Roman",
+      "tier": 2,
+      "source": {
+        "type": "live_guidelines_page",
+        "citation": "https://link.springer.com/journal/13349/submission-guidelines",
+        "quote": "10-point Times Roman",
+        "note": "The real motivating case for audit_cross_document_consistency: this session found the SI's BodyText/Normal styles explicitly set to 12pt by eye, a mismatch no existing tooling would have caught before this."
+      },
+      "verified_date": "2026-09-17"
+    },
+    "body_text_font_size_pt": {
+      "value": 10,
+      "tier": 2,
+      "source": {
+        "type": "live_guidelines_page",
+        "citation": "https://link.springer.com/journal/13349/submission-guidelines",
+        "quote": "10-point Times Roman"
+      },
+      "verified_date": "2026-09-17"
+    },
+    "abstract_word_count_min": {
+      "value": 150,
+      "tier": 2,
+      "source": {
+        "type": "live_guidelines_page",
+        "citation": "https://link.springer.com/journal/13349/submission-guidelines",
+        "quote": "Abstract 150-250 words",
+        "note": "Explicit, numeric, unambiguous rule -- not inferred. Not checked by any tooling before audit_manuscript_structure."
+      },
+      "verified_date": "2026-09-18"
+    },
+    "abstract_word_count_max": {
+      "value": 250,
+      "tier": 2,
+      "source": {
+        "type": "live_guidelines_page",
+        "citation": "https://link.springer.com/journal/13349/submission-guidelines",
+        "quote": "Abstract 150-250 words"
+      },
+      "verified_date": "2026-09-18"
+    },
+    "keyword_count_min": {
+      "value": 4,
+      "tier": 2,
+      "source": {
+        "type": "live_guidelines_page",
+        "citation": "https://link.springer.com/journal/13349/submission-guidelines",
+        "quote": "4-6 Keywords"
+      },
+      "verified_date": "2026-09-18"
+    },
+    "keyword_count_max": {
+      "value": 6,
+      "tier": 2,
+      "source": {
+        "type": "live_guidelines_page",
+        "citation": "https://link.springer.com/journal/13349/submission-guidelines",
+        "quote": "4-6 Keywords"
+      },
+      "verified_date": "2026-09-18"
+    }
+  }
+}

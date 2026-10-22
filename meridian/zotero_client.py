@@ -83,6 +83,22 @@ def _base_url(base_url: str | None) -> str:
     return _DEFAULT_BASE_URL
 
 
+def _selected_collection_keys() -> list[str]:
+    """Read the optional workstation-local citation scope."""
+    try:
+        from .tunnel_config import get_zotero_collection_keys
+
+        return get_zotero_collection_keys()
+    except Exception:  # noqa: BLE001 — malformed local prefs never break lookup
+        return []
+
+
+def _items_url(base: str, collection_key: str | None = None) -> str:
+    if collection_key:
+        return f"{base}/users/{_LOCAL_USER_ID}/collections/{collection_key}/items"
+    return f"{base}/users/{_LOCAL_USER_ID}/items"
+
+
 def _looks_like_doi(s: Any) -> bool:
     """True if ``s`` is a bare DOI string (``10.NNNN/....``).
 
@@ -213,63 +229,305 @@ async def _resolve_zotero_key(
     return _normalize_item(body)
 
 
+_ZOTERO_ITEM_KEY_RE = re.compile(r"^[A-Za-z0-9]{8}$")
+
+
+def _valid_zotero_item_key(key: Any) -> bool:
+    return isinstance(key, str) and _ZOTERO_ITEM_KEY_RE.fullmatch(key) is not None
+
+
+async def fetch_zotero_item_details(
+    key: str,
+    *,
+    base_url: str | None = None,
+    client: Any = None,
+) -> dict[str, Any] | None:
+    """Fetch local-only Zotero provenance for one item key.
+
+    This deliberately returns only scalar metadata and collection keys; the
+    local attachment path remains local to the caller and must never be sent
+    to hosted Meridian.
+    """
+    if not _valid_zotero_item_key(key):
+        return None
+    base = _base_url(base_url)
+
+    async def _fetch(c: Any) -> dict[str, Any] | None:
+        body = await _get_json(
+            c,
+            f"{base}/users/{_LOCAL_USER_ID}/items/{key}",
+            {"format": "json"},
+        )
+        if isinstance(body, list):
+            body = body[0] if body else None
+        normalized = _normalize_item(body)
+        if normalized is None or not isinstance(body, dict):
+            return None
+        data = body.get("data")
+        data = data if isinstance(data, dict) else {}
+        collections = data.get("collections")
+        collection_keys = sorted({
+            value.strip().upper()
+            for value in collections
+            if isinstance(value, str) and _valid_zotero_item_key(value.strip())
+        }) if isinstance(collections, list) else []
+        version = body.get("version")
+        return {
+            **normalized,
+            "version": version if isinstance(version, int) and version >= 0 else None,
+            "collection_keys": collection_keys,
+            "parent_key": data.get("parentItem") if _valid_zotero_item_key(data.get("parentItem")) else None,
+            "path": data.get("path") if isinstance(data.get("path"), str) else None,
+            "filename": data.get("filename") if isinstance(data.get("filename"), str) else None,
+            "content_type": data.get("contentType") if isinstance(data.get("contentType"), str) else None,
+        }
+
+    try:
+        if client is not None:
+            return await _fetch(client)
+        import httpx  # noqa: PLC0415 — optional, imported lazily
+
+        async with httpx.AsyncClient(timeout=_REQUEST_TIMEOUT) as owned:
+            return await _fetch(owned)
+    except Exception:  # noqa: BLE001 — provenance is best-effort
+        _log.debug("zotero item metadata lookup failed for key=%s", key, exc_info=True)
+        return None
+
+
+async def list_zotero_item_attachments(
+    parent_key: str,
+    *,
+    base_url: str | None = None,
+    client: Any = None,
+) -> list[dict[str, Any]]:
+    """List local Zotero attachment metadata for one parent item.
+
+    The result contains no file bytes. ``path`` is a workstation-local Zotero
+    path and must only be used locally for integrity registration.
+    """
+    if not _valid_zotero_item_key(parent_key):
+        return []
+    base = _base_url(base_url)
+
+    async def _fetch(c: Any) -> list[dict[str, Any]]:
+        body = await _get_json(
+            c,
+            f"{base}/users/{_LOCAL_USER_ID}/items/{parent_key}/children",
+            {"format": "json", "limit": 100},
+        )
+        if not isinstance(body, list):
+            return []
+        attachments: list[dict[str, Any]] = []
+        for item in body:
+            if not isinstance(item, dict):
+                continue
+            data = item.get("data")
+            data = data if isinstance(data, dict) else {}
+            key = item.get("key") or data.get("key")
+            if data.get("itemType") != "attachment" or not _valid_zotero_item_key(key):
+                continue
+            version = item.get("version")
+            attachments.append({
+                "zotero_key": key,
+                "parent_key": parent_key,
+                "version": version if isinstance(version, int) and version >= 0 else None,
+                "path": data.get("path") if isinstance(data.get("path"), str) else None,
+                "filename": data.get("filename") if isinstance(data.get("filename"), str) else None,
+                "content_type": data.get("contentType") if isinstance(data.get("contentType"), str) else None,
+            })
+        return attachments
+
+    try:
+        if client is not None:
+            return await _fetch(client)
+        import httpx  # noqa: PLC0415 — optional, imported lazily
+
+        async with httpx.AsyncClient(timeout=_REQUEST_TIMEOUT) as owned:
+            return await _fetch(owned)
+    except Exception:  # noqa: BLE001 — attachment metadata is best-effort
+        _log.debug("zotero child item lookup failed for key=%s", parent_key, exc_info=True)
+        return []
+
+
 async def _resolve_doi(
     client: Any, base: str, doi: str
 ) -> dict[str, Any] | None:
     """Resolve a DOI ref: text-search, then filter to a case-insensitive DOI match."""
-    url = f"{base}/users/{_LOCAL_USER_ID}/items"
-    body = await _get_json(
-        client,
-        url,
-        {
-            "q": doi,
-            "qmode": "everything",
-            "format": "json",
-            "limit": _SEARCH_LIMIT,
-        },
-    )
-    if not isinstance(body, list):
-        return None
     target = doi.strip().lower()
-    for item in body:
-        normalized = _normalize_item(item)
-        if normalized is None:
-            continue
-        item_doi = normalized.get("doi")
-        if isinstance(item_doi, str) and item_doi.strip().lower() == target:
-            return normalized
+    scopes = _selected_collection_keys() or [None]
+    matches: dict[str, dict[str, Any]] = {}
+    for collection_key in scopes:
+        body = await _get_json(
+            client,
+            _items_url(base, collection_key),
+            {
+                "q": doi,
+                "qmode": "everything",
+                "format": "json",
+                "limit": _SEARCH_LIMIT,
+            },
+        )
+        if not isinstance(body, list):
+            return None
+        for item in body:
+            normalized = _normalize_item(item)
+            if normalized is None:
+                continue
+            item_doi = normalized.get("doi")
+            if isinstance(item_doi, str) and item_doi.strip().lower() == target:
+                matches[normalized["zotero_key"]] = normalized
+    if len(matches) == 1:
+        return next(iter(matches.values()))
+    if len(matches) > 1:
+        _log.debug("DOI %s matched multiple selected Zotero collections", doi)
     # No item whose DOI matches — do NOT fabricate a link from a loose text hit.
     return None
+
+
+_TAG_PAGE_SIZE = 100
+_MAX_TAG_PAGES = 100
+
+
+async def _fetch_all_tags(
+    client: Any, base: str, collection_key: str | None = None
+) -> tuple[list[str] | None, str | None]:
+    """Fetch Better BibTeX tags with bounded Zotero pagination."""
+    tags: list[str] = []
+    tags_url = (
+        f"{base}/users/{_LOCAL_USER_ID}/collections/{collection_key}/tags"
+        if collection_key
+        else f"{base}/users/{_LOCAL_USER_ID}/tags"
+    )
+    for page_number in range(_MAX_TAG_PAGES):
+        start = page_number * _TAG_PAGE_SIZE
+        body = await _get_json(
+            client,
+            tags_url,
+            {"start": start, "limit": _TAG_PAGE_SIZE},
+        )
+        if not isinstance(body, list):
+            return None, "Zotero local API unavailable while fetching citation tags"
+        if not body:
+            return tags, None
+        tags.extend(
+            entry["tag"]
+            for entry in body
+            if isinstance(entry, dict) and isinstance(entry.get("tag"), str)
+        )
+        if len(body) < _TAG_PAGE_SIZE:
+            return tags, None
+    return None, "Zotero citation-tag search exceeded its pagination bound"
+
+
+async def _lookup_citation_key(
+    client: Any, base: str, citation_key: str
+) -> tuple[dict[str, Any], dict[str, Any] | None]:
+    """Resolve one exact Better BibTeX citation-key tag.
+
+    The result deliberately separates unresolved, unavailable, and ambiguous
+    states. A matching tag is never inferred from a fuzzy title/creator search.
+    """
+    key = citation_key.strip()
+    if not key:
+        return {"resolved": False, "status": "unresolved"}, None
+
+    suffix = f":key:{key}"
+    scopes: list[str | None] = _selected_collection_keys() or [None]
+    matches: list[tuple[str, str | None]] = []
+    for collection_key in scopes:
+        tags, error = await _fetch_all_tags(client, base, collection_key)
+        if tags is None:
+            return {
+                "resolved": None,
+                "status": "unavailable",
+                "reason": error or "Zotero local API unavailable",
+            }, None
+        matches.extend(
+            (tag, collection_key) for tag in tags if tag.endswith(suffix)
+        )
+    if not matches:
+        return {"resolved": False, "status": "unresolved"}, None
+    tags_by_scope = list(dict.fromkeys(matches))
+    if len({tag for tag, _collection_key in tags_by_scope}) > 1:
+        return {
+            "resolved": None,
+            "status": "ambiguous",
+            "reason": "multiple Better BibTeX tags in the selected scope carry this citation key",
+        }, None
+    tag = tags_by_scope[0][0]
+    items_by_key: dict[str, dict[str, Any]] = {}
+    for matched_tag, collection_key in tags_by_scope:
+        body = await _get_json(
+            client,
+            _items_url(base, collection_key),
+            {"tag": matched_tag},
+        )
+        for raw in (body if isinstance(body, list) else []):
+            normalized = _normalize_item(raw)
+            if normalized is not None:
+                items_by_key[normalized["zotero_key"]] = normalized
+    items = list(items_by_key.values())
+    if len(items) > 1:
+        return {
+            "resolved": None,
+            "status": "ambiguous",
+            "reason": "multiple Zotero items in the selected scope carry this citation key",
+        }, None
+
+    item = items[0] if items else None
+    return {
+        "resolved": True,
+        "status": "resolved",
+        "tag": tag,
+        "title": item.get("title") if item else None,
+    }, item
+
+
+async def lookup_citation_key(
+    citation_key: str | None,
+    *,
+    base_url: str | None = None,
+    client: Any = None,
+) -> dict[str, Any]:
+    """Validate a bare BibTeX key using Zotero's exact Better BibTeX tag.
+
+    Returns a ``resolved`` tri-state compatible with the local LaTeX engine:
+    true for an exact match, false when the local library has no such tag, and
+    null when Zotero is unavailable or the key is ambiguous. ``status`` adds
+    the reason for null without changing the older tri-state contract.
+    """
+    if not isinstance(citation_key, str) or not citation_key.strip():
+        return {"resolved": False, "status": "unresolved"}
+    base = _base_url(base_url)
+
+    async def _run(c: Any) -> dict[str, Any]:
+        result, _item = await _lookup_citation_key(c, base, citation_key)
+        return result
+
+    try:
+        if client is not None:
+            return await _run(client)
+        import httpx  # noqa: PLC0415 — optional, imported lazily like other call sites
+
+        async with httpx.AsyncClient(timeout=_REQUEST_TIMEOUT) as owned:
+            return await _run(owned)
+    except Exception:  # noqa: BLE001 — this is a best-effort local lookup
+        _log.debug("zotero citation-key lookup failed", exc_info=True)
+        return {
+            "resolved": None,
+            "status": "unavailable",
+            "reason": "Zotero local API request failed",
+        }
 
 
 async def _resolve_citekey(
     client: Any, base: str, citekey: str
 ) -> dict[str, Any] | None:
-    """Best-effort resolve a bare BibTeX citekey via a text search.
-
-    Without Better BibTeX, Zotero does not index the citekey token itself, so a
-    hit here is fuzzy (it matches title/creator/etc. text that happens to contain
-    the citekey string). We return the TOP hit if the search yields anything,
-    else ``None``. Documented as lossy — DOIs are the reliable key.
-    """
-    url = f"{base}/users/{_LOCAL_USER_ID}/items"
-    body = await _get_json(
-        client,
-        url,
-        {
-            "q": citekey,
-            "qmode": "everything",
-            "format": "json",
-            "limit": _SEARCH_LIMIT,
-        },
-    )
-    if not isinstance(body, list):
+    """Resolve a bare BibTeX citekey only through an exact Better BibTeX tag."""
+    result, item = await _lookup_citation_key(client, base, citekey)
+    if result.get("resolved") is not True:
         return None
-    for item in body:
-        normalized = _normalize_item(item)
-        if normalized is not None:
-            return normalized
-    return None
+    return item
 
 
 async def resolve_citation_ref(
@@ -286,7 +544,7 @@ async def resolve_citation_ref(
       searches the library and returns the item whose ``data.DOI`` matches
       case-insensitively.
     * ``zotero:<key>`` → a direct item GET by Zotero key.
-    * a bare citekey → a best-effort text search, top hit (fuzzy without BBT).
+    * a bare citekey → exact Better BibTeX :key: tag lookup; no fuzzy top-hit fallback.
 
     On a hit returns a normalized dict::
 
@@ -295,7 +553,7 @@ async def resolve_citation_ref(
 
     Returns ``None`` when the ref is empty/unclassifiable, when Zotero is
     unreachable or its local API is disabled (HTTP 403), when the item/DOI is not
-    found, or on any error. **Never raises.**
+    found, when a citekey is ambiguous, or on any error. **Never raises.**
 
     ``base_url`` overrides the endpoint (default: ``$MERIDIAN_ZOTERO_API_URL`` or
     ``http://127.0.0.1:23119/api``). ``client`` injects a preconfigured

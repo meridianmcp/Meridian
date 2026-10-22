@@ -376,12 +376,39 @@ def test_fetch_sprint_item_live_parses_json(monkeypatch):
             return body
 
     def _fake_urlopen(url, timeout=5.0):
-        assert "/sprint-items/i1" in url
+        assert "/sprint-items/i1" in url.full_url
         return _FakeResp()
 
     monkeypatch.setattr(claim_verify.urllib.request, "urlopen", _fake_urlopen)
+    monkeypatch.delenv("MERIDIAN_TOKEN", raising=False)
+    monkeypatch.delenv("BEARER_TOKEN", raising=False)
     item = claim_verify.fetch_sprint_item_live("http://localhost:7878", "p1", "i1")
     assert item == {"id": "i1", "status": "in_progress"}
+
+
+def test_fetch_sprint_item_live_sends_hosted_bearer_header(monkeypatch):
+    body = json.dumps({"id": "i1", "status": "in_progress"}).encode("utf-8")
+    monkeypatch.setenv("BEARER_TOKEN", "hosted-test-token")
+    captured = {}
+
+    class _FakeResp:
+        def __enter__(self):
+            return self
+        def __exit__(self, *a):
+            return False
+        def read(self):
+            return body
+
+    def _fake_urlopen(request, timeout=5.0):
+        captured["url"] = request.full_url
+        captured["headers"] = {key.casefold(): value for key, value in request.header_items()}
+        return _FakeResp()
+
+    monkeypatch.setattr(claim_verify.urllib.request, "urlopen", _fake_urlopen)
+
+    item = claim_verify.fetch_sprint_item_live("https://usemeridian.us", "p1", "i1")
+    assert item == {"id": "i1", "status": "in_progress"}
+    assert captured["headers"]["authorization"] == "Bearer hosted-test-token"
 
 
 def test_fetch_sprint_item_live_network_error_returns_none(monkeypatch):

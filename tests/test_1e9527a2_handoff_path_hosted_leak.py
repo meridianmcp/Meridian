@@ -44,7 +44,7 @@ async def _seed_handoff(db, name: str, tmp_path):
     p = await db_module.create_project(db, name)
     await db_module.set_goal(db, p["id"], "ship it", sprint="s1")
     await handoff_module.generate_handoff(
-        db, p["id"], str(tmp_path), skip_ai_summary=True,
+        db, p["id"], str(tmp_path), skip_ai_summary=True, mode="full",
     )
     rows = await db_module.get_handoffs(db, p["id"], limit=1)
     return p, rows[0]

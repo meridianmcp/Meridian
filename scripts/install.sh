@@ -3,6 +3,7 @@ set -e
 
 REPO="https://github.com/meridianmcp/Meridian.git"
 INSTALL_DIR="$HOME/.meridian"
+TARGET_REPO="$(pwd -P)"
 
 echo "Installing Meridian..."
 
@@ -18,12 +19,37 @@ if command -v uv >/dev/null 2>&1; then
     echo "Installed meridian-server with uv."
     echo "If 'meridian' isn't found, run: uv tool update-shell  (then restart your shell)"
     echo "Run: meridian --tunnel --repo ."
+    echo "Configuring the Meridian MCP bundle for this repository..."
+    if ! uv tool run --from meridian-server meridian setup --repo "$TARGET_REPO"; then
+      echo "warning: MCP bundle setup reported a conflict or error; run 'meridian setup --repo \"$TARGET_REPO\"' to retry." >&2
+    fi
     exit 0
   fi
   echo "uv tool install failed; falling back to source install." >&2
 fi
 
 # ---- Fallback path: clone repo + pixi ---------------------------------------
+
+# db03774e -- this fallback needs pixi, and this repo's pixi workspace declares
+# only win-64, linux-64, osx-64 and osx-arm64 (pixi.toml `platforms`). On Linux
+# arm64 `pixi install` therefore dies with an opaque "unsupported platform" error
+# only AFTER the git clone. Say so up front, before any network access, and point
+# at the published package, which does not go through pixi. (Intel macOS is
+# osx-64 and IS supported here, so it is deliberately not blocked.)
+case "$(uname -s)-$(uname -m)" in
+  Linux-aarch64|Linux-arm64)
+    {
+      echo "error: the source-install fallback is not available on Linux arm64 (aarch64):"
+      echo "the pixi workspace does not declare linux-aarch64, so 'pixi install' would fail."
+      echo ""
+      echo "Install the published package instead:"
+      echo "  uv tool install meridian-server      (get uv: https://docs.astral.sh/uv/getting-started/installation/)"
+      echo "  pipx install meridian-server         (or: pip install meridian-server)"
+      echo "  meridian --tunnel --repo ."
+    } >&2
+    exit 1
+    ;;
+esac
 
 # Check dependencies
 command -v git >/dev/null 2>&1 || { echo "git required"; exit 1; }
@@ -59,3 +85,7 @@ chmod +x "$HOME/.local/bin/meridian"
 echo ""
 echo "Meridian installed. Run: meridian"
 echo "Dashboard: http://localhost:7878/dashboard"
+echo "Configuring the Meridian MCP bundle for this repository..."
+if ! pixi run python -m meridian setup --repo "$TARGET_REPO"; then
+  echo "warning: MCP bundle setup reported a conflict or error; run 'meridian setup --repo \"$TARGET_REPO\"' to retry." >&2
+fi

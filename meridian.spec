@@ -2,9 +2,10 @@
 """PyInstaller spec for the slim Meridian tunnel-client executable.
 
 The downloadable ``meridian`` binary (``meridian.exe`` / ``meridian-linux`` /
-``meridian-mac-*``) is only ever used as the Pro filesystem tunnel client
-(``meridian --tunnel --repo .``). It does NOT need to embed the FastAPI/uvicorn
-server, psycopg3, langgraph, the hosted/billing routes or any DB stack.
+``meridian-mac-*``) is used as the Pro filesystem tunnel client
+(``meridian --tunnel --repo .``) and for the offline ``meridian setup`` MCP
+bundle installer. It does NOT need to embed the FastAPI/uvicorn server,
+psycopg3, langgraph, the hosted/billing routes or any DB stack.
 
 So this spec builds from the minimal ``meridian/tunnel_main.py`` entry point and
 aggressively excludes the server-only deps + heavy transitive libraries, with
@@ -86,6 +87,11 @@ a = Analysis(
         'meridian.tunnel_main',
         'meridian.tunnel_client',
         'meridian.serena_pool',
+        # Offline setup configures local MCP hosts without importing the
+        # server-side stack, and is used by the platform install scripts.
+        'meridian.setup_bundle',
+        # Local provider output capture is dynamically dispatched by CLI/tray.
+        'meridian.artifact_capture',
         # httpx / websockets are imported lazily inside run_tunnel; declare the
         # transport submodules so the frozen binary can find them at runtime.
         'httpx',

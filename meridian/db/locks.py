@@ -256,7 +256,7 @@ async def _amend_sprint_item_resources_for_session(
             # scoped to this session and still in_progress. No ORDER BY /
             # LIMIT guessing across sibling in_progress items.
             async with db.execute(
-                "SELECT id, touches_resources, wave FROM sprint_items "
+                "SELECT id, project_id, touches_resources, wave FROM sprint_items "
                 f"WHERE id = ? AND {owner_sql} AND status = 'in_progress'",
                 (item_id, *owner_params),
             ) as cur:
@@ -267,7 +267,7 @@ async def _amend_sprint_item_resources_for_session(
             # Correct by construction only when the session holds at most one
             # concurrently in_progress item.
             async with db.execute(
-                "SELECT id, touches_resources, wave FROM sprint_items "
+                "SELECT id, project_id, touches_resources, wave FROM sprint_items "
                 f"WHERE {owner_sql} AND status = 'in_progress' "
                 "ORDER BY claimed_at DESC LIMIT 1",
                 owner_params,
@@ -317,6 +317,18 @@ async def _amend_sprint_item_resources_for_session(
             (new_json, item_id),
         )
         await db.commit()
+        # 8a665a03 -- the declared-resource list (and the amended flag) is on every item
+        # row the Queue / Live tab draws, so the write must bust the list cache and be
+        # announced like any other item edit. Best effort inside this never-raises helper.
+        _item_project_id = item.get("project_id")
+        if _item_project_id:
+            from meridian.db import _publish_project_event  # noqa: PLC0415
+            from meridian.db.sprint_items import _invalidate_sprint_items_cache  # noqa: PLC0415
+            _invalidate_sprint_items_cache(_item_project_id)
+            _publish_project_event(
+                _item_project_id, "sprint_item_updated",
+                {"item_id": item_id, "fields": ["touches_resources", "resources_amended"]},
+            )
         hint: dict[str, Any] | None = None
         if current_wave:
             hint = {

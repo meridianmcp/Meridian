@@ -10,8 +10,9 @@ from typing import Any
 from fastapi import APIRouter, HTTPException, Request
 from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse, Response
 
-from .._deps import _db, _hosted_mode
+from .._deps import _hosted_mode, _require_hosted_operator, add_public_waitlist_entry
 from .. import db as db_module
+from ..plans import PURCHASABLE_PLANS, UNBILLED_PLANS
 
 router = APIRouter()
 
@@ -38,9 +39,10 @@ async def join_waitlist(request: Request) -> dict[str, Any]:
         note_parts.append(body["note"].strip())
     note_parts.append(f"plan:{plan} source:{source}")
     note = " ".join(note_parts) if note_parts else None
-    db = await _db(request)
     try:
-        entry = await db_module.add_waitlist_entry(db, email, note)
+        # ece2ac0a — public form: write-only accessor into the control-plane
+        # DB (where /admin/waitlist reads it), never the tenant resolver _db().
+        entry = await add_public_waitlist_entry(request, email, note)
     except Exception as exc:
         if "UNIQUE" in str(exc) or "unique" in str(exc):
             raise HTTPException(status_code=409, detail="email already on waitlist")
@@ -57,7 +59,13 @@ async def join_waitlist(request: Request) -> dict[str, Any]:
 
 @router.get("/waitlist")
 async def list_waitlist(request: Request) -> list[dict[str, Any]]:
-    """GET all waitlist entries, newest first. Admin use only."""
+    """GET all waitlist entries, newest first. Admin use only.
+
+    ece2ac0a — this returned every waitlist email address to anyone. Hosted
+    mode now requires the operator (same bar as /admin/waitlist); self-hosted
+    is unchanged.
+    """
+    await _require_hosted_operator(request, require_admin_password=False)
     db = request.app.state.db
     return await db_module.get_waitlist(db)
 
@@ -84,7 +92,11 @@ async def admin_waitlist_page(request: Request) -> HTMLResponse:
 
     total_tenants = await _count("SELECT COUNT(*) FROM tenants")
     free_tenants = await _count("SELECT COUNT(*) FROM tenants WHERE plan='free'")
-    paid_tenants = await _count("SELECT COUNT(*) FROM tenants WHERE plan NOT IN ('free','') AND plan IS NOT NULL")
+    # Unbilled plans (playtester) are not paying customers, so they are not "paid".
+    _unbilled_sql = ", ".join(f"'{p}'" for p in sorted(UNBILLED_PLANS))
+    paid_tenants = await _count(
+        f"SELECT COUNT(*) FROM tenants WHERE plan NOT IN ('free','',{_unbilled_sql}) AND plan IS NOT NULL"
+    )
 
     rows_html = "".join(
         f"""<tr>
@@ -277,7 +289,7 @@ async def checkout_redirect(request: Request, plan: str = "standard") -> Redirec
     """
     from ..hosted import create_stripe_checkout_session, get_current_tenant
 
-    if plan not in ("standard", "pro"):
+    if plan not in PURCHASABLE_PLANS:
         raise HTTPException(status_code=400, detail="plan must be standard or pro")
 
     try:
@@ -369,7 +381,9 @@ async def stripe_webhook(request: Request) -> dict[str, str]:
 
     # Resolve plan from checkout metadata (standard or pro); default to standard
     plan = event_obj.get("metadata", {}).get("plan", "standard")
-    if plan not in ("standard", "pro"):
+    # Only a purchasable plan can come out of a payment; a playtester is
+    # granted by an operator and must never be reachable from webhook metadata.
+    if not isinstance(plan, str) or plan not in PURCHASABLE_PLANS:
         plan = "standard"
 
     tenant = await db_module.upsert_tenant(db, email=email)

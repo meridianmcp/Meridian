@@ -52,6 +52,7 @@ from typing import Any
 import aiosqlite
 
 from meridian.db import _new_id, _row_to_dict  # noqa: PLC0415
+from meridian.secret_redaction import redact as _redact_secret_shapes
 
 #: Every valid terminal (or in-flight) status a verification run may carry.
 #: Mirrors the status vocabulary already returned by
@@ -237,13 +238,20 @@ async def complete_verification_run(
             "exit_code on file cannot be recorded as complete."
         )
 
+    # RT-LEAD-002: redact once, at this store boundary, before the captured
+    # test output is persisted (the tails come from a real subprocess and can
+    # echo env dumps or credentials). Every write path goes through here.
+    stdout_tail = _redact_secret_shapes(stdout_tail or "")
+    stderr_tail = _redact_secret_shapes(stderr_tail or "")
+    message = _redact_secret_shapes(message)
+
     await db.execute(
         "UPDATE verification_runs SET status = ?, exit_code = ?, passed = ?, "
         "failed = ?, stdout_tail = ?, stderr_tail = ?, message = ?, "
         "ended_at = datetime('now') WHERE id = ?",
         (
             status, exit_code, passed, failed,
-            stdout_tail or "", stderr_tail or "", message,
+            stdout_tail, stderr_tail, message,
             run_id,
         ),
     )

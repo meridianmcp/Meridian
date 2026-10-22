@@ -105,7 +105,8 @@ RESOLVER_STATUS_VALUES: frozenset[str] = frozenset({
 
 EVIDENCE_KIND_VALUES: frozenset[str] = frozenset({
     "claim", "source", "citation", "dataset", "code", "run", "output",
-    "figure", "table", "document", "review",
+    "figure", "table", "document", "review", "conversation",
+    "transcript_range", "provider_artifact",
 })
 
 

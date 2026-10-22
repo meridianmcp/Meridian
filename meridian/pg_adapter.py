@@ -24,7 +24,7 @@ import logging
 import os
 import re
 import uuid
-from typing import Any
+from typing import Any, Callable
 from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
 
 logger = logging.getLogger(__name__)
@@ -375,6 +375,14 @@ class PostgresConnection:
     # ------------------------------------------------------------------ API
 
     def execute(self, sql: str, params: tuple = ()) -> _ExecProxy:
+        pending = self._pending_txn_var.get()
+        if pending is not None:
+            pending._assert_owner_task()
+            # A begin_transaction() scope pins one borrowed connection. Keep
+            # ordinary adapter calls in that same task on the pinned handle
+            # too, so callers that share helpers using ``db.execute`` cannot
+            # silently escape the transaction or release row locks early.
+            return _ExecProxy(pending.execute(sql, params))
         return _ExecProxy(self._do_execute(sql, params))
 
     def begin_transaction(self) -> "_PendingPgTransaction":
@@ -413,13 +421,33 @@ class PostgresConnection:
         isolation, which wraps the whole test in one outer transaction) or
         not (a fresh production pool connection, autocommit=True) — the
         savepoint owns only ITS OWN scope either way and never accidentally
-        commits/rolls back a transaction it did not itself start.
+        commits/rolls back a transaction it did not itself start. Ordinary
+        ``PostgresConnection.execute()`` calls in this task are also routed to
+        the pinned handle until commit/rollback finishes the transaction.
         """
+        pending = self._pending_txn_var.get()
+        if pending is not None:
+            pending._assert_owner_task()
         return _PendingPgTransaction(self)
+
+    def add_after_commit_callback(self, callback: Callable[[], None]) -> bool:
+        """Register a synchronous callback on the current explicit transaction.
+
+        Nested savepoint commits transfer callbacks to their parent; only the
+        successful outer commit runs them. Returns False when this task has no
+        explicit transaction, since an ordinary autocommit statement needs no
+        deferred work.
+        """
+        pending = self._pending_txn_var.get()
+        if pending is None:
+            return False
+        pending.add_after_commit_callback(callback)
+        return True
 
     async def _finish_pending_txn(self, *, rollback: bool) -> None:
         pending = self._pending_txn_var.get()
         if pending is not None:
+            pending._assert_owner_task()
             await pending.finish(rollback=rollback)
 
     async def executescript(self, sql: str) -> None:
@@ -802,7 +830,10 @@ class _PendingPgTransaction:
     transaction.
     """
 
-    __slots__ = ("_owner", "_conn", "_savepoint", "_started_own_txn", "_done", "_token")
+    __slots__ = (
+        "_owner", "_conn", "_savepoint", "_started_own_txn", "_done",
+        "_token", "_owner_task", "_parent_pending", "_after_commit_callbacks",
+    )
 
     def __init__(self, owner: "PostgresConnection") -> None:
         self._owner = owner
@@ -811,23 +842,90 @@ class _PendingPgTransaction:
         self._started_own_txn = False
         self._done = False
         self._token: Any = None
+        self._owner_task: Any = None
+        self._parent_pending: _PendingPgTransaction | None = None
+        self._after_commit_callbacks: list[Callable[[], None]] = []
 
     async def __aenter__(self) -> _PinnedExec:
         import psycopg.pq  # local import — keeps SQLite-only installs psycopg-free
 
-        self._conn = await self._owner._pool.getconn()
-        self._started_own_txn = (
-            self._conn.info.transaction_status == psycopg.pq.TransactionStatus.IDLE
-        )
-        if self._started_own_txn:
-            await self._conn.execute("BEGIN")
-        self._savepoint = f"sp_rwrco_{uuid.uuid4().hex}"
-        await self._conn.execute(f"SAVEPOINT {self._savepoint}")
-        # Per-task, not per-connection-instance — see the ContextVar's own
-        # comment on PostgresConnection.__init__ for why a plain attribute
-        # would be unsafe under concurrent requests sharing this pool.
-        self._token = self._owner._pending_txn_var.set(self)
-        return _PinnedExec(self._conn)
+        self._owner_task = asyncio.current_task()
+        self._parent_pending = self._owner._pending_txn_var.get()
+        if self._parent_pending is not None:
+            self._parent_pending._assert_owner_task()
+            # Nested explicit scopes are savepoints on the parent's pinned
+            # connection. Borrowing another pool connection would make the
+            # child commit independent of the parent rollback it must follow.
+            self._conn = self._parent_pending._conn
+        else:
+            self._conn = await self._owner._pool.getconn()
+        savepoint_started = False
+        try:
+            self._started_own_txn = self._parent_pending is None and (
+                self._conn.info.transaction_status == psycopg.pq.TransactionStatus.IDLE
+            )
+            if self._started_own_txn:
+                await self._conn.execute("BEGIN")
+            self._savepoint = f"sp_rwrco_{uuid.uuid4().hex}"
+            await self._conn.execute(f"SAVEPOINT {self._savepoint}")
+            savepoint_started = True
+            # Per-task, not per-connection-instance — see the ContextVar's own
+            # comment on PostgresConnection.__init__ for why a plain attribute
+            # would be unsafe under concurrent requests sharing this pool.
+            self._token = self._owner._pending_txn_var.set(self)
+            return _PinnedExec(self._conn)
+        except BaseException:
+            # __aexit__ is never invoked when __aenter__ raises. Restore a
+            # clean transaction boundary here before returning the borrowed
+            # connection; when an ambient transaction has no confirmed
+            # savepoint boundary, discard it rather than risk poisoning the
+            # caller's outer transaction.
+            if self._parent_pending is not None:
+                if savepoint_started:
+                    try:
+                        await self._conn.execute(
+                            f"ROLLBACK TO SAVEPOINT {self._savepoint}"
+                        )
+                        await self._conn.execute(
+                            f"RELEASE SAVEPOINT {self._savepoint}"
+                        )
+                    except BaseException:
+                        # The parent still owns the connection and can make
+                        # the final rollback decision if its transaction was
+                        # left in an error state.
+                        pass
+                if self._token is not None:
+                    self._reset_pending_context()
+                self._conn = None
+                raise
+            try:
+                if self._started_own_txn:
+                    await self._conn.execute("ROLLBACK")
+                elif savepoint_started:
+                    await self._conn.execute(
+                        f"ROLLBACK TO SAVEPOINT {self._savepoint}"
+                    )
+                    await self._conn.execute(f"RELEASE SAVEPOINT {self._savepoint}")
+                else:
+                    raise RuntimeError("failed before an ambient savepoint was established")
+            except BaseException:
+                await self._discard_connection()
+            else:
+                conn = self._conn
+                try:
+                    await self._return_connection()
+                except BaseException:
+                    # Preserve the setup error and make a second best effort
+                    # to discard the connection if pool return itself failed.
+                    try:
+                        await conn.close()
+                    except BaseException:
+                        pass
+                    try:
+                        await self._owner._pool.putconn(conn)
+                    except BaseException:
+                        pass
+            raise
 
     async def __aexit__(self, exc_type: Any, exc: Any, tb: Any) -> bool:
         # An exception (including asyncio.CancelledError from a caller that
@@ -847,20 +945,109 @@ class _PendingPgTransaction:
             await self.finish(rollback=False)
         return False
 
+    async def execute(self, sql: str, params: tuple = ()) -> _PgCursor:
+        """Execute on this transaction's pinned connection."""
+        self._assert_owner_task()
+        if self._done or self._conn is None:
+            raise RuntimeError("cannot execute on a completed Postgres transaction")
+        return await _PinnedExec(self._conn).execute(sql, params)
+
+    def _assert_owner_task(self) -> None:
+        """Reject child tasks that inherited this ContextVar transaction."""
+        if asyncio.current_task() is not self._owner_task:
+            raise RuntimeError(
+                "Postgres transaction context cannot be used from a different task"
+            )
+
     async def finish(self, *, rollback: bool) -> None:
+        self._assert_owner_task()
         if self._done:
             return
-        self._done = True
-        if self._token is not None:
-            self._owner._pending_txn_var.reset(self._token)
-            self._token = None
         try:
             verb = "ROLLBACK TO SAVEPOINT" if rollback else "RELEASE SAVEPOINT"
             await self._conn.execute(f"{verb} {self._savepoint}")
             if self._started_own_txn:
                 await self._conn.execute("ROLLBACK" if rollback else "COMMIT")
-        finally:
-            await self._owner._pool.putconn(self._conn)
+        except BaseException:
+            # Keep the ContextVar and borrowed connection live until the
+            # finalizer succeeds. If COMMIT/RELEASE failed, recover the owned
+            # transaction (or just our savepoint inside an ambient one) before
+            # returning the connection to the pool.
+            try:
+                if self._started_own_txn:
+                    await self._conn.execute("ROLLBACK")
+                else:
+                    await self._conn.execute(
+                        f"ROLLBACK TO SAVEPOINT {self._savepoint}"
+                    )
+                    await self._conn.execute(f"RELEASE SAVEPOINT {self._savepoint}")
+            except BaseException:
+                await self._discard_connection()
+            else:
+                self._after_commit_callbacks.clear()
+                await self._return_connection()
+            raise
+        else:
+            callbacks = self._after_commit_callbacks
+            self._after_commit_callbacks = []
+            if rollback:
+                callbacks.clear()
+            elif callbacks:
+                if self._parent_pending is not None:
+                    self._parent_pending._after_commit_callbacks.extend(callbacks)
+                elif self._started_own_txn:
+                    for callback in callbacks:
+                        try:
+                            callback()
+                        except Exception:  # noqa: BLE001 - committed data stays committed
+                            logger.exception("Postgres after-commit callback failed")
+                else:
+                    # An ambient transaction not opened via this adapter has
+                    # no observable completion signal. Dropping the callback
+                    # avoids announcing data that its owner may still roll back.
+                    logger.warning(
+                        "discarding %d after-commit callback(s) for an "
+                        "unmanaged ambient Postgres transaction",
+                        len(callbacks),
+                    )
+            await self._return_connection()
+
+    def add_after_commit_callback(self, callback: Callable[[], None]) -> None:
+        """Run ``callback`` only when this transaction's outer commit succeeds."""
+        self._assert_owner_task()
+        if self._done:
+            raise RuntimeError("cannot register a callback on a completed transaction")
+        self._after_commit_callbacks.append(callback)
+
+    def _reset_pending_context(self) -> None:
+        self._done = True
+        if self._token is not None:
+            self._owner._pending_txn_var.reset(self._token)
+            self._token = None
+
+    async def _return_connection(self) -> None:
+        self._reset_pending_context()
+        conn = self._conn
+        self._conn = None
+        if self._parent_pending is None:
+            await self._owner._pool.putconn(conn)
+
+    async def _discard_connection(self) -> None:
+        self._reset_pending_context()
+        conn = self._conn
+        self._conn = None
+        if self._parent_pending is not None:
+            # The outer transaction remains responsible for recovering or
+            # discarding its pinned connection after this savepoint fails.
+            return
+        try:
+            await conn.close()
+        except BaseException:
+            pass
+        try:
+            await self._owner._pool.putconn(conn)
+        except BaseException:
+            pass
 
 
 # ---------------------------------------------------------------------------
@@ -893,6 +1080,7 @@ CREATE TABLE IF NOT EXISTS projects (
     pending_goal TEXT,
     parent_project_id TEXT,
     execution_mode TEXT NOT NULL DEFAULT 'autonomous',
+    use_mode TEXT NOT NULL DEFAULT 'standard_publication',
     status TEXT NOT NULL DEFAULT 'active' CHECK (status IN ('active', 'parked', 'archived')),
     priority TEXT NOT NULL DEFAULT 'P2' CHECK (priority IN ('P0', 'P1', 'P2')),
     created_at TEXT NOT NULL DEFAULT ({_TS})
@@ -1360,12 +1548,26 @@ CREATE TABLE IF NOT EXISTS workspace_members (
     github_access TEXT NOT NULL DEFAULT 'read'
         CHECK (github_access IN ('none','read','write')),
     -- d116642e: project-level invites foundation. NULL = workspace-wide
-    -- (current behavior); set = project-scoped (listing-only scoping for now).
-    -- Airtight per-request enforcement deferred (pin b11c7cf6).
+    -- (current behavior), set = project-scoped (that project and its
+    -- subprojects, with what they may do inside it set by member_policy below).
     project_id TEXT,
     token_hash TEXT,
     invited_at TEXT NOT NULL DEFAULT ({_TS}),
     joined_at TEXT
+);
+
+-- Capability policy for project-scoped members. tenant_id is the workspace
+-- OWNER's tenant id, subject is '*' for the workspace default and LOWER(email)
+-- for one person's override. policy is a JSON object of {{capability_id: bool}}.
+-- Created here (main auth DB only) and never by ALTER: this literal runs on
+-- every boot. Mirrors the SQLite literal in db/__init__.py.
+CREATE TABLE IF NOT EXISTS member_policy (
+    tenant_id TEXT NOT NULL,
+    subject TEXT NOT NULL,
+    policy TEXT NOT NULL DEFAULT '{{}}',
+    updated_by TEXT,
+    updated_at TEXT NOT NULL DEFAULT ({_TS}),
+    PRIMARY KEY (tenant_id, subject)
 );
 
 -- v2.1 dark — per-tenant named environments, not exposed at launch
@@ -1805,11 +2007,9 @@ async def _migrate_pg_workspace_members_project_scope(conn: PostgresConnection) 
     """d116642e — project-level invites foundation.
 
     Adds a nullable ``project_id`` to ``workspace_members``: NULL = workspace-wide
-    member (current behavior), set = project-scoped member (listing-only scoping
-    for now). ADD COLUMN IF NOT EXISTS so re-running is a no-op. Mirrors
-    db._migrate_workspace_members_project_scope. Airtight per-request access
-    enforcement is intentionally deferred pending the product decision (pin
-    b11c7cf6).
+    member (current behavior), set = project-scoped member (that project plus
+    its subprojects). ADD COLUMN IF NOT EXISTS so re-running is a no-op. Mirrors
+    db._migrate_workspace_members_project_scope.
     """
     await conn.executescript(
         "ALTER TABLE workspace_members ADD COLUMN IF NOT EXISTS project_id TEXT"
@@ -1846,11 +2046,15 @@ async def _migrate_pg_tenants_is_internal(conn: PostgresConnection) -> None:
         await conn.execute(
             "ALTER TABLE tenants ALTER COLUMN is_internal SET DEFAULT 0", ()
         )
-    # Backfill known internal emails.
+    from .plans import PLAYTESTER  # noqa: PLC0415
+
+    # Backfill known internal emails. A playtester is skipped: the plan is an
+    # operator's explicit decision and this runs on every boot, so it must not
+    # turn the account back into staff.
     for email in sorted(db_module._internal_emails()):
         await conn.execute(
-            "UPDATE tenants SET is_internal = 1 WHERE LOWER(email) = ?",
-            (email,),
+            "UPDATE tenants SET is_internal = 1 WHERE LOWER(email) = ? AND plan != ?",
+            (email, PLAYTESTER),
         )
 
 
@@ -1901,11 +2105,15 @@ async def _migrate_pg_admin_plan(conn: PostgresConnection) -> None:
     whitelist_raw = os.environ.get("MERIDIAN_ADMIN_EMAILS", os.environ.get("ADMIN_EMAIL", ""))
     if not whitelist_raw:
         return
+    from .plans import PLAYTESTER  # noqa: PLC0415
+
     admin_emails = {e.strip().lower() for e in whitelist_raw.split(",") if e.strip()}
     for email in sorted(admin_emails):
+        # A playtester is skipped for the same reason as in the is_internal backfill.
         await conn.execute(
-            "UPDATE tenants SET plan = 'admin' WHERE LOWER(email) = ? AND plan != 'admin'",
-            (email,),
+            "UPDATE tenants SET plan = 'admin' WHERE LOWER(email) = ? AND plan != 'admin' "
+            "AND plan != ?",
+            (email, PLAYTESTER),
         )
 
 
@@ -2148,6 +2356,21 @@ async def _migrate_pg_project_execution_mode(conn: PostgresConnection) -> None:
     await conn.executescript(
         "ALTER TABLE projects ADD COLUMN IF NOT EXISTS execution_mode "
         "TEXT NOT NULL DEFAULT 'autonomous'"
+    )
+
+
+async def _migrate_pg_project_use_mode(conn: PostgresConnection) -> None:
+    """projects.use_mode: the rights gate's per-project use mode.
+
+    'standard_publication' (default) or 'commercialized'. NOT NULL DEFAULT
+    'standard_publication' so existing rows backfill to standard. No CHECK,
+    same as execution_mode: the Python layer (db.validate_use_mode) validates.
+    ADD COLUMN IF NOT EXISTS so re-running is a no-op. Mirrors
+    db._migrate_project_use_mode.
+    """
+    await conn.executescript(
+        "ALTER TABLE projects ADD COLUMN IF NOT EXISTS use_mode "
+        "TEXT NOT NULL DEFAULT 'standard_publication'"
     )
 
 
@@ -5145,6 +5368,9 @@ async def _migrate_pg_wave_run_summaries(conn: PostgresConnection) -> None:
 async def _migrate_pg_external_job_register(conn: PostgresConnection) -> None:
     """88277b63 — Postgres mirror of the durable external-job register."""
     await conn.executescript(
+        # Serialize first-time sequence/table upgrades across concurrent startups.
+        "SELECT pg_advisory_xact_lock(5062994, 88277);"
+        "CREATE SEQUENCE IF NOT EXISTS external_job_events_event_order_seq;"
         "CREATE TABLE IF NOT EXISTS external_jobs ("
         "    id TEXT PRIMARY KEY,"
         "    project_id TEXT NOT NULL REFERENCES projects(id),"
@@ -5178,12 +5404,46 @@ async def _migrate_pg_external_job_register(conn: PostgresConnection) -> None:
         "    phase TEXT,"
         "    detail TEXT,"
         "    snapshot_json TEXT NOT NULL,"
-        f"    created_at TEXT NOT NULL DEFAULT ({_TS})"
+        f"    created_at TEXT NOT NULL DEFAULT ({_TS}),"
+        "    event_order BIGINT NOT NULL "
+        "        DEFAULT nextval('external_job_events_event_order_seq'::regclass)"
         ");"
+        "ALTER TABLE external_job_events "
+        "ADD COLUMN IF NOT EXISTS event_order BIGINT;"
+        "ALTER TABLE external_job_events "
+        "ALTER COLUMN event_order SET DEFAULT "
+        "nextval('external_job_events_event_order_seq'::regclass);"
+        "ALTER SEQUENCE external_job_events_event_order_seq "
+        "OWNED BY external_job_events.event_order;"
+        "CREATE TABLE IF NOT EXISTS external_job_event_order_migration ("
+        "    id SMALLINT PRIMARY KEY CHECK (id = 1)"
+        ");"
+        "WITH missing AS ("
+        "SELECT id, COALESCE((SELECT MAX(event_order) FROM external_job_events), 0) "
+        "+ ROW_NUMBER() OVER (ORDER BY created_at ASC, id ASC) AS event_order "
+        "FROM external_job_events WHERE event_order IS NULL "
+        "AND NOT EXISTS (SELECT 1 FROM external_job_event_order_migration WHERE id = 1)) "
+        "UPDATE external_job_events AS events SET event_order = missing.event_order "
+        "FROM missing WHERE events.id = missing.id;"
+        "WITH sequence_state AS ("
+        "SELECT last_value, is_called FROM external_job_events_event_order_seq), "
+        "event_state AS (SELECT MAX(event_order) AS max_order FROM external_job_events "
+        "WHERE NOT EXISTS (SELECT 1 FROM external_job_event_order_migration WHERE id = 1)) "
+        "SELECT setval('external_job_events_event_order_seq'::regclass, "
+        "GREATEST(sequence_state.last_value, COALESCE(event_state.max_order, 1)), "
+        "sequence_state.is_called OR event_state.max_order IS NOT NULL) "
+        "FROM sequence_state CROSS JOIN event_state "
+        "WHERE NOT EXISTS (SELECT 1 FROM external_job_event_order_migration WHERE id = 1);"
+        "ALTER TABLE external_job_events ALTER COLUMN event_order SET NOT NULL;"
+        "INSERT INTO external_job_event_order_migration (id) VALUES (1) "
+        "ON CONFLICT (id) DO NOTHING;"
         "CREATE INDEX IF NOT EXISTS idx_external_jobs_project_status "
         "ON external_jobs(project_id, status, last_observed_at DESC);"
         "CREATE INDEX IF NOT EXISTS idx_external_job_events_job "
         "ON external_job_events(external_job_id, created_at ASC);"
+        "CREATE INDEX IF NOT EXISTS idx_external_job_events_job_order "
+        "ON external_job_events("
+        "external_job_id, created_at ASC, event_order ASC NULLS FIRST, id ASC);"
     )
 
 
@@ -5493,6 +5753,55 @@ async def _migrate_pg_sprint_item_coarse_lock_files(conn: PostgresConnection) ->
     )
 
 
+async def _migrate_pg_backfill_finding_note_kind(conn: PostgresConnection) -> None:
+    """fe0b0331 -- Postgres mirror of
+    db.migrations._migrate_backfill_finding_note_kind: set
+    ``project_notes.note_kind = 'finding'`` on every NULL-kind note carrying a
+    ``finding`` tag token (rows ``save_finding`` wrote while 'finding' was missing
+    from add_project_note's kind allow-list and got coerced to NULL).
+
+    Touches only ``note_kind IS NULL`` rows, so re-running is a no-op; never
+    deletes, never touches ``updated_at``. STRPOS is used instead of a LIKE
+    pattern so the SQL carries no literal ``%`` for the adapter to escape. PG runs
+    autocommit -- no commit.
+    """
+    await conn.execute(
+        "UPDATE project_notes SET note_kind = 'finding' "
+        "WHERE note_kind IS NULL "
+        "AND STRPOS(',' || REPLACE(LOWER(COALESCE(tags, '')), ' ', '') || ',', "
+        "',finding,') > 0"
+    )
+
+
+async def _migrate_pg_project_state_milestones(conn: PostgresConnection) -> None:
+    """Add the immutable project-state milestone ledger on Postgres."""
+    await conn.execute(
+        "CREATE TABLE IF NOT EXISTS project_state_milestones ("
+        "id TEXT PRIMARY KEY, project_id TEXT NOT NULL REFERENCES projects(id) ON DELETE CASCADE, "
+        "sequence BIGINT NOT NULL, session_id TEXT NOT NULL, trigger TEXT NOT NULL, "
+        "risk_score INTEGER NOT NULL, risk_threshold INTEGER NOT NULL, previous_hash TEXT, "
+        "content_hash TEXT NOT NULL, snapshot_json TEXT NOT NULL, captured_at TEXT NOT NULL, "
+        "UNIQUE(project_id, sequence))"
+    )
+    await conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_project_state_milestones_recent "
+        "ON project_state_milestones(project_id, sequence DESC)"
+    )
+    await conn.execute(
+        "CREATE OR REPLACE FUNCTION meridian_reject_project_state_milestone_update() "
+        "RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN "
+        "RAISE EXCEPTION 'project state milestones are append-only'; END; $$"
+    )
+    await conn.execute(
+        "DROP TRIGGER IF EXISTS project_state_milestones_no_update ON project_state_milestones"
+    )
+    await conn.execute(
+        "CREATE TRIGGER project_state_milestones_no_update BEFORE UPDATE "
+        "ON project_state_milestones FOR EACH ROW "
+        "EXECUTE FUNCTION meridian_reject_project_state_milestone_update()"
+    )
+
+
 async def _migrate_pg_paper_contract(conn: PostgresConnection) -> None:
     """7c96d41b — Postgres mirror of the paper_contract schema: the
     first-class versioned editorial-intent document for Meridian's
@@ -5785,4 +6094,7 @@ _PG_MIGRATIONS_LATE = (
     _migrate_pg_docx_derivatives,
     _migrate_pg_sprint_item_lock_session_id,
     _migrate_pg_sprint_item_coarse_lock_files,
+    _migrate_pg_backfill_finding_note_kind,
+    _migrate_pg_project_state_milestones,
+    _migrate_pg_project_use_mode,
 )

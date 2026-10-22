@@ -44,6 +44,8 @@ import subprocess
 from pathlib import Path
 from typing import Any, Callable, Iterable
 
+from .pid_probe import pid_is_alive
+
 logger = logging.getLogger(__name__)
 
 
@@ -97,6 +99,42 @@ def looks_like_worktree_path(repo_root: Path, abs_path: Path) -> bool:
     return False
 
 
+def _git_in(abs_path: Path, *args: str) -> subprocess.CompletedProcess[str]:
+    """Run a git subcommand with *abs_path* as its working directory."""
+    return subprocess.run(
+        ["git", *args],
+        cwd=str(abs_path),
+        capture_output=True,
+        text=True,
+        timeout=30,
+    )
+
+
+def _is_provably_clean(abs_path: Path) -> bool:
+    """True only when *abs_path* is its own git work tree root AND
+    ``git status --porcelain`` run there lists nothing.
+
+    Anything else is NOT provably clean and the caller must refuse: a tree
+    with uncommitted or untracked files, a plain directory, a directory
+    nested inside some other repo (where git would report THAT repo's
+    status instead), a missing or broken git registration, or a git error
+    or timeout. Fail closed. Never raises.
+    """
+    try:
+        top = _git_in(abs_path, "rev-parse", "--show-toplevel")
+        if top.returncode != 0:
+            return False
+        toplevel = os.path.normcase(str(Path(top.stdout.strip()).resolve()))
+        if toplevel != os.path.normcase(str(abs_path.resolve())):
+            return False
+        status = _git_in(abs_path, "--no-optional-locks", "status", "--porcelain")
+        if status.returncode != 0:
+            return False
+        return not status.stdout.strip()
+    except Exception:  # noqa: BLE001 -- an unverifiable state must never count as clean
+        return False
+
+
 def remove_worktree_on_disk(repo_root: Path, wt_path: str) -> dict[str, Any]:
     """Best-effort REAL disk removal of a git worktree. Never raises.
 
@@ -111,6 +149,11 @@ def remove_worktree_on_disk(repo_root: Path, wt_path: str) -> dict[str, Any]:
     convention (see :func:`looks_like_worktree_path`) — checked BEFORE the
     ``git worktree remove`` attempt below, not just as a fallback gate, so
     a path outside that convention can never reach either removal strategy.
+
+    Also refuses (``detail="DIRTY_WORKTREE"``, ``attempted=False``) before
+    touching disk when the worktree is not provably clean (see
+    :func:`_is_provably_clean`): uncommitted or untracked files, or a status
+    that cannot be verified. Dirty trees are skipped, never deleted.
     """
     try:
         abs_path = resolve_worktree_disk_path(repo_root, wt_path)
@@ -135,11 +178,20 @@ def remove_worktree_on_disk(repo_root: Path, wt_path: str) -> dict[str, Any]:
             "detail": "NOT_A_WORKTREE_PATH",
         }
 
+    # Uncommitted-work gate: runs BEFORE any git call or rmtree, so neither
+    # removal strategy below can reach a worktree holding uncommitted files.
+    if not _is_provably_clean(abs_path):
+        logger.warning(
+            "worktree_cleanup: refusing disk removal for %s - uncommitted "
+            "changes present or status could not be verified", abs_path,
+        )
+        return {"attempted": False, "removed": False, "detail": "DIRTY_WORKTREE"}
+
     git_error = ""
     removed_by_git = False
     try:
         result = subprocess.run(
-            ["git", "worktree", "remove", str(abs_path), "--force"],
+            ["git", "worktree", "remove", str(abs_path)],
             cwd=str(repo_root),
             capture_output=True,
             text=True,
@@ -154,8 +206,9 @@ def remove_worktree_on_disk(repo_root: Path, wt_path: str) -> dict[str, Any]:
         return {"attempted": True, "removed": True, "detail": "git worktree remove"}
 
     # Fallback: manual rmtree + prune the now-stale registration. Covers a
-    # dirty/locked worktree or an admin dir `git worktree remove` refuses to
-    # touch even with --force.
+    # locked worktree or an admin dir `git worktree remove` refuses to touch.
+    # Reachable only after _is_provably_clean() above passed, so it never
+    # deletes uncommitted work.
     try:
         if abs_path.exists():
             shutil.rmtree(abs_path, ignore_errors=True)
@@ -190,23 +243,8 @@ def remove_worktree_on_disk(repo_root: Path, wt_path: str) -> dict[str, Any]:
 
 
 def _pid_is_alive(pid: int) -> bool:
-    """Liveness check for a recorded worktree-owner PID.
-
-    Mirrors the exact catch tuple the existing task_log PID watchdog uses
-    (meridian/server.py's ``_auto_summary_loop``) so this repo has ONE
-    liveness-check convention, not two subtly different ones:
-    ``os.kill(pid, 0)`` signals nothing (signal 0), it only probes whether
-    the OS will let us address the PID at all. ``ProcessLookupError`` means
-    the PID is genuinely gone; ``PermissionError``/other ``OSError`` (incl.
-    Windows' WinError 87 for a non-existent PID) are both treated the same
-    as "not alive" here, matching the established repo-wide precedent rather
-    than inventing a new interpretation for this one call site.
-    """
-    try:
-        os.kill(pid, 0)
-    except (ProcessLookupError, PermissionError, OSError):
-        return False
-    return True
+    """Liveness check for a recorded worktree-owner PID."""
+    return pid_is_alive(pid)
 
 
 def validate_worktree_cleanup_target(
@@ -342,7 +380,12 @@ async def sweep_stale_worktrees(
             swept.append({"id": wt["id"], "path": wt["path"]})
         else:
             skipped.append(
-                {"id": wt["id"], "path": wt["path"], "detail": outcome["detail"]}
+                {
+                    "id": wt["id"],
+                    "path": wt["path"],
+                    "reason": outcome.get("reason") or outcome["detail"],
+                    "detail": outcome["detail"],
+                }
             )
     return {
         "swept": swept,

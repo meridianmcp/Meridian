@@ -38,10 +38,10 @@ inventing new ones
     / ``kill_fn`` is never assumed, and omitting one means "refuse", never
     "guess". This module reuses ``worktree_cleanup``'s quarantine primitives
     directly for interrupted-run cleanup rather than re-implementing them.
-  * **PID liveness via ``os.kill(pid, 0)``** -- the same catch tuple
-    ``worktree_cleanup._pid_is_alive`` / ``meridian/tunnel_client.py`` /
-    ``meridian/orphan_reaper.py`` already use, so this repo has ONE
-    liveness-check convention.
+  * **PID liveness via the shared ``meridian.pid_probe.pid_is_alive``** --
+    POSIX uses the conventional signal-zero probe; Windows uses
+    ``OpenProcess``/``GetExitCodeProcess`` so a liveness check cannot emit a
+    console control event.
   * **Durable JSON ledger, atomic ``os.replace`` write** -- the same idiom
     ``extensions/meridian-outputs/meridian_outputs/annotate.py`` /
     ``fingerprint.py`` and ``extensions/meridian-docs/meridian_docs
@@ -86,6 +86,7 @@ from pathlib import Path
 from typing import Any, Callable, Iterable
 
 from . import capability_manifest, worktree_cleanup
+from .pid_probe import pid_is_alive
 
 __all__ = [
     "LocalResilienceError",
@@ -513,13 +514,8 @@ def list_temp_runs(manifest_dir: str, *, status: str | None = None) -> list[dict
 
 
 def _pid_is_alive(pid: int) -> bool:
-    """Same catch tuple as ``worktree_cleanup._pid_is_alive`` /
-    ``orphan_reaper`` -- ONE liveness-check convention across this repo."""
-    try:
-        os.kill(pid, 0)
-    except (ProcessLookupError, PermissionError, OSError):
-        return False
-    return True
+    """Check a run-owner PID without signalling any Windows console."""
+    return pid_is_alive(pid)
 
 
 def scan_interrupted_runs(
@@ -537,8 +533,8 @@ def scan_interrupted_runs(
     Args:
       manifest_dir:  The same directory :func:`start_temp_run` was called
                     against.
-      pid_alive:      Injectable liveness check (for tests); defaults to a
-                    real ``os.kill(pid, 0)`` probe.
+      pid_alive:      Injectable liveness check (for tests); defaults to the
+                    shared platform-correct probe in ``meridian.pid_probe``.
 
     Returns:
       ``{"manifest_dir", "checked", "interrupted": [...run dicts...]}``.

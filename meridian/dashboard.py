@@ -16,6 +16,7 @@ import asyncio
 import json
 import os
 from pathlib import Path
+from typing import Any
 
 from fastapi import WebSocket
 
@@ -99,6 +100,27 @@ class WebSocketBroadcaster:
         for the close handshake to land.
         """
         queue = db_module.subscribe_tasks(project_id)
+        await self._pump(
+            ws, queue, lambda: db_module.unsubscribe_tasks(project_id, queue),
+        )
+
+    async def serve_account(self, ws: WebSocket, db: Any) -> None:
+        """Pipe the ACCOUNT stream of ``db`` (the project list) to an accepted WebSocket.
+
+        8a665a03: a dashboard opens one socket per project TAB, so with no tab open it
+        held none and never heard a project being created, renamed or deleted. This socket
+        is the page's own and is independent of the tabs. ``db`` is the database the
+        caller reads -- ``server.py``'s ``ws_account`` resolves it exactly as the HTTP
+        routes do (the tenant's own database on hosted) -- and the stream is keyed by that
+        database, so a caller only ever hears about changes to a project list it can read.
+        """
+        queue = db_module.subscribe_account(db)
+        await self._pump(
+            ws, queue, lambda: db_module.unsubscribe_account(db, queue),
+        )
+
+    async def _pump(self, ws: WebSocket, queue: asyncio.Queue, unsubscribe: Any) -> None:
+        """Forward ``queue`` to ``ws`` until either side closes, then unsubscribe."""
 
         async def reader() -> None:
             try:
@@ -117,7 +139,7 @@ class WebSocketBroadcaster:
                     break
         finally:
             reader_task.cancel()
-            db_module.unsubscribe_tasks(project_id, queue)
+            unsubscribe()
             try:
                 await ws.close()
             except Exception:

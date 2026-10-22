@@ -1,0 +1,33 @@
+{
+  "meta": {
+    "journal": "ieee",
+    "display_name": "IEEE journals (Editorial Style Manual for Authors)",
+    "publisher": "IEEE",
+    "status": "populated",
+    "status_detail": "Round 1 (workspace proposal 3674c0c1) migration. Verified 2026-09-11 against the IEEE Editorial Style Manual for Authors PDF (journals.ieeeauthorcenter.ieee.org). heading_numbering_visible was deliberately left unset in the original dict entry rather than forced to True -- section-heading enumeration is explicitly a stated author preference in the manual, not a hard requirement -- and stays absent here.",
+    "last_verified": "2026-09-11"
+  },
+  "fields": {
+    "citation_style": {
+      "value": "numbered_bracket",
+      "tier": 2,
+      "source": {
+        "type": "live_guidelines_page",
+        "citation": "journals.ieeeauthorcenter.ieee.org/wp-content/uploads/sites/7/IEEE-Editorial-Style-Manual-for-Authors.pdf",
+        "note": "In-text references are numbered in square brackets, reference list in citation order (not alphabetical)."
+      },
+      "verified_date": "2026-09-11"
+    },
+    "heading_levels_max": {
+      "value": 4,
+      "tier": 2,
+      "source": {
+        "type": "live_guidelines_page",
+        "citation": "journals.ieeeauthorcenter.ieee.org/wp-content/uploads/sites/7/IEEE-Editorial-Style-Manual-for-Authors.pdf",
+        "quote": "desirable, but not required",
+        "note": "Up to four heading levels are specified (Roman numerals / A. / 1) / a)). heading_numbering_visible is intentionally left unset (absent from this file) rather than forced to True: section-heading enumeration is explicitly 'desirable, but not required' per the manual -- a stated author preference, not a hard requirement."
+      },
+      "verified_date": "2026-09-11"
+    }
+  }
+}

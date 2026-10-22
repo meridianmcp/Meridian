@@ -746,6 +746,64 @@ async def test_get_session_brief_role_executor(db, project):
     assert result["role"] == "executor"
 
 
+@pytest.mark.asyncio
+async def test_get_session_brief_includes_escaped_session_locked_item(db, project, session):
+    import xml.etree.ElementTree as ET
+
+    pid, sid = project["id"], session["id"]
+    item = await db_module.add_sprint_item(
+        db,
+        pid,
+        "v-recovery",
+        "Restore <hook> & item context",
+    )
+    await db_module.claim_sprint_item(
+        db, pid, item["id"], actor=sid, lock_session_id=sid
+    )
+    await db.execute(
+        "UPDATE sprint_items SET touches_resources = ? WHERE id = ?",
+        ('["file:meridian/session_brief.py"]', item["id"]),
+    )
+    await db.commit()
+    await db_module.add_sprint_item_pointer(
+        db,
+        pid,
+        item["id"],
+        "code",
+        [{"uri": "meridian/session_brief.py", "selector": {"type": "range", "start_line": 50, "end_line": 70}}],
+        label="hook source",
+    )
+    await db_module.log_task(
+        db, sid, pid, "Checked the scoped brief & its pointer", status="in_progress",
+        sprint_item_id=item["id"],
+    )
+
+    result = await st_mod.handle_get_session_brief(
+        {"project_id": pid, "role": "executor", "session_id": sid},
+        db, _DATA_DIR, None, None,
+    )
+    text = result["text"]
+    start = text.index("<item_recovery ")
+    end = text.index("</item_recovery>", start) + len("</item_recovery>")
+    recovery_xml = text[start:end]
+    recovery = ET.fromstring(recovery_xml)
+    assert recovery.attrib["trust"] == "untrusted"
+    entries = [entry.text or "" for entry in recovery.findall("entry")]
+    assert any("Restore <hook> & item context" in entry for entry in entries)
+    assert any("file:meridian/session_brief.py" in entry for entry in entries)
+    assert any("Checked the scoped brief & its pointer" in entry for entry in entries)
+    assert "&amp;" in recovery_xml and "&lt;hook&gt;" in recovery_xml
+    assert len(recovery_xml.encode("utf-8")) <= 1500
+
+    foreign_project = await db_module.create_project(db, "foreign-recovery-project")
+    foreign_session = await db_module.register_session(db, foreign_project["id"], "foreign")
+    mismatch = await st_mod.handle_get_session_brief(
+        {"project_id": pid, "role": "executor", "session_id": foreign_session["id"]},
+        db, _DATA_DIR, None, None,
+    )
+    assert "<item_recovery " not in mismatch["text"]
+
+
 # ---------------------------------------------------------------------------
 # checkpoint (requires monkeypatching heavy IO)
 # ---------------------------------------------------------------------------

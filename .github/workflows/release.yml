@@ -14,8 +14,8 @@ jobs:
   build-windows:
     runs-on: windows-latest
     steps:
-      - uses: actions/checkout@v4
-      - uses: prefix-dev/setup-pixi@v0.8.1
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: prefix-dev/setup-pixi@ba3bb36eb2066252b2363392b7739741bb777659 # v0.8.1
         with:
           pixi-version: v0.79.0
           cache: true
@@ -24,7 +24,7 @@ jobs:
       - name: Build Windows executable
         run: pixi run -e dev build-exe
       - name: Upload Windows artifact
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
           name: meridian-windows
           path: dist/meridian.exe
@@ -39,8 +39,8 @@ jobs:
   build-tray:
     runs-on: windows-latest
     steps:
-      - uses: actions/checkout@v4
-      - uses: prefix-dev/setup-pixi@v0.8.1
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: prefix-dev/setup-pixi@ba3bb36eb2066252b2363392b7739741bb777659 # v0.8.1
         with:
           pixi-version: v0.79.0
           cache: true
@@ -49,12 +49,12 @@ jobs:
       - name: Build Windows tray executable
         run: pixi run -e dev build-tray
       - name: Upload tray artifact
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
           name: meridian-tray-windows
           path: dist/meridian-tray.exe
 
-  # 73257801 -- macOS tray build (meridian-tray-mac, unsigned .app). Same
+  # macOS tray build (unsigned .app + drag-and-drop DMG). Same
   # PyInstaller+pystray mechanism as build-tray above (meridian/tray_main.py
   # has zero platform-specific code -- see meridian-tray.spec's own darwin
   # branch for where platform actually matters: hiddenimports and the
@@ -64,7 +64,8 @@ jobs:
   # constraint already accepted for the slim client per decision 80f1d4bc).
   # No UPX install step, matching build-mac-arm64's existing precedent for
   # this runner (pixi run -e dev build-tray still passes upx=True; PyInstaller
-  # skips compression gracefully when the upx binary isn't on PATH).
+  # skips compression gracefully when the upx binary isn't on PATH). The
+  # build-tray-mac task creates the ICNS asset from the shared Meridian mark.
   # Ships UNSIGNED / not notarized, matching build-tray's own Windows
   # precedent -- code signing/notarization is a deliberate, separate follow-up
   # (see meridian-tray.spec's module docstring for the macOS Gatekeeper
@@ -72,29 +73,40 @@ jobs:
   build-tray-mac:
     runs-on: macos-14
     steps:
-      - uses: actions/checkout@v4
-      - uses: prefix-dev/setup-pixi@v0.8.1
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: prefix-dev/setup-pixi@ba3bb36eb2066252b2363392b7739741bb777659 # v0.8.1
         with:
           pixi-version: v0.79.0
           cache: true
       - name: Build macOS tray app bundle
-        run: pixi run -e dev build-tray
+        run: pixi run -e dev build-tray-mac
       - name: Zip app bundle
+        id: zip_app
         # ditto (not a plain `zip`) preserves the .app bundle's resource
         # forks/extended attributes correctly -- Apple's own documented tool
         # for this, matching how Finder's own "Compress" does it.
         run: ditto -c -k --sequesterRsrc --keepParent dist/meridian-tray.app meridian-tray-mac.zip
+      - name: Create drag-and-drop DMG
+        run: |
+          mkdir -p dist/meridian-tray-dmg
+          ditto dist/meridian-tray.app dist/meridian-tray-dmg/Meridian.app
+          ln -s /Applications dist/meridian-tray-dmg/Applications
+          hdiutil create -volname Meridian -srcfolder dist/meridian-tray-dmg -ov -format UDZO meridian-tray-mac.dmg
+      # DMG packaging is optional: preserve the ZIP if hdiutil fails afterward.
       - name: Upload tray artifact
-        uses: actions/upload-artifact@v4
+        if: ${{ always() && steps.zip_app.outcome == 'success' }}
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
           name: meridian-tray-mac
-          path: meridian-tray-mac.zip
+          path: |
+            meridian-tray-mac.zip
+            meridian-tray-mac.dmg
 
   build-linux:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
-      - uses: prefix-dev/setup-pixi@v0.8.1
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: prefix-dev/setup-pixi@ba3bb36eb2066252b2363392b7739741bb777659 # v0.8.1
         with:
           pixi-version: v0.79.0
           cache: true
@@ -105,7 +117,7 @@ jobs:
       - name: Stage artifact
         run: cp dist/meridian dist/meridian-linux
       - name: Upload Linux artifact
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
           name: meridian-linux
           path: dist/meridian-linux
@@ -113,8 +125,8 @@ jobs:
   build-mac-arm64:
     runs-on: macos-14
     steps:
-      - uses: actions/checkout@v4
-      - uses: prefix-dev/setup-pixi@v0.8.1
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: prefix-dev/setup-pixi@ba3bb36eb2066252b2363392b7739741bb777659 # v0.8.1
         with:
           pixi-version: v0.79.0
           cache: true
@@ -123,7 +135,7 @@ jobs:
       - name: Stage artifact
         run: cp dist/meridian dist/meridian-mac-arm64
       - name: Upload macOS arm64 artifact
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
           name: meridian-mac-arm64
           path: dist/meridian-mac-arm64
@@ -155,8 +167,8 @@ jobs:
             artifact: meridian-connect-x86_64-windows.exe
     runs-on: ${{ matrix.os }}
     steps:
-      - uses: actions/checkout@v4
-      - uses: prefix-dev/setup-pixi@v0.8.1
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: prefix-dev/setup-pixi@ba3bb36eb2066252b2363392b7739741bb777659 # v0.8.1
         with:
           pixi-version: v0.79.0
           cache: true
@@ -168,7 +180,7 @@ jobs:
       - name: Stage artifact (Windows)
         if: runner.os == 'Windows'
         run: mv dist/meridian-connect.exe ${{ matrix.artifact }}
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
           name: ${{ matrix.artifact }}
           path: ${{ matrix.artifact }}
@@ -183,13 +195,52 @@ jobs:
     permissions:
       contents: write
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
       - name: Download all artifacts
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
         with:
           path: dist-artifacts
+      # f66e8f23 — publish SHA-256 checksums for every binary this release ships.
+      # install.sh / install.ps1 / scripts/install-windows.ps1 download SHA256SUMS
+      # from the same release and refuse to install or run a binary whose hash is
+      # not listed (they fail closed). The hashes are computed here over the exact
+      # files that are uploaded below, in `sha256sum` format ("<hex>  <basename>"),
+      # so `sha256sum -c SHA256SUMS` also works for a manual download. The asset
+      # list below MUST stay in sync with the `files:` list of the next step
+      # (tests/test_f66e8f23_download_integrity.py pins this). A platform that did
+      # not build is skipped, mirroring fail_on_unmatched_files: false.
+      # NOTE: this proves the bytes match what the release workflow produced; it
+      # does not authenticate the workflow itself -- detached signing of the
+      # release assets is a separate follow-up.
+      - name: Generate SHA256SUMS for every release binary
+        run: |
+          set -euo pipefail
+          mkdir -p release-assets
+          : > release-assets/SHA256SUMS
+          for f in \
+            dist-artifacts/meridian-windows/meridian.exe \
+            dist-artifacts/meridian-tray-windows/meridian-tray.exe \
+            dist-artifacts/meridian-tray-mac/meridian-tray-mac.zip \
+            dist-artifacts/meridian-tray-mac/meridian-tray-mac.dmg \
+            dist-artifacts/meridian-linux/meridian-linux \
+            dist-artifacts/meridian-mac-arm64/meridian-mac-arm64 \
+            dist-artifacts/meridian-connect-x86_64-unknown-linux/meridian-connect-x86_64-unknown-linux \
+            dist-artifacts/meridian-connect-aarch64-apple-darwin/meridian-connect-aarch64-apple-darwin \
+            dist-artifacts/meridian-connect-x86_64-windows.exe/meridian-connect-x86_64-windows.exe
+          do
+            if [ -f "$f" ]; then
+              (cd "$(dirname "$f")" && sha256sum "$(basename "$f")") >> release-assets/SHA256SUMS
+            else
+              echo "::warning::not checksummed (artifact missing, will not be released): $f"
+            fi
+          done
+          if [ ! -s release-assets/SHA256SUMS ]; then
+            echo "::error::no release binaries were found to checksum"
+            exit 1
+          fi
+          cat release-assets/SHA256SUMS
       - name: Create GitHub Release
-        uses: softprops/action-gh-release@v2
+        uses: softprops/action-gh-release@3bb12739c298aeb8a4eeaf626c5b8d85266b0e65 # v2
         with:
           # 80f1d4bc — ship whatever built; a missing platform artifact (transient
           # runner outage) must not fail the whole release. macos-x86 is no longer
@@ -199,11 +250,13 @@ jobs:
             dist-artifacts/meridian-windows/meridian.exe
             dist-artifacts/meridian-tray-windows/meridian-tray.exe
             dist-artifacts/meridian-tray-mac/meridian-tray-mac.zip
+            dist-artifacts/meridian-tray-mac/meridian-tray-mac.dmg
             dist-artifacts/meridian-linux/meridian-linux
             dist-artifacts/meridian-mac-arm64/meridian-mac-arm64
             dist-artifacts/meridian-connect-x86_64-unknown-linux/meridian-connect-x86_64-unknown-linux
             dist-artifacts/meridian-connect-aarch64-apple-darwin/meridian-connect-aarch64-apple-darwin
             dist-artifacts/meridian-connect-x86_64-windows.exe/meridian-connect-x86_64-windows.exe
+            release-assets/SHA256SUMS
           generate_release_notes: true
 
   docker-publish:
@@ -211,7 +264,7 @@ jobs:
     if: startsWith(github.ref, 'refs/tags/')
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
       # 80f1d4bc — skip Docker Hub publish cleanly when creds aren't configured
       # (repo without DOCKER_USERNAME/DOCKER_TOKEN) instead of failing the run.
       # The ghcr image (docker-ghcr, via GITHUB_TOKEN) still publishes regardless.
@@ -225,13 +278,13 @@ jobs:
         run: echo "has=${{ secrets.DOCKER_USERNAME != '' && secrets.DOCKER_TOKEN != '' }}" >> "$GITHUB_OUTPUT"
       - name: Log in to Docker Hub
         if: steps.dockercreds.outputs.has == 'true'
-        uses: docker/login-action@v3
+        uses: docker/login-action@c94ce9fb468520275223c153574b00df6fe4bcc9 # v3
         with:
           username: ${{ secrets.DOCKER_USERNAME }}
           password: ${{ secrets.DOCKER_TOKEN }}
       - name: Build and push Docker image
         if: steps.dockercreds.outputs.has == 'true'
-        uses: docker/build-push-action@v5
+        uses: docker/build-push-action@ca052bb54ab0790a636c9b5f226502c73d547a25 # v5
         with:
           context: .
           push: true
@@ -246,13 +299,13 @@ jobs:
       contents: read
       packages: write
     steps:
-      - uses: actions/checkout@v4
-      - uses: docker/login-action@v3
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: docker/login-action@c94ce9fb468520275223c153574b00df6fe4bcc9 # v3
         with:
           registry: ghcr.io
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
-      - uses: docker/build-push-action@v5
+      - uses: docker/build-push-action@ca052bb54ab0790a636c9b5f226502c73d547a25 # v5
         with:
           context: .
           push: true
@@ -264,8 +317,8 @@ jobs:
     if: startsWith(github.ref, 'refs/tags/')
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-node@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
         with:
           # '22', not '20': @meridianmcp/mcp now bundles the meridian-latex
           # engine in as a real subpath (npm/scripts/bundle-latex.mjs, run
@@ -308,8 +361,8 @@ jobs:
       id-token: write
       contents: read
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-node@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
         with:
           node-version: '20'
       - name: Publish to MCP Registry
@@ -321,8 +374,8 @@ jobs:
     if: startsWith(github.ref, 'refs/tags/')
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
-      - uses: astral-sh/setup-uv@v5
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: astral-sh/setup-uv@d4b2f3b6ecc6e67c4457f6d3e41ec42d3d0fcb86 # v5
         with:
           version: latest
       - name: Build and publish to PyPI

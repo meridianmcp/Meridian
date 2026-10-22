@@ -18,9 +18,11 @@ All tests use synthetic .docx bytes built inline -- no real files, no network.
 from __future__ import annotations
 
 import io
+import json
 import os
 import sys
 import zipfile
+from pathlib import Path
 
 import pytest
 
@@ -190,6 +192,40 @@ def _numbered_row(para_id: str, number_text: str) -> str:
     </w:tr>'''
 
 
+def _numbered_row_with_spacer(para_id: str, number_text: str) -> str:
+    """9c1a3fd2 -- the 3-column [empty indent spacer, equation, number]
+    template Word's own equation-numbering commands commonly produce
+    (caught against a real JCSHM manuscript), as opposed to _numbered_row's
+    plain 2-column [equation, number] shape."""
+    return f'''    <w:tr>
+      <w:tc><w:p/></w:tc>
+      <w:tc><w:p w14:paraId="{para_id}">{_SIMPLE_OMATH}</w:p></w:tc>
+      <w:tc><w:p><w:r><w:t>{number_text}</w:t></w:r></w:p></w:tc>
+    </w:tr>'''
+
+
+_SPACER_NUMBERED_DOC = _doc(
+    "    <w:tbl>\n"
+    + _numbered_row_with_spacer("EQS001", "(1)") + "\n"
+    + _numbered_row_with_spacer("EQS002", "(2)") + "\n"
+    + _numbered_row_with_spacer("EQS003", "(3)") + "\n"
+    "    </w:tbl>"
+)
+
+# A genuinely non-equation 3-column content table -- must NOT be
+# misdetected as a numbered-equation row just because it has 3 cells;
+# neither the middle nor any other cell has an <m:oMath>, and the last
+# cell's text doesn't match the parenthesized-number pattern.
+_ORDINARY_3COL_TABLE_DOC = _doc(
+    "    <w:tbl>\n"
+    "    <w:tr>\n"
+    "      <w:tc><w:p><w:r><w:t>Method</w:t></w:r></w:p></w:tc>\n"
+    "      <w:tc><w:p><w:r><w:t>MAE</w:t></w:r></w:p></w:tc>\n"
+    "      <w:tc><w:p><w:r><w:t>RMSE</w:t></w:r></w:p></w:tc>\n"
+    "    </w:tr>\n"
+    "    </w:tbl>"
+)
+
 _DUPLICATE_NUMBERS_DOC = _doc(
     "    <w:tbl>\n"
     + _numbered_row("EQD001", "(1)") + "\n"
@@ -201,6 +237,31 @@ _GAP_NUMBERS_DOC = _doc(
     "    <w:tbl>\n"
     + _numbered_row("EQG001", "(1)") + "\n"
     + _numbered_row("EQG002", "(3)") + "\n"
+    "    </w:tbl>"
+)
+
+# df716454 -- a document (e.g. a supplementary-information file) whose
+# equation numbering legitimately CONTINUES a companion document's own
+# sequence instead of starting at 1. No internal gap here -- 39, 40, 41 are
+# contiguous -- so this must produce ZERO equation_number_gap findings, not
+# 38 false ones for "missing" numbers 1-38.
+_CONTINUED_NUMBERING_NO_GAP_DOC = _doc(
+    "    <w:tbl>\n"
+    + _numbered_row("EQC001", "(39)") + "\n"
+    + _numbered_row("EQC002", "(40)") + "\n"
+    + _numbered_row("EQC003", "(41)") + "\n"
+    "    </w:tbl>"
+)
+
+# Same continued-numbering scenario, but with a genuine internal gap: 39, 40,
+# 41, then a jump to 44 -- 42 and 43 are really missing and must still be
+# flagged, even though the sequence doesn't start at 1.
+_CONTINUED_NUMBERING_WITH_GAP_DOC = _doc(
+    "    <w:tbl>\n"
+    + _numbered_row("EQC101", "(39)") + "\n"
+    + _numbered_row("EQC102", "(40)") + "\n"
+    + _numbered_row("EQC103", "(41)") + "\n"
+    + _numbered_row("EQC104", "(44)") + "\n"
     "    </w:tbl>"
 )
 
@@ -237,6 +298,7 @@ def test_resolve_style_policy_defaults():
         "heading_terminal_punctuation": None,
         "table_label_column_alignment": None,
         "table_data_column_alignment": None,
+        "table_alignment": None,
         # 4d0ca929 -- journal-style-preset-oriented keys, all "not verified"
         # sentinels (None or "unspecified") by default.
         "heading_numbering_visible": None,
@@ -246,6 +308,10 @@ def test_resolve_style_policy_defaults():
         "table_caption_bold": None,
         "figure_caption_label_punctuation": "unspecified",
         "table_caption_label_punctuation": "unspecified",
+        # 8e2f4a17 -- independent of the label-punctuation keys above: the
+        # LAST character of the caption's full text, not the number label.
+        "figure_caption_terminal_punctuation": None,
+        "table_caption_terminal_punctuation": None,
         "paragraph_indent_method": "unspecified",
         "figure_dpi_minimum_general": None,
         "figure_dpi_minimum_halftone": None,
@@ -253,6 +319,24 @@ def test_resolve_style_policy_defaults():
         "figure_dpi_minimum_combination": None,
         "si_reformatting_policy": "unspecified",
         "citation_style": "unspecified",
+        # df716454 -- audit_heading_style / audit_cross_document_consistency
+        # keys, same "not verified" None-default discipline as every key
+        # above.
+        "heading_spacing_before_h1_twips": None,
+        "heading_spacing_after_h1_twips": None,
+        "heading_spacing_before_h2_twips": None,
+        "heading_spacing_after_h2_twips": None,
+        "heading_spacing_before_h3_twips": None,
+        "heading_spacing_after_h3_twips": None,
+        "body_text_font_family": None,
+        "body_text_font_size_pt": None,
+        # docs-intel-jcshm-linter-gap-cleanup-20260918 -- audit_manuscript_
+        # structure's Abstract-word-count/Keywords-count keys, same
+        # "not verified" None-default discipline as every key above.
+        "abstract_word_count_min": None,
+        "abstract_word_count_max": None,
+        "keyword_count_min": None,
+        "keyword_count_max": None,
     }
 
 
@@ -800,6 +884,253 @@ def test_server_get_journal_style_preset_result_usable_as_style_policy(tmp_path)
 
 
 # ---------------------------------------------------------------------------
+# docs-intel-journal-preset-externalization-20260918 -- JOURNAL_STYLE_PRESETS
+# is now loaded from journal_style_presets/<key>.json files at import time
+# (_load_builtin_journal_style_presets) instead of a hand-maintained dict
+# literal. Covers: every file loads/validates, the loader's output is
+# reproducible by independently re-reading the same files (catches a loader
+# bug, as distinct from a bad extraction file), the loader's output still
+# matches a frozen snapshot of the pre-migration dict literal's own resolved
+# output (the actual migration parity check, pinned as real test data so a
+# future accidental value change is caught), and the new provenance surface
+# (get_journal_style_preset_provenance / _JOURNAL_STYLE_PRESET_PROVENANCE).
+# ---------------------------------------------------------------------------
+
+_PRESETS_DIR = (
+    Path(docs_intel.__file__).parent / "journal_style_presets"
+)
+_PRE_MIGRATION_SNAPSHOT_PATH = (
+    Path(__file__).parent / "fixtures" / "journal_style_presets_pre_migration_snapshot.json"
+)
+
+
+def test_journal_style_presets_dir_has_exactly_the_expected_29_files():
+    names = {p.stem for p in _PRESETS_DIR.glob("*.json")}
+    assert names == _ALL_29_PRESET_NAMES
+    assert len(list(_PRESETS_DIR.glob("*.json"))) == 29
+
+
+@pytest.mark.parametrize("name", sorted(_ALL_29_PRESET_NAMES))
+def test_journal_style_preset_file_is_valid_and_well_shaped(name):
+    path = _PRESETS_DIR / f"{name}.json"
+    with open(path, encoding="utf-8") as fh:
+        data = json.load(fh)
+    assert isinstance(data, dict)
+    assert "meta" in data and "fields" in data
+    assert data["meta"]["journal"] == name
+    assert isinstance(data["fields"], dict)
+    valid_policy_keys = set(docs_intel.resolve_style_policy())
+    for field_name, entry in data["fields"].items():
+        assert field_name in valid_policy_keys, (
+            f"{name}.json: {field_name!r} is not a real style_policy key"
+        )
+        assert "value" in entry
+        assert "tier" in entry and entry["tier"] in (1, 2, 3, 4)
+        assert "source" in entry
+        assert "verified_date" in entry
+
+
+@pytest.mark.parametrize("name", sorted(_ALL_29_PRESET_NAMES))
+def test_loader_output_matches_independent_recomputation_from_files(name):
+    """Re-derives the resolved policy directly from the JSON file (bypassing
+    _load_builtin_journal_style_presets entirely) and checks it matches what
+    the real loader produced -- catches a bug IN THE LOADER itself (wrong
+    field read, forgetting resolve_style_policy, etc.), as opposed to a bad
+    value in one preset's own JSON file."""
+    path = _PRESETS_DIR / f"{name}.json"
+    with open(path, encoding="utf-8") as fh:
+        data = json.load(fh)
+    overrides = {field_name: entry["value"] for field_name, entry in data["fields"].items()}
+    expected = docs_intel.resolve_style_policy(overrides)
+    assert docs_intel.JOURNAL_STYLE_PRESETS[name] == expected
+
+
+# ---------------------------------------------------------------------------
+# _load_builtin_journal_style_presets -- fail-closed error paths (adversarial
+# review of docs-intel-journal-preset-externalization-20260918, 2026-09-18).
+# Exercised by calling the loader directly against a fake module `__file__`
+# (monkeypatched) pointed at a tmp_path sibling "journal_style_presets"
+# directory we control -- NOT by mutating the real preset files on disk,
+# so these run safely under xdist/parallel workers with no shared-state
+# cleanup risk.
+# ---------------------------------------------------------------------------
+
+def test_loader_raises_on_missing_presets_directory(tmp_path, monkeypatch):
+    """Path.glob() on a directory that doesn't exist silently yields nothing
+    rather than raising -- without an explicit is_dir() check, a deleted or
+    unpackaged journal_style_presets/ directory would leave
+    JOURNAL_STYLE_PRESETS == {} instead of failing loudly at import time,
+    defeating the loader's own fail-closed design intent."""
+    fake_module_file = tmp_path / "no_presets_dir_here" / "docs_intel.py"
+    monkeypatch.setattr(docs_intel, "__file__", str(fake_module_file))
+    with pytest.raises(ValueError, match="does not exist"):
+        docs_intel._load_builtin_journal_style_presets()
+
+
+def test_loader_raises_on_empty_presets_directory(tmp_path, monkeypatch):
+    """An existing-but-empty journal_style_presets/ directory (e.g. a
+    packaging step that created the directory but failed to include any
+    *.json files) must also fail closed, not silently resolve to zero
+    presets."""
+    (tmp_path / "journal_style_presets").mkdir()
+    fake_module_file = tmp_path / "docs_intel.py"
+    monkeypatch.setattr(docs_intel, "__file__", str(fake_module_file))
+    with pytest.raises(ValueError, match="no \\*\\.json files"):
+        docs_intel._load_builtin_journal_style_presets()
+
+
+def test_loader_raises_on_field_entry_missing_value_key(tmp_path, monkeypatch):
+    """A field entry that isn't a JSON object with a "value" key (e.g. a
+    hand-edit that dropped "value") must raise the documented ValueError
+    contract, not an undocumented bare KeyError/TypeError leaking out of a
+    dict comprehension."""
+    presets_dir = tmp_path / "journal_style_presets"
+    presets_dir.mkdir()
+    (presets_dir / "default.json").write_text(
+        json.dumps({"meta": {"journal": "default"}, "fields": {}}), encoding="utf-8"
+    )
+    (presets_dir / "broken.json").write_text(
+        json.dumps(
+            {
+                "meta": {"journal": "broken"},
+                "fields": {"citation_style": {"tier": 2}},  # no "value" key
+            }
+        ),
+        encoding="utf-8",
+    )
+    fake_module_file = tmp_path / "docs_intel.py"
+    monkeypatch.setattr(docs_intel, "__file__", str(fake_module_file))
+    with pytest.raises(ValueError, match="must be a JSON object with a 'value' key"):
+        docs_intel._load_builtin_journal_style_presets()
+
+
+def test_journal_style_presets_matches_pre_migration_snapshot():
+    """THE parity check (docs-intel-journal-preset-externalization-20260918):
+    tests/data/journal_style_presets_pre_migration_snapshot.json is a frozen
+    dump of resolve_style_policy(JOURNAL_STYLE_PRESETS[key]) for all 29 keys,
+    taken from the module's OWN pre-migration hardcoded dict literal before
+    it was deleted. The post-migration, file-backed JOURNAL_STYLE_PRESETS
+    must produce byte-for-byte the same resolved dict for every key,
+    including every key a given preset never explicitly set (both must
+    apply resolve_style_policy's defaults identically) -- any drift here is
+    a real migration bug (a value dropped, mistyped, or a tier/source field
+    that leaked into the runtime value dict), not a style choice."""
+    with open(_PRE_MIGRATION_SNAPSHOT_PATH, encoding="utf-8") as fh:
+        pre_migration = json.load(fh)
+
+    assert set(pre_migration) == set(docs_intel.JOURNAL_STYLE_PRESETS) == _ALL_29_PRESET_NAMES
+
+    mismatches = {}
+    for name in sorted(_ALL_29_PRESET_NAMES):
+        old = pre_migration[name]
+        new = docs_intel.JOURNAL_STYLE_PRESETS[name]
+        if old != new:
+            mismatches[name] = {
+                field: (old.get(field, "<MISSING>"), new.get(field, "<MISSING>"))
+                for field in sorted(set(old) | set(new))
+                if old.get(field, "<MISSING>") != new.get(field, "<MISSING>")
+            }
+    assert mismatches == {}, f"migration parity mismatches: {mismatches}"
+
+
+def test_journal_style_preset_provenance_covers_same_keys_as_presets():
+    assert set(docs_intel._JOURNAL_STYLE_PRESET_PROVENANCE) == set(docs_intel.JOURNAL_STYLE_PRESETS)
+
+
+def test_journal_style_preset_lookup_still_derives_from_presets_dict():
+    """4d0ca929 -- _JOURNAL_STYLE_PRESET_LOOKUP is built FROM
+    JOURNAL_STYLE_PRESETS' own keys, so it can never list a name
+    JOURNAL_STYLE_PRESETS doesn't have -- still true after externalization,
+    since both are populated by the same file-backed loader pass."""
+    assert docs_intel._JOURNAL_STYLE_PRESET_LOOKUP == {
+        name.lower(): name for name in docs_intel.JOURNAL_STYLE_PRESETS
+    }
+
+
+# ---------------------------------------------------------------------------
+# get_journal_style_preset_provenance -- docs-intel-journal-preset-
+# externalization-20260918
+# ---------------------------------------------------------------------------
+
+def test_get_journal_style_preset_provenance_jcshm_open_question_field():
+    """jcshm's table_caption_bold is a deliberately unresolved question, not
+    merely an unset field -- it must surface with status="open_question",
+    value None, and its explanatory note, not just be absent."""
+    provenance = docs_intel.get_journal_style_preset_provenance("jcshm")
+    assert provenance["journal"] == "jcshm"
+    assert "meta" in provenance
+    field = provenance["fields"]["table_caption_bold"]
+    assert field["value"] is None
+    assert field["status"] == "open_question"
+    assert field["tier"] == 4
+    assert "note" in field["source"]
+
+
+def test_get_journal_style_preset_provenance_regular_field_has_no_open_question_status():
+    provenance = docs_intel.get_journal_style_preset_provenance("jcshm")
+    field = provenance["fields"]["citation_style"]
+    assert field["value"] == "numbered_bracket"
+    assert "status" not in field
+
+
+def test_get_journal_style_preset_provenance_field_absent_when_never_set():
+    """A style_policy key jcshm's preset never touches (e.g. note_style,
+    which no built-in preset overrides) is entirely absent from "fields" --
+    not present with a null/default value."""
+    provenance = docs_intel.get_journal_style_preset_provenance("jcshm")
+    assert "note_style" not in provenance["fields"]
+
+
+def test_get_journal_style_preset_provenance_default_has_empty_fields():
+    provenance = docs_intel.get_journal_style_preset_provenance("default")
+    assert provenance["fields"] == {}
+    assert provenance["meta"]["status"] == "baseline"
+
+
+def test_get_journal_style_preset_provenance_case_insensitive_lookup():
+    assert docs_intel.get_journal_style_preset_provenance(
+        "JCSHM"
+    ) == docs_intel.get_journal_style_preset_provenance("jcshm")
+    assert docs_intel.get_journal_style_preset_provenance(
+        "Nature"
+    ) == docs_intel.get_journal_style_preset_provenance("nature")
+
+
+def test_get_journal_style_preset_provenance_rejects_unknown_name():
+    with pytest.raises(ValueError, match="unknown journal style preset"):
+        docs_intel.get_journal_style_preset_provenance("not-a-real-journal")
+
+
+def test_get_journal_style_preset_provenance_elsevier_caveat_preserved():
+    """The elsevier preset's emphasis_style carries a caveat inherited from
+    workspace proposal 3674c0c1 (a closest-available-official-signal
+    substitution, not independently re-verified in the round-1 pass) --
+    this must be preserved verbatim in the provenance record, and
+    meta.status must reflect it as partially_populated, not an unqualified
+    tier-2 fact."""
+    provenance = docs_intel.get_journal_style_preset_provenance("elsevier")
+    assert provenance["meta"]["status"] == "partially_populated"
+    emphasis_source = provenance["fields"]["emphasis_style"]["source"]
+    assert "CAVEAT" in emphasis_source["note"] or "caveat" in emphasis_source["note"].lower()
+
+
+# ---------------------------------------------------------------------------
+# get_journal_style_preset_provenance -- MCP tool boundary (server.py wrapper)
+# ---------------------------------------------------------------------------
+
+def test_server_get_journal_style_preset_provenance_delegates_to_docs_intel():
+    assert server.get_journal_style_preset_provenance(
+        "jcshm"
+    ) == docs_intel.get_journal_style_preset_provenance("jcshm")
+
+
+def test_server_get_journal_style_preset_provenance_unknown_name_returns_error_dict():
+    result = server.get_journal_style_preset_provenance("not-a-real-journal")
+    assert "error" in result
+    assert "not-a-real-journal" in result["error"]
+
+
+# ---------------------------------------------------------------------------
 # audit_equation_style -- basic shape / no equations
 # ---------------------------------------------------------------------------
 
@@ -974,6 +1305,30 @@ def test_audit_equation_number_gap(tmp_path):
     assert finding["missing_number"] == 2
 
 
+def test_audit_equation_numbering_continuing_a_companion_document_has_no_gap(tmp_path):
+    """df716454 regression -- a real SI document's equations legitimately
+    and correctly continue its companion manuscript's own numbering (e.g.
+    39-94 continuing 1-38). The gap check must scope its expected range to
+    the numbers actually OBSERVED (39..41 here), never assume every
+    document starts at 1 -- so this must report zero findings, not 38 false
+    "missing_number" findings for 1 through 38."""
+    path = _write_docx(tmp_path, _CONTINUED_NUMBERING_NO_GAP_DOC)
+    result = docs_intel.audit_equation_style(path)
+    assert result["findings"] == []
+
+
+def test_audit_equation_numbering_continuing_a_companion_document_still_flags_real_gap(tmp_path):
+    """Companion-document continuation (not starting at 1) must not mask a
+    GENUINE internal gap: 39, 40, 41, then a jump to 44 -- 42 and 43 are
+    really missing and must still be reported, and ONLY those two (not 1-38
+    below the observed start)."""
+    path = _write_docx(tmp_path, _CONTINUED_NUMBERING_WITH_GAP_DOC)
+    result = docs_intel.audit_equation_style(path)
+    assert result["findings_by_type"] == {"equation_number_gap": 2}
+    missing = sorted(f["missing_number"] for f in result["findings"])
+    assert missing == [42, 43]
+
+
 def test_audit_alphabetic_suffix_does_not_create_false_gap_or_duplicate(tmp_path):
     path = _write_docx(tmp_path, _ALPHA_SUFFIX_DOC)
     result = docs_intel.audit_equation_style(path)
@@ -996,6 +1351,41 @@ def test_audit_table_numbered_equations_excluded_from_alignment_check(tmp_path):
     types = {f["type"] for f in result["findings"]}
     assert "misaligned_equation" not in types
     assert "missing_trailing_punctuation" not in types
+
+
+def test_table_numbered_row_with_leading_spacer_cell_extracts_the_number(tmp_path):
+    """9c1a3fd2 regression -- a real JCSHM manuscript's equation-numbering
+    table rows are [empty indent spacer, equation, number], not the plain
+    [equation, number] the original implementation assumed at fixed
+    cells[0]/cells[1] indices. Every equation in a spacer-led row was
+    silently misclassified as "standalone" (number=None), which cascaded
+    into false equation_number_gap findings for every number 1..N even
+    though the document's real numbering was complete and correct."""
+    path = _write_docx(tmp_path, _SPACER_NUMBERED_DOC)
+    with open(path, "rb") as fh:
+        raw = fh.read()
+    equations = docs_intel.parse_docx_equations_local(raw)
+    numbered = [eq for eq in equations if eq["pattern"] == "table-numbered"]
+    assert [eq["number"] for eq in numbered] == ["(1)", "(2)", "(3)"]
+    assert [eq["para_id"] for eq in numbered] == ["EQS001", "EQS002", "EQS003"]
+
+    result = docs_intel.audit_equation_style(path)
+    assert result["findings_by_type"] == {}, result["findings"]
+
+
+def test_ordinary_3column_content_table_not_misdetected_as_numbered_equations(tmp_path):
+    """A real (non-equation) 3-column table must not be swept up by the
+    spacer-tolerant table-numbered detection just because it happens to
+    have 3 cells -- neither an <m:oMath> nor a parenthesized-number last
+    cell is present, so every cell should be scanned as ordinary content
+    (i.e. contributes zero equations, not a false table-numbered one)."""
+    path = _write_docx(tmp_path, _ORDINARY_3COL_TABLE_DOC)
+    with open(path, "rb") as fh:
+        raw = fh.read()
+    equations = docs_intel.parse_docx_equations_local(raw)
+    assert equations == []
+    result = docs_intel.audit_equation_style(path)
+    assert result["findings_by_type"] == {}
 
 
 # ---------------------------------------------------------------------------

@@ -1,0 +1,33 @@
+{
+  "meta": {
+    "journal": "aps",
+    "display_name": "American Physical Society journals (Physical Review family)",
+    "publisher": "American Physical Society",
+    "status": "populated",
+    "status_detail": "Mechanically migrated 2026-09-18 from the JOURNAL_STYLE_PRESETS dict literal in docs_intel.py (round 2, proposal 64266f13, dated 2026-09-11) as part of the JSON-preset externalization work (proposal 3b93b7ef) -- values and evidence carried over verbatim from the real in-code comment, not regenerated.",
+    "last_verified": "2026-09-11"
+  },
+  "fields": {
+    "citation_style": {
+      "value": "numbered_superscript",
+      "tier": 2,
+      "source": {
+        "type": "live_guidelines_page",
+        "citation": "journals.aps.org/authors/style-basics; journals.aps.org/authors/references-physical-review-physical-review-letters",
+        "note": "most Physical Review journals prefer superscript numbered citations (Physical Review Letters and a few others use inline bracketed numerals instead -- callers targeting PRL specifically should override citation_style to 'numbered_bracket')."
+      },
+      "verified_date": "2026-09-11"
+    },
+    "figure_dpi_minimum_general": {
+      "value": 600,
+      "tier": 2,
+      "source": {
+        "type": "live_guidelines_page",
+        "citation": "journals.aps.org/authors/style-basics; journals.aps.org/authors/references-physical-review-physical-review-letters",
+        "quote": "make scans with as high a resolution as possible, preferably 600 dpi or higher",
+        "note": "the guide's own explicit number (600 dpi) is stated specifically for SCANNED images, not as a blanket floor for every figure-creation method -- used here as figure_dpi_minimum_general with that caveat, since no separate non-scanned floor was stated."
+      },
+      "verified_date": "2026-09-11"
+    }
+  }
+}

@@ -25,8 +25,8 @@ jobs:
   test-latex:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-node@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
         with:
           node-version: '22'
           cache: 'npm'
@@ -46,12 +46,27 @@ jobs:
       id-token: write  # needed for OIDC auth to MCP registry
       contents: read
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
 
-      - uses: actions/setup-node@v4
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
         with:
           node-version: '22'
           registry-url: 'https://registry.npmjs.org'
+
+      # 2026-09-29 reconciliation: bundle-latex.mjs now copies
+      # extensions/meridian-latex/engine/DIST (tsc/esbuild-compiled
+      # output), not engine/src, so it exists on disk in npm/'s own
+      # "prepack" hook (`npm publish` below). This job is a FRESH
+      # checkout on its own runner -- test-latex's build above ran in a
+      # different job and does not carry over -- so without an explicit
+      # build here, engine/dist would not exist yet and
+      # bundle-latex.mjs's readdirSync would throw, failing the publish
+      # outright. Root `npm ci` installs the engine's build-time
+      # devDependencies (esbuild, typescript) via the workspace.
+      - name: Install deps + build the meridian-latex engine (dist/ source for the npm bundle)
+        run: |
+          npm ci
+          npm run build --workspace=extensions/meridian-latex/engine
 
       - name: Set version from tag
         run: |

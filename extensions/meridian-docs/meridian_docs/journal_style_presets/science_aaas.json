@@ -1,0 +1,32 @@
+{
+  "meta": {
+    "journal": "science_aaas",
+    "display_name": "Science / Science Advances (AAAS)",
+    "publisher": "American Association for the Advancement of Science (AAAS)",
+    "status": "populated",
+    "status_detail": "Mechanically migrated 2026-09-18 from the JOURNAL_STYLE_PRESETS dict literal in docs_intel.py (round 2, proposal 64266f13, dated 2026-09-11) as part of the JSON-preset externalization work (proposal 3b93b7ef) -- values and evidence carried over verbatim from the real in-code comment, not regenerated. Round-2 proposal 64266f13 names this preset 'aaas_science'; this codebase uses 'science_aaas' per this sprint item's own naming instructions. citation_style is deliberately left unspecified/absent: in-text references use numbers, but as ITALIC numerals inside PARENTHESES (e.g. '(1)', '(2, 3)', '(4-6)'), numbered in citation order -- this does not cleanly match either 'numbered_superscript' (not superscript) or 'numbered_bracket' (this schema's enum means square brackets, not parentheses), so rather than force-fit a punctuation-mismatched value, the field is left absent; a caller targeting Science specifically should supply this convention directly via a style_policy override.",
+    "last_verified": "2026-09-11"
+  },
+  "fields": {
+    "figure_dpi_minimum_halftone": {
+      "value": 300,
+      "tier": 2,
+      "source": {
+        "type": "live_guidelines_page",
+        "citation": "science.org/content/page/instructions-authors-new-research-articles; science.org/content/page/science-advances-information-authors",
+        "note": "figures need at least 300 dpi for photographs."
+      },
+      "verified_date": "2026-09-11"
+    },
+    "figure_dpi_minimum_line_art": {
+      "value": 600,
+      "tier": 2,
+      "source": {
+        "type": "live_guidelines_page",
+        "citation": "science.org/content/page/instructions-authors-new-research-articles; science.org/content/page/science-advances-information-authors",
+        "note": "600 dpi for line art."
+      },
+      "verified_date": "2026-09-11"
+    }
+  }
+}

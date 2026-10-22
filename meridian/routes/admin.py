@@ -11,7 +11,7 @@ import aiosqlite
 from fastapi import APIRouter, HTTPException, Request
 from fastapi.responses import JSONResponse, Response
 
-from .._deps import _db, _hosted_mode, _is_demo_request
+from .._deps import _db, _hosted_mode, _is_demo_request, _require_hosted_operator
 from .. import db as db_module
 
 router = APIRouter()
@@ -67,6 +67,30 @@ async def admin_health_json(request: Request) -> dict[str, Any]:
         "hosted_mode": _hosted_mode(),
         "pending_provisions": (await provisioning_health(db)).get("pending_provisions"),
     }
+
+
+@router.get("/admin/pool-load")
+async def admin_pool_load(request: Request, top_n: int = 10) -> dict[str, Any]:
+    """1b2fbebe -- redacted per-tenant / per-Neon-pool load telemetry (admin only).
+
+    Same gate as /admin/health. In-memory and per server process: with several Fly
+    machines each one reports only the requests it served. Advisory only: nothing here
+    moves a tenant or changes a quota."""
+    from ..hosted import get_current_tenant, is_admin_db, check_admin_password  # noqa: PLC0415
+    from ..pool_telemetry import METER  # noqa: PLC0415
+
+    try:
+        tenant = await get_current_tenant(request)
+    except HTTPException:
+        raise HTTPException(status_code=403, detail="not authenticated")
+    if not await is_admin_db(tenant.get("email", ""), request.app.state.db):
+        raise HTTPException(status_code=403, detail="admin only")
+    if not check_admin_password(request):
+        raise HTTPException(status_code=403, detail="admin password required")
+
+    snapshot = METER.snapshot(top_n=max(1, min(int(top_n), 50)))
+    snapshot["scope"] = "this server process only"
+    return snapshot
 
 
 @router.get("/health/deep")
@@ -150,8 +174,12 @@ async def admin_stats_json(request: Request) -> dict[str, Any]:
 
 
 @router.get("/admin/git-status")
-async def git_status() -> dict[str, Any]:
-    """Check if local repo is behind/ahead of remote."""
+async def git_status(request: Request) -> dict[str, Any]:
+    """Check if local repo is behind/ahead of remote.
+
+    ece2ac0a — runs ``git fetch`` on the server; operator-only when hosted.
+    """
+    await _require_hosted_operator(request, require_admin_password=False)
     import subprocess as sp
     try:
         cwd = str(Path(__file__).parent.parent.parent)
@@ -191,12 +219,17 @@ async def git_status() -> dict[str, Any]:
 
 @router.post("/admin/shutdown")
 async def admin_shutdown(request: Request) -> Response:
-    """Gracefully stop the server process."""
+    """Gracefully stop the server process.
+
+    ece2ac0a — was callable by anyone on the hosted service. Hosted mode now
+    requires the operator (admin session + admin password).
+    """
     if _is_demo_request(request):
         return JSONResponse(
             {"detail": "Not available in demo mode. Sign up at usemeridian.us"},
             status_code=403,
         )
+    await _require_hosted_operator(request)
 
     async def _delayed_shutdown() -> None:
         await asyncio.sleep(0.5)
@@ -213,12 +246,16 @@ async def admin_restart(request: Request) -> Response:
     Requires an explicit ``{"confirm": true}`` body — a restart kills every
     active session on the machine (a real hazard on shared Fly machines), so an
     unconfirmed call returns a warning instead of restarting.
+
+    ece2ac0a — hosted mode requires the operator (admin session + admin
+    password); previously anyone could restart the hosted server.
     """
     if _is_demo_request(request):
         return JSONResponse(
             {"detail": "Not available in demo mode. Sign up at usemeridian.us"},
             status_code=403,
         )
+    await _require_hosted_operator(request)
 
     try:
         body = await request.json()
@@ -311,6 +348,63 @@ async def admin_reset_tenant_provisioning(tenant_id: str, request: Request) -> R
     return JSONResponse({"reset": True, **result})
 
 
+@router.post("/admin/tenants/plan")
+async def admin_set_tenant_plan(request: Request) -> Response:
+    """Set or revoke a tenant's plan by account email (grant the playtester plan).
+
+    The ``playtester`` plan is unpaid Pro entitlements with usage still bounded.
+
+    Body: ``{"email": ..., "plan": "playtester"|"free"|"standard"|"pro",
+    "expires_at": "YYYY-MM-DD" | null, "is_internal": false, "confirm": true}``.
+    ``expires_at`` is only for a playtester (omitted keeps its current end date;
+    null clears it). ``is_internal`` may only be ``false``: it clears the staff
+    flag when moving a staff account to playtester and is never set here.
+    Without ``confirm`` nothing is written and the response says what would
+    change (``applied`` is false); with it the change is applied, idempotent and
+    audited. The response carries the plan label and any warning (a staff flag
+    that still exempts the tenant, a tenant with no database yet). A playtester
+    is refused with 409, preview included, when its database is in a Neon pool
+    project other tenants use: the message says to reset its provisioning first,
+    after which its next database is created in a project of its own.
+
+    Hosted operator only (admin session + admin password), like
+    reset-provisioning. See ``meridian/tenant_plan_admin.py``.
+    """
+    from ..tenant_plan_admin import UNSET, PlanChangeError, set_tenant_plan_by_email  # noqa: PLC0415
+
+    if not _hosted_mode():
+        raise HTTPException(status_code=404)
+    await _require_hosted_operator(request)
+    from ..hosted import get_current_tenant  # noqa: PLC0415
+
+    caller = await get_current_tenant(request)
+    try:
+        body = await request.json()
+    except Exception:
+        body = None
+    if not isinstance(body, dict):
+        raise HTTPException(status_code=400, detail="JSON object body required")
+    if "is_internal" in body and body["is_internal"] is not False:
+        raise HTTPException(
+            status_code=400,
+            detail="is_internal can only be false here: the staff flag is never set by this action",
+        )
+    try:
+        result = await set_tenant_plan_by_email(
+            request.app.state.db,
+            body.get("email", ""),
+            body.get("plan", ""),
+            expires_at=body["expires_at"] if "expires_at" in body else UNSET,
+            clear_internal=body.get("is_internal") is False,
+            apply=body.get("confirm") is True,
+            actor=caller.get("email", ""),
+            via="admin_route",
+        )
+    except PlanChangeError as exc:
+        raise HTTPException(status_code=exc.status, detail=exc.message) from exc
+    return JSONResponse(result)
+
+
 @router.get("/admin/snapshot")
 async def download_snapshot(request: Request) -> Response:
     """Download the current DB as a SQLite snapshot file."""
@@ -318,7 +412,11 @@ async def download_snapshot(request: Request) -> Response:
     db = await _db(request)
     db_url = os.environ.get("MERIDIAN_DB_URL")
 
-    if not db_url:
+    # ece2ac0a — the raw-file branch copies the WHOLE local SQLite file. That
+    # is the single user's own DB when self-hosted, but on the hosted service
+    # it would be the shared control-plane DB, so hosted callers always take
+    # the table-copy branch below, which reads only their own resolved DB.
+    if not db_url and not _hosted_mode():
         db_path = os.environ.get("MERIDIAN_DB", str(Path("data") / "meridian.db"))
         if db_path == ":memory:":
             raise HTTPException(400, "Cannot snapshot in-memory database")

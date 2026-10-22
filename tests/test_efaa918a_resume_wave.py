@@ -156,7 +156,7 @@ async def test_missing_pointer_fails_closed(db):
     run = await _run(db, pid, item_ids=[item["id"]])
 
     # The pointer evidence is deleted after the wave was planned.
-    await db_module.delete_sprint_item_pointer(db, pointer["id"])
+    await db_module.delete_sprint_item_pointer(db, pid, pointer["id"])
 
     with pytest.raises(WaveResumeStale) as excinfo:
         await db_module.check_wave_resume(db, run["id"])

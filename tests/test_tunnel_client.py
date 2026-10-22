@@ -17,6 +17,7 @@ import httpx
 import pytest
 
 from meridian import tunnel_client as tc
+from meridian import tunnel_config
 
 
 # ---------------------------------------------------------------------------
@@ -47,6 +48,27 @@ def test_resolve_token_empty_when_unset(monkeypatch):
     monkeypatch.delenv("MERIDIAN_API_KEY", raising=False)
     monkeypatch.delenv("BEARER_TOKEN", raising=False)
     assert tc._resolve_token() == ""
+
+
+def test_zotero_slot_spawn_env_scrubs_inherited_secrets_and_uses_local_vault(monkeypatch):
+    monkeypatch.setattr(tc, "_office_slot_spawn_env", lambda env: dict(env))
+    monkeypatch.setattr(tunnel_config, "get_zotero_api_key", lambda: "vault-key")
+    monkeypatch.setattr(tunnel_config, "get_zotero_library_id", lambda: "123456")
+
+    env = tc._zotero_slot_spawn_env(
+        {
+            "PATH": "keep-me",
+            "ZOTERO_API_KEY": "stale-server-key",
+            "zotero_library_id": "stale-server-user",
+            "ZOTERO_LIBRARY_TYPE": "group",
+        }
+    )
+
+    assert env["PATH"] == "keep-me"
+    assert env["ZOTERO_API_KEY"] == "vault-key"
+    assert env["ZOTERO_LIBRARY_ID"] == "123456"
+    assert env["ZOTERO_LIBRARY_TYPE"] == "user"
+    assert "zotero_library_id" not in env
 
 
 # ---------------------------------------------------------------------------
@@ -1184,74 +1206,11 @@ def test_find_codebase_memory_mcp_npm_global_cmd_on_windows(monkeypatch, tmp_pat
 
 
 # ---------------------------------------------------------------------------
-# _pick_release_asset
+# Pinned-release selection (f66e8f23). The old _pick_release_asset() heuristic
+# scored the *latest* release's assets by filename; it was replaced by the
+# hard-coded _CBM_PINNED_ASSETS table, covered in
+# tests/test_f66e8f23_download_integrity.py.
 # ---------------------------------------------------------------------------
-
-_FAKE_ASSETS = [
-    {"name": "codebase-memory-mcp-x86_64-pc-windows-msvc.exe", "browser_download_url": "https://gh/win.exe"},
-    {"name": "codebase-memory-mcp-x86_64-unknown-linux-musl",  "browser_download_url": "https://gh/linux"},
-    {"name": "codebase-memory-mcp-aarch64-apple-darwin",        "browser_download_url": "https://gh/mac-arm"},
-    {"name": "codebase-memory-mcp-x86_64-apple-darwin",         "browser_download_url": "https://gh/mac-x64"},
-    {"name": "codebase-memory-mcp-source.tar.gz",               "browser_download_url": "https://gh/src.tar.gz"},
-]
-
-
-def test_pick_release_asset_windows(monkeypatch):
-    monkeypatch.setattr(tc.sys, "platform", "win32")
-    import platform as _p
-    monkeypatch.setattr(_p, "machine", lambda: "AMD64")
-    asset = tc._pick_release_asset(_FAKE_ASSETS)
-    assert asset is not None
-    assert asset["name"].endswith(".exe")
-
-
-def test_pick_release_asset_windows_never_picks_darwin(monkeypatch):
-    """Core regression: darwin-amd64 must NOT be selected on Windows even if
-    no Windows asset exists — arch match alone must not beat hard OS exclusion."""
-    monkeypatch.setattr(tc.sys, "platform", "win32")
-    import platform as _p
-    monkeypatch.setattr(_p, "machine", lambda: "AMD64")
-    darwin_only = [
-        {"name": "codebase-memory-mcp-x86_64-apple-darwin",
-         "browser_download_url": "https://gh/mac-x64"},
-        {"name": "codebase-memory-mcp-aarch64-apple-darwin",
-         "browser_download_url": "https://gh/mac-arm"},
-    ]
-    assert tc._pick_release_asset(darwin_only) is None
-
-
-def test_pick_release_asset_linux_never_picks_windows(monkeypatch):
-    monkeypatch.setattr(tc.sys, "platform", "linux")
-    import platform as _p
-    monkeypatch.setattr(_p, "machine", lambda: "x86_64")
-    win_only = [
-        {"name": "codebase-memory-mcp-x86_64-pc-windows-msvc.exe",
-         "browser_download_url": "https://gh/win.exe"},
-    ]
-    assert tc._pick_release_asset(win_only) is None
-
-
-def test_pick_release_asset_linux(monkeypatch):
-    monkeypatch.setattr(tc.sys, "platform", "linux")
-    import platform as _p
-    monkeypatch.setattr(_p, "machine", lambda: "x86_64")
-    asset = tc._pick_release_asset(_FAKE_ASSETS)
-    assert asset is not None
-    assert "linux" in asset["name"]
-    assert not asset["name"].endswith(".tar.gz")
-
-
-def test_pick_release_asset_macos_arm(monkeypatch):
-    monkeypatch.setattr(tc.sys, "platform", "darwin")
-    import platform as _p
-    monkeypatch.setattr(_p, "machine", lambda: "arm64")
-    asset = tc._pick_release_asset(_FAKE_ASSETS)
-    assert asset is not None
-    assert "aarch64" in asset["name"] or "arm64" in asset["name"]
-
-
-def test_pick_release_asset_returns_none_for_empty():
-    assert tc._pick_release_asset([]) is None
 
 
 # ---------------------------------------------------------------------------
@@ -1279,23 +1238,35 @@ def test_ensure_returns_none_on_download_failure(monkeypatch):
 
 
 def test_download_codebase_memory_mcp_installs_binary(monkeypatch, tmp_path):
-    """_download_codebase_memory_mcp writes binary and returns its path."""
+    """_download_codebase_memory_mcp verifies the pinned archive, extracts only the
+    executable, writes it to the managed dir and returns its path (f66e8f23)."""
+    import hashlib
+    import io
+    import tarfile
+
     monkeypatch.setattr(tc, "_managed_bin_dir", lambda: tmp_path)
 
-    fake_release = {
-        "tag_name": "v1.2.3",
-        "assets": [
-            {"name": "codebase-memory-mcp-x86_64-unknown-linux-musl",
-             "browser_download_url": "https://gh/linux"},
-        ],
-    }
     fake_content = b"\x7fELF fake binary" + b"\x00" * (1024 * 1024)  # >1MB to pass size check
+    buf = io.BytesIO()
+    with tarfile.open(fileobj=buf, mode="w:gz") as tf:
+        info = tarfile.TarInfo("codebase-memory-mcp")
+        info.size = len(fake_content)
+        tf.addfile(info, io.BytesIO(fake_content))
+    archive = buf.getvalue()
+
+    monkeypatch.setattr(tc.sys, "platform", "linux")
+    import platform as _p
+    monkeypatch.setattr(_p, "machine", lambda: "x86_64")
+    monkeypatch.setattr(
+        tc, "_CBM_PINNED_ASSETS",
+        {("linux", "amd64"): ("codebase-memory-mcp-linux-amd64-portable.tar.gz",
+                              hashlib.sha256(archive).hexdigest())},
+    )
 
     def make_mock_client(*args, **kwargs):
         class FakeResp:
             def raise_for_status(self): pass
-            def json(self): return fake_release
-            content = fake_content
+            content = archive
 
         class FakeClient:
             async def __aenter__(self): return self
@@ -1303,9 +1274,6 @@ def test_download_codebase_memory_mcp_installs_binary(monkeypatch, tmp_path):
             async def get(self, url, **kw): return FakeResp()
 
         return FakeClient()
-
-    monkeypatch.setattr(tc.sys, "platform", "linux")
-    monkeypatch.setattr(tc, "_pick_release_asset", lambda assets: assets[0])
 
     import httpx as _httpx
     monkeypatch.setattr(_httpx, "AsyncClient", make_mock_client)
@@ -5965,9 +5933,9 @@ class _FakeWin32JobAPIForTunnel:
         self._next += 1
         return self._next
 
-    def create_job(self):
+    def create_job(self, name=None):
         h = self._h()
-        self.calls.append(("create_job", h))
+        self.calls.append(("create_job", h, name))
         return h
 
     def set_kill_on_close(self, job_handle):
@@ -6011,7 +5979,13 @@ def test_spawn_owned_with_cache_retry_windows_assigns_job(monkeypatch):
     assert handle is not None
     assert handle.job_id is not None
     kinds = [c[0] for c in fake_api.calls]
-    assert kinds == ["create_job", "set_kill_on_close", "open_process", "assign_process"]
+    # close_handle on the OpenProcess handle is expected even on success --
+    # it's only needed transiently to make the assign call, never for the
+    # job's continued lifetime (2026-09-28 handle-leak fix in
+    # process_lifecycle._assign_to_job).
+    assert kinds == [
+        "create_job", "set_kill_on_close", "open_process", "assign_process", "close_handle",
+    ]
 
 
 def test_spawn_owned_with_cache_retry_degrades_to_none_on_adopt_failure(monkeypatch):
@@ -6859,6 +6833,34 @@ def test_reconnect_loop_backs_off_on_repeated_never_ready_not_busy_loop(monkeypa
     # normally" behavior produced.
     assert len(sleeps) == 3
     assert sleeps == [1.0, 2.0, 4.0]
+
+
+def test_zotero_slot_spawn_env_uses_only_local_keyring_value(monkeypatch):
+    from meridian import tunnel_client as tc
+    from meridian import tunnel_config
+
+    monkeypatch.setenv("ZOTERO_API_KEY", "parent-test-secret")
+    monkeypatch.setattr(tunnel_config, "get_zotero_api_key", lambda: "vault-test-secret")
+    env = tc._zotero_slot_spawn_env({
+        "ZOTERO_API_KEY": "hosted-test-secret",
+        "zotero_api_key": "lowercase-hosted-test-secret",
+        "ZOTERO_LOCAL": "true",
+    })
+
+    assert env["ZOTERO_API_KEY"] == "vault-test-secret"
+    assert "zotero_api_key" not in env
+    assert env["ZOTERO_LOCAL"] == "true"
+
+
+def test_zotero_slot_spawn_env_drops_stale_key_when_vault_is_empty(monkeypatch):
+    from meridian import tunnel_client as tc
+    from meridian import tunnel_config
+
+    monkeypatch.setenv("ZOTERO_API_KEY", "parent-test-secret")
+    monkeypatch.setattr(tunnel_config, "get_zotero_api_key", lambda: None)
+    env = tc._zotero_slot_spawn_env({"ZOTERO_API_KEY": "hosted-test-secret"})
+
+    assert not any(name.casefold() == "zotero_api_key" for name in env)
 
 
 def test_reconnect_loop_lazy_backs_off_on_repeated_never_ready_not_busy_loop(monkeypatch):

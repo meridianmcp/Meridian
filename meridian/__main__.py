@@ -197,8 +197,75 @@ def _ensure_event_loop() -> "asyncio.AbstractEventLoop":
         return loop
 
 
+_SUBCOMMANDS = ("artifacts", "doctor", "hooks", "memory", "recovery", "setup", "zotero")
+
+
+def _dispatch_subcommand(raw_argv: list[str]) -> int | None:
+    """Local maintenance subcommands (55d48d69), dispatched BEFORE the
+    server/--mcp/--tunnel argparse so none of those flags (or MERIDIAN_HOST /
+    MERIDIAN_PORT defaults) are consulted, no port is killed and no server is
+    started:
+
+    * ``hooks install-guard --repo P [--scope project|user]
+      [--mode enforce|advisory] [--dry-run] [--uninstall]`` -- idempotent
+      merge of the Meridian guard entries into a Claude Code settings.json.
+    * ``memory import [--out FILE] [--apply APPROVED_FILE]`` -- dry-run
+      auto-memory importer; ``--apply`` needs an owner-approved mapping.
+    * ``setup [--repo P ...] [--host H ...] [--dry-run] [--uninstall]`` --
+      merge the local MCP bundle into Claude Code/Desktop, Codex and Cursor.
+    * ``doctor [--repo P ...] [--host H ...] [--json] [--no-network]`` --
+      read-only config, runtime and hosted-service diagnostics.
+    * ``recovery catalog|pack`` -- inspect local provider-session metadata or
+      write a selected-session context pack into host-local application data.
+    * ``artifacts configure|capture|restore|export|purge`` -- manage opted-in,
+      local-only provider output capture and verification.
+    * ``zotero sync`` -- run one bounded workstation sync of hosted citation
+      markers through authenticated MCP calls; no background loop is started.
+    * ``zotero install-plugin [--profile DIR] [--dry-run] [--keep-zotero-open]`` -- install the
+      Zotero bridge plugin into Zotero's profile. A running Zotero is closed first when the
+      saved setting allows it; ``--keep-zotero-open`` refuses instead.
+
+    Returns the exit code, or ``None`` when ``raw_argv`` is not a subcommand.
+    """
+    if not raw_argv or raw_argv[0] not in _SUBCOMMANDS:
+        return None
+    if raw_argv[0] == "hooks":
+        from .hook_settings_merge import cli_main as _hooks_cli
+
+        return _hooks_cli(raw_argv[1:])
+    if raw_argv[0] == "setup":
+        from .setup_bundle import cli_main as _setup_cli
+
+        return _setup_cli(raw_argv[1:])
+    if raw_argv[0] == "doctor":
+        from .doctor import cli_main as _doctor_cli
+
+        return _doctor_cli(raw_argv[1:])
+    if raw_argv[0] == "recovery":
+        from .provider_sessions import cli_main as _recovery_cli
+
+        return _recovery_cli(raw_argv[1:])
+    if raw_argv[0] == "artifacts":
+        from .artifact_capture import cli_main as _artifact_cli
+
+        return _artifact_cli(raw_argv[1:])
+    if raw_argv[0] == "zotero":
+        if len(raw_argv) > 1 and raw_argv[1] == "install-plugin":
+            from .zotero_plugin_install import cli_main as _plugin_cli
+
+            return _plugin_cli(raw_argv[2:])
+        from .zotero_sync import cli_main as _zotero_cli
+
+        return _zotero_cli(raw_argv[1:])
+    from .memory_import import cli_main as _memory_cli
+
+    return _memory_cli(raw_argv[1:])
+
+
 def main(argv: list[str] | None = None) -> int:
-    """CLI dispatch: HTTP server by default, MCP stdio with ``--mcp``.
+    """CLI dispatch: HTTP server by default, MCP stdio with ``--mcp``,
+    offline ``artifacts`` / ``doctor`` / ``hooks`` / ``memory`` / ``recovery`` / ``setup`` subcommands (see
+    ``_dispatch_subcommand``).
 
     Frozen-aware: when running as the downloadable binary (``sys.frozen``) with
     no explicit mode flag, dispatch defaults to the tunnel client rather than
@@ -207,6 +274,9 @@ def main(argv: list[str] | None = None) -> int:
     # Capture the exact argv we're dispatching on (not sys.argv) so the
     # frozen host/port heuristic is correct under tests and embedding.
     raw_argv = list(argv) if argv is not None else list(sys.argv[1:])
+    sub_rc = _dispatch_subcommand(raw_argv)
+    if sub_rc is not None:
+        return sub_rc
     parser = argparse.ArgumentParser(
         prog="meridian",
         description="Multi-session Claude coordinator.",
@@ -225,8 +295,9 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument(
         "--token",
         default=None,
-        help="API token for --tunnel (defaults to MERIDIAN_API_KEY / "
-        "BEARER_TOKEN).",
+        help="API token for --tunnel (defaults to MERIDIAN_TOKEN / "
+        "MERIDIAN_API_KEY / BEARER_TOKEN, in that order). Prefer the env "
+        "var: a --token value is visible in process listings.",
     )
     parser.add_argument(
         "--server",

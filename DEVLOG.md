@@ -194,4 +194,18 @@
 - 2026-09-13 **test-ckpt-session** — Fixed the bug
 - 2026-09-13 **session-with-tasks** — task one (+1 more)
 - 2026-09-13 **exec-1** — did A (+1 more)
+- 2026-09-17 **test-ckpt-session** — Fixed the bug
+- 2026-09-17 **session-with-tasks** — task one (+1 more)
+- 2026-09-19 **test-ckpt-session** — Fixed the bug
+- 2026-09-19 **exec-1** — did A (+1 more)
+- 2026-09-19 **session-with-tasks** — task one (+1 more)
+- 2026-09-23 **test-ckpt-session** — Fixed the bug
+- 2026-09-23 **exec-1** — did A (+1 more)
+- 2026-09-23 **session-with-tasks** — task one (+1 more)
+- 2026-09-24 **test-ckpt-session** — Fixed the bug
+- 2026-09-24 **session-with-tasks** — task one (+1 more)
+- 2026-09-24 **exec-1** — did A (+1 more)
+- 2026-09-28 **test-ckpt-session** — Fixed the bug
+- 2026-09-28 **session-with-tasks** — task one (+1 more)
+- 2026-09-28 **exec-1** — did A (+1 more)
 <!-- MERIDIAN:ANCHOR:END:devlog -->

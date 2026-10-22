@@ -9,7 +9,7 @@ item.
 ## Install
 
 ```bash
-uvx --from /path/to/meridian-outputs meridian-outputs-mcp
+uvx --from "git+https://github.com/meridianmcp/Meridian.git#subdirectory=extensions/meridian-outputs" meridian-outputs-mcp
 ```
 
 Or add to your MCP client config:
@@ -19,7 +19,7 @@ Or add to your MCP client config:
   "mcpServers": {
     "meridian-outputs": {
       "command": "uvx",
-      "args": ["--from", "/path/to/extensions/meridian-outputs", "meridian-outputs-mcp"]
+      "args": ["--from", "git+https://github.com/meridianmcp/Meridian.git#subdirectory=extensions/meridian-outputs", "meridian-outputs-mcp"]
     }
   }
 }

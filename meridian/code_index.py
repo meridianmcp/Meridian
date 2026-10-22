@@ -134,32 +134,17 @@ def search_code_semantic(
     kind: str | None = None,
     db_path: str = ":memory:",
     reindex: bool = True,
+    allow_broad_root: bool = False,
 ) -> dict[str, Any]:
     """Meridian's thin caller over the extracted ``meridian_codeindex`` package.
 
-    Workspace decision 0dedff91 (2026-07-12) -- this function reads root_dir
-    off the LOCAL filesystem of whatever process is running it. On hosted
-    Meridian that's the server, which can never reach a caller's own
-    machine -- fail honestly here instead of letting the underlying package
-    silently mis-resolve a Windows path against the server's own cwd (the
-    original bug this guard was written to close for good). All the actual
-    chunking/reindex/search work below is the extracted package's
-    (``normalize_root_dir`` / ``get_code_index`` / ``_vectors_enabled``,
-    re-exported above); this wrapper adds nothing but the guard + orchestration.
+    On hosted Meridian this function reads the server's filesystem, not the
+    caller's machine, and therefore fails honestly instead of resolving a
+    remote path against the server cwd. The extracted package owns the actual
+    chunking, bounded scan, root identity, indexing, and convergence contract.
 
-    ec91e311 -- this used to build its OWN result dict by hand (total_indexed
-    / vectors_active / hits only) instead of delegating to the extracted
-    package's own ``impl.search_code_semantic``, which silently dropped the
-    ``convergence`` (:meth:`~meridian_codeindex.code_index.CodeIndex.get_convergence_state`)
-    and top-level ``degraded`` fields that function already computes on every
-    call (e631d54f). That meant every MCP caller of the ``search_code_semantic``
-    tool -- and ``prospect_symbol``'s Rung 3 (``semantic_raw``) -- never saw
-    the explicit embedding-freshness/degraded signal the underlying index
-    already tracks, even though it was one call away. Now delegates to
-    ``impl.search_code_semantic`` for the actual index/search/convergence work
-    and only adds the hosted-mode guard + root_dir pre-normalization on top --
-    so this wrapper's result shape is a strict superset of what it returned
-    before (same keys, same values) plus ``convergence``/``degraded``.
+    ``allow_broad_root`` is an explicit opt-in for a broad non-project root;
+    the default remains fail-closed and safe for an ordinary active checkout.
     """
     from meridian_codeindex import code_index as impl
 
@@ -175,10 +160,6 @@ def search_code_semantic(
                 "meridian-docs/desktop-commander tool)."
             ),
         }
-    # a0cf71ef — normalize (unquote / expanduser / abspath) so a valid local dir
-    # handed to us in a quoted or ~-prefixed shape resolves; report the resolved
-    # path back so the caller sees exactly what was searched. "does not exist" is
-    # then returned ONLY when the normalized path truly is not a directory.
     root_dir = impl.normalize_root_dir(root_dir)
     result: dict[str, Any] = {
         "root_dir": root_dir,
@@ -193,14 +174,14 @@ def search_code_semantic(
     if not root_dir or not os.path.isdir(root_dir):
         result["error"] = f"root_dir does not exist: {root_dir}"
         return result
-    # ec91e311 -- delegate to the extracted package's OWN search_code_semantic
-    # (already normalizes root_dir a second time -- a no-op here since we just
-    # did it above -- and already re-checks query/root_dir, both no-ops given
-    # the guards above) so this wrapper's result carries the SAME
-    # convergence/degraded state a direct `meridian_codeindex.search_code_semantic`
-    # caller gets, instead of hand-rolling a subset of the same dict.
     delegated = impl.search_code_semantic(
-        root_dir, query, limit=limit, kind=kind, db_path=db_path, reindex=reindex,
+        root_dir,
+        query,
+        limit=limit,
+        kind=kind,
+        db_path=db_path,
+        reindex=reindex,
+        allow_broad_root=allow_broad_root,
     )
     result.update(delegated)
     return result

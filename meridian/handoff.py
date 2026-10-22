@@ -106,8 +106,16 @@ async def _persist_handoff_history_and_pending_goal(
     content: str,
     session_id: "str | None",
     pending_goal_body: str,
+    receiver: "dict[str, str] | None" = None,
 ) -> bool:
     """aec043cb — shared amend-vs-fresh persistence + pending_goal write.
+
+    0527f636 — ``receiver`` (already normalised by ``generate_handoff`` via
+    ``db.normalize_pending_goal_receiver``; ``None`` = unaddressed, today's
+    behaviour) is stored alongside ``pending_goal_body`` in the same
+    ``set_pending_goal`` write, so only the addressed receiving session's
+    ``start_session`` can consume the trusted-channel goal — a sibling
+    session's ``start_session`` can no longer silently pop it.
 
     Extracted VERBATIM (zero behavior change) from the pre-existing full/
     delta code path in ``generate_handoff`` so ``mode == "goal"`` — now
@@ -137,13 +145,35 @@ async def _persist_handoff_history_and_pending_goal(
     recorded fresh (the same ``amended`` flag ``generate_handoff`` itself
     returns). Fully guarded exactly as before extraction: a failure in
     either step is swallowed, never breaking handoff generation.
+
+    0b0b24d8 — a write with no ``session_id`` (an unattended background writer:
+    the session-close auto-save and the idle-expire loop pass only
+    ``window_session_id``, and a dashboard render names no session either)
+    never amends a row a session owns. The amend keeps the row's owner but
+    bumps its ``created_at``, and ``created_at`` of a session's own row is that
+    session's "last handoff" anchor for delta's "Completed since last handoff"
+    list: an unattended amend moved the anchor to the auto-save, so the
+    session's next explicit delta silently dropped everything completed
+    between its own earlier handoff and the auto-save. Such a write records a
+    separate, unowned row instead. An unowned latest row (a previous
+    background write) is still amended, as before.
     """
     amended = False
     try:
         prior_goal = await db_module.get_pending_goal(db, project_id)
         if prior_goal is not None:
-            # Prior handoff exists and was never consumed — amend in-place.
-            amend_result = await db_module.amend_handoff(db, project_id, content, mode)
+            # Prior handoff exists and was never consumed — amend in-place,
+            # unless this write is unattended and the row belongs to a session.
+            _owned_by_a_session = False
+            if not session_id:
+                _latest = await db_module.get_latest_handoff(db, project_id)
+                _owned_by_a_session = bool(_latest and _latest.get("session_id"))
+            if _owned_by_a_session:
+                amend_result = None
+            else:
+                amend_result = await db_module.amend_handoff(
+                    db, project_id, content, mode
+                )
             if amend_result is not None:
                 amended = True
             else:
@@ -161,7 +191,12 @@ async def _persist_handoff_history_and_pending_goal(
     # instead of a spoofable copy-pasted chat string. Read-once (pop). Fully
     # guarded so a pre-migration DB never breaks handoff generation.
     try:
-        await db_module.set_pending_goal(db, project_id, pending_goal_body)
+        if receiver:
+            await db_module.set_pending_goal(
+                db, project_id, pending_goal_body, receiver=receiver
+            )
+        else:
+            await db_module.set_pending_goal(db, project_id, pending_goal_body)
     except Exception:  # noqa: BLE001
         pass
     return amended
@@ -927,6 +962,7 @@ async def invalidate_handoff(
     *,
     reason: str,
     correction_id: str | None = None,
+    project_id: str | None = None,
 ) -> dict[str, Any] | None:
     """Mark a ``handoffs`` row invalidated/non-executable WITHOUT mutating its body.
 
@@ -938,15 +974,25 @@ async def invalidate_handoff(
     overwrites the reason/correction_id/timestamp with the latest call's
     values. Returns the updated row, or ``None`` if ``handoff_id`` doesn't
     exist.
+
+    ``project_id`` (RT-TI-005 pass 3, F-D5) binds the UPDATE and the returned row to one
+    project: a handoff of another project is left untouched and reads as not found
+    (``None``), exactly like an unknown id. :func:`regenerate_handoff_correction` always
+    passes the correction's own project, so a correction can never invalidate a handoff
+    of a different project. ``None`` keeps the unbound behaviour for internal callers.
     """
     now_expr = "now()" if hasattr(db, "_pool") else "datetime('now')"
-    await db.execute(
+    sql = (
         f"UPDATE handoffs SET invalidated = 1, invalidated_reason = ?, "
-        f"invalidated_at = {now_expr}, superseded_by_correction_id = ? WHERE id = ?",
-        (reason, correction_id, handoff_id),
+        f"invalidated_at = {now_expr}, superseded_by_correction_id = ? WHERE id = ?"
     )
+    params: tuple[Any, ...] = (reason, correction_id, handoff_id)
+    if project_id is not None:
+        sql += " AND project_id = ?"
+        params += (project_id,)
+    await db.execute(sql, params)
     await db.commit()
-    return await db_module.get_handoff(db, handoff_id)
+    return await db_module.get_handoff(db, handoff_id, project_id=project_id)
 
 
 async def record_handoff_correction(
@@ -1015,7 +1061,11 @@ async def record_handoff_correction(
         if existing is not None:
             return _deserialize_correction_row(db_module._row_to_dict(existing))
 
-    source = await db_module.get_handoff(db, source_handoff_id)
+    # RT-TI-005 (pass 3, F-D5) -- the source must be a handoff of THIS project. The lookup
+    # used to be unbound, so a caller scoped to project A could name a handoff of project B
+    # here, record a correction against it and (with regenerate) invalidate it; a handoff of
+    # another project is now indistinguishable from an unknown id (never legitimate).
+    source = await db_module.get_handoff(db, source_handoff_id, project_id=project_id)
     if source is None:
         raise HandoffCorrectionError(
             f"source handoff {source_handoff_id!r} not found — a correction "
@@ -1089,7 +1139,10 @@ async def regenerate_handoff_correction(
     output_dir: str,
     *,
     session_id: str | None = None,
-    mode: str = "full",
+    # 0b0b24d8 — None, not "full": a regenerated revision replaces an
+    # executor-facing handoff, so omission must resolve by intent (see
+    # generate_handoff's ``mode``), not pull in every workspace note.
+    mode: str | None = None,
     **generate_handoff_kwargs: Any,
 ) -> dict[str, Any]:
     """Repair pointers, invalidate the source, and produce a new deterministic revision.
@@ -1136,7 +1189,9 @@ async def regenerate_handoff_correction(
         )
 
     if correction.get("new_handoff_id"):
-        new_handoff = await db_module.get_handoff(db, correction["new_handoff_id"])
+        new_handoff = await db_module.get_handoff(
+            db, correction["new_handoff_id"], project_id=project_id
+        )
         return {
             "correction": correction,
             "regenerated": False,
@@ -1177,6 +1232,7 @@ async def regenerate_handoff_correction(
             f"(blocker: {correction['blocker_classification']})"
         ),
         correction_id=correction_id,
+        project_id=project_id,
     )
 
     # edd9c54b interaction (discovered while building this feature): generate_
@@ -1193,6 +1249,21 @@ async def regenerate_handoff_correction(
     # touched. Best-effort/guarded: a pre-migration DB missing the column
     # must not break regeneration (amend is merely a redundant-row nicety,
     # not a correctness requirement, on such a DB).
+    #
+    # 0527f636 — the pop below also discards the unconsumed goal's receiver
+    # address (it lives in the same cell). Capture it first and re-apply it to
+    # the regenerated handoff, so correcting a handoff that was addressed to a
+    # specific session never silently turns it into an unaddressed
+    # (sibling-stealable) one. An explicit pending_goal_receiver already in
+    # generate_handoff_kwargs wins.
+    try:
+        _prior_receiver = await db_module.get_pending_goal_receiver(db, project_id)
+    except Exception:  # noqa: BLE001
+        _prior_receiver = None
+    if _prior_receiver and "pending_goal_receiver" not in generate_handoff_kwargs:
+        generate_handoff_kwargs = {
+            **generate_handoff_kwargs, "pending_goal_receiver": _prior_receiver,
+        }
     try:
         await db_module.pop_pending_goal(db, project_id)
     except Exception:  # noqa: BLE001
@@ -1306,7 +1377,9 @@ async def load_handoff_correction(
         return None
     new_handoff_content = None
     if row.get("new_handoff_id"):
-        new_handoff = await db_module.get_handoff(db, row["new_handoff_id"])
+        new_handoff = await db_module.get_handoff(
+            db, row["new_handoff_id"], project_id=project_id
+        )
         if new_handoff is not None:
             new_handoff_content = new_handoff.get("body")
     return {**row, "new_handoff_content": new_handoff_content}
@@ -1422,7 +1495,7 @@ async def amend_handoff(
     correction_rationale: "str | None" = None,
     status: str = "draft",
     force_regenerate: bool = False,
-    mode: str = "full",
+    mode: "str | None" = None,  # 0b0b24d8 — see regenerate_handoff_correction
     idempotency_key: "str | None" = None,
     **generate_handoff_kwargs: Any,
 ) -> dict[str, Any]:
@@ -3986,7 +4059,8 @@ def _build_quick_start_goal(
             f"until the wave gate(s) at {_xml_escape(', '.join(_boundaries))} "
             "complete: run the configured action pipeline (push_dev/push_main/"
             "deploy/wait/run_verification) then call complete_wave_gate with the "
-            "real run_verification result. This is enforced at claim time, not "
+            "verification_run_id that run_verification returned (a hand-typed "
+            "result is refused). This is enforced at claim time, not "
             "just this prose note. -->"
         )
     # 83a7586d — DEPENDENCY / FAN-IN BARRIER: exclude items whose frontier
@@ -5627,6 +5701,7 @@ async def _annotate_touches_files(
     if not changed_files:
         return pending_items
 
+    annotated_ids: list[str] = []
     for item in pending_items:
         if item.get("touches_resources"):
             continue
@@ -5660,8 +5735,17 @@ async def _annotate_touches_files(
                 ) as _:
                     pass
                 await db.commit()
+                annotated_ids.append(item["id"])
             except Exception:  # noqa: BLE001
                 pass
+    if annotated_ids:
+        # 8a665a03 -- the inferred resources are written straight to the rows the Queue /
+        # Live tab draws, so bust the list cache and announce once for the whole pass.
+        db_module._invalidate_sprint_items_cache(project_id)
+        db_module._publish_project_event(
+            project_id, "sprint_item_updated",
+            {"item_ids": annotated_ids, "fields": ["touches_resources"]},
+        )
     return pending_items
 
 
@@ -7515,16 +7599,22 @@ async def _persist_sprint_retrospective(
 # ---------------------------------------------------------------------------
 
 _SPRINT_GUARD_SH = """#!/usr/bin/env bash
-# c0d2356d — Claude Code Stop hook (auto-written by generate_handoff). Blocks a
-# session from stopping while this project has pending sprint items. Fails OPEN.
+# c0d2356d -- Claude Code Stop hook (auto-written by generate_handoff). Blocks an
+# EXECUTOR session from stopping while this project has pending sprint items. Fails OPEN.
 # This is NOT hooks.sh (the token-rotation installer).
-# b4ce3274 — bounded retry ceiling: the server stops reporting pending>0 for a
+# b4ce3274 -- bounded retry ceiling: the server stops reporting pending>0 for a
 # session after MERIDIAN_STOP_OVERRIDE_CEILING forced continuations, so this
 # guard then lets the stop through (exit 0) instead of blocking forever.
-# e2e1b682 — verification_pending_count is ADVISORY ONLY: it surfaces items
+# e2e1b682 -- verification_pending_count is ADVISORY ONLY: it surfaces items
 # flagged require_verification that are still missing an independent
 # fresh-session PASS, but never changes the exit code (only
 # complete_sprint_item's structural gate blocks the completion itself).
+# 55d48d69 fix round 1 (mirrors sprint_guard.ps1): only a session that claimed a
+# sprint item (a claim_sprint_item tool call in its own transcript) is held back;
+# curl gets a 1 s connect timeout; a03c0eeb's worktree sweep trigger was REMOVED
+# (the server's sweep force-removes terminal worktrees, dirty ones included, and
+# already runs periodically there); the owner kill switch (MERIDIAN_GUARD=off|advisory,
+# guard.off / guard.advisory, MERIDIAN_GUARD_DISABLE=sprint_guard) never blocks.
 set -uo pipefail
 PROJECT_ID="__PROJECT_ID__"
 MERIDIAN_URL="${MERIDIAN_URL:-__URL__}"
@@ -7532,18 +7622,55 @@ payload="$(cat 2>/dev/null || true)"
 if printf '%s' "$payload" | grep -Eq '"stop_hook_active"[[:space:]]*:[[:space:]]*true'; then
   exit 0
 fi
-# b4ce3274 — forward the session id (if the hook payload carries one) so the
+
+mode=enforce
+_raw="$(printf '%s' "${MERIDIAN_GUARD:-}" | tr '[:upper:]' '[:lower:]' | tr -d '[:space:]')"
+[ -n "$_raw" ] && [ "$_raw" != "enforce" ] && mode=advisory
+[ -z "$_raw" ] && [ "$(printf '%s' "${MERIDIAN_GUARD_DEFAULT_MODE:-}" | tr '[:upper:]' '[:lower:]' | tr -d '[:space:]')" = "advisory" ] && mode=advisory
+[ "$_raw" = "off" ] && mode=off
+for _tok in $(printf '%s' "${MERIDIAN_GUARD_DISABLE:-}" | tr ',;' '  ' | tr '[:upper:]' '[:lower:]'); do
+  [ "$_tok" = "sprint_guard" ] && mode=off
+done
+if [ -n "${LOCALAPPDATA:-}" ]; then _gd="$LOCALAPPDATA/meridian/guard"
+elif [ -n "${USERPROFILE:-}" ]; then _gd="$USERPROFILE/AppData/Local/meridian/guard"
+else _gd="${XDG_STATE_HOME:-${HOME:-/nonexistent}/.local/state}/meridian/guard"
+fi
+if [ "$mode" != "off" ]; then
+  if [ -f "$_gd/guard.off" ]; then mode=off; elif [ -f "$_gd/guard.advisory" ]; then mode=advisory; fi
+fi
+[ "$mode" = "off" ] && exit 0
+
+# Only an executor session -- one that claimed a sprint item -- is held back.
+tp="$(printf '%s' "$payload" | grep -oE '"transcript_path"[[:space:]]*:[[:space:]]*"([^"\\\\]|\\\\.)*"' | head -1 | sed -E 's/^"transcript_path"[[:space:]]*:[[:space:]]*"//; s/"$//')"
+tp="${tp//\\\\\\\\/\\\\}"
+[ -n "$tp" ] && [ -f "$tp" ] || exit 0
+grep -qE '"name"[[:space:]]*:[[:space:]]*"mcp__[^"]*__claim_sprint_item"' "$tp" 2>/dev/null || exit 0
+
+# b4ce3274 -- forward the session id (if the hook payload carries one) so the
 # override budget is counted per session, not per project.
 sid="$(printf '%s' "$payload" | grep -oE '"session_id"[[:space:]]*:[[:space:]]*"[^"]*"' | head -1 | sed -E 's/.*"session_id"[[:space:]]*:[[:space:]]*"([^"]*)".*/\\1/' || true)"
 url="$MERIDIAN_URL/projects/$PROJECT_ID/sprint/pending_count"
 [ -n "$sid" ] && url="$url?session_id=$sid"
-# 41f26499 — a Meridian-unreachable window (or a malformed/empty response)
+# Hosted instances require a bearer token. Read it from the hook environment,
+# validate it, and pass it to curl through stdin config so it never appears in
+# the process arguments or this hook's output.
+_auth_token="${MERIDIAN_TOKEN:-${BEARER_TOKEN:-}}"
+_auth_config=""
+if [[ "$_auth_token" =~ ^[A-Za-z0-9._~+/-]+=*$ ]]; then
+  _auth_quote='"'
+  _auth_config="header = ${_auth_quote}Authorization: Bearer ${_auth_token}${_auth_quote}"
+fi
+# 41f26499 -- a Meridian-unreachable window (or a malformed/empty response)
 # used to fail open SILENTLY here, which could abandon this session's file
 # claims with no visible signal (they then only clear via the file-claim 2h
 # TTL). Fail-open behavior is UNCHANGED (still exit 0) but now surfaces a
 # clear stderr warning so the human/agent notices instead of silently
 # continuing.
-resp="$(curl -sf --max-time 5 "$url" 2>/dev/null || true)"
+if [ -n "$_auth_config" ]; then
+  resp="$(printf '%s\\n' "$_auth_config" | curl -sf --connect-timeout 1 --max-time 5 --config - "$url" 2>/dev/null || true)"
+else
+  resp="$(curl -sf --connect-timeout 1 --max-time 5 "$url" 2>/dev/null || true)"
+fi
 if [ -z "$resp" ]; then
   echo "Meridian (41f26499): could not reach $MERIDIAN_URL to check pending sprint items - allowing stop (fail-open). WARNING: any file claims held by this session will NOT be released and will only clear via the 2h claim TTL; release them manually (release_file) once Meridian is reachable again." >&2
   exit 0
@@ -7554,66 +7681,132 @@ if [ -z "$pending" ]; then
   exit 0
 fi
 if [ "$pending" -gt 0 ] 2>/dev/null; then
-  echo "Meridian: $pending sprint item(s) still pending — complete or skip them (complete_sprint_item) before stopping." >&2
+  if [ "$mode" = "advisory" ]; then
+    echo "[advisory, not blocked] Meridian: $pending sprint item(s) still pending - complete or skip them (complete_sprint_item) before stopping." >&2
+    exit 0
+  fi
+  echo "Meridian: $pending sprint item(s) still pending - complete or skip them (complete_sprint_item) before stopping." >&2
   exit 2
 fi
-# pending==0: either genuinely done, or the stop-override ceiling was reached —
+# pending==0: either genuinely done, or the stop-override ceiling was reached --
 # surface the ceiling case so the human/agent knows to generate a delta handoff.
 if printf '%s' "$resp" | grep -Eq '"stopped_at_ceiling"[[:space:]]*:[[:space:]]*true'; then
-  echo "Meridian: stop-override ceiling reached — allowing stop despite pending items; generate a delta handoff." >&2
+  echo "Meridian: stop-override ceiling reached - allowing stop despite pending items; generate a delta handoff." >&2
 fi
 verpending="$(printf '%s' "$resp" | grep -oE '"verification_pending_count"[[:space:]]*:[[:space:]]*[0-9]+' | grep -oE '[0-9]+$' || true)"
 if [ -n "$verpending" ] && [ "$verpending" -gt 0 ] 2>/dev/null; then
   echo "Meridian: $verpending item(s) require an independent fresh-session PASS/FAIL verification before their completion can stick (require_verification=true, no independent PASS on file yet)." >&2
 fi
-# a03c0eeb - the moment the guard is about to let a stop through is the
-# natural post-integration point (this session has no pending sprint items
-# left): fire a best-effort real disk cleanup pass for this project's git
-# worktrees so items that already merged/finished don't leave orphaned
-# worktree dirs behind. Self-hosted only server-side (see worktree_cleanup.py
-# module docstring); fire-and-forget here, never blocks or fails the stop.
-curl -sf --max-time 5 -X POST "$MERIDIAN_URL/projects/$PROJECT_ID/worktrees/sweep" >/dev/null 2>&1 || true
 exit 0
 """
 
-_SPRINT_GUARD_PS1 = """# c0d2356d — Claude Code Stop hook (auto-written by generate_handoff). Blocks a
-# session from stopping while this project has pending sprint items. Fails OPEN.
+_SPRINT_GUARD_PS1 = """# c0d2356d -- Claude Code Stop hook (auto-written by generate_handoff). Blocks an
+# EXECUTOR session from stopping while this project has pending sprint items. Fails OPEN.
 # This is NOT hooks.ps1 (the token-rotation installer).
-# b4ce3274 — bounded retry ceiling: after MERIDIAN_STOP_OVERRIDE_CEILING forced
+# b4ce3274 -- bounded retry ceiling: after MERIDIAN_STOP_OVERRIDE_CEILING forced
 # continuations the server reports pending 0 + stopped_at_ceiling, so this guard
 # lets the stop through instead of blocking forever.
-# e2e1b682 — verification_pending_count is ADVISORY ONLY: it surfaces items
+# e2e1b682 -- verification_pending_count is ADVISORY ONLY: it surfaces items
 # flagged require_verification that are still missing an independent
 # fresh-session PASS, but never changes the exit code (only
 # complete_sprint_item's structural gate blocks the completion itself).
+# 55d48d69 fix round 1 (the launcher fix made this hook's exit 2 real):
+# - Only a session that claimed a sprint item (a claim_sprint_item tool call in its
+#   own transcript) is held back. The server's pending count is project-wide, so
+#   planner, Q&A and review sessions stop freely -- and without any network call.
+# - The server is probed with a 300 ms TCP connect first: a down server (the
+#   default state) no longer costs ~5 s at every turn end.
+# - a03c0eeb's worktree sweep trigger was REMOVED from this hook: the server's
+#   sweep force-removes worktrees whose item or session is terminal, dirty ones
+#   holding uncommitted work included, and it already runs periodically there.
+# - The owner kill switch (MERIDIAN_GUARD=off|advisory, guard.off / guard.advisory,
+#   MERIDIAN_GUARD_DISABLE=sprint_guard) covers this hook: off and advisory never block.
+# Pure ASCII: PS 5.1 reads BOM-less UTF-8 as cp1252.
 $ErrorActionPreference = 'SilentlyContinue'
 $ProjectId = '__PROJECT_ID__'
 $Url = if ($env:MERIDIAN_URL) { $env:MERIDIAN_URL } else { '__URL__' }
 $raw = [Console]::In.ReadToEnd()
 try { $payload = $raw | ConvertFrom-Json } catch { $payload = $null }
 if ($payload -and $payload.stop_hook_active -eq $true) { exit 0 }
-# b4ce3274 — forward the session id (when present) so the override budget is
+
+function Get-GuardMode([string]$HookName) {
+    $gm = ([string]$env:MERIDIAN_GUARD).Trim().ToLowerInvariant()
+    if ($gm -eq 'off') { return 'off' }
+    $mode = if ($gm -eq '' -or $gm -eq 'enforce') { 'enforce' } else { 'advisory' }
+    if ($gm -eq '' -and ([string]$env:MERIDIAN_GUARD_DEFAULT_MODE).Trim().ToLowerInvariant() -eq 'advisory') { $mode = 'advisory' }
+    foreach ($tok in ([string]$env:MERIDIAN_GUARD_DISABLE -split '[\\s,;]+')) {
+        if ($tok.Trim().ToLowerInvariant() -eq $HookName) { return 'off' }
+    }
+    $gd = $null
+    if ($env:LOCALAPPDATA) { $gd = [System.IO.Path]::Combine($env:LOCALAPPDATA, 'meridian', 'guard') }
+    elseif ($env:USERPROFILE) { $gd = [System.IO.Path]::Combine($env:USERPROFILE, 'AppData', 'Local', 'meridian', 'guard') }
+    if ($gd) {
+        if ([System.IO.File]::Exists([System.IO.Path]::Combine($gd, 'guard.off'))) { return 'off' }
+        if ([System.IO.File]::Exists([System.IO.Path]::Combine($gd, 'guard.advisory'))) { return 'advisory' }
+    }
+    return $mode
+}
+
+# Resolve MERIDIAN_URL to a base URL whose TCP port answers within the timeout, or $null.
+function Resolve-LiveUrl([string]$Base, [int]$TimeoutMs = 300) {
+    try { $u = [System.Uri]$Base } catch { return $null }
+    $hostName = $u.Host
+    $cands = if ($hostName -eq 'localhost') { @('127.0.0.1', '::1') } else { @($hostName) }
+    foreach ($h in $cands) {
+        $fam = if ($h -eq '::1' -or $h.StartsWith('[')) { [System.Net.Sockets.AddressFamily]::InterNetworkV6 } else { [System.Net.Sockets.AddressFamily]::InterNetwork }
+        $c = $null
+        try {
+            $c = [System.Net.Sockets.TcpClient]::new($fam)
+            $ar = $c.BeginConnect($h.Trim('[', ']'), $u.Port, $null, $null)
+            if ($ar.AsyncWaitHandle.WaitOne($TimeoutMs) -and $c.Connected) {
+                $c.EndConnect($ar)
+                if ($hostName -ne 'localhost') { return $Base.TrimEnd('/') }
+                $lit = if ($h -eq '::1') { '[::1]' } else { $h }
+                return ($u.Scheme + '://' + $lit + ':' + $u.Port + $u.AbsolutePath.TrimEnd('/'))
+            }
+        } catch { } finally { if ($c) { $c.Close() } }
+    }
+    return $null
+}
+
+$mode = Get-GuardMode 'sprint_guard'
+if ($mode -eq 'off') { exit 0 }
+
+# Only an executor session -- one that claimed a sprint item -- is held back.
+$claimed = $false
+$tp = if ($payload) { [string]$payload.transcript_path } else { '' }
+if ($tp -and [System.IO.File]::Exists($tp)) {
+    try { $claimed = [bool](Select-String -LiteralPath $tp -Pattern '"name"\\s*:\\s*"mcp__[^"]*__claim_sprint_item"' -Quiet) } catch { $claimed = $false }
+}
+if (-not $claimed) { exit 0 }
+
+# 41f26499 -- a Meridian-unreachable window (or a malformed/empty response)
+# used to fail open SILENTLY here, which could abandon this session's file
+# claims with no visible signal (they then only clear via the file-claim 2h
+# TTL). Fail-open behavior is UNCHANGED (still exit 0) but surfaces a clear
+# stderr warning so the human/agent notices instead of silently continuing.
+$live = Resolve-LiveUrl $Url
+if (-not $live) {
+    [Console]::Error.WriteLine("Meridian (41f26499): could not reach $Url to check pending sprint items - allowing stop (fail-open). WARNING: any file claims held by this session will NOT be released and will only clear via the 2h claim TTL; release them manually (release_file) once Meridian is reachable again.")
+    exit 0
+}
+# b4ce3274 -- forward the session id (when present) so the override budget is
 # counted per session, not per project.
-# 41f26499 — MUST use ${reqUrl} (braced) here, not bare $reqUrl: PowerShell
+# 41f26499 -- MUST use ${reqUrl} (braced) here, not bare $reqUrl: PowerShell
 # treats "?" as a legal bare-variable-name character, so "$reqUrl?session_id="
 # parsed as the (nonexistent, empty) variable $reqUrl?session_id followed by
-# literal "=", silently dropping the whole base URL and producing an invalid
-# URI. That sent Invoke-RestMethod down the catch branch below on every stop
-# with a session_id present -- i.e. always -- making this whole endpoint a
-# silent no-op on Windows. Caught while adding the warning below, which would
-# otherwise have falsely reported "server unreachable" on every normal stop.
-$reqUrl = "$Url/projects/$ProjectId/sprint/pending_count"
+# literal "=", silently dropping the whole base URL and producing an invalid URI.
+$reqUrl = "$live/projects/$ProjectId/sprint/pending_count"
 if ($payload -and $payload.session_id) {
     $reqUrl = "${reqUrl}?session_id=$([uri]::EscapeDataString([string]$payload.session_id))"
 }
-# 41f26499 — a Meridian-unreachable window (or a malformed/empty response)
-# used to fail open SILENTLY here, which could abandon this session's file
-# claims with no visible signal (they then only clear via the file-claim 2h
-# TTL). Fail-open behavior is UNCHANGED (still exit 0) but now surfaces a
-# clear stderr warning so the human/agent notices instead of silently
-# continuing.
+$authHeaders = @{}
+$authToken = if ($env:MERIDIAN_TOKEN) { [string]$env:MERIDIAN_TOKEN } else { [string]$env:BEARER_TOKEN }
+if ($authToken -match '^[A-Za-z0-9._~+/-]+=*$') {
+    $authHeaders["Authorization"] = "Bearer $authToken"
+}
 try {
-    $r = Invoke-RestMethod -Method GET -Uri $reqUrl -TimeoutSec 5
+    $r = Invoke-RestMethod -Method GET -Uri $reqUrl -Headers $authHeaders -TimeoutSec 5
 } catch {
     [Console]::Error.WriteLine("Meridian (41f26499): could not reach $Url to check pending sprint items - allowing stop (fail-open). WARNING: any file claims held by this session will NOT be released and will only clear via the 2h claim TTL; release them manually (release_file) once Meridian is reachable again.")
     exit 0
@@ -7624,7 +7817,9 @@ if ($null -eq $r -or $null -eq $r.pending_count) {
 }
 $pending = [int]$r.pending_count
 if ($pending -gt 0) {
-    [Console]::Error.WriteLine("Meridian: $pending sprint item(s) still pending - complete or skip them (complete_sprint_item) before stopping.")
+    $msg = "Meridian: $pending sprint item(s) still pending - complete or skip them (complete_sprint_item) before stopping."
+    if ($mode -eq 'advisory') { [Console]::Error.WriteLine('[advisory, not blocked] ' + $msg); exit 0 }
+    [Console]::Error.WriteLine($msg)
     exit 2
 }
 if ($r.stopped_at_ceiling -eq $true) {
@@ -7633,15 +7828,6 @@ if ($r.stopped_at_ceiling -eq $true) {
 if ($null -ne $r.verification_pending_count -and [int]$r.verification_pending_count -gt 0) {
     [Console]::Error.WriteLine("Meridian: $([int]$r.verification_pending_count) item(s) require an independent fresh-session PASS/FAIL verification before their completion can stick (require_verification=true, no independent PASS on file yet).")
 }
-# a03c0eeb - the moment the guard is about to let a stop through is the
-# natural post-integration point (this session has no pending sprint items
-# left): fire a best-effort real disk cleanup pass for this project's git
-# worktrees so items that already merged/finished don't leave orphaned
-# worktree dirs behind. Self-hosted only server-side (see worktree_cleanup.py
-# module docstring); fire-and-forget here, never blocks or fails the stop.
-try {
-    Invoke-RestMethod -Method POST -Uri "$Url/projects/$ProjectId/worktrees/sweep" -TimeoutSec 5 | Out-Null
-} catch { }
 exit 0
 """
 
@@ -11958,8 +12144,9 @@ async def generate_handoff(
     *,
     summarizer: object | None = None,
     skip_ai_summary: bool = False,
-    mode: str = "full",
+    mode: str | None = None,
     session_id: str | None = None,
+    window_session_id: str | None = None,
     commit_messages: list[str] | None = None,
     graph_searcher: Callable[[str], Any] | None = None,
     pointer_symbol_resolver: Callable[..., Any] | None = None,
@@ -11988,8 +12175,73 @@ async def generate_handoff(
     research_evidence_envelope: Any = None,
     proposal_scope: "dict[str, Any] | None" = None,
     goal_string_out: "dict[str, Any] | None" = None,
+    pending_goal_receiver: "dict[str, Any] | None" = None,
+    refresh_retrospective: bool = False,
+    include_workspace: bool = True,
 ) -> tuple[str, str, bool]:
     """Fetch all state, render the L0/L1/L2 template, write the file, return both.
+
+    ``mode`` (0b0b24d8, extends aec043cb) — ``None`` (the default) means "the
+    caller did not say", and is resolved through the SAME intent logic the
+    MCP/HTTP transports use (:func:`resolve_handoff_mode`: a session that
+    already produced a handoff -> ``delta``; anything else -> the bounded
+    ``goal``), so omitting it can never mean ``full``. aec043cb made that true
+    for the transports, but this Python default was still ``"full"`` — and
+    ``full`` is the only mode that prepends every cross-project workspace
+    decision AND note, so every internal caller that simply left ``mode`` off
+    (session-close auto-save, the idle-expire loop, proposal promotion)
+    silently inherited the archival dump. ``mode="full"`` stays fully
+    available, but only as an explicit request. An unrecognized string still
+    raises ``ValueError`` below rather than degrading quietly.
+
+    ``window_session_id`` (0b0b24d8) — ``mode="delta"`` only; ``None`` by
+    default (zero change for every caller). Bounds the "Completed since last
+    handoff" list, and scopes the session-span footer, to this session's
+    window (its last handoff, else its own start) WITHOUT attributing the
+    handoff to it. ``session_id`` does both jobs at once: it also becomes the
+    row's owner, the session's "last handoff" anchor, its resumed-session
+    marker (an omitted mode from it then resolves to ``delta``) and the point
+    its goal compliance is recorded. That is right for the session's own
+    handoff and wrong for an unattended background write: the session-close
+    auto-save and the idle-expire loop run while the session can still resume,
+    and a later explicit delta from it would then start its list at the
+    auto-save and silently drop the work completed before it. Those two
+    callers pass ``window_session_id`` instead. ``session_id`` wins when both
+    are given. A write with no ``session_id`` is also never allowed to amend
+    (edd9c54b) a handoffs row that a session owns -- see
+    :func:`_persist_handoff_history_and_pending_goal`.
+
+    ``refresh_retrospective`` (0b0b24d8) -- ``mode="delta"`` only; ``False`` by
+    default (zero change for every caller, including an explicit delta and
+    ``checkpoint()``, which stay free of the retrospective step per 4c7cd788).
+    The two unattended session-end writers (the session-close auto-save and the
+    idle-expire loop) pass ``True``: they used to inherit ``mode="full"``, whose
+    retrospective step (aef94e4a) refreshed the project's Sprint Retrospective
+    note on every session end, and moving them to ``delta`` silently stopped
+    that. ``True`` runs just that one step for a delta. It never makes delta
+    run the other two Haiku seams, and it never brings back the workspace
+    notes. With ``skip_ai_summary`` it uses the deterministic body and makes no
+    network call, so it needs no API key; without it, it behaves exactly as it
+    did for the old ``full`` default (Haiku when a key is configured, the same
+    deterministic body otherwise).
+
+    ``pending_goal_receiver`` (0527f636) — optional, ``None`` by default (every
+    pre-existing call site: zero behaviour change). An object with any subset
+    of ``session_name`` / ``role`` / ``worktree`` naming the session this
+    handoff is FOR. ``projects.pending_goal`` is one read-once slot per
+    project, and before this argument existed ANY sibling ``start_session``
+    popped it — so a parallel session (another executor, a verifier subagent,
+    a resumed session) could silently consume a handoff addressed to a
+    different session and leave the intended receiver with nothing. When
+    given, the persisted ``pending_goal`` (``full``/``delta``/``goal`` modes —
+    the only ones that persist it) is delivered, and cleared, ONLY to a
+    ``start_session`` whose ``session_name`` / ``role`` / ``cwd`` match EVERY
+    given field; any other session neither receives nor consumes it, and the
+    stored handoff stays readable through the idempotent ``load_handoff``.
+    Validated up front (a non-object, unknown key, non-string or over-long
+    field raises ``ValueError`` before anything is rendered or persisted) so
+    a mistyped address can never silently degrade to an unaddressed handoff.
+    Ignored by the non-persisting ``planner``/``starter``/``compact`` modes.
 
     ``emit_manifest`` (acf6f51a) — opt-in, defaults to False (zero behaviour
     change for every existing caller). Currently wired for ``mode="goal"``
@@ -12401,9 +12653,18 @@ async def generate_handoff(
     ``evidence_status``'s own documented mode gap above. A caller that never
     passes ``proposal_scope`` sees zero functional change.
     """
+    if mode is None:
+        # 0b0b24d8 — omission is intent-resolved, never a silent 'full'.
+        mode = resolve_handoff_mode(None, session_id)
     project = await db_module.get_project(db, project_id)
     if project is None:
         raise ValueError(f"project not found: {project_id}")
+    # 0527f636 — validate/canonicalise the receiver address BEFORE anything is
+    # rendered or persisted: a bad address must raise, never silently persist
+    # as an unaddressed (sibling-stealable) handoff. None -> unaddressed.
+    _pending_goal_receiver = db_module.normalize_pending_goal_receiver(
+        pending_goal_receiver
+    )
     # 248c0bb9 — resolve the mode-aware max_content_bytes default ONCE, before
     # any mode branch below. An explicit argument (any int, or None to opt out
     # of budgeting) always wins — see the docstring above.
@@ -12574,6 +12835,7 @@ async def generate_handoff(
         # here: the entire goal-only body IS the /goal snippet.
         _g_amended = await _persist_handoff_history_and_pending_goal(
             db, project_id, "goal", _g_content, session_id, _g_content,
+            receiver=_pending_goal_receiver,
         )
         return (
             _g_path,
@@ -12648,7 +12910,9 @@ async def generate_handoff(
     # No allowlisted "workspace-policy" channel exists yet for delta/goal/
     # starter/planner to opt into a narrow slice of this — see the aec043cb
     # item notes point 4; until one exists, the answer is "none survives".
-    if mode == "full":
+    # include_workspace=False (a project-scoped caller) keeps the owner's workspace
+    # records out of the document, exactly as the non-full modes do.
+    if mode == "full" and include_workspace:
         workspace_decisions = await db_module.get_workspace_decisions(db)
         workspace_notes = await db_module.get_workspace_notes(db)
     else:
@@ -13306,6 +13570,11 @@ async def generate_handoff(
             goal = {**goal, "sprint": f"{_effective_version} — {_version_desc}"}
             _sprint_stale = None
 
+    # 0b0b24d8 — whose window bounds a delta: the owning session, else the
+    # session a background writer named for the bound only (see the
+    # ``window_session_id`` docstring). Reads only: nothing below records
+    # this id, so a background write is never the session's "last handoff".
+    _window_sid = session_id or window_session_id
     if mode == "delta":
         # 00dbeed0 — since_ts MUST be durable, not the in-memory
         # _SESSION_HANDOFF_STATE dict, which is a plain per-process Python dict:
@@ -13321,11 +13590,11 @@ async def generate_handoff(
         # run BEFORE this call's own record_handoff() below, or it would see
         # itself. Fail-open to the in-memory value (then None) on any DB error
         # so a lookup failure degrades to "full history" rather than raising.
-        since_ts = _SESSION_HANDOFF_STATE.get(session_id, None) if session_id else None
-        if session_id:
+        since_ts = _SESSION_HANDOFF_STATE.get(_window_sid, None) if _window_sid else None
+        if _window_sid:
             try:
                 _prior = await db_module.get_handoffs(
-                    db, project_id, limit=1, session_id=session_id
+                    db, project_id, limit=1, session_id=_window_sid
                 )
                 if _prior:
                     since_ts = _prior[0].get("created_at") or since_ts
@@ -13345,8 +13614,8 @@ async def generate_handoff(
         # completed_items cap below (mirroring bc834237's pending cap) is a
         # second, independent bound for pathological cases (e.g. a long-lived
         # session that has been open for weeks).
-        if since_ts is None and session_id:
-            _sess_row = next((s for s in sessions if s.get("id") == session_id), None)
+        if since_ts is None and _window_sid:
+            _sess_row = next((s for s in sessions if s.get("id") == _window_sid), None)
             if _sess_row:
                 since_ts = _sess_row.get("created_at")
         completed_items = [
@@ -13458,10 +13727,10 @@ async def generate_handoff(
     # keeps the project-wide span (it IS a whole-project state dump), but delta
     # is a per-session update, so scope its footer to just this session: only
     # this session's own task_log rows plus its own created_at/last_seen.
-    if mode == "delta" and session_id:
-        _span_sess_row = next((s for s in sessions if s.get("id") == session_id), None)
+    if mode == "delta" and _window_sid:
+        _span_sess_row = next((s for s in sessions if s.get("id") == _window_sid), None)
         _span_timestamps = [
-            t.get("created_at") for t in tasks if t.get("session_id") == session_id
+            t.get("created_at") for t in tasks if t.get("session_id") == _window_sid
         ]
         if _span_sess_row:
             _span_timestamps += [
@@ -13588,6 +13857,7 @@ async def generate_handoff(
     # mode can reuse it too. See that function's own docstring.
     _amended = await _persist_handoff_history_and_pending_goal(
         db, project_id, mode, content, session_id, quick_start_goal,
+        receiver=_pending_goal_receiver,
     )
     # 5abf3e12 — measure & persist this session's goal compliance (did its /goal
     # item list get fully complete_sprint_item()'d?) at the canonical session-end
@@ -13608,17 +13878,29 @@ async def generate_handoff(
     # 4c7cd788 — also skipped for mode='delta': it makes another network Haiku
     # call, and a full AI retrospective does not belong on every lightweight delta /
     # checkpoint (it's a full/session-end concern). Same hang class as _ai_summary.
-    if not _ai_disabled:
+    # 0b0b24d8 — "a full/session-end concern" is exactly what the two unattended
+    # session-end writers are, and they only became delta when this lane stopped
+    # them inheriting 'full': refresh_retrospective=True lets them keep running
+    # this one step (and only this one: the summary fan-out and ai_summary above
+    # stay off for delta). skip_ai_summary then means "deterministic body, no
+    # network" instead of "no retrospective", so it needs no API key.
+    _retro_for_delta = mode == "delta" and refresh_retrospective
+    if not _ai_disabled or _retro_for_delta:
         try:
             retro_completed = [
                 it for it in sprint_items_all
                 if it.get("status") in {"done", "skipped", "failed", "pushed"}
             ]
             if retro_completed:
-                retro_text = await _generate_sprint_retrospective(
-                    retro_completed, pinned_decisions, goal.get("sprint"),
-                    summarizer=summarizer,
-                )
+                if skip_ai_summary:
+                    retro_text = _render_retro_fallback(
+                        retro_completed, goal.get("sprint")
+                    )
+                else:
+                    retro_text = await _generate_sprint_retrospective(
+                        retro_completed, pinned_decisions, goal.get("sprint"),
+                        summarizer=summarizer,
+                    )
                 await _persist_sprint_retrospective(
                     db, project_id, goal.get("sprint"), retro_text,
                     version=goal.get("version"),

@@ -329,11 +329,10 @@ async def test_process_death_releases_lease_via_reconciliation(db, project, sess
     stale = await db_module.get_in_progress_tasks_with_pid(db)
     matched = [t for t in stale if t["id"] == task["id"]]
     assert len(matched) == 1
+    from meridian.pid_probe import pid_is_alive
     for t in matched:
         pid = t["worker_pid"]
-        try:
-            os.kill(int(pid), 0)
-        except (ProcessLookupError, PermissionError, OSError):
+        if not pid_is_alive(int(pid)):
             await db_module.update_task(
                 db, t["id"], status="failed",
                 description=f"[claude-error] worker process died unexpectedly (PID {pid})",

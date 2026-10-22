@@ -14,6 +14,12 @@ from __future__ import annotations
 
 from typing import FrozenSet
 
+from .tool_catalog import (
+    LEAN_PROFILE,
+    LEAN_PROFILE_TOOL_NAMES,
+    ROLE_PROFILE_TOOL_NAMES,
+)
+
 
 OPENAI_PUBLIC_PROFILE = "openai"
 
@@ -82,6 +88,7 @@ OPENAI_PUBLIC_TOOL_NAMES: FrozenSet[str] = frozenset(
         "paper_search",
         "social_search",
         "github_search",
+        "zotero_search",
         "search_synthesis",
         "get_capability_manifest",
         "get_effective_capability_profile",
@@ -94,6 +101,8 @@ OPENAI_PUBLIC_TOOL_NAMES: FrozenSet[str] = frozenset(
 
 _PROFILES: dict[str, FrozenSet[str]] = {
     OPENAI_PUBLIC_PROFILE: OPENAI_PUBLIC_TOOL_NAMES,
+    LEAN_PROFILE: LEAN_PROFILE_TOOL_NAMES,
+    **ROLE_PROFILE_TOOL_NAMES,
 }
 
 

@@ -62,7 +62,9 @@ Quick setup (30 seconds):
 Or use the hosted SSE endpoint (no install):
   Name: meridian
   URL:  ${HOSTED}
-  Add to your MCP client config and you're done.
+  Auth: required. Send "Authorization: Bearer sk_meridian_..." (an API token
+        from https://usemeridian.us/dashboard), or sign in with OAuth if your
+        MCP client supports it.
 
 Docs: https://docs.usemeridian.us
 `);

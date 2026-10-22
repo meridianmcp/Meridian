@@ -1,0 +1,60 @@
+{
+  "meta": {
+    "journal": "springer",
+    "display_name": "Springer Nature journals (generic/journal-agnostic guidelines)",
+    "publisher": "Springer Nature",
+    "status": "populated",
+    "status_detail": "Mechanically migrated 2026-09-18 from the JOURNAL_STYLE_PRESETS dict literal in docs_intel.py (round 2, proposal 64266f13, dated 2026-09-11) as part of the JSON-preset externalization work (proposal 3b93b7ef) -- values and evidence carried over verbatim from the real in-code comment, not regenerated. Springer Nature generic/journal-agnostic manuscript guidelines -- round-2 proposal 64266f13 names this preset 'springer_general'; this codebase uses the shorter 'springer' key per this sprint item's own naming instructions. Distinct from the deeply-verified 'jcshm' preset, which is one specific Springer journal.",
+    "last_verified": "2026-09-11"
+  },
+  "fields": {
+    "citation_style": {
+      "value": "not_fixed",
+      "tier": 2,
+      "source": {
+        "type": "live_guidelines_page",
+        "citation": "springernature.com/gp/authors manuscript guidelines; link.springer.com submission-guidelines pages",
+        "note": "citations may be author-date ('Harvard system') or numbered, depending on the journal -- an explicit defers-to-the-individual-journal fact, hence not_fixed."
+      },
+      "verified_date": "2026-09-11"
+    },
+    "heading_levels_max": {
+      "value": 3,
+      "tier": 2,
+      "source": {
+        "type": "live_guidelines_page",
+        "citation": "springernature.com/gp/authors manuscript guidelines; link.springer.com submission-guidelines pages",
+        "quote": "no more than three levels of displayed headings"
+      },
+      "verified_date": "2026-09-11"
+    },
+    "figure_dpi_minimum_halftone": {
+      "value": 300,
+      "tier": 2,
+      "source": {
+        "type": "live_guidelines_page",
+        "citation": "springernature.com/gp/authors manuscript guidelines; link.springer.com submission-guidelines pages"
+      },
+      "verified_date": "2026-09-11"
+    },
+    "figure_dpi_minimum_line_art": {
+      "value": 800,
+      "tier": 2,
+      "source": {
+        "type": "live_guidelines_page",
+        "citation": "springernature.com/gp/authors manuscript guidelines; link.springer.com submission-guidelines pages",
+        "note": "preferably 1200 dpi; 800 used as the stated floor."
+      },
+      "verified_date": "2026-09-11"
+    },
+    "figure_dpi_minimum_combination": {
+      "value": 600,
+      "tier": 2,
+      "source": {
+        "type": "live_guidelines_page",
+        "citation": "springernature.com/gp/authors manuscript guidelines; link.springer.com submission-guidelines pages"
+      },
+      "verified_date": "2026-09-11"
+    }
+  }
+}

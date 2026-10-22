@@ -81,6 +81,23 @@ def test_catalog_covers_every_builtin_plugin():
     bundled_names = {t["name"] for t in tp.bundled_plugin_tools()}
     assert bundled_names == set(tp.builtin_names())
 
+    # meridian-latex is served by its own built-in route; keep its catalog entry
+    # in sync with the launcher and the real MCP engine inventory.
+    latex = next(t for t in tp.bundled_plugin_tools() if t["name"] == "meridian-latex")
+    assert (latex["package"], latex["runtime"], latex["slot"], latex["owner_item"]) == (
+        "@meridianmcp/mcp", "npx", "latex", None
+    )
+    listed_tools = latex["description"].split("Engine tools: ", 1)[1].rstrip(".").split(", ")
+    assert set(listed_tools) == {
+        "outline_tex", "outline_tex_file", "claim_node", "lease_document",
+        "release_claim", "get_live_claims", "record_provenance", "list_provenance",
+        "mark_provenance_synced", "lookup_citation_key", "list_project_docs",
+        "pull_doc_expanded", "get_bibliography", "expand_section_aliases",
+        "list_local_snapshots", "overleaf_login_status", "list_citation_keys",
+        "snapshot_document", "lint_tex", "lint_tex_file", "get_style_guide",
+        "check_section_style", "lookup_published_framing",
+    }
+
 
 def test_bundled_slots_match_the_builtin_plugin_slots():
     # Each bundled catalog entry's slot matches that plugin's actual built-in slot

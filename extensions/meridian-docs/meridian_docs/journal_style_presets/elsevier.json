@@ -1,0 +1,61 @@
+{
+  "meta": {
+    "journal": "elsevier",
+    "display_name": "Elsevier journals (general Guide for Authors)",
+    "publisher": "Elsevier",
+    "status": "partially_populated",
+    "status_detail": "Round 1 (workspace proposal 3674c0c1) migration. si_reformatting_policy and the three figure_dpi_minimum_* keys were independently verified 2026-09-11 against Elsevier's own elsevier.com/subject/next/guide-for-authors and artwork-FAQ pages. emphasis_style carries a CAVEAT inherited from proposal 3674c0c1, not independently re-verified in that pass: its original citation was Elsevier's general 'Copyediting Specification for Authors v3.0' (a book-authors document), used as the closest available official signal rather than a journal-specific guide -- an explicitly flagged imperfect substitution. The 2026-09-11 pass's own search independently found matching 'discouraged' emphasis guidance on a general journal-facing guide-for-authors page, which corroborates but does not fully resolve that original caveat (a single generic page, not a per-journal check) -- see emphasis_style's own source.note below.",
+    "last_verified": "2026-09-11"
+  },
+  "fields": {
+    "emphasis_style": {
+      "value": "discouraged",
+      "tier": 2,
+      "source": {
+        "type": "live_guidelines_page",
+        "citation": "elsevier.com/subject/next/guide-for-authors",
+        "quote": "Use of italic or bold for emphasis within the text is discouraged",
+        "note": "CAVEAT (inherited from proposal 3674c0c1, not independently re-verified in this pass): round-1's own citation for emphasis_style was Elsevier's 'Copyediting Specification for Authors v3.0', a book-authors document, used as the closest available official signal rather than a journal-specific guide -- flagged there as an imperfect substitution. This pass's own search independently found matching 'discouraged' guidance on a general journal-facing guide-for-authors page, which corroborates but does not fully resolve that original caveat (a single generic page, not a per-journal check)."
+      },
+      "verified_date": "2026-09-11"
+    },
+    "si_reformatting_policy": {
+      "value": "as_received",
+      "tier": 2,
+      "source": {
+        "type": "live_guidelines_page",
+        "citation": "elsevier.com/subject/next/guide-for-authors",
+        "quote": "published exactly as they are received",
+        "note": "Applies to Supplementary material."
+      },
+      "verified_date": "2026-09-11"
+    },
+    "figure_dpi_minimum_halftone": {
+      "value": 300,
+      "tier": 2,
+      "source": {
+        "type": "live_guidelines_page",
+        "citation": "elsevier.com/about/policies-and-standards/author/artwork-and-media-instructions/artwork-faq"
+      },
+      "verified_date": "2026-09-11"
+    },
+    "figure_dpi_minimum_line_art": {
+      "value": 1000,
+      "tier": 2,
+      "source": {
+        "type": "live_guidelines_page",
+        "citation": "elsevier.com/about/policies-and-standards/author/artwork-and-media-instructions/artwork-faq"
+      },
+      "verified_date": "2026-09-11"
+    },
+    "figure_dpi_minimum_combination": {
+      "value": 500,
+      "tier": 2,
+      "source": {
+        "type": "live_guidelines_page",
+        "citation": "elsevier.com/about/policies-and-standards/author/artwork-and-media-instructions/artwork-faq"
+      },
+      "verified_date": "2026-09-11"
+    }
+  }
+}

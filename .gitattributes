@@ -1,1 +1,14 @@
 docs/mcp-tools.md text eol=lf
+/extensions/meridian-docs/meridian_docs/docs_intel.py text eol=lf
+/extensions/meridian-outputs/tests/test_outputs_local.py text eol=lf
+/extensions/meridian-outputs/meridian_outputs/outputs_local.py text eol=lf
+/meridian/tunnel_client.py text eol=lf
+/meridian/outputs_indexer.py text eol=lf
+/extensions/meridian-codeindex/meridian_codeindex/code_index.py text eol=lf
+/extensions/meridian-codeindex/tests/test_code_index.py text eol=lf
+/tests/test_filesystem_roots.py text eol=lf
+/tests/test_outputs_fts.py text eol=lf
+/extensions/meridian-docs/tests/test_docs_intel_chunks.py text eol=lf
+/tests/test_code_index.py text eol=lf
+/meridian/code_index.py text eol=lf
+/.claude/settings.json text eol=lf

@@ -1,4 +1,4 @@
-﻿"""Core tests for Meridian — db layer, HTTP endpoints, and handoff."""
+"""Core tests for Meridian — db layer, HTTP endpoints, and handoff."""
 
 from __future__ import annotations
 
@@ -348,7 +348,7 @@ async def test_handoff_generates_clean_markdown(db, tmp_path):
     await db_module.log_task(db, s1["id"], p["id"], "did A", "done")
     await db_module.log_task(db, s2["id"], p["id"], "did B", "done")
     path, content, _ = await handoff_module.generate_handoff(
-        db, p["id"], str(tmp_path), skip_ai_summary=True
+        db, p["id"], str(tmp_path), skip_ai_summary=True, mode="full"
     )
     assert "MERIDIAN_CONTEXT" in content
     # v2.4 — tier markers replace the old single "Goal State" header.
@@ -384,7 +384,7 @@ async def test_handoff_custom_template(db, tmp_path):
 
     # Default behavior first: no template set → standard L0/L1 handoff.
     _, default_content, _ = await handoff_module.generate_handoff(
-        db, p["id"], str(tmp_path), skip_ai_summary=True
+        db, p["id"], str(tmp_path), skip_ai_summary=True, mode="full"
     )
     assert "MERIDIAN_CONTEXT" in default_content
 
@@ -400,7 +400,7 @@ async def test_handoff_custom_template(db, tmp_path):
     )
     assert (await db_module.get_workspace_settings(db))["handoff_template"]
     _, content, _ = await handoff_module.generate_handoff(
-        db, p["id"], str(tmp_path), skip_ai_summary=True
+        db, p["id"], str(tmp_path), skip_ai_summary=True, mode="full"
     )
     assert "# Custom Handoff" in content
     assert "Goal: ship v1.1 features" in content
@@ -414,7 +414,7 @@ async def test_handoff_custom_template(db, tmp_path):
     await db_module.update_workspace_settings(db, handoff_template="")
     assert (await db_module.get_workspace_settings(db))["handoff_template"] is None
     _, reverted, _ = await handoff_module.generate_handoff(
-        db, p["id"], str(tmp_path), skip_ai_summary=True
+        db, p["id"], str(tmp_path), skip_ai_summary=True, mode="full"
     )
     assert "MERIDIAN_CONTEXT" in reverted
 
@@ -456,7 +456,7 @@ async def test_handoff_lists_pending_sprint_items_in_dependency_order(db, tmp_pa
         db, p["id"], "v1", "Second fix", depends_on=first["id"]
     )
     _, content, _ = await handoff_module.generate_handoff(
-        db, p["id"], str(tmp_path), skip_ai_summary=True
+        db, p["id"], str(tmp_path), skip_ai_summary=True, mode="full"
     )
     assert "1. [pending] First fix" in content
     assert "2. [pending] Second fix" in content
@@ -493,7 +493,7 @@ async def test_handoff_includes_strategic_notes(db, tmp_path):
         "technical",
     )
     _, content, _ = await handoff_module.generate_handoff(
-        db, p["id"], str(tmp_path), skip_ai_summary=True
+        db, p["id"], str(tmp_path), skip_ai_summary=True, mode="full"
     )
     assert "Strategic Notes (1)" in content
     assert "Competitive Landscape" in content
@@ -1185,7 +1185,7 @@ def test_tunnel_status_returns_inactive_for_unknown_tenant(client):
     }
     # 02dbd8b4 — config_generation/inflight/safe_to_restart are always present
     # (empty/True for a tenant with no recorded runtime config generation yet).
-    assert body == {"tenant_id": "no-such-tenant", "active": False, "code_active": False, "extract_active": False, "ppt_active": False, "word_active": False, "dc_active": False, "docs_active": False, "zotero_active": False, "outputs_active": False, "debug_active": False, "slot_health": {}, "slot_status": {}, "config_generation": {}, "inflight": {}, "safe_to_restart": True}
+    assert body == {"tenant_id": "no-such-tenant", "active": False, "code_active": False, "extract_active": False, "ppt_active": False, "word_active": False, "dc_active": False, "docs_active": False, "latex_active": False, "zotero_active": False, "outputs_active": False, "debug_active": False, "slot_health": {}, "slot_status": {}, "config_generation": {}, "inflight": {}, "safe_to_restart": True}
 
 
 def test_fs_mcp_proxy_returns_503_when_not_hosted(client):
@@ -3402,23 +3402,33 @@ async def test_dispatch_project_scoped_tool_with_only_project_name(db):
     )
     assert any(it["id"] == added["id"] for it in items)
 
+    # get_project_state_milestones follows the same project-name resolution
+    # contract as other read-only project-scoped tools.
+    milestones = await srv._dispatch_mcp_tool(
+        "get_project_state_milestones",
+        {"project_name": "only-by-name-proj"},
+        db,
+        "/tmp",
+    )
+    assert milestones["project_id"] == p["id"]
+    assert milestones["milestones"] == []
+
 
 @pytest.mark.asyncio
-async def test_dispatch_project_id_wins_over_project_name(db):
-    """a9c041d7 — CORRECTED: this test's original name/docstring claimed
-    project_id takes precedence over project_name when both are supplied.
-    That was never true of the resolver (``_lookup = _pname_raw or
-    _pid_raw`` picks project_name whenever it is present) and the original
-    assertion (``isinstance(items, list)``) was too weak to notice: it passed
-    regardless of which project's data actually came back. Verified here by
-    seeding each project with a distinguishing sprint item and asserting on
-    identity — project_name's project id (the decoy) is what actually gets
-    dispatched against, not the supplied project_id. This resolver precedence
-    is a separate, pre-existing behavior from the scoped_project_ids bypass
-    fixed by a9c041d7 (see the dedicated scoped_project_ids tests below) —
-    changing WHICH of project_id/project_name wins during resolution is out
-    of that fix's scope, so this test now documents the real behavior instead
-    of asserting a false one."""
+async def test_dispatch_project_id_conflicting_project_name_is_rejected(db):
+    """3f47cc6e — a project_id and a project_name that resolve to DIFFERENT
+    projects are rejected with a clear error instead of silently dispatching
+    against one of them.
+
+    History: a9c041d7 first CORRECTED this test's original claim that
+    project_id wins (the resolver's ``_lookup = _pname_raw or _pid_raw`` let a
+    resolvable project_name silently override a supplied project_id, so
+    dispatch ran against the decoy). 3f47cc6e then fixed the resolver itself:
+    an explicit id is never overridden by a name that resolves elsewhere
+    (rename/merge free old names, so a stale name could otherwise retarget a
+    call). The full matrix — matching pair, unresolvable name keeps the id,
+    stale names after rename/merge, scoped tokens — lives in
+    tests/test_3f47cc6e_project_resolution_precedence.py."""
     from meridian import server as srv
 
     real = await db_module.create_project(db, "wins-real")
@@ -3426,18 +3436,21 @@ async def test_dispatch_project_id_wins_over_project_name(db):
     await db_module.add_sprint_item(db, real["id"], "v1", "real-project-item")
     await db_module.add_sprint_item(db, decoy["id"], "v1", "decoy-project-item")
 
+    with pytest.raises(ValueError, match="refer to different projects"):
+        await srv._dispatch_mcp_tool(
+            "get_sprint_items",
+            {"project_id": real["id"], "project_name": "wins-decoy"},
+            db, "/tmp",
+        )
+
+    # The same id with its OWN name is fine and stays on the real project.
     items = await srv._dispatch_mcp_tool(
         "get_sprint_items",
-        {"project_id": real["id"], "project_name": "wins-decoy"},
+        {"project_id": real["id"], "project_name": "wins-real"},
         db, "/tmp",
     )
-    assert isinstance(items, list)
-    titles = {it["title"] for it in items}
-    # The resolver overrides the supplied project_id with project_name's
-    # project — dispatch actually runs against the DECOY project.
-    assert titles == {"decoy-project-item"}
-    assert "real-project-item" not in titles
-    assert all(it["project_id"] == decoy["id"] for it in items)
+    assert {it["title"] for it in items} == {"real-project-item"}
+    assert all(it["project_id"] == real["id"] for it in items)
 
 
 @pytest.mark.asyncio
@@ -3480,9 +3493,13 @@ async def test_scoped_project_ids_blocks_project_name_override_of_in_scope_id(db
     _handle_mcp_request only inspects the raw project_id and lets this
     through; without the a9c041d7 post-resolution re-check, the resolver in
     _dispatch_mcp_tool would then silently swap in the out-of-scope project
-    (project_name wins — see test_dispatch_project_id_wins_over_project_name)
-    and dispatch would proceed against data the caller has no access to. Must
-    be denied with the same -32603 "access scope" shape as the pre-check gate."""
+    (before 3f47cc6e a resolvable project_name beat project_id — see
+    test_dispatch_project_id_conflicting_project_name_is_rejected) and
+    dispatch would proceed against data the caller has no access to. Must
+    be denied with the same -32603 "access scope" shape as the pre-check gate
+    (3f47cc6e keeps this opaque: the out-of-scope check runs BEFORE the
+    id/name conflict error, so a conflict message can never confirm that a
+    name resolves to a project outside the caller's scope)."""
     from meridian.mcp.handler import _handle_mcp_request
 
     in_scope = await db_module.create_project(db, "scope-in-a9c041d7")
@@ -3514,10 +3531,11 @@ async def test_scoped_project_ids_blocks_project_name_override_of_in_scope_id(db
 @pytest.mark.asyncio
 async def test_scoped_project_ids_none_unaffected_by_new_check(db):
     """No scoping in effect (self-host / owner / workspace-wide member) —
-    the a9c041d7 post-resolution check must not fire at all. Combined
-    in-scope-shaped id + a different project_name still resolves and
-    dispatches against whatever project_name resolves to, matching the
-    documented pre-existing resolver precedence."""
+    the a9c041d7 post-resolution scope check must not fire at all. A combined
+    id + a DIFFERENT project_name is still rejected, but by the 3f47cc6e
+    id/name conflict rule (previously the name silently won and dispatch ran
+    against the name's project) — never with the "access scope" error, and
+    never dispatched against either project."""
     from meridian.mcp.handler import _handle_mcp_request
 
     id_only_project = await db_module.create_project(db, "noscope-id-a9c041d7")
@@ -3538,10 +3556,10 @@ async def test_scoped_project_ids_none_unaffected_by_new_check(db):
         db=db, data_dir="/tmp",
         scoped_project_ids=None,
     )
-    assert "error" not in resp, resp
-    payload = json.loads(resp["result"]["content"][0]["text"])
-    assert isinstance(payload, list)
-    assert any(it["title"] == "name-project-item" for it in payload)
+    assert "error" in resp, resp
+    assert resp["error"]["code"] == -32603
+    assert "refer to different projects" in resp["error"]["message"]
+    assert "access scope" not in resp["error"]["message"]
 
 
 @pytest.mark.asyncio
@@ -6163,14 +6181,14 @@ async def test_generate_handoff_appends_and_clears_queue(db, tmp_path):
     p = await db_module.create_project(db, "queue-proj2")
     await db_module.set_queued_session(db, p["id"], "/goal next sprint")
     _, content, _ = await handoff_module.generate_handoff(
-        db, p["id"], str(tmp_path), skip_ai_summary=True
+        db, p["id"], str(tmp_path), skip_ai_summary=True, mode="full"
     )
     assert "=== QUEUED NEXT SESSION ===" in content
     assert "/goal next sprint" in content
     # Cleared after exactly one handoff.
     assert await db_module.get_queued_session(db, p["id"]) is None
     _, content2, _ = await handoff_module.generate_handoff(
-        db, p["id"], str(tmp_path), skip_ai_summary=True
+        db, p["id"], str(tmp_path), skip_ai_summary=True, mode="full"
     )
     assert "=== QUEUED NEXT SESSION ===" not in content2
 
@@ -6205,7 +6223,7 @@ async def test_generate_handoff_persists_pending_goal(db, tmp_path):
     await db_module.add_sprint_item(db, p["id"], "v1", "Do a thing")
     assert await db_module.get_pending_goal(db, p["id"]) is None
     await handoff_module.generate_handoff(
-        db, p["id"], str(tmp_path), skip_ai_summary=True
+        db, p["id"], str(tmp_path), skip_ai_summary=True, mode="full"
     )
     stored = await db_module.get_pending_goal(db, p["id"])
     assert stored is not None
@@ -6623,12 +6641,12 @@ async def test_generate_handoff_prepends_loop_when_workspace_default_on(db, tmp_
     p = await db_module.create_project(db, "loop-proj")
     await db_module.add_sprint_item(db, p["id"], "v1", "an item")
     await db_module.update_workspace_settings(db, loop_enabled_default=True)
-    await handoff_module.generate_handoff(db, p["id"], str(tmp_path), skip_ai_summary=True)
+    await handoff_module.generate_handoff(db, p["id"], str(tmp_path), skip_ai_summary=True, mode="full")
     # 5abf3e12 — XML-structured /goal starts with "/loop /goal\n" / "/goal\n".
     assert (await db_module.get_pending_goal(db, p["id"])).startswith("/loop /goal\n")
     # Workspace default OFF (and no project override) → no /loop.
     await db_module.update_workspace_settings(db, loop_enabled_default=False)
-    await handoff_module.generate_handoff(db, p["id"], str(tmp_path), skip_ai_summary=True)
+    await handoff_module.generate_handoff(db, p["id"], str(tmp_path), skip_ai_summary=True, mode="full")
     stored2 = await db_module.get_pending_goal(db, p["id"])
     assert stored2.startswith("/goal\n") and not stored2.startswith("/loop")
 
@@ -7343,6 +7361,8 @@ async def test_in_progress_status_set_on_spawn(db):
 @pytest.mark.asyncio
 async def test_watchdog_marks_dead_pid_failed(db):
     """get_in_progress_tasks_with_pid returns rows; update_task marks them failed."""
+    from meridian.pid_probe import pid_is_alive
+
     proj = await db_module.create_project(db, "watchdog-test")
     sess = await db_module.register_session(db, proj["id"], "s")
     task = await db_module.log_task(db, sess["id"], proj["id"], "work", "pending")
@@ -7359,10 +7379,7 @@ async def test_watchdog_marks_dead_pid_failed(db):
         pid = t.get("worker_pid")
         if pid is None:
             continue
-        try:
-            os.kill(int(pid), 0)
-        except (ProcessLookupError, PermissionError, OSError):
-            # OSError covers Windows WinError 87 for non-existent PIDs
+        if not pid_is_alive(int(pid)):
             await db_module.update_task(db, t["id"], status="failed",
                 description=f"[claude-error] worker process died unexpectedly (PID {pid})")
 
@@ -7892,6 +7909,8 @@ def test_batch_delete_projects_requires_settings_perm_not_write(client, monkeypa
     import asyncio
     from datetime import datetime, timezone
 
+    from meridian import _deps
+
     monkeypatch.setenv("MERIDIAN_HOSTED", "true")
     # Defensively blank a real Neon admin URL a dev .env might supply — the
     # owner tenant below is 'admin' plan specifically so the cross-workspace
@@ -7905,6 +7924,10 @@ def test_batch_delete_projects_requires_settings_perm_not_write(client, monkeypa
         await db.execute("UPDATE tenants SET plan='admin' WHERE id=?", (owner["id"],))
         member = await db_module.upsert_tenant(db, "batchdel-member@example.com")
         raw, _ = await db_module.create_api_token(db, member["id"])
+        # ece2ac0a — hosted mode now 401s anonymous callers instead of serving
+        # them the control-plane DB, so the owner's own checks below
+        # authenticate with the owner's API token (admin plan -> this same DB).
+        owner_raw, _ = await db_module.create_api_token(db, owner["id"])
         proj = await db_module.create_project(db, "batchdel-owner-proj")
         now = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
         await db.execute(
@@ -7915,10 +7938,12 @@ def test_batch_delete_projects_requires_settings_perm_not_write(client, monkeypa
              "member", "read", now),
         )
         await db.commit()
-        return owner["id"], raw, proj["id"]
+        return owner["id"], raw, owner_raw, proj["id"]
 
-    owner_id, member_token, pid = asyncio.run(_setup())
+    owner_id, member_token, owner_token, pid = asyncio.run(_setup())
+    monkeypatch.setitem(_deps._tenant_db_cache, owner_id, db)
     hdr = {"Authorization": f"Bearer {member_token}", "X-Workspace-Tenant-Id": owner_id}
+    owner_hdr = {"Authorization": f"Bearer {owner_token}"}
 
     # A 'member' has PERM_WRITE but not PERM_SETTINGS — the batch delete
     # of the owner's project must be rejected.
@@ -7927,14 +7952,14 @@ def test_batch_delete_projects_requires_settings_perm_not_write(client, monkeypa
     assert "settings" in r.text.lower()
 
     # The project must survive the rejected attempt.
-    assert client.get(f"/projects/{pid}").status_code == 200
+    assert client.get(f"/projects/{pid}", headers=owner_hdr).status_code == 200
 
-    # Sanity: the batch endpoint still works normally for a same-workspace /
-    # self-hosted caller (no cross-workspace header → no gate, per
-    # _enforcement_context's own no-header fast path).
-    r2 = client.delete("/projects", params={"project_id": [pid]})
+    # Sanity: the batch endpoint still works normally for the workspace's own
+    # owner (no cross-workspace header → no gate, per _enforcement_context's
+    # own no-header fast path).
+    r2 = client.delete("/projects", params={"project_id": [pid]}, headers=owner_hdr)
     assert r2.status_code == 200, r2.text
-    assert client.get(f"/projects/{pid}").status_code == 404
+    assert client.get(f"/projects/{pid}", headers=owner_hdr).status_code == 404
 
 
 def test_dashboard_js_has_project_mgmt(client):
@@ -8560,10 +8585,16 @@ def test_pg_migration_registry_matches_historical_order():
         "_migrate_pg_docx_derivatives",
         "_migrate_pg_sprint_item_lock_session_id",
         "_migrate_pg_sprint_item_coarse_lock_files",
+        "_migrate_pg_backfill_finding_note_kind",
+        "_migrate_pg_project_state_milestones",
+        # use_mode (4bfc9293) was added after this order was pinned and is not on main,
+        # so no production database has run it. It is appended at the tail, not mid-list.
+        # Its ADD COLUMN IF NOT EXISTS is idempotent and nothing later depends on it.
+        "_migrate_pg_project_use_mode",
     ]
     # No duplicates across the three groups.
     allnames = core + hosted + late
-    assert len(allnames) == len(set(allnames)) == 173
+    assert len(allnames) == len(set(allnames)) == 176
 
 
 def test_core_schema_literals_have_no_inline_tenant_id_indexes():
@@ -9412,7 +9443,10 @@ def test_roadmap_auto_update_replaces_existing_entry(client, tmp_path, monkeypat
 
 @pytest.mark.asyncio
 async def test_expire_regenerates_claude_md(db, tmp_path, monkeypatch):
-    """_expire_and_generate_handoffs regenerates CLAUDE.md for each project."""
+    """_expire_and_generate_handoffs writes the state block to CLAUDE.local.md.
+
+    The tracked CLAUDE.md must not be created or rewritten (gh-claude-md-state-untracked).
+    """
     from meridian import server as srv
     monkeypatch.setattr(srv, "_REPO_ROOT", tmp_path)
 
@@ -9425,10 +9459,59 @@ async def test_expire_regenerates_claude_md(db, tmp_path, monkeypatch):
     await db.commit()
 
     await srv._expire_and_generate_handoffs(db, str(tmp_path))
-    claude_md = tmp_path / "CLAUDE.md"
-    assert claude_md.exists(), "CLAUDE.md should have been written after session expiry"
-    content = claude_md.read_text(encoding="utf-8")
-    assert "MERIDIAN STATE" in content
+    assert not (tmp_path / "CLAUDE.md").exists(), "tracked CLAUDE.md must not be written on session expiry"
+    local = tmp_path / "CLAUDE.local.md"
+    assert local.exists(), "CLAUDE.local.md should have been written after session expiry"
+    assert "MERIDIAN STATE" in local.read_text(encoding="utf-8")
+
+
+@pytest.mark.asyncio
+async def test_regenerate_claude_md_leaves_tracked_claude_md_bytes_unchanged(db, tmp_path):
+    """Regeneration never rewrites the tracked CLAUDE.md bytes.
+
+    The generated block goes to the gitignored CLAUDE.local.md. The tracked file,
+    with its legacy MERIDIAN STATE marker and human content above it, must come
+    back byte-for-byte identical. The key-files block must name meridian/db/__init__.py.
+    """
+    from meridian import server as srv
+
+    p = await db_module.create_project(db, "untracked-state")
+    tracked = tmp_path / "CLAUDE.md"
+    original = (
+        "# Project notes\n\nHuman-written guidance.\n"
+        + srv._CLAUDE_MD_STATE_MARKER
+        + "## stale legacy state\n"
+    ).encode("utf-8")
+    tracked.write_bytes(original)
+
+    await srv._regenerate_claude_md(db, p["id"], tmp_path)
+
+    assert tracked.read_bytes() == original
+    local = (tmp_path / "CLAUDE.local.md").read_text(encoding="utf-8")
+    assert "MERIDIAN STATE" in local
+    assert "`meridian/db/__init__.py`" in local
+    assert "`meridian/db.py`" not in local
+
+
+@pytest.mark.asyncio
+async def test_regenerate_claude_md_preserves_human_content_in_claude_local(db, tmp_path):
+    """Human content above the marker in CLAUDE.local.md survives regeneration."""
+    from meridian import server as srv
+
+    p = await db_module.create_project(db, "local-human-content")
+    local = tmp_path / "CLAUDE.local.md"
+    local.write_text(
+        "Project ID: 1234\n" + srv._CLAUDE_MD_STATE_MARKER + "## old generated\n",
+        encoding="utf-8",
+    )
+
+    await srv._regenerate_claude_md(db, p["id"], tmp_path)
+    await srv._regenerate_claude_md(db, p["id"], tmp_path)
+
+    content = local.read_text(encoding="utf-8")
+    assert content.startswith("Project ID: 1234\n")
+    assert "## old generated" not in content
+    assert content.count("MERIDIAN STATE") == 1
 
 
 # ---------------------------------------------------------------------------
@@ -11029,11 +11112,29 @@ def test_landing_page_charset_and_emoji_survival(client):
 
 def test_g519_roles_map_grants_expected_permissions():
     """G5.19 — ROLE_PERMS map: owner has everything; admin has invite/
-    settings/HITL but NOT billing/delete; member has read+write only;
-    viewer has read only."""
+    settings/HITL but NOT billing/delete/member-policy; member has read+write
+    only; viewer has read only."""
     from meridian import roles
     assert roles.has_perm("owner",  roles.PERM_DELETE_TENANT)
     assert roles.has_perm("owner",  roles.PERM_BILLING)
+    assert roles.has_perm("owner",  roles.PERM_MANAGE_POLICY)
+    assert not roles.has_perm("admin",  roles.PERM_MANAGE_POLICY)
+    assert not roles.has_perm("member", roles.PERM_MANAGE_POLICY)
+    assert not roles.has_perm("viewer", roles.PERM_MANAGE_POLICY)
+    # Exact sets: a permission added to a role must be a deliberate edit here too.
+    assert roles.ROLE_PERMS == {
+        "owner": frozenset({
+            roles.PERM_READ, roles.PERM_WRITE, roles.PERM_HITL_ANSWER,
+            roles.PERM_INVITE, roles.PERM_SETTINGS, roles.PERM_BILLING,
+            roles.PERM_DELETE_TENANT, roles.PERM_MANAGE_POLICY,
+        }),
+        "admin": frozenset({
+            roles.PERM_READ, roles.PERM_WRITE, roles.PERM_HITL_ANSWER,
+            roles.PERM_INVITE, roles.PERM_SETTINGS,
+        }),
+        "member": frozenset({roles.PERM_READ, roles.PERM_WRITE}),
+        "viewer": frozenset({roles.PERM_READ}),
+    }
     assert roles.has_perm("admin",  roles.PERM_INVITE)
     assert roles.has_perm("admin",  roles.PERM_HITL_ANSWER)
     assert not roles.has_perm("admin",  roles.PERM_BILLING)
@@ -11444,7 +11545,7 @@ async def test_churn_cleanup_drops_only_the_tenants_own_database(monkeypatch):
 
         dropped = []
 
-        async def _fake_drop(tenant):
+        async def _fake_drop(tenant, db=None):
             dropped.append(tenant["id"])
 
         decremented = []
@@ -12262,25 +12363,61 @@ def test_delete_pinned_decision_http(client):
 
 
 def test_hooks_session_start_and_stop(client):
-    """POST /hooks/session-start returns hookSpecificOutput; /hooks/stop returns ok."""
+    """The host hook receives Meridian's id separately from its own session id."""
     project = client.post("/projects", json={"name": "v29-hooks-test"}).json()
     r = client.post("/hooks/session-start", json={"project_id": project["id"]})
     assert r.status_code == 200
     body = r.json()
     assert "hookSpecificOutput" in body
-    assert "hookEventName" in body["hookSpecificOutput"]
     assert body["hookSpecificOutput"]["hookEventName"] == "SessionStart"
     assert project["name"] in body["hookSpecificOutput"]["additionalContext"]
-    # Stop hook — uses session_id from start result
-    additional = body["hookSpecificOutput"]["additionalContext"]
-    session_id = None
-    for line in additional.splitlines():
-        if line.startswith("SESSION ID:"):
-            session_id = line.split(":", 1)[1].strip()
-            break
-    r = client.post("/hooks/stop", json={"project_id": project["id"], "session_id": session_id})
+    meridian_session_id = body["meridian_session_id"]
+    assert meridian_session_id
+    assert f"SESSION ID: {meridian_session_id}" in body["hookSpecificOutput"]["additionalContext"]
+    r = client.post(
+        "/hooks/stop",
+        json={"project_id": project["id"], "session_id": meridian_session_id},
+    )
     assert r.status_code == 200
     assert r.json()["ok"] is True
+
+
+def test_compact_hook_loads_persisted_handoff_without_consuming_it(client):
+    project = client.post("/projects", json={"name": "compact-handoff-test"}).json()
+    started = client.post(
+        "/hooks/session-start",
+        json={
+            "project_id": project["id"],
+            "session_name": "claude-hook-compact-handoff-test",
+            "source": "startup",
+            "mode": "continue",
+        },
+    )
+    assert started.status_code == 200
+    meridian_session_id = started.json()["meridian_session_id"]
+    assert meridian_session_id
+
+    generated = client.post(
+        f"/projects/{project['id']}/handoff",
+        json={"mode": "full", "session_id": meridian_session_id},
+    )
+    assert generated.status_code == 200
+    assert generated.json().get("content")
+
+    body = {
+        "project_id": project["id"],
+        "session_name": "claude-hook-compact-handoff-test",
+        "source": "compact",
+        "mode": "continue",
+    }
+    first = client.post("/hooks/session-start", json=body)
+    second = client.post("/hooks/session-start", json=body)
+    assert first.status_code == second.status_code == 200
+    assert first.json()["meridian_session_id"] == meridian_session_id
+    assert second.json()["meridian_session_id"] == meridian_session_id
+    for response in (first, second):
+        context = response.json()["hookSpecificOutput"]["additionalContext"]
+        assert "[Meridian load_handoff: stored project handoff follows." in context
 
 
 def _session_id_from_start(start_json: dict) -> str | None:
@@ -16279,6 +16416,16 @@ async def test_claim_sprint_item_returns_worktree_fields_when_isolation_set(db):
     assert "git worktree add" in result["worktree_setup_cmd"]
     assert "git worktree remove" in result["worktree_cleanup_cmd"]
     assert "git merge" in result["worktree_merge_cmd"]
+    # The cleanup command must never force-remove: it gates removal on a clean
+    # `git -C <path> status --porcelain` before `git worktree remove`, and
+    # neither handed-out command may carry --force (it discards uncommitted work).
+    assert "git -C" in result["worktree_cleanup_cmd"]
+    assert "status --porcelain" in result["worktree_cleanup_cmd"]
+    assert "--force" not in result["worktree_cleanup_cmd"]
+    assert "--force" not in result["worktree_merge_cmd"]
+    # Merge cleanup keeps the safe branch delete (-d), never the forced -D.
+    assert "git branch -d " in result["worktree_merge_cmd"]
+    assert "git branch -D" not in result["worktree_merge_cmd"]
     # eb2e44f8 — the claim response also names the base branch the worktree
     # is expected to be created from, matching worktree_merge_cmd's target,
     # so an executor can pass it straight to POST /worktrees' base_branch
@@ -16564,7 +16711,7 @@ def test_generate_handoff_accepts_commit_messages(db, tmp_path):
         _, content, _ = await hm.generate_handoff(
             db, p["id"], str(tmp_path),
             skip_ai_summary=True,
-            commit_messages=commits,
+            commit_messages=commits, mode="full",
         )
         return content
 
@@ -20947,7 +21094,7 @@ async def test_handoff_excludes_deferred_from_pending_list(db, tmp_path):
         db, p["id"], "v1", "Backburner task", deferred_until=future
     )
     _, content, _ = await handoff_module.generate_handoff(
-        db, p["id"], str(tmp_path), skip_ai_summary=True
+        db, p["id"], str(tmp_path), skip_ai_summary=True, mode="full"
     )
     assert "Visible task" in content
     assert "Backburner task" not in content
@@ -20966,7 +21113,7 @@ async def test_handoff_force_include_ids_re_adds_deferred(db, tmp_path):
     )
     _, content, _ = await handoff_module.generate_handoff(
         db, p["id"], str(tmp_path), skip_ai_summary=True,
-        force_include_ids=[deferred["id"]],
+        force_include_ids=[deferred["id"]], mode="full",
     )
     assert "Backburner task" in content
     # deferred_until is NOT cleared — the item is still deferred in the DB
@@ -20987,7 +21134,7 @@ async def test_handoff_force_include_ids_does_not_affect_claim_gate(db, tmp_path
     # Generate handoff with force_include_ids — item appears in handoff
     _, content, _ = await handoff_module.generate_handoff(
         db, p["id"], str(tmp_path), skip_ai_summary=True,
-        force_include_ids=[deferred["id"]],
+        force_include_ids=[deferred["id"]], mode="full",
     )
     assert "Deferred task" in content
     # But claiming the item is still blocked
@@ -21018,7 +21165,7 @@ async def test_handoff_force_include_ids_unknown_item_is_ignored(db, tmp_path):
     # Include a made-up id — should not raise, just ignore
     _, content, _ = await handoff_module.generate_handoff(
         db, p["id"], str(tmp_path), skip_ai_summary=True,
-        force_include_ids=["nonexistent-id-00000000"],
+        force_include_ids=["nonexistent-id-00000000"], mode="full",
     )
     assert "Real task" in content
 

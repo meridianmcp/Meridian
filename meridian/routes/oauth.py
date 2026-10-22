@@ -398,6 +398,28 @@ def _device_hash(code: str) -> str:
     return _hs.sha256(code.encode()).hexdigest()
 
 
+async def _prune_expired_device_codes(auth_db: Any) -> int:
+    """Delete ``device_codes`` rows whose ``expires_at`` has passed (e37187f3).
+
+    Every OTHER code path that touches a row already deletes it — consumed
+    (successful poll), explicitly denied, or found-expired-on-poll — but a
+    device_code that's minted (this endpoint) and then simply abandoned (the
+    user never opens the activation link, or opens it but never approves)
+    is never polled again, so none of those paths ever run for it and the
+    row would sit in the table forever. Called at mint time — the one call
+    site guaranteed to run under any real usage of this flow — so the table
+    self-limits without needing a separate scheduled job, mirroring the same
+    lazy-sweep-on-use pattern ``server.py``'s ``_cleanup_tunnel_device_codes``
+    already applies to the sibling in-memory tunnel-cli device-code dict.
+    Returns the number of rows deleted (mainly for tests).
+    """
+    from datetime import datetime as _dt, timezone as _tz  # noqa: PLC0415
+    now = _dt.now(tz=_tz.utc).strftime("%Y-%m-%d %H:%M:%S")
+    cur = await auth_db.execute("DELETE FROM device_codes WHERE expires_at < ?", (now,))
+    await auth_db.commit()
+    return cur.rowcount
+
+
 @router.post("/oauth/device")
 async def _oauth_device(request: Request):
     """RFC 8628 device authorization endpoint.
@@ -407,6 +429,7 @@ async def _oauth_device(request: Request):
     persisted — the raw values are returned once and never stored or logged.
     """
     auth_db = request.app.state.db
+    await _prune_expired_device_codes(auth_db)  # e37187f3 — sweep abandoned rows
     b = str(request.base_url).rstrip("/")
     device_code = _sec.token_hex(32)  # 256 bits of entropy
     # Crockford-ish base32 alphabet (no I/L/O/U/0/1) — unambiguous when typed.

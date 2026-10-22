@@ -1,0 +1,33 @@
+{
+  "meta": {
+    "journal": "acs",
+    "display_name": "American Chemical Society (ACS Publications) journals",
+    "publisher": "American Chemical Society",
+    "status": "populated",
+    "status_detail": "Mechanically migrated 2026-09-18 from the JOURNAL_STYLE_PRESETS dict literal in docs_intel.py (round 2, proposal 64266f13, dated 2026-09-11) as part of the JSON-preset externalization work (proposal 3b93b7ef) -- values and evidence carried over verbatim from the real in-code comment, not regenerated.",
+    "last_verified": "2026-09-11"
+  },
+  "fields": {
+    "citation_style": {
+      "value": "numbered_superscript",
+      "tier": 2,
+      "source": {
+        "type": "live_guidelines_page",
+        "citation": "researcher-resources.acs.org publish/author_guidelines pages",
+        "quote": "references are cited with superscript numbers, listed numerically by order of first appearance (per The ACS Style Guide, 3rd ed.)",
+        "note": "The Style Guide attribution is as cited on the live guidelines page fetched this pass, not an independent fetch of the Style Guide book itself -- kept at tier 2, not upgraded to an official-template tier 1."
+      },
+      "verified_date": "2026-09-11"
+    },
+    "figure_dpi_minimum_general": {
+      "value": 300,
+      "tier": 2,
+      "source": {
+        "type": "live_guidelines_page",
+        "citation": "researcher-resources.acs.org publish/author_guidelines pages",
+        "note": "pixel-based images need at least 300 dpi (blanket)."
+      },
+      "verified_date": "2026-09-11"
+    }
+  }
+}

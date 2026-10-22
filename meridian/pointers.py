@@ -209,9 +209,10 @@ _SELECTOR_TYPES = frozenset(
     {
         "range", "symbol", "node_id", "zotero_key", "text_quote", "finding_id",
         # 62640241 — typed external pointer targets: directory / git /
-        # remote_fs / artifact. See the module docstring for the full shape
-        # of each.
-        "directory", "git", "remote_fs", "artifact",
+        # remote_fs / artifact. 2197fb73 adds metadata-only provider references.
+        # project_state_milestone points to immutable recovery state.
+        "directory", "git", "remote_fs", "artifact", "project_state_milestone",
+        "provider_conversation", "provider_artifact",
     }
 )
 
@@ -626,10 +627,59 @@ def _validate_selector(selector: Any, *, is_sub: bool = False) -> dict[str, Any]
                         f"{what} artifact {field!r} must be a non-empty string"
                     )
                 out[field] = val.strip()
+    elif stype in {"provider_conversation", "provider_artifact"}:
+        # 2197fb73 — provider-native ids are durable references only. Never
+        # accept transcript/artifact bytes here; a selected range is permitted
+        # only when bound to the local export's content hash below.
+        provider = _require_str_field(
+            selector, "provider", what=what, stype=stype
+        )
+        if provider not in {"claude.ai", "codex", "chatgpt"}:
+            raise PointerValidationError(
+                f"{what} {stype} provider must be one of claude.ai, codex, chatgpt"
+            )
+        out["provider"] = provider
+        out["conversation_id"] = _require_str_field(
+            selector, "conversation_id", what=what, stype=stype
+        )
+        hash_field = "transcript_hash"
+        if stype == "provider_artifact":
+            out["artifact_id"] = _require_str_field(
+                selector, "artifact_id", what=what, stype=stype
+            )
+            hash_field = "content_hash"
+        digest = selector.get(hash_field)
+        if digest is not None:
+            if not isinstance(digest, str) or not re.fullmatch(r"[0-9a-f]{64}", digest):
+                raise PointerValidationError(
+                    f"{what} {stype} {hash_field} must be a SHA-256 hex digest"
+                )
+            out[hash_field] = digest
+    elif stype == "project_state_milestone":
+        out["id"] = _require_str_field(
+            selector, "id", what=what, stype="project_state_milestone"
+        )
+        digest = selector.get("content_hash")
+        if digest is not None:
+            if not isinstance(digest, str) or not re.fullmatch(r"[0-9a-f]{64}", digest):
+                raise PointerValidationError(
+                    f"{what} project_state_milestone content_hash must be a SHA-256 hex digest"
+                )
+            out["content_hash"] = digest
 
     # W3C hasSubSelector — optional, recursive, validated by the same rules.
     sub = selector.get("subSelector")
     if sub is not None:
+        if stype in {"provider_conversation", "provider_artifact"}:
+            hash_field = "transcript_hash" if stype == "provider_conversation" else "content_hash"
+            if not isinstance(sub, dict) or sub.get("type") != "range":
+                raise PointerValidationError(
+                    f"{what} {stype} subSelector must be a range; provider references store only IDs and ranges"
+                )
+            if hash_field not in out:
+                raise PointerValidationError(
+                    f"{what} {stype} range subSelector requires {hash_field} to bind the selected bytes"
+                )
         out["subSelector"] = _validate_selector(sub, is_sub=True)
     return out
 
@@ -1036,12 +1086,49 @@ async def _resolve_symbol(
     return out
 
 
+def _payload_in_foreign_project(project_id: str, *payload_project_ids: Any) -> bool:
+    """6f7ce9d6 — ``True`` when a resolver's returned row names an owning project
+    that is NOT ``project_id`` (the pointer's own project).
+
+    Defense in depth behind the scoped lookups themselves
+    (``db.get_project_note(project_id=...)`` /
+    ``DocStructureStore.get_element_by_id(project_id=...)``): whatever resolver
+    seam a caller injects, a ``finding_id`` / ``node_id`` target may only ever
+    surface a row from the pointer's OWN project. A row that self-identifies a
+    different project is treated exactly like a not-found id by the callers
+    (same reason string, no body), so a pointer on a project-A item can never
+    read a project-B note or document element by bare id.
+
+    Only a POSITIVE mismatch rejects. A payload that carries no project
+    identity at all (a bare test stub) cannot be checked here — the seam owner
+    is then responsible for scoping, and every in-repo seam is scoped. An
+    empty ``project_id`` (a caller that supplied no scope and whose pointer
+    row names none) has nothing to compare against and never rejects here; the
+    DEFAULT resolvers fail closed in that case instead.
+    """
+    if not project_id:
+        return False
+    return any(
+        isinstance(p, str) and p and p != project_id for p in payload_project_ids
+    )
+
+
 async def _resolve_node_id(
     selector: dict[str, Any],
     uri: str,
     node_resolver: NodeResolver | None,
+    project_id: str = "",
 ) -> dict[str, Any]:
-    """``node_id`` — look an element up in the doc_store by its id (9ee6d2ec)."""
+    """``node_id`` — look an element up in the doc_store by its id (9ee6d2ec).
+
+    6f7ce9d6 — only an element owned by ``project_id`` (the pointer's own
+    project) may resolve. The injected ``node_resolver`` is expected to be
+    scoped already (the MCP handler's is); this also rejects a resolved row
+    whose ``document.project_id`` names a different project, reporting it
+    with the SAME ``"no element with that id"`` reason a genuinely unknown id
+    gets, so the result never confirms that a foreign row exists nor returns
+    any of its body.
+    """
     nid = selector.get("id")
     if node_resolver is None:
         return _unresolved("no doc_store available", selector_type="node_id",
@@ -1052,6 +1139,16 @@ async def _resolve_node_id(
         _log.debug("node_id resolve failed for %r", nid, exc_info=True)
         return _unresolved("doc_store lookup failed", selector_type="node_id",
                            uri=uri, id=nid)
+    if found and isinstance(found, dict):
+        _doc = found.get("document")
+        if _payload_in_foreign_project(
+            project_id, _doc.get("project_id") if isinstance(_doc, dict) else None
+        ):
+            _log.warning(
+                "node_id pointer target %r rejected: element belongs to a "
+                "different project than the pointer's (%s)", nid, project_id,
+            )
+            found = None
     if not found:
         return _unresolved("no element with that id", selector_type="node_id",
                            uri=uri, id=nid)
@@ -1127,8 +1224,17 @@ async def _resolve_finding_id(
     selector: dict[str, Any],
     uri: str,
     finding_resolver: FindingResolver | None,
+    project_id: str = "",
 ) -> dict[str, Any]:
-    """``finding_id`` — resolve a save_finding artifact (a note) by id (1f1cd4d9)."""
+    """``finding_id`` — resolve a save_finding artifact (a note) by id (1f1cd4d9).
+
+    6f7ce9d6 — only a note owned by ``project_id`` (the pointer's own project)
+    may resolve. The default resolver is scoped at the SQL layer; this also
+    rejects a resolved row whose ``project_id`` names a different project
+    (whatever resolver was injected), reporting it with the SAME ``"no finding
+    artifact with that id"`` reason a genuinely unknown id gets, so the result
+    never confirms that a foreign note exists nor returns any of its body.
+    """
     fid = selector.get("id")
     if finding_resolver is None:
         return _unresolved("no finding resolver available",
@@ -1139,6 +1245,14 @@ async def _resolve_finding_id(
         _log.debug("finding_id resolve failed for %r", fid, exc_info=True)
         return _unresolved("finding lookup failed",
                            selector_type="finding_id", uri=uri, id=fid)
+    if found and isinstance(found, dict) and _payload_in_foreign_project(
+        project_id, found.get("project_id")
+    ):
+        _log.warning(
+            "finding_id pointer target %r rejected: note belongs to a "
+            "different project than the pointer's (%s)", fid, project_id,
+        )
+        found = None
     if not found:
         return _unresolved("no finding artifact with that id",
                            selector_type="finding_id", uri=uri, id=fid)
@@ -1387,13 +1501,13 @@ async def _resolve_selector(
     if stype == "symbol":
         return await _resolve_symbol(db, project_id, selector, uri, symbol_resolver)
     if stype == "node_id":
-        return await _resolve_node_id(selector, uri, node_resolver)
+        return await _resolve_node_id(selector, uri, node_resolver, project_id)
     if stype == "zotero_key":
         return await _resolve_zotero_key(selector, uri, citation_resolver)
     if stype == "text_quote":
         return await _resolve_text_quote(selector, uri, web_fetcher)
     if stype == "finding_id":
-        return await _resolve_finding_id(selector, uri, finding_resolver)
+        return await _resolve_finding_id(selector, uri, finding_resolver, project_id)
     if stype == "directory":
         return await _resolve_directory(selector, uri, directory_resolver)
     if stype == "git":
@@ -1402,7 +1516,99 @@ async def _resolve_selector(
         return await _resolve_remote_fs(selector, uri, remote_fs_resolver)
     if stype == "artifact":
         return await _resolve_artifact(selector, uri, artifact_resolver)
+    if stype == "project_state_milestone":
+        return await _resolve_project_state_milestone(db, project_id, selector, uri)
+    if stype in {"provider_conversation", "provider_artifact"}:
+        # A provider-native pointer resolves its identity only. This deliberately
+        # performs no provider/API call and does not imply that transcript or
+        # artifact contents were fetched or verified.
+        result = {
+            "uri": uri,
+            "selector_type": stype,
+            "resolved": True,
+            "provider": selector["provider"],
+            "conversation_id": selector["conversation_id"],
+            "resolution_source": "provider_native_reference",
+            "resolution_scope": "identity_only",
+            "content_loaded": False,
+        }
+        if stype == "provider_conversation" and selector.get("transcript_hash"):
+            result["transcript_hash"] = selector["transcript_hash"]
+        if stype == "provider_artifact":
+            result["artifact_id"] = selector["artifact_id"]
+            if selector.get("content_hash"):
+                result["content_hash"] = selector["content_hash"]
+        return result
     return _unresolved(f"unknown selector.type {stype!r}", uri=uri)
+
+
+async def _resolve_project_state_milestone(
+    db: Any, project_id: str, selector: dict[str, Any], uri: str
+) -> dict[str, Any]:
+    """Resolve a milestone only in its owning project and verify its hash."""
+    if not project_id:
+        return _unresolved("project scope is required", uri=uri)
+    milestone_id = selector.get("id")
+    if not isinstance(milestone_id, str) or not milestone_id:
+        return _unresolved("project state milestone id is missing", uri=uri)
+    from .db import get_project_state_milestone  # noqa: PLC0415
+
+    try:
+        row = await get_project_state_milestone(db, project_id, milestone_id)
+    except Exception:  # noqa: BLE001 — pointer resolution is best-effort
+        row = None
+    if not isinstance(row, dict):
+        return _unresolved("project state milestone not found", uri=uri)
+    expected = selector.get("content_hash")
+    if row.get("integrity_verified") is not True or (
+        expected is not None and expected != row.get("content_hash")
+    ):
+        return _unresolved("project state milestone hash verification failed", uri=uri)
+    return {
+        "uri": uri,
+        "selector_type": "project_state_milestone",
+        "resolved": True,
+        "project_id": project_id,
+        "milestone_id": row.get("id"),
+        "sequence": row.get("sequence"),
+        "content_hash": row.get("content_hash"),
+        "captured_at": row.get("captured_at"),
+    }
+
+
+def build_project_state_milestone_pointer(record: dict[str, Any]) -> dict[str, Any]:
+    """Build a typed, project-scoped pointer to one hashed milestone record."""
+    if not isinstance(record, dict):
+        raise PointerValidationError("project state milestone record must be an object")
+    project_id = record.get("project_id")
+    milestone_id = record.get("id")
+    content_hash = record.get("content_hash")
+    if not isinstance(project_id, str) or not project_id.strip():
+        raise PointerValidationError("project state milestone requires a project id")
+    if not isinstance(milestone_id, str) or not milestone_id.strip():
+        raise PointerValidationError("project state milestone requires an id")
+    if not isinstance(content_hash, str) or not re.fullmatch(r"[0-9a-f]{64}", content_hash):
+        raise PointerValidationError("project state milestone requires a SHA-256 content hash")
+    return validate_pointer(
+        {
+            "source_type": "project_state_milestone",
+            "label": f"Project state milestone {record.get('sequence', '')}".strip(),
+            "targets": [
+                {
+                    "uri": (
+                        f"meridian://project/{project_id.strip()}"
+                        f"/state-milestones/{milestone_id.strip()}"
+                    ),
+                    "selector": {
+                        "type": "project_state_milestone",
+                        "id": milestone_id.strip(),
+                        "content_hash": content_hash,
+                    },
+                    "target_kind": "existing",
+                }
+            ],
+        }
+    )
 
 
 def _freshness_state_for_target(
@@ -1488,6 +1694,15 @@ async def resolve_pointer(
     ``range`` is echoed as ``narrowed_range`` — "these lines, within this
     function"). **NEVER raises** — malformed targets degrade to unresolved.
 
+    6f7ce9d6 — ``finding_id`` / ``node_id`` targets resolve ONLY within the
+    pointer's owning project (``project_id``, else the pointer row's own
+    ``project_id``): a note / document-element id belonging to another project
+    is reported as the ordinary not-found unresolved result (same reason as an
+    unknown id, no body), never as a hit. A caller injecting its own
+    ``node_resolver`` should scope it to that project too (the MCP handler
+    does); a resolved row that self-identifies another project is rejected
+    here regardless.
+
     Resolver seams default to the real implementations
     (``db.search_graph_entities`` / doc_store / ``zotero_client``); tests inject
     stubs so no network / live Zotero is touched. 62640241 —
@@ -1540,12 +1755,26 @@ async def resolve_pointer(
         async def web_fetcher(_uri: str):  # type: ignore[misc]
             return await _wf(_uri)
 
+    # 6f7ce9d6 — the pointer's OWNING project: the caller-supplied scope, else
+    # the stored pointer row's own ``project_id``. Every finding_id / node_id
+    # target must resolve only inside it (see _resolve_finding_id /
+    # _resolve_node_id). Computed BEFORE the default resolvers below so the
+    # default finding resolver can be scoped to it.
+    pid = project_id or pointer.get("project_id") or ""
+
     if finding_resolver is None:
         # 1f1cd4d9 — a save_finding artifact IS a kind='finding' project note.
         from .db import get_project_note as _gn  # noqa: PLC0415
 
         async def finding_resolver(_id: str):  # type: ignore[misc]
-            return await _gn(db, _id)
+            # 6f7ce9d6 — scoped to the pointer's own project at the SQL layer
+            # (WHERE id = ? AND project_id = ?): another project's note id
+            # comes back as None, i.e. "no finding artifact with that id".
+            # With no owning project at all there is nothing to scope by, so
+            # fail closed rather than fall back to the old bare-id lookup.
+            if not pid:
+                return None
+            return await _gn(db, _id, project_id=pid)
 
     # 62640241 — core-local, local-filesystem-only defaults. remote_fs has
     # deliberately NO default (see the docstring above).
@@ -1556,7 +1785,6 @@ async def resolve_pointer(
     if artifact_resolver is None:
         artifact_resolver = _default_artifact_resolver()
 
-    pid = project_id or pointer.get("project_id") or ""
     source_type = pointer.get("source_type")
     targets = pointer.get("targets") or []
 

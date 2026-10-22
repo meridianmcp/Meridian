@@ -176,7 +176,7 @@ def _normalize_output_path(path: Any) -> str:
     if not s:
         return ""
     try:
-        s = os.path.abspath(s)
+        s = os.path.realpath(os.path.abspath(s))
     except (OSError, ValueError):
         pass
     # normcase lower-cases + flips slashes on Windows; normpath collapses ./..;
@@ -742,6 +742,7 @@ class OutputsFtsIndex:
         hasher: Callable[[str], str | None] = _sha256_file,
     ) -> None:
         self.outputs_dir = outputs_dir
+        self.canonical_root = _normalize_output_path(outputs_dir) or os.path.abspath(str(outputs_dir))
         self._db_path = db_path
         self._hasher = hasher
         self._lock = threading.RLock()
@@ -1453,6 +1454,8 @@ class OutputsFtsIndex:
             degraded = bool(inconclusive or partial_index or self.last_pending_count)
             return {
                 "outputs_dir": self.outputs_dir,
+                "canonical_root": self.canonical_root,
+                "scope_id": f"outputs:{self.canonical_root}",
                 "index_revision": self.index_revision,
                 "last_rebuilt_at": self.last_rebuilt_at,
                 "total_indexed": len(self._row_cache),

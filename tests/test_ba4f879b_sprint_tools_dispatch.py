@@ -1178,9 +1178,11 @@ async def test_delete_sprint_item_pointer_missing_id(db):
 
 @pytest.mark.asyncio
 async def test_delete_sprint_item_pointer_nonexistent(db):
+    project = await db_module.create_project(db, "sprint-test-proj-del-nonexistent")
     result = await mh._handle_sprint_tools(
         "delete_sprint_item_pointer",
-        {"pointer_id": "00000000-0000-0000-0000-000000000000"},
+        {"project_id": project["id"],
+         "pointer_id": "00000000-0000-0000-0000-000000000000"},
         db, _DATA_DIR, None, None
     )
     assert result is not mh._MISS
@@ -1190,8 +1192,10 @@ async def test_delete_sprint_item_pointer_nonexistent(db):
 
 @pytest.mark.asyncio
 async def test_delete_sprint_item_pointer_handler_direct(db):
+    project = await db_module.create_project(db, "sprint-test-proj-del-direct")
     result = await st_mod.handle_delete_sprint_item_pointer(
-        {"pointer_id": "00000000-0000-0000-0000-000000000001"},
+        {"project_id": project["id"],
+         "pointer_id": "00000000-0000-0000-0000-000000000001"},
         db, _DATA_DIR, None, None
     )
     assert "deleted" in result

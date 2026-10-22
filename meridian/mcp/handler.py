@@ -25,6 +25,7 @@ from .. import db as db_module
 from .. import goal_md as goal_md_module
 from .. import md_anchors as md_anchors_module
 from .._deps import _hosted_mode, validate_input_size, _MANUAL_NOTE_LINT
+from . import scope_guard
 
 # CI-PERF-3B — named, overridable timeout constants (extracted from inline
 # literals scattered across the dispatch functions below) so tests can
@@ -1076,6 +1077,13 @@ async def discover_and_link_manual_issue(
     # 4. Wave-relative velocity/anomaly check — non-blocking escalation only.
     try:
         item = await db_module.get_sprint_item(db, item_id)
+        if item is not None and item.get("project_id") != project_id:
+            # 6fe5210c (wave 2, third pass) -- the row only supplies a wave label to
+            # the velocity signal, but that signal (wave label included) is written
+            # into this project's HITL context and audit row, so another project's
+            # item must never feed it. link_sprint_item_github_issue below is
+            # already bound to project_id; this read is now too.
+            item = None
         anomaly = await db_module.check_manual_issue_action_velocity(
             db, project_id, triggering_item=item,
         )
@@ -1171,6 +1179,390 @@ def _meridian_tool_names() -> "frozenset[str]":
             t["name"] for t in _server._MCP_TOOLS_LIST if t.get("name")
         )
     return _MERIDIAN_TOOL_NAMES_CACHE
+
+
+async def _authorize_scoped_mcp_call(
+    name: str,
+    args: dict[str, Any],
+    db: Any,
+    data_dir: str,
+    tenant: dict[str, Any] | None,
+    scoped_project_ids: "list[str]",
+    *,
+    resolve_references: bool = True,
+    tunnel_candidate: bool = False,
+) -> dict[str, Any]:
+    """Resolve, scope-check, then apply the canonical member capability policy.
+
+    Keep ``scoped_project_ids`` intact: in hosted mode it is a
+    ``ScopedProjectIds`` instance carrying the effective policy, and copying
+    it to a plain list makes policy evaluation fail closed as unavailable.
+    """
+    from .. import member_policy  # noqa: PLC0415
+    from ..mcp_tools import member_policy_operation  # noqa: PLC0415
+
+    # Never trust an argument that resembles our private compare-and-set
+    # context. A fresh, typed snapshot is attached only after this call passes
+    # the member capability check below.
+    args = dict(args)
+    args.pop(member_policy.MEMBER_POLICY_AUTHORIZED_PARENT_ARG, None)
+
+    operation_name = name.rsplit("__", 1)[-1] if tunnel_candidate else name
+    operation = member_policy_operation(name) or member_policy_operation(operation_name)
+    normalized_name = operation_name.lower().replace("-", "_")
+    operation_words = set(normalized_name.split("_"))
+    tenant_profile_scopes = {"workspace", "user", "hosted_default"}
+    profile_scope_args = {
+        "save_profile_layer": "scope_type",
+        "reset_profile_layer": "scope_type",
+        "set_capability_profile": "scope_type",
+        "clear_capability_profile": "scope_type",
+        "clone_profile_layer": "target_scope_type",
+    }
+    profile_write_tools = set(profile_scope_args) | {"activate_profile_layer"}
+    if normalized_name == "activate_profile_layer":
+        profile_target_scope_type = "hosted_default"
+    else:
+        scope_arg = profile_scope_args.get(normalized_name)
+        profile_target_scope_type = args.get(scope_arg) if scope_arg else None
+    tenant_profile_mutation = (
+        normalized_name in profile_write_tools
+        and isinstance(profile_target_scope_type, str)
+        and profile_target_scope_type.strip().lower() in tenant_profile_scopes
+    )
+    batch_has_tenant_profile_mutation = (
+        normalized_name == "batch_mutate"
+        and isinstance(args.get("entries"), list)
+        and any(
+            isinstance(entry, dict)
+            and entry.get("kind") == "profile_layer"
+            and isinstance(entry.get("scope_type"), str)
+            and entry["scope_type"].strip().lower() in tenant_profile_scopes
+            for entry in args["entries"]
+        )
+    )
+    has_project_ref = any(
+        key == "project_id" or key.endswith("_project_id")
+        or key == "project_ids"
+        or key == "project_name" or key.endswith("_project_name")
+        for key in args
+    )
+    mutating_prefixes = (
+        "add_", "apply_", "archive_", "batch_", "bulk_", "commit_",
+        "create_", "delete_", "execute_", "hard_delete_", "merge_",
+        "move_", "remove_", "restore_", "set_", "update_", "write_",
+    )
+    bare_mutations = {
+        "add", "apply", "archive", "batch", "bulk", "commit", "create",
+        "delete", "execute", "hard_delete", "merge", "move", "remove",
+        "restore", "set", "update", "write",
+    }
+    read_prefixes = (
+        "check_", "compare_", "describe_", "fetch_", "find_", "get_",
+        "list_", "preview_", "read_", "resolve_", "search_",
+    )
+    non_project_resource_words = {
+        "artifact", "artifacts", "citation", "citations", "decision", "decisions",
+        "doc", "docs", "document", "documents", "experiment", "experiments",
+        "file", "files", "finding", "findings", "figure", "figures", "hook",
+        "hooks", "issue", "issues", "note", "notes", "output", "outputs",
+        "pointer", "pointers", "profile", "profiles", "proposal", "proposals",
+        "research", "run", "runs", "session", "sessions", "sprint", "table",
+        "tables", "task", "tasks", "workspace", "workspaces",
+    }
+    generic_tunnel_ids = (
+        tunnel_candidate
+        and "ids" in args
+        and args.get("ids") is not None
+        and (
+            normalized_name.startswith(mutating_prefixes)
+            or normalized_name in bare_mutations
+        )
+        and not (operation_words & non_project_resource_words)
+    )
+    project_context = (
+        (
+            bool(operation_words & {"project", "projects"})
+            and not (operation_words & non_project_resource_words)
+        )
+        or "project_ids" in args
+        or operation in {
+            "project_create", "project_reparent", "project_merge",
+            "project_delete", "project_status",
+        }
+        or (bool(operation_words & {"bulk", "batch"}) and has_project_ref)
+        or generic_tunnel_ids
+        or bool(operation_words & {"parent", "reparent"})
+        or (
+            "move" in operation_words
+            and ("parent_project_id" in args or "parent_project_name" in args)
+        )
+    )
+
+    # Project id arrays can arrive through noncanonical tunnel aliases. Check
+    # every explicit project_ids target, and ids arrays on recognizable project
+    # or bulk-project operations, before the scope guard performs any lookups.
+    batch_target_ids: list[str] = []
+    for key in ("project_ids", "ids"):
+        if key not in args or (key == "ids" and not project_context):
+            continue
+        value = args[key]
+        if isinstance(value, str):
+            raw_values = [value]
+        elif isinstance(value, (list, tuple, set)):
+            raw_values = list(value)
+        elif value is None and key == "ids":
+            continue
+        else:
+            raise ValueError("project is outside your access scope")
+        for raw_value in raw_values:
+            if not isinstance(raw_value, str) or not raw_value.strip():
+                raise ValueError("project is outside your access scope")
+            project_id = raw_value.strip()
+            if project_id not in batch_target_ids:
+                batch_target_ids.append(project_id)
+    if scoped_project_ids is not None and any(
+        project_id not in scoped_project_ids for project_id in batch_target_ids
+    ):
+        raise ValueError("project is outside your access scope")
+    has_project_ref = has_project_ref or bool(batch_target_ids)
+
+    if resolve_references:
+        try:
+            args = await _resolve_project_reference(db, args, scoped_project_ids)
+            # Hierarchy tools carry project refs beyond the common
+            # project_id/project_name pair handled by the resolver above.
+            for name_key, id_key in (
+                ("parent_project_name", "parent_project_id"),
+                ("source_project_name", "source_project_id"),
+                ("target_project_name", "target_project_id"),
+            ):
+                if args.get(id_key) or not args.get(name_key):
+                    continue
+                row = await db_module.get_project_by_name(db, str(args[name_key]))
+                if row is None:
+                    raise ValueError("project is outside your access scope")
+                args = {**args, id_key: row.get("id")}
+        except ValueError:
+            raise
+        except member_policy.MemberPolicyUnavailable:
+            raise
+        except Exception as exc:  # noqa: BLE001 — lookup failure is a refusal
+            raise member_policy.MemberPolicyUnavailable() from exc
+
+    try:
+        await scope_guard.enforce_scoped_call(
+            name, args, db, scoped_project_ids,
+            doc_store_factory=lambda: _resolve_ingest_doc_store(db, data_dir, tenant),
+        )
+    except (ValueError, member_policy.MemberPolicyDenied):
+        raise
+    except member_policy.MemberPolicyUnavailable:
+        raise
+    except Exception as exc:  # noqa: BLE001 — never forward on an unreadable scope
+        raise member_policy.MemberPolicyUnavailable() from exc
+
+    # mcp_tools owns MCP operation intent; member_policy.py remains the only
+    # source of capability ids and hierarchy-to-capability rules.
+    if operation is None:
+        looks_mutating = (
+            normalized_name.startswith(mutating_prefixes)
+            or normalized_name in bare_mutations
+            or (project_context and not normalized_name.startswith(read_prefixes))
+        )
+        if has_project_ref and looks_mutating:
+            # Tunnel plugins may expose aliases that are not present in the
+            # native registry. Preserve the catalog's hierarchy capabilities
+            # for obvious project lifecycle operations instead of reducing
+            # them to the generic project-write capability. Keep this name
+            # based so tools such as delete_note/archive_decision remain
+            # ordinary scoped writes.
+            project_operation = project_context or bool(
+                {"parent", "reparent"} & operation_words
+            )
+            if project_operation and "create" in operation_words:
+                operation = "project_create"
+            elif project_operation and (
+                "reparent" in operation_words
+                or "parent" in operation_words
+                or (
+                    "move" in operation_words
+                    and ("parent_project_id" in args or "parent_project_name" in args)
+                )
+            ):
+                operation = "project_reparent"
+            elif project_operation and "merge" in operation_words:
+                operation = "project_merge"
+            elif project_operation and operation_words & {"delete", "remove", "hard_delete"}:
+                operation = "project_delete"
+            elif project_operation and operation_words & {"archive", "restore", "status"}:
+                operation = "project_status"
+            else:
+                operation = "project_write"
+    if operation is None:
+        return args
+
+    family_ops = {
+        "project_create", "project_reparent", "project_merge",
+        "project_delete", "project_status",
+    }
+    family: dict[str, dict[str, Any]] = {}
+    ids: list[str] = []
+    raw_ids: list[Any] = []
+    if operation in family_ops:
+        if operation == "project_create":
+            parent_id = args.get("parent_project_id")
+            if parent_id is not None and not isinstance(parent_id, str):
+                raise ValueError("project is outside your access scope")
+            if parent_id:
+                raw_ids.append(parent_id)
+        elif operation == "project_reparent":
+            raw_ids.extend((args.get("project_id"), args.get("parent_project_id")))
+        elif operation == "project_merge":
+            raw_ids.extend((args.get("source_project_id"), args.get("target_project_id")))
+        elif operation == "project_delete":
+            for key in ("project_ids", "ids"):
+                if key in args:
+                    values = args[key]
+                    raw_ids.extend(
+                        values if isinstance(values, (list, tuple, set)) else [values]
+                    )
+            for key in ("project_id", "id"):
+                if args.get(key) is not None:
+                    raw_ids.append(args[key])
+            if not raw_ids:
+                raw_ids.append(None)
+        else:  # archive/restore/status
+            raw_ids.append(args.get("project_id", args.get("id")))
+        ids = list(dict.fromkeys(
+            value.strip() for value in raw_ids if isinstance(value, str) and value.strip()
+        ))
+        if operation == "project_reparent" and (
+            not isinstance(args.get("project_id"), str)
+            or not args.get("project_id", "").strip()
+            or (args.get("parent_project_id") is not None
+                and not isinstance(args.get("parent_project_id"), str))
+        ):
+            raise ValueError("project is outside your access scope")
+        if operation == "project_merge" and any(
+            not isinstance(args.get(key), str) or not args.get(key, "").strip()
+            for key in ("source_project_id", "target_project_id")
+        ):
+            raise ValueError("project is outside your access scope")
+        if operation in {
+            "project_reparent", "project_merge", "project_delete", "project_status",
+        } and not ids:
+            raise ValueError("project is outside your access scope")
+        if scoped_project_ids is not None and any(
+            project_id not in scoped_project_ids for project_id in ids
+        ):
+            # Scope guard covers the standard project_id fields. Keep a direct
+            # check here as well for tunnel aliases that use id/project_ids.
+            raise ValueError("project is outside your access scope")
+        if operation == "project_delete" and len(ids) != len(raw_ids):
+            # A malformed or mixed-id batch must not degrade to a smaller,
+            # potentially destructive subset.
+            raise ValueError("project is outside your access scope")
+        if ids:
+            try:
+                family = await db_module.get_project_family(db, ids)
+            except member_policy.MemberPolicyUnavailable:
+                raise
+            except Exception as exc:  # noqa: BLE001 — no policy from a failed lookup
+                raise member_policy.MemberPolicyUnavailable() from exc
+            if any(project_id not in family for project_id in ids):
+                raise ValueError("project is outside your access scope")
+            family = {
+                project_id: {"id": project_id, **row}
+                for project_id, row in family.items()
+            }
+
+    if operation == "project_create":
+        required = member_policy.required_caps_for_create(args.get("parent_project_id"))
+    elif operation == "project_reparent":
+        project_id = args.get("project_id")
+        row = family[project_id]
+        current_parent_id = row.get("parent_project_id")
+        new_parent_id = args.get("parent_project_id") or None
+        new_parent = family.get(new_parent_id) if new_parent_id else None
+        if new_parent_id and new_parent is None:
+            raise ValueError("project is outside your access scope")
+        required = member_policy.required_caps_for_reparent(
+            row, family.get(current_parent_id), new_parent,
+        )
+    elif operation == "project_merge":
+        source_id = args["source_project_id"]
+        target_id = args["target_project_id"]
+        required = member_policy.required_caps_for_merge(
+            family[source_id], family[target_id], family,
+        )
+    elif operation == "project_delete":
+        required = member_policy.required_caps_for_delete(
+            [family[project_id] for project_id in ids], family,
+        )
+    elif operation == "project_status":
+        project_id = ids[0]
+        new_status = args.get("status", args.get("new_status"))
+        operation_words = set(operation_name.lower().replace("-", "_").split("_"))
+        if "archive" in operation_words:
+            new_status = "archived"
+        elif "restore" in operation_words:
+            new_status = "active"
+        required = member_policy.required_caps_for_status(
+            family[project_id], new_status, family,
+        )
+    elif operation == "workspace_write":
+        required = frozenset({member_policy.WRITE_WORKSPACE_LEVEL})
+    elif operation == "workspace_to_project":
+        required = frozenset({
+            member_policy.WRITE_WORKSPACE_LEVEL,
+            member_policy.WRITE_PROJECT,
+        })
+    elif tenant_profile_mutation:
+        # Profile writes target either a project (the usual project_write
+        # policy) or tenant-wide policy.  The latter must be authorized by the
+        # workspace capability instead of inheriting project_write merely
+        # because these tools share the project-tools MCP namespace.
+        required = frozenset({member_policy.WRITE_WORKSPACE_LEVEL})
+    else:
+        required = frozenset({member_policy.WRITE_PROJECT})
+
+    policy_targets = list(batch_target_ids)
+    for key in (
+        "project_id", "source_project_id", "target_project_id", "parent_project_id",
+    ):
+        value = args.get(key)
+        if isinstance(value, str) and value.strip() and value.strip() not in policy_targets:
+            policy_targets.append(value.strip())
+    if policy_targets:
+        for target in policy_targets:
+            member_policy.require_capabilities(scoped_project_ids, required, target=target)
+    else:
+        member_policy.require_capabilities(scoped_project_ids, required)
+    if batch_has_tenant_profile_mutation:
+        # batch_mutate remains a project-write operation because its envelope
+        # may also update project-owned objects.  Each tenant-scoped profile
+        # entry adds the workspace-level grant requirement independently.
+        member_policy.require_capabilities(
+            scoped_project_ids, {member_policy.WRITE_WORKSPACE_LEVEL},
+        )
+    if (
+        operation == "project_reparent"
+        and normalized_name == "set_parent_project"
+        and not tunnel_candidate
+    ):
+        project_id = args.get("project_id")
+        row = family.get(project_id)
+        if row is None:
+            raise ValueError("project is outside your access scope")
+        args[member_policy.MEMBER_POLICY_AUTHORIZED_PARENT_ARG] = (
+            member_policy.AuthorizedParentSnapshot(
+                project_id=project_id,
+                parent_project_id=row.get("parent_project_id") or None,
+                parent_exists=bool(row.get("parent_exists")),
+            )
+        )
+    return args
 
 
 async def _handle_mcp_request(
@@ -1343,6 +1735,17 @@ async def _handle_mcp_request(
     if method == "prompts/get":
         prompt_name = params.get("name", "")
         prompt_args = params.get("arguments") or {}
+        # Decision 6fe5210c (wave 2, F-M1) -- the executor-goal prompt renders a
+        # project's live pending sprint items, so prompts/get is a project-reading
+        # method exactly like tools/call and needs the same scope gate. Same
+        # opaque error as the tools/call pre-gate (-32603, no distinguishing
+        # data). A no-op, with no DB access, for an unscoped caller.
+        try:
+            await scope_guard.enforce_scoped_prompt(
+                prompt_name, prompt_args, db, scoped_project_ids,
+            )
+        except Exception as exc:  # noqa: BLE001 -- fail closed: never render the prompt
+            return _server._jsonrpc_err(req_id, -32603, str(exc))
         try:
             messages = await _build_prompt_messages_async(prompt_name, prompt_args, db)
         except ValueError as exc:
@@ -1370,21 +1773,42 @@ async def _handle_mcp_request(
             )
         if token_type == "readonly" and name not in _server._mcp_readonly_tools:
             return _server._jsonrpc_err(req_id, -32603, f"tool '{name}' not allowed for read-only tokens")
-        # 95499c3e / decision 6fe5210c — Option A project-scope enforcement for
-        # API tokens (mirrors the HTTP middleware). A scoped member may only touch
-        # projects in their scope; resolve the tool's target project (by project_id,
-        # else project_name → id) and deny when it's out of scope.
+        # 95499c3e / decision 6fe5210c — scope and member-capability checks must
+        # run before either native dispatch or tunnel forwarding. The comprehensive
+        # scope guard covers direct ids, related objects, parent/source/target refs,
+        # and batch envelopes; the attached policy object must remain intact.
         if scoped_project_ids is not None:
-            _tgt_pid = (args.get("project_id") or "").strip()
-            if not _tgt_pid and args.get("project_name"):
-                try:
-                    _sp = await db_module.get_project_by_name(db, str(args["project_name"]))
-                    _tgt_pid = (_sp or {}).get("id", "") if _sp else ""
-                except Exception:  # noqa: BLE001
-                    _tgt_pid = ""
-            if _tgt_pid and _tgt_pid not in scoped_project_ids:
+            from ..member_policy import MemberPolicyDenied, MemberPolicyUnavailable  # noqa: PLC0415
+            try:
+                args = await _authorize_scoped_mcp_call(
+                    name,
+                    args,
+                    db,
+                    data_dir,
+                    tenant,
+                    scoped_project_ids,
+                    tunnel_candidate=(
+                        name not in _meridian_tool_names()
+                        and name not in _server._GITHUB_TOOL_NAMES
+                    ),
+                )
+            except MemberPolicyUnavailable:
                 return _server._jsonrpc_err(
-                    req_id, -32603, "project is outside your access scope",
+                    req_id,
+                    -32000,
+                    "member policy check unavailable",
+                    data={"status_code": 503, "code": "MEMBER_POLICY_UNAVAILABLE"},
+                )
+            except (MemberPolicyDenied, ValueError) as exc:
+                return _server._jsonrpc_err(
+                    req_id, -32603, str(exc),
+                )
+            except Exception:  # noqa: BLE001 — fail closed before any forwarding
+                return _server._jsonrpc_err(
+                    req_id,
+                    -32000,
+                    "member policy check unavailable",
+                    data={"status_code": 503, "code": "MEMBER_POLICY_UNAVAILABLE"},
                 )
         # 393eed0a — workspace-role gate (defense in depth for cross-workspace MCP).
         if enforce_role is not None and name not in _server._mcp_readonly_tools \
@@ -1531,6 +1955,7 @@ async def _handle_mcp_request(
                 result = await _dispatch_mcp_tool(
                     name, _dispatch_args, db, data_dir, tenant=tenant,
                     scoped_project_ids=scoped_project_ids,
+                    _authorization_prechecked=scoped_project_ids is not None,
                 )
                 # 4b698ea5 — implicit last_seen bump on the HOSTED path, mirroring
                 # the stdio handler. Previously ONLY stdio tool calls refreshed a
@@ -1572,6 +1997,13 @@ async def _handle_mcp_request(
                     _exc_sid
                     and _exc_sid in _EXECUTOR_SESSIONS
                     and name not in _ACTIVITY_SKIP_TOOLS
+                    # Decision 6fe5210c — a scoped caller's refused/failed call
+                    # that merely NAMES another project's executor session must
+                    # not land a row in that session's feed (a planner reads the
+                    # feed as proof of life). Unscoped callers skip this lookup.
+                    and await scope_guard.session_in_scope(
+                        db, _exc_sid, scoped_project_ids,
+                    )
                 ):
                     await db_module.record_session_activity(
                         db, _exc_sid, name,
@@ -1579,6 +2011,15 @@ async def _handle_mcp_request(
                     )
             except Exception:  # noqa: BLE001 — never mask the real error below
                 pass
+            from ..member_policy import MemberPolicyUnavailable  # noqa: PLC0415
+            if isinstance(exc, MemberPolicyUnavailable):
+                return _server._jsonrpc_err(
+                    req_id,
+                    -32000,
+                    "member policy check unavailable",
+                    data={"tool_exception": True, "status_code": 503,
+                          "code": "MEMBER_POLICY_UNAVAILABLE"},
+                )
             return _server._jsonrpc_err(
                 req_id, -32603, str(exc), data={"tool_exception": True},
             )
@@ -2977,7 +3418,7 @@ async def _handle_project_tools(
     _mcp_tenant_id: Any,
 ) -> Any:
     """Dispatch group: create_project, set_parent_project, rename_project,
-    set_project_execution_mode, register_session, start_session, list_projects, get_project_by_name,
+    set_project_execution_mode, set_project_use_mode, check_image_rights, register_session, start_session, list_projects, get_project_by_name,
     get_goal, set_goal, set_north_star, merge_project, add_custom_hook,
     get_custom_hooks, delete_custom_hook, get_capability_manifest,
     set_capability_manifest, set_capability_profile, clear_capability_profile,
@@ -3001,6 +3442,8 @@ async def _handle_project_tools(
         handle_set_parent_project,
         handle_rename_project,
         handle_set_project_execution_mode,
+        handle_set_project_use_mode,
+        handle_check_image_rights,
         handle_register_session,
         handle_start_session,
         handle_list_projects,
@@ -3034,6 +3477,8 @@ async def _handle_project_tools(
         "set_parent_project": handle_set_parent_project,
         "rename_project": handle_rename_project,
         "set_project_execution_mode": handle_set_project_execution_mode,
+        "set_project_use_mode": handle_set_project_use_mode,
+        "check_image_rights": handle_check_image_rights,
         "register_session": handle_register_session,
         "list_projects": handle_list_projects,
         "get_project_by_name": handle_get_project_by_name,
@@ -3337,6 +3782,13 @@ async def _handle_task_tools(
         # acf6f51a — opt-in, off by default; see generate_handoff's own
         # emit_manifest docstring. Currently only mode="goal" acts on this.
         _emit_manifest = bool(args.get("emit_manifest"))
+        # 0527f636 — optional receiver address for the persisted pending_goal
+        # (session_name/role/worktree). Passed through RAW: generate_handoff
+        # validates it up front (a malformed address raises before anything is
+        # rendered or persisted) so it can never silently degrade to an
+        # unaddressed, sibling-stealable handoff. Absent -> None -> today's
+        # behaviour. See generate_handoff's own pending_goal_receiver docstring.
+        _pending_goal_receiver = args.get("receiver")
         try:
             path, content, _handoff_amended = await asyncio.wait_for(
                 handoff_module_local.generate_handoff(
@@ -3362,6 +3814,9 @@ async def _handle_task_tools(
                     strict_continuation=_strict_continuation,
                     continuation_status=_continuation_status,
                     emit_manifest=_emit_manifest,
+                    pending_goal_receiver=_pending_goal_receiver,
+                    # A scoped caller never gets the owner's workspace notes/decisions.
+                    include_workspace=not args.get(scope_guard.WORKSPACE_SCOPED_ARG),
                 ),
                 # 65c8b426 — Part 2: raised from 90s to 180s as a secondary safety
                 # margin. The real fix (skip_ai_summary=True default) eliminates the
@@ -3789,6 +4244,14 @@ async def _handle_task_tools(
             _pending = await db_module.get_pending_goal(db, _pid)
         except Exception:  # noqa: BLE001
             _pending = None
+        # 0527f636 — the {session_name, role, worktree} address the pending
+        # goal was generated FOR (None: unaddressed, or nothing pending).
+        # Read-only, best-effort, purely additive to the response.
+        _pending_receiver = None
+        try:
+            _pending_receiver = await db_module.get_pending_goal_receiver(db, _pid)
+        except Exception:  # noqa: BLE001
+            _pending_receiver = None
         # 3af86d28 — surface the latest corrective handoff (any status)
         # directly, so a receiving executor never has to reconstruct a
         # correction from narrative notes. None when the project has no
@@ -3802,6 +4265,7 @@ async def _handle_task_tools(
             _correction = None
         return {
             "pending_goal": _pending,
+            "pending_goal_receiver": _pending_receiver,
             # 22f2604d — explicit, machine-readable trust marker (requirement
             # 4): load_handoff always returns the exact stored,
             # project-scoped payload straight from this project's own DB
@@ -3902,7 +4366,9 @@ async def _handle_task_tools(
             _regen_result = await handoff_module_local.regenerate_handoff_correction(
                 db, _pid, _correction["id"], _out_dir,
                 session_id=args.get("session_id"),
-                mode=args.get("mode") or "full",
+                # 0b0b24d8 — an omitted mode resolves by intent (never a silent
+                # 'full', which would prepend every workspace note).
+                mode=args.get("mode") or None,
             )
         except handoff_module_local.HandoffCorrectionError as exc:
             return {
@@ -4063,6 +4529,12 @@ async def _handle_task_tools(
         _hashes = args.get("content_hashes")
         if _hashes is not None and not isinstance(_hashes, list):
             raise ValueError("content_hashes must be a list of 'sha256:...' strings")
+        # RT-TI-001 — the artifact store is a filesystem tree keyed by project
+        # id in a data dir shared by every tenant, so the caller's own
+        # (per-tenant) database is the only authority on whether this project
+        # is theirs. Answer exactly like any other unknown project id.
+        if await db_module.get_project(db, args["project_id"]) is None:
+            raise ValueError("project not found")
         try:
             return artifact_store_module.export_artifacts(
                 data_dir, args["project_id"],
@@ -4104,6 +4576,13 @@ async def _handle_task_tools(
         # tests/test_ai_log_retention.py) that this call must not disturb.
         _events_cutoff = _parsed_cutoff.strftime("%Y-%m-%d %H:%M:%S")
         _pid = args["project_id"]
+        # RT-TI-002 — same ownership rule as export_ai_log_artifacts: the
+        # artifact sweep below deletes files under a data dir shared by every
+        # tenant, so refuse a project id the caller's own database does not
+        # know. (A project already deleted from the database therefore cannot
+        # be swept through this tool; its leftovers need an operator purge.)
+        if await db_module.get_project(db, _pid) is None:
+            raise ValueError("project not found")
         _events_deleted = await db_module.purge_events_before(db, _pid, _events_cutoff)
         _artifacts_deleted = artifact_store_module.purge_artifacts_before(
             data_dir, _pid, _cutoff_raw,
@@ -4184,7 +4663,9 @@ async def _resolve_ingest_doc_store(
         plan: str | None = None
         tenant_pg_url: str | None = None
         if tenant:
-            plan = tenant.get("plan")
+            from ..plans import tenant_entitlement_plan  # noqa: PLC0415
+
+            plan = tenant_entitlement_plan(tenant, default="")  # playtester -> pro
             enc = tenant.get("neon_db_url")
             tid = tenant.get("id")
             if enc and tid:
@@ -4761,7 +5242,9 @@ async def _handle_session_tools(
         handle_search_synthesis,
         handle_paper_search,
         handle_social_search,
+        handle_zotero_search,
         handle_get_session_brief,
+        handle_get_project_state_milestones,
     )
     from .handlers.research_tools import (  # noqa: PLC0415
         handle_github_search,
@@ -4820,6 +5303,7 @@ async def _handle_session_tools(
         "search_synthesis": handle_search_synthesis,
         "paper_search": handle_paper_search,
         "social_search": handle_social_search,
+        "zotero_search": handle_zotero_search,
         "github_search": handle_github_search,
         # a5343387 — bounded ephemeral research runs.
         "start_research_run": handle_start_research_run,
@@ -4828,6 +5312,7 @@ async def _handle_session_tools(
         "list_research_runs": handle_list_research_runs,
         "promote_research_run": handle_promote_research_run,
         "get_session_brief": handle_get_session_brief,
+        "get_project_state_milestones": handle_get_project_state_milestones,
         "save_watchlist_query": handle_save_watchlist_query,
         "list_watchlist_queries": handle_list_watchlist_queries,
         "run_watchlist_query": handle_run_watchlist_query,
@@ -6863,6 +7348,7 @@ async def _handle_code_index_tools(
                 kind=kind,
                 db_path=db_path,
                 reindex=bool(reindex),
+                allow_broad_root=bool(args.get("allow_broad_root", False)),
                 label="search_code_semantic",
             )
         except _hardening.HeavyToolTimeout as exc:
@@ -6951,6 +7437,66 @@ async def _handle_docx_derivative_tools(
     }
     if name in _standard_dispatch:
         return await _standard_dispatch[name](args, db, data_dir, tenant, _mcp_tenant_id)
+    return _MISS
+
+
+async def _handle_paper_contract_tools(
+    name: str,
+    args: dict[str, Any],
+    db: Any,
+    data_dir: str,
+    tenant: dict[str, Any] | None,
+    _mcp_tenant_id: Any,
+) -> Any:
+    """Dispatch group: 7c96d41b paper_contract editorial-intent tooling --
+    create_paper_contract, get_paper_contract, create_paper_contract_revision,
+    list_paper_contract_revisions, approve_paper_contract_revision,
+    get_current_paper_contract_content. A new sibling dispatch group (own
+    module, own group function), matching _handle_docx_derivative_tools'
+    precedent immediately above rather than growing an existing group --
+    see meridian/mcp/handlers/paper_contract_tools.py's module docstring."""
+    from .handlers.paper_contract_tools import (  # noqa: PLC0415
+        handle_create_paper_contract,
+        handle_get_paper_contract,
+        handle_create_paper_contract_revision,
+        handle_list_paper_contract_revisions,
+        handle_approve_paper_contract_revision,
+        handle_get_current_paper_contract_content,
+    )
+
+    _standard_dispatch: dict[str, Any] = {
+        "create_paper_contract": handle_create_paper_contract,
+        "get_paper_contract": handle_get_paper_contract,
+        "create_paper_contract_revision": handle_create_paper_contract_revision,
+        "list_paper_contract_revisions": handle_list_paper_contract_revisions,
+        "approve_paper_contract_revision": handle_approve_paper_contract_revision,
+        "get_current_paper_contract_content": handle_get_current_paper_contract_content,
+    }
+    if name in _standard_dispatch:
+        return await _standard_dispatch[name](args, db, data_dir, tenant, _mcp_tenant_id)
+    return _MISS
+
+
+async def _handle_runpod_tools(
+    name: str,
+    args: dict[str, Any],
+    db: Any,
+    data_dir: str,
+    tenant: dict[str, Any] | None,
+    _mcp_tenant_id: Any,
+) -> Any:
+    """Dispatch group: runpod_check_key and runpod_list_pods, the local-only RunPod key
+    check and pod listing (meridian/mcp/handlers/runpod_tools.py). They resolve their own
+    credential and take no project, so the database, tenant and data dir are unused."""
+    from .handlers.runpod_tools import (  # noqa: PLC0415
+        handle_runpod_check_key,
+        handle_runpod_list_pods,
+    )
+
+    if name == "runpod_check_key":
+        return await handle_runpod_check_key(args)
+    if name == "runpod_list_pods":
+        return await handle_runpod_list_pods(args)
     return _MISS
 
 
@@ -7143,6 +7689,112 @@ async def _complete_sprint_item_timeout_response(
     }
 
 
+_PROJECT_UUID_RE = re.compile(
+    r"^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$", re.I
+)
+
+
+async def _resolve_project_reference(
+    db: Any,
+    args: dict[str, Any],
+    scoped_project_ids: "list[str] | None" = None,
+) -> dict[str, Any]:
+    """Settle ``project_id`` / ``project_name`` in a tools/call ``args`` dict.
+
+    b6ab6e83 — ``project_name`` is accepted as an alternative to
+    ``project_id``, and a non-UUID ``project_id`` is resolved as a
+    human-readable name. 3f47cc6e — precedence rules, so a name can never
+    silently retarget a call that also names a project by id:
+
+    * lone ``project_id`` (UUID): passed through untouched;
+    * lone ``project_name`` (or a non-UUID ``project_id``): resolved by name;
+      a ``project_name`` that resolves to nothing raises ``ValueError``;
+    * explicit UUID ``project_id`` + a name that does NOT resolve: the id is
+      kept (the schema text promises "project_id wins if both are given");
+    * explicit UUID ``project_id`` + a name that resolves to the SAME
+      project: fine, ``project_id`` is normalised to the stored id;
+    * explicit UUID ``project_id`` + a name that resolves to a DIFFERENT
+      project: rejected with a clear ``ValueError`` rather than silently
+      running against the name's project. Rename and merge free old names
+      (a merge renames the source to ``[merged] <name>``), so a stale
+      ``project_name`` can otherwise retarget a call that carried the right
+      id. The same rule applies when a non-UUID ``project_id`` (treated as a
+      name) and ``project_name`` resolve to different projects.
+
+    ``scoped_project_ids`` keeps the out-of-scope error opaque: if a
+    name-resolved project is outside the caller's scope, the ordinary
+    "project is outside your access scope" error is raised BEFORE any
+    conflict error, so a conflict message can never confirm that a name
+    resolves to a project the caller may not see.
+    """
+    _pid_raw = args.get("project_id") or ""
+    _pname_raw = args.get("project_name") or ""
+    _is_uuid = bool(_PROJECT_UUID_RE.match(_pid_raw))
+    _explicit_id = _pid_raw if _is_uuid else ""
+    # (label, value) pairs that must be looked up as project NAMES.
+    _name_refs: list[tuple[str, str]] = []
+    if _pname_raw:
+        _name_refs.append(("project_name", _pname_raw))
+    if _pid_raw and not _is_uuid:
+        _name_refs.append(("project_id (resolved as a name)", _pid_raw))
+    if not _name_refs:
+        return args
+
+    _resolved: list[tuple[str, str, str]] = []  # (label, value, resolved id)
+    for _label, _ref in _name_refs:
+        _proj = await db_module.get_project_by_name(db, _ref)
+        if _proj:
+            _resolved.append((_label, _ref, str(_proj["id"])))
+
+    if not _resolved:
+        if _pname_raw and not _pid_raw:
+            raise ValueError(f"no project found matching name '{_pname_raw}'")
+        # Unresolvable name(s) next to a project_id: keep the id as given.
+        return args
+
+    _distinct_ids = {rid.lower() for _l, _v, rid in _resolved}
+    if _explicit_id:
+        _distinct_ids.add(_explicit_id.lower())
+    if len(_distinct_ids) > 1:
+        if scoped_project_ids is not None and any(
+            rid not in scoped_project_ids for _l, _v, rid in _resolved
+        ):
+            raise ValueError("project is outside your access scope")
+        _refs = [f"project_id={_explicit_id!r}"] if _explicit_id else []
+        _refs += [f"{_l}={_v!r} -> project {rid}" for _l, _v, rid in _resolved]
+        raise ValueError(
+            "project_id and project_name refer to different projects ("
+            + "; ".join(_refs)
+            + "). Pass only one of them, or make them refer to the same "
+            "project -- a project_name can go stale after a project rename "
+            "or merge."
+        )
+    return {**args, "project_id": _resolved[0][2]}
+
+
+async def _handle_zotero_sync(
+    name: str,
+    args: dict[str, Any],
+    db: Any,
+    data_dir: str,
+    tenant: dict[str, Any] | None,
+    _mcp_tenant_id: Any,
+) -> Any:
+    """Dispatch workstation-originated Zotero citation sync tools."""
+    from .handlers.zotero_sync import (  # noqa: PLC0415
+        handle_apply_zotero_citation_edges,
+        handle_get_pending_zotero_citations,
+    )
+
+    handler = {
+        "get_pending_zotero_citations": handle_get_pending_zotero_citations,
+        "apply_zotero_citation_edges": handle_apply_zotero_citation_edges,
+    }.get(name)
+    if handler is None:
+        return _MISS
+    return await handler(args, db, data_dir, tenant, _mcp_tenant_id)
+
+
 async def _dispatch_mcp_tool(
     name: str,
     args: dict[str, Any],
@@ -7150,24 +7802,27 @@ async def _dispatch_mcp_tool(
     data_dir: str,
     tenant: dict[str, Any] | None = None,
     scoped_project_ids: "list[str] | None" = None,
+    *,
+    _authorization_prechecked: bool = False,
 ) -> Any:
     """Route a tools/call to the appropriate db_module function.
 
     ``scoped_project_ids`` (a9c041d7) — defense-in-depth re-check of the
-    project-scope gate, run AFTER the project_name/non-UUID resolver below has
-    settled on a final ``project_id``. The pre-dispatch gate in
-    ``_handle_mcp_request`` only inspects the caller-supplied ``project_id``
-    (falling back to resolving ``project_name`` itself when ``project_id`` is
-    absent); it never re-runs once this resolver's own name lookup overrides
-    ``args["project_id"]``. That left a bypass: a scoped caller supplying an
-    in-scope ``project_id`` alongside an out-of-scope ``project_name`` sailed
-    through the pre-check gate (which saw the in-scope id and stopped there),
-    then had this resolver silently swap in the out-of-scope project — since
-    ``project_name`` wins over a UUID ``project_id`` whenever both are present
-    (see ``_lookup`` below). Re-checking here, against the actually-resolved
-    id, closes that gap regardless of which of the three resolution paths
-    (plain UUID passthrough, non-UUID project_id-as-name, or project_name
-    override) produced it.
+    project-scope gate, run AFTER the project_name/non-UUID resolver
+    (:func:`_resolve_project_reference`) has settled on a final
+    ``project_id``. The pre-dispatch gate in ``_handle_mcp_request`` only
+    inspects the caller-supplied ``project_id`` (falling back to resolving
+    ``project_name`` itself when ``project_id`` is absent); it never re-runs
+    once the resolver's own name lookup sets ``args["project_id"]``. That
+    left a bypass: a scoped caller supplying an in-scope ``project_id``
+    alongside an out-of-scope ``project_name`` sailed through the pre-check
+    gate (which saw the in-scope id and stopped there), then had the resolver
+    silently swap in the out-of-scope project (before 3f47cc6e, a resolvable
+    ``project_name`` beat a UUID ``project_id``). Re-checking here, against
+    the actually-resolved id, closes that gap regardless of which resolution
+    path (plain UUID passthrough, non-UUID project_id-as-name, or
+    project_name) produced it. Since 3f47cc6e a conflicting id/name pair is
+    additionally rejected inside the resolver itself.
     """
     # Tenant scope for the workspace layer (notes/decisions/settings). None for
     # self-host / unauthenticated; the db functions then skip isolation.
@@ -7182,35 +7837,57 @@ async def _dispatch_mcp_tool(
     _capture_correlation_id = uuid.uuid4().hex
     # b6ab6e83 — project_name resolver: accept project_name as alternative to
     # project_id, and resolve non-UUID project_id values as human-readable names.
-    _pid_raw = args.get("project_id", "")
-    _pname_raw = args.get("project_name", "")
-    _is_uuid = bool(re.match(
-        r"^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$",
-        _pid_raw, re.I,
-    ))
-    if _pname_raw or (_pid_raw and not _is_uuid):
-        _lookup = _pname_raw or _pid_raw
-        _resolved_proj = await db_module.get_project_by_name(db, _lookup)
-        if _resolved_proj:
-            args = {**args, "project_id": _resolved_proj["id"]}
-        elif _pname_raw and not _pid_raw:
-            raise ValueError(f"no project found matching name '{_lookup}'")
+    # 3f47cc6e — an explicit project_id is never silently overridden by a
+    # project_name that resolves elsewhere: that conflict is rejected.
+    if scoped_project_ids is None:
+        args = await _resolve_project_reference(db, args, scoped_project_ids)
+    elif not _authorization_prechecked:
+        args = await _authorize_scoped_mcp_call(
+            name, args, db, data_dir, tenant, scoped_project_ids,
+        )
+    # RT-TI-006 — never trust a caller-supplied scope list: drop it, then (for a
+    # scoped caller only) inject the real one for the discovery tools to filter on.
+    if name in ("list_projects", "get_project_by_name"):
+        args = {k: v for k, v in args.items() if k != "_scoped_project_ids"}
+        if scoped_project_ids is not None:
+            args = {**args, "_scoped_project_ids": list(scoped_project_ids)}
+    # Handoff, context block and session start carry the owner's workspace notes and
+    # decisions. The flag that leaves them out is never taken from the caller: it is
+    # stripped here and set only for a project-scoped caller.
+    if name in scope_guard.WORKSPACE_CONTEXT_TOOLS:
+        args = {k: v for k, v in args.items() if k != scope_guard.WORKSPACE_SCOPED_ARG}
+        if scoped_project_ids is not None:
+            args = {**args, scope_guard.WORKSPACE_SCOPED_ARG: True}
     # a9c041d7 — re-check tenant scope against the FINAL resolved project_id,
-    # after the resolver above may have overridden it via project_name (or a
+    # after the resolver above may have set it via project_name (or a
     # non-UUID project_id-as-name lookup). The pre-dispatch gate in
     # _handle_mcp_request only ever sees the caller's raw args, so a combined
     # {project_id: <in-scope>, project_name: <out-of-scope>} payload could pass
     # that gate and then have this resolver silently swap in the out-of-scope
     # project. Same error shape/message as the pre-check gate so callers can't
     # distinguish which layer caught it.
-    if scoped_project_ids is not None:
-        _final_pid = (args.get("project_id") or "").strip()
-        if _final_pid and _final_pid not in scoped_project_ids:
-            raise ValueError("project is outside your access scope")
+    #
+    # Decision 6fe5210c (wave 2) — that re-check is now one case of a single
+    # table-driven guard (meridian/mcp/scope_guard.py), a no-op with no DB
+    # access when scoped_project_ids is None. It also covers every OTHER way a
+    # call reaches a project: other *_project_id / *_project_name arguments
+    # (merge_project, set_parent_project ...), object ids with no project
+    # argument (notes, decisions, HITL requests, sessions, wave runs,
+    # proposals ...), listings that span every project when project_id is
+    # omitted, and profile-layer scope ids.
+    if scoped_project_ids is None:
+        await scope_guard.enforce_scoped_call(
+            name, args, db, scoped_project_ids,
+            # link_figure_caption / link_table_caption bind a figure or table id to
+            # the caller's own stored document (the doc store is a separate backend,
+            # opened lazily and only for those two tools).
+            doc_store_factory=lambda: _resolve_ingest_doc_store(db, data_dir, tenant),
+        )
     _groups = (
         _handle_project_tools,
         _handle_task_tools,
         _handle_notes_decisions,
+        _handle_zotero_sync,
         _handle_hitl_tools,
         _handle_session_tools,
         _handle_sprint_tools,
@@ -7222,6 +7899,8 @@ async def _dispatch_mcp_tool(
         _handle_code_index_tools,
         _handle_experiment_tools,
         _handle_docx_derivative_tools,
+        _handle_paper_contract_tools,
+        _handle_runpod_tools,
     )
     # a2a027cf — complete_sprint_item timeout-safety at the dispatch layer.
     # Repeated live reports: an MCP client (HTTP/stdio/connector — this
@@ -7291,6 +7970,13 @@ async def _dispatch_mcp_tool(
         else:
             _result = await _grp(name, args, db, data_dir, tenant, _mcp_tenant_id)
         if _result is not _MISS:
+            # Decision 6fe5210c — a cross-project listing (list_profile_layers)
+            # cannot be narrowed by an argument: drop the rows outside a scoped
+            # caller's scope. No-op (and no DB access) for every other tool and
+            # for an unscoped caller.
+            _result = await scope_guard.filter_scoped_result(
+                name, _result, db, scoped_project_ids, args=args,
+            )
             # 8c147109 — activity heartbeat: record a compact one-liner into the
             # session_activity ring-buffer so a remote planner session can observe
             # signs of life via get_session_log even before the executor calls

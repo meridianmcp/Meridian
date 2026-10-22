@@ -1,0 +1,43 @@
+{
+  "meta": {
+    "journal": "nature",
+    "display_name": "Nature Portfolio journals",
+    "publisher": "Springer Nature",
+    "status": "populated",
+    "status_detail": "Round 1 (workspace proposal 3674c0c1) migration of the JOURNAL_STYLE_PRESETS dict literal into per-journal JSON. Independently verified 2026-09-11 against nature.com/nature/for-authors/formatting-guide and nature.com/nature/for-authors/final-submission. heading_numbering_visible, emphasis_style, and the caption/SI/indent keys were left unset in the original dict entry -- not addressed by the pages checked in that pass -- and stay entirely absent here rather than being backfilled with a guess.",
+    "last_verified": "2026-09-11"
+  },
+  "fields": {
+    "citation_style": {
+      "value": "numbered_superscript",
+      "tier": 2,
+      "source": {
+        "type": "live_guidelines_page",
+        "citation": "nature.com/nature/for-authors/formatting-guide and nature.com/nature/for-authors/final-submission",
+        "note": "In-text citations are superscript numerals assigned in order of first appearance, placed after punctuation (paraphrased from the guide in the original in-code comment; not a direct quote)."
+      },
+      "verified_date": "2026-09-11"
+    },
+    "figure_dpi_minimum_halftone": {
+      "value": 300,
+      "tier": 2,
+      "source": {
+        "type": "live_guidelines_page",
+        "citation": "nature.com/nature/for-authors/final-submission",
+        "quote": "in RGB color and at 300 dpi or higher resolution",
+        "note": "Applies to halftone/photographic images specifically."
+      },
+      "verified_date": "2026-09-11"
+    },
+    "figure_dpi_minimum_line_art": {
+      "value": 800,
+      "tier": 2,
+      "source": {
+        "type": "live_guidelines_page",
+        "citation": "nature.com/nature/for-authors/final-submission",
+        "note": "Line art needs 800-1200 dpi per the guide; 800 is the floor value used here (paraphrased range, not a direct quote in the original comment)."
+      },
+      "verified_date": "2026-09-11"
+    }
+  }
+}

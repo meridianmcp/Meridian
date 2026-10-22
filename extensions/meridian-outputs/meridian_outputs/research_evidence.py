@@ -118,9 +118,7 @@ class EnvelopeValidationError(ValueError):
 
 
 class EvidenceKind(str, Enum):
-    """The eleven research-artifact kinds this envelope covers (acceptance
-    criteria: "claim/source/citation/dataset/code/run/output/figure/table/
-    document/review edges")."""
+    """Typed research evidence, including metadata-only external AI references."""
 
     CLAIM = "claim"
     SOURCE = "source"
@@ -133,6 +131,9 @@ class EvidenceKind(str, Enum):
     TABLE = "table"
     DOCUMENT = "document"
     REVIEW = "review"
+    CONVERSATION = "conversation"
+    TRANSCRIPT_RANGE = "transcript_range"
+    PROVIDER_ARTIFACT = "provider_artifact"
 
 
 class ResolverStatus(str, Enum):

@@ -52,32 +52,36 @@ other's task log, and resume from a compressed handoff when context fills up.
 
 ### Option 1 — binary release (recommended)
 
-Signed binaries for Windows, macOS (Apple Silicon), and Linux are attached to
-every [GitHub release](https://github.com/meridianmcp/Meridian/releases).
+Prebuilt downloads are attached to every [GitHub release](https://github.com/meridianmcp/Meridian/releases).
+They are **unsigned**; each release includes a `SHA256SUMS` file to check downloads against.
 
-**Linux / macOS (one-liner via uv):**
+- **Windows tray app** (`meridian-tray.exe`): a system-tray icon that runs the dashboard server. Choose **Open Dashboard** from the tray menu, which opens **http://127.0.0.1:7878**.
+- **macOS tray app** (`meridian-tray-mac.dmg`): the same tray app. The app is not notarized, so the first launch needs right-click > **Open**.
+- **Linux**: there is no tray app yet. Use the uv install below.
+- `meridian.exe`, `meridian-linux`, `meridian-mac-arm64`: the **tunnel client** only (`meridian --tunnel --repo .`, Pro plan and API token required). They do not serve the dashboard.
+
+**Dashboard via uv (Linux, macOS, Windows):**
 ```bash
 uv tool install meridian-server
+meridian
+```
+
+Dashboard opens at **http://localhost:7878**. The data directory defaults to `./data`; set `MERIDIAN_DATA_DIR` to change it.
+
+**Pro tunnel client (optional):**
+```bash
 meridian --tunnel --repo .
 ```
 
-**Linux / macOS (manual binary download):**
+**Linux / macOS (installer script, uses uv):**
 ```bash
 curl -fsSL https://usemeridian.us/install.sh | sh
 ```
 
-**Windows (PowerShell, one-liner via uv):**
-```powershell
-uv tool install meridian-server
-meridian --tunnel --repo .
-```
-
-**Windows (PowerShell, manual binary download):**
+**Windows (PowerShell, installs the tunnel client `meridian.exe`):**
 ```powershell
 irm https://usemeridian.us/install-windows.ps1 | iex
 ```
-
-Dashboard opens at **http://localhost:7878**. Data persists in `~/.meridian/` by default.
 
 ### Option 2 — from source (dev setup / self-host)
 
@@ -132,6 +136,19 @@ Drop a `.mcp.json` at your project root.
 }
 ```
 
+**Self-host (tray app or uv install already running on port 7878):**
+```json
+{
+  "mcpServers": {
+    "meridian": {
+      "type": "http",
+      "url": "http://127.0.0.1:7878/mcp"
+    }
+  }
+}
+```
+Use the same `mcpServers` key in `~/.claude.json` to make it available in every project. A self-hosted server needs no API key. If you set `MERIDIAN_PORT`, change the port in the URL to match.
+
 ### Cursor / Windsurf
 
 Same JSON snippet — both clients read `.mcp.json` from the project root.
@@ -148,17 +165,17 @@ before editing any client cache.
 
 ### claude.ai web (recommended for planning chat)
 
-Use [dnakov/claude-mcp](https://github.com/dnakov/claude-mcp) — included as a submodule — to bridge claude.ai to your local Meridian server:
+A claude.ai connector cannot reach `http://localhost`. Pick one of these:
 
-```bash
-git clone --recurse-submodules https://github.com/meridianmcp/Meridian
-```
+- **Hosted (no install):** in claude.ai go to **Customize > Connectors > Add custom connector**, set the URL to `https://usemeridian.us/mcp`, and complete the OAuth prompt.
+- **Self-hosted, Chrome bridge:** use [dnakov/claude-mcp](https://github.com/dnakov/claude-mcp), included as a submodule:
+  ```bash
+  git clone --recurse-submodules https://github.com/meridianmcp/Meridian
+  ```
+  Open `chrome://extensions`, enable **Developer mode**, click **Load unpacked**, and select `extensions/claude-mcp`. Set the bridge URL to `http://localhost:7878/mcp/sse`.
+- **Self-hosted, public URL:** expose your server over HTTPS and add `https://<your-host>/mcp` as the connector.
 
-1. Open `chrome://extensions` and enable **Developer mode**
-2. Click **Load unpacked** and select `extensions/claude-mcp`
-3. Click the extension icon and set the URL to `http://localhost:7878/mcp`
-
-All 54+ Meridian tools (`checkpoint`, `log_task`, `pin_decision`, etc.) are now available directly in claude.ai planning chat. No copy-pasting session output.
+Full steps are in the [browser connector guide](docs/browser-connector.md).
 
 ### Hosted tier (no install)
 
@@ -169,7 +186,7 @@ Or manually:
 {"mcpServers":{"meridian":{"type":"http","url":"https://usemeridian.us/mcp","headers":{"Authorization":"Bearer sk_meridian_YOUR_KEY_HERE"}}}}
 ```
 
-**claude.ai (browser)** users: install the [dnakov/claude-mcp](https://github.com/dnakov/claude-mcp) Chrome extension, then visit [usemeridian.us/install-mcp](https://usemeridian.us/install-mcp) for a step-by-step setup guide with one-click copy buttons.
+**claude.ai (browser)** users: no extension is needed for hosted Meridian. Add `https://usemeridian.us/mcp` under **Customize > Connectors**. See the [browser connector guide](docs/browser-connector.md).
 
 Get your API key at [usemeridian.us/settings](https://usemeridian.us/settings) after sign-in. Free tier: 30 days, no card, full features.
 
