@@ -1228,6 +1228,10 @@ def _fan_out_spec_to_batch_entry(spec: Any, index: int) -> dict[str, Any]:
     ck = spec.get("correlation_key")
     if isinstance(ck, str) and ck.strip():
         entry["correlation_key"] = ck
+    # #8 — the tool pins reach the item the same way on this path as on add_sprint_item, instead of being dropped.
+    for pin in ("required_tool", "tool_requirements"):
+        if spec.get(pin) not in (None, ""):
+            entry[pin] = spec.get(pin)
     return entry
 
 
@@ -1304,8 +1308,15 @@ async def fan_out_sprint_items(
         )
         return result.to_dict()
 
+    # #8 — validate every typed tool_requirements value before the first INSERT. A malformed value now raises here,
+    # before anything is written. The loop used to drop the field without a word.
+    tool_requirements_json = [
+        _tool_requirements.serialize_tool_requirements(spec.get("tool_requirements"))
+        if isinstance(spec, dict) else None
+        for spec in items
+    ]
     ids: list[str] = []
-    for spec in items:
+    for index, spec in enumerate(items):
         title = (spec.get("title") or "").strip()
         if not title:
             continue
@@ -1328,10 +1339,11 @@ async def fan_out_sprint_items(
         await db.execute(
             "INSERT INTO sprint_items "
             "(id, project_id, version, title, item_group, notes, touches_resources, "
-            "slug, nickname) "
-            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            "slug, nickname, required_tool, tool_requirements) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
             (iid, project_id, version, title, group, description, resources_json,
-             _item_slug, _item_nickname),
+             _item_slug, _item_nickname, spec.get("required_tool") or None,
+             tool_requirements_json[index]),
         )
         ids.append(iid)
     if ids:
