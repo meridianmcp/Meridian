@@ -1146,6 +1146,23 @@ def _repaired_keys(scan: str, token: str, prefs: str) -> list[str]:
     return keys
 
 
+def _api_listening() -> bool:
+    """Whether something accepts a connection on the local write API's loopback port. Reads only; never raises.
+
+    The API starts when Zotero starts, from the profile's prefs, so a repair made while Zotero runs does not
+    bring it up. The result tells the caller, so the install can say that Zotero needs a restart.
+    """
+    import socket
+
+    from meridian import zotero_bridge_api as bridge  # imported here: see _ensure_api
+
+    try:
+        with socket.create_connection(("127.0.0.1", bridge.API_PORT), timeout=1.0):
+            return True
+    except OSError:
+        return False
+
+
 def _repair_profile(profile: "Path | str", result: Mapping[str, Any]) -> dict[str, Any]:
     """The profile repairs that follow the .xpi: the scan line, then the API token and prefs. Never raises.
 
@@ -1170,6 +1187,7 @@ def _repair_profile(profile: "Path | str", result: Mapping[str, Any]) -> dict[st
         "api_token": token,
         "api_prefs": prefs,
         "repaired": _repaired_keys(scan, token, prefs),
+        "api_listening": _api_listening(),
     }
 
 
@@ -1430,15 +1448,26 @@ def _print_repairs(result: Mapping[str, Any]) -> None:
         print("Repaired in this profile: " + ", ".join(labels) + ".")
 
 
+def _print_api_state(result: Mapping[str, Any]) -> None:
+    """Say when the local write API is not listening, so the user knows Zotero must start (or restart) to use it."""
+    if result.get("api_listening") is False:
+        print(
+            "The local write API (127.0.0.1:23125) is not running yet. It starts when Zotero starts, so if Zotero "
+            "is already open, restart it."
+        )
+
+
 def _print_install_status(result: Mapping[str, Any], xpi: Path, profile: Path) -> int:
     """Print the install's own outcome line. Returns the exit code."""
     status = result["status"]
     if status == "installed":
         print(f"Installed the Zotero bridge plugin to {result['path']}.")
+        _print_api_state(result)
         return 0
     if status == "unchanged":
         print(f"The Zotero bridge plugin is already up to date at {result['path']}.")
         _print_repairs(result)
+        _print_api_state(result)
         return 0
     if status == "refused_not_profile":
         print(result.get("error", _NOT_PROFILE_MESSAGE.format(profile=profile)))
