@@ -524,6 +524,9 @@ SILENT_WRITERS: dict[tuple[str, str, str], str] = {
     ),
     ("projects", "meridian/db/__init__.py", "set_project_execution_mode"): _SETTINGS_FORM,
     ("projects", "meridian/db/__init__.py", "update_project_settings"): _SETTINGS_FORM,
+    # use_mode is rendered only in the settings form (dashboard-settings.ts), so no
+    # WebSocket-fed list needs a repaint. Allowlisted the same way as its siblings above.
+    ("projects", "meridian/db/__init__.py", "set_project_use_mode"): _SETTINGS_FORM,
     ("projects", "meridian/db/__init__.py", "set_agent_instructions"): _SETTINGS_FORM,
     ("projects", "meridian/db/__init__.py", "set_project_repo_identity"): (
         "stores a one-way repo fingerprint used for MCP scope checks; never rendered"
@@ -555,6 +558,15 @@ SILENT_WRITERS: dict[tuple[str, str, str], str] = {
     ("projects", "meridian/db/migrations.py", "_migrate_github_to_projects"): _STARTUP_MIGRATION,
     ("projects", "meridian/db/migrations.py", "_backfill_agent_instructions"): _STARTUP_MIGRATION,
     ("projects", "meridian/pg_adapter.py", "_migrate_pg_backfill_agent_instructions"): _STARTUP_MIGRATION,
+    ("sprint_items", "meridian/db/__init__.py", "_delete_project_data"): (
+        "internal cascade helper; delete_project publishes the project-deleted event after commit"
+    ),
+    ("projects", "meridian/db/__init__.py", "_delete_project_data"): (
+        "internal cascade helper; delete_project publishes the project-deleted event after commit"
+    ),
+    ("projects", "meridian/db/__init__.py", "_expected_project_delete_transaction"): (
+        "SQLite lock acquisition uses UPDATE projects ... WHERE 0, so no project row changes"
+    ),
 }
 
 
@@ -637,11 +649,10 @@ def test_the_writer_scan_sees_the_functions_the_verifier_found_silent():
             ("meridian/handoff.py", "_annotate_touches_files"),
         ],
         "projects": [
-            ("meridian/db/__init__.py", "create_project"),
-            ("meridian/db/__init__.py", "delete_project"),
+            ("meridian/db/__init__.py", "_create_project_unlocked"),
             ("meridian/db/__init__.py", "merge_project"),
             ("meridian/db/__init__.py", "rename_project"),
-            ("meridian/db/__init__.py", "set_parent_project"),
+            ("meridian/db/__init__.py", "_set_parent_project_unlocked"),
             ("meridian/db/__init__.py", "set_project_status"),
             ("meridian/db/__init__.py", "set_decision"),
         ],

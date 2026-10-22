@@ -271,3 +271,54 @@ async def test_windows_path_separator_handled(db, project, tmp_path, monkeypatch
 
     # Skill is present so no warning expected
     assert "setup_warning" not in result
+
+
+# ---------------------------------------------------------------------------
+# 7. Executor git-hygiene rules appear in both /goal copies: the SKILL.md
+#    execution steps and the AGENTS.md fallback snippet (kept in sync).
+# ---------------------------------------------------------------------------
+
+_REPO_ROOT = Path(__file__).resolve().parent.parent
+
+_GOAL_RULE_PHRASES = (
+    "its own git worktree",
+    "get_file_claims",
+    "claim_file",
+    "stage by path only",
+    "never force push",
+    "never push main",
+    "run the targeted tests before any merge",
+    "complete_sprint_item",
+)
+
+
+def _normalise(text: str) -> str:
+    return " ".join(text.split()).lower()
+
+
+def _goal_skill_steps_section() -> str:
+    text = (_REPO_ROOT / ".claude" / "skills" / "goal" / "SKILL.md").read_text(encoding="utf-8")
+    start = text.index("## Step 2")
+    end = text.index("## Step 3")
+    return text[start:end]
+
+
+def _agents_fallback_snippet() -> str:
+    text = (_REPO_ROOT / "AGENTS.md").read_text(encoding="utf-8")
+    anchor = text.index("If curl is unavailable")
+    open_fence = text.index("```markdown", anchor)
+    body_start = text.index("\n", open_fence) + 1
+    close_fence = text.index("```", body_start)
+    return text[body_start:close_fence]
+
+
+@pytest.mark.parametrize("phrase", _GOAL_RULE_PHRASES)
+def test_goal_rule_phrase_in_skill_md(phrase):
+    """Each executor git-hygiene rule must appear in the SKILL.md execution steps."""
+    assert phrase in _normalise(_goal_skill_steps_section())
+
+
+@pytest.mark.parametrize("phrase", _GOAL_RULE_PHRASES)
+def test_goal_rule_phrase_in_agents_fallback(phrase):
+    """The AGENTS.md fallback snippet must carry the same rule list."""
+    assert phrase in _normalise(_agents_fallback_snippet())

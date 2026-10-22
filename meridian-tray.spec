@@ -49,6 +49,29 @@ block_cipher = None
 
 _IS_MACOS = sys.platform == "darwin"
 
+# The Zotero bridge plugin source. The tray's auto-install packs this folder into
+# the .xpi at run time (meridian/zotero_plugin_install.py resolves it under
+# sys._MEIPASS), so it ships in the bundle. test/ and node_modules/ never do.
+_ZOTERO_BRIDGE_ROOT = os.path.join('extensions', 'zotero-bridge')
+_ZOTERO_BRIDGE_PRUNED = frozenset({'test', 'node_modules', '__pycache__'})
+
+
+def _zotero_bridge_datas():
+    """(source file, bundle folder) pairs for the bridge plugin source, pruned as above."""
+    if not os.path.isdir(_ZOTERO_BRIDGE_ROOT):
+        raise FileNotFoundError(f'Zotero bridge plugin source is missing: {_ZOTERO_BRIDGE_ROOT}')
+    entries = []
+    for root, dirs, files in os.walk(_ZOTERO_BRIDGE_ROOT):
+        dirs[:] = sorted(d for d in dirs if d not in _ZOTERO_BRIDGE_PRUNED)
+        relative = os.path.relpath(root, _ZOTERO_BRIDGE_ROOT)
+        folder = 'extensions/zotero-bridge'
+        if relative != os.curdir:
+            folder += '/' + relative.replace(os.sep, '/')
+        for name in sorted(files):
+            entries.append((os.path.join(root, name), folder))
+    return entries
+
+
 a = Analysis(
     ['meridian/tray_main.py'],
     pathex=[str(Path('.').resolve())],
@@ -75,6 +98,8 @@ a = Analysis(
         # the second build's server started fine (health check passed) but
         # GET / (landing.html) 500'd until this was added.
         ('meridian/templates', 'meridian/templates'),
+        # Zotero bridge plugin source, for the tray's auto-install (see _zotero_bridge_datas).
+        *_zotero_bridge_datas(),
     ],
     hiddenimports=[
         'meridian',

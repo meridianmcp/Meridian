@@ -55,9 +55,11 @@ def _run_hook(payload: str, env: dict[str, str] | None = None) -> subprocess.Com
     # even C:/ posix form) breaks git-bash's usr/bin/bash (it wants /c/... MSYS form),
     # and `bash -c <script>` doesn't reliably deliver stdin to `cat` on git-bash. A
     # relative path from the repo root works identically on Linux CI and Windows.
+    # 60s, not 15s: under the full gate's 8 workers, Git Bash startup alone can
+    # exceed 15s. The hook itself is instant. The bound exists to catch a hang.
     return subprocess.run(
         [_HITL_BASH, ".claude/hooks/hitl_guard.sh"],
-        input=payload, cwd=str(_REPO), capture_output=True, text=True, timeout=15,
+        input=payload, cwd=str(_REPO), capture_output=True, text=True, timeout=60,
         env=env,
     )
 

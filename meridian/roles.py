@@ -8,7 +8,8 @@ Roles
 -----
 ``owner``   tenant owner; alias of the implicit case above when an invitee
             is co-promoted to full access. Can do anything.
-``admin``   tenant-management permissions short of billing/deletion.
+``admin``   tenant-management permissions short of billing, deletion and
+            member-policy administration.
 ``member``  read + write project data; no team/billing/settings changes.
 ``viewer``  read-only.
 
@@ -45,11 +46,16 @@ PERM_INVITE = "invite"        # add or remove workspace members
 PERM_SETTINGS = "settings"    # change tenant-level settings
 PERM_BILLING = "billing"      # open Stripe portal, change plan
 PERM_DELETE_TENANT = "delete" # /account/delete
+# Edit the workspace default and per-member capability policy for
+# project-scoped members. Owner only, deliberately not grantable to an admin:
+# an admin who could edit the policy could grant itself any capability.
+PERM_MANAGE_POLICY = "policy"
 
 ROLE_PERMS: Final[dict[str, frozenset[str]]] = {
     ROLE_OWNER: frozenset({
         PERM_READ, PERM_WRITE, PERM_HITL_ANSWER,
         PERM_INVITE, PERM_SETTINGS, PERM_BILLING, PERM_DELETE_TENANT,
+        PERM_MANAGE_POLICY,
     }),
     ROLE_ADMIN: frozenset({
         PERM_READ, PERM_WRITE, PERM_HITL_ANSWER,

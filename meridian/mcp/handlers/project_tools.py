@@ -21,7 +21,14 @@ from meridian import capability_manifest as _capability_manifest
 from meridian import db as db_module
 from meridian import profile_contract as _profile_contract
 from meridian._deps import _hosted_mode
+from meridian.mcp.scope_guard import WORKSPACE_SCOPED_ARG
 from meridian.mcp_tools import _select_active_tool_set
+from meridian.rights_policy import (
+    COMMERCIALIZED,
+    STANDARD_PUBLICATION,
+    RightsPolicyError,
+    decide_image_storage,
+)
 
 if TYPE_CHECKING:
     pass
@@ -72,6 +79,17 @@ async def handle_set_parent_project(
         _pid = (_p or {}).get("id", "") if _p else ""
     if not _pid:
         return {"error": "project_id (or project_name) is required"}
+    from ... import member_policy  # noqa: PLC0415
+
+    authorized = args.pop(member_policy.MEMBER_POLICY_AUTHORIZED_PARENT_ARG, None)
+    compare_and_set: dict[str, Any] = {}
+    if isinstance(authorized, member_policy.AuthorizedParentSnapshot):
+        if authorized.project_id != _pid:
+            return {"error": "project authorization snapshot does not match"}
+        compare_and_set = {
+            "expect_parent": authorized.parent_project_id,
+            "expect_parent_exists": authorized.parent_exists,
+        }
     _parent = args.get("parent_project_id")
     if not _parent and args.get("parent_project_name"):
         _pp = await db_module.get_project_by_name(db, str(args["parent_project_name"]))
@@ -79,7 +97,9 @@ async def handle_set_parent_project(
     if not _parent:  # "" / missing -> detach
         _parent = None
     try:
-        updated = await db_module.set_parent_project(db, _pid, _parent)
+        updated = await db_module.set_parent_project(
+            db, _pid, _parent, **compare_and_set,
+        )
     except ValueError as exc:
         return {"error": str(exc)}
     if updated is None:
@@ -145,6 +165,106 @@ async def handle_set_project_execution_mode(
     if updated is None:
         return {"error": f"project '{_pid}' not found"}
     return updated
+
+
+async def handle_set_project_use_mode(
+    args: dict[str, Any],
+    db: Any,
+    data_dir: str,
+    tenant: dict[str, Any] | None,
+    _mcp_tenant_id: Any,
+) -> Any:
+    """MCP tool: set_project_use_mode.
+
+    MCP wrapper over the strict db.set_project_use_mode, the rights gate's
+    per-project input. A value other than standard_publication or commercialized
+    returns {error} and changes nothing. An unknown project returns {error}. The
+    change is audited with the actor ``mcp:set_project_use_mode``.
+    """
+    _pid = (args.get("project_id") or "").strip()
+    if not _pid and args.get("project_name"):
+        _p = await db_module.get_project_by_name(db, str(args["project_name"]))
+        _pid = (_p or {}).get("id", "") if _p else ""
+    if not _pid:
+        return {"error": "project_id (or project_name) is required"}
+    if args.get("use_mode") is None:
+        return {"error": "use_mode is required"}
+    try:
+        current = await db_module.get_project_use_mode(db, _pid)
+    except ValueError as exc:
+        return {"error": str(exc)}
+    # Downgrading a commercialized project would unlock restricted images with
+    # no human in the loop, so it is refused over MCP. The owner makes that change
+    # in the dashboard, where it is audited the same way.
+    if current == COMMERCIALIZED and args["use_mode"] == STANDARD_PUBLICATION:
+        return {
+            "error": (
+                "a commercialized project cannot be moved back to standard_publication "
+                "over MCP; the owner must make that change in the dashboard"
+            ),
+        }
+    try:
+        return await db_module.set_project_use_mode(
+            db, _pid, args["use_mode"],
+            actor="mcp:set_project_use_mode",
+            reason=args.get("reason"),
+        )
+    except ValueError as exc:
+        return {"error": str(exc)}
+
+
+async def handle_check_image_rights(
+    args: dict[str, Any],
+    db: Any,
+    data_dir: str,
+    tenant: dict[str, Any] | None,
+    _mcp_tenant_id: Any,
+) -> Any:
+    """MCP tool: check_image_rights (read-only).
+
+    Previews how the image-storage rights policy classifies one source image for
+    this project: its tier, its flags, the project's effective use mode, and
+    whether image bytes would be refused without a human-approved override.
+
+    Read-only by construction. The decision is the pure
+    ``decide_image_storage``, the use mode is one SELECT through the same
+    fail-closed helper the gate uses, and nothing here reaches the override path
+    (``request_rights_override`` / ``authorize_image_storage``). So no approval
+    request is filed, no approval is spent and no audit row is written. A missing
+    or unknown license is LINK_ONLY.
+    """
+    # Lazy import: rights_override pulls in gate_override, so keep it off the
+    # module import path of this handler module.
+    from meridian import rights_override as _rights_override  # noqa: PLC0415
+
+    _pid = (args.get("project_id") or "").strip()
+    if not _pid and args.get("project_name"):
+        _p = await db_module.get_project_by_name(db, str(args["project_name"]))
+        _pid = (_p or {}).get("id", "") if _p else ""
+    if not _pid:
+        return {"error": "project_id (or project_name) is required"}
+    try:
+        use_mode = await _rights_override._effective_use_mode(db, _pid, None)
+    except RightsPolicyError as exc:
+        return {"error": str(exc), "code": exc.code}
+    decision = decide_image_storage(
+        args.get("license"),
+        derived=bool(args.get("derived", False)),
+        redrawn=bool(args.get("redrawn", False)),
+        use_mode=use_mode,
+    )
+    return {
+        "project_id": _pid,
+        "use_mode": use_mode,
+        "license": decision.license,
+        "tier": decision.tier,
+        "flags": list(decision.flags),
+        "jurisdiction": decision.jurisdiction,
+        "derived": decision.derived,
+        "redrawn": decision.redrawn,
+        "override_required": not decision.allowed,
+        "reason": decision.reason,
+    }
 
 
 async def handle_register_session(
@@ -241,6 +361,7 @@ async def handle_start_session(
         compact=args.get("compact", True),
         version=args.get("version"),
         mode=args.get("mode"),
+        include_workspace=not args.get(WORKSPACE_SCOPED_ARG),
     )
     # bf51b12e — register executor sessions in-memory so the planner
     # context-refresh hook skips them (the nudge is planner-only). Best-effort:

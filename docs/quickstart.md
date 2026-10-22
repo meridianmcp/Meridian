@@ -7,57 +7,42 @@ Get Meridian running and connected to Claude Code in under 10 minutes.
 ## Prerequisites
 
 - A Claude Code, Claude Desktop, Cursor, or Windsurf installation
-- No Python required for binary installs (Windows/Linux/macOS tabs below)
+- No Python required for the Windows or macOS tray apps (tabs below)
 
 ---
 
 ## Step 1 — Install Meridian
 
-=== "Windows .exe"
+=== "Windows tray app"
 
-    Download the latest binary from the [Releases page](https://github.com/meridianmcp/Meridian/releases/latest).
+    Download `meridian-tray.exe` from the [Releases page](https://github.com/meridianmcp/Meridian/releases/latest) (under **Assets**).
 
-    Look for `meridian.exe` under **Assets**.
+    1. Double-click `meridian-tray.exe`. Windows SmartScreen may warn because the binary is unsigned.
+    2. A Meridian icon appears in the system tray. The tray starts the dashboard server on port 7878.
+    3. Choose **Open Dashboard** from the tray menu. It opens **http://127.0.0.1:7878/**.
 
-    1. Download `meridian.exe`
-    2. Double-click to run — Windows Firewall may prompt, click **Allow**
-    3. Your browser opens automatically at **http://localhost:7878**
+    !!! note
+        `meridian.exe` is the tunnel client and does not serve the dashboard. Use `meridian-tray.exe` for the dashboard.
 
-    !!! tip
-        To run from a specific folder (for data persistence), open a terminal and run:
-        ```
-        meridian.exe
-        ```
+=== "macOS tray app"
 
-=== "Linux binary"
+    Download `meridian-tray-mac.dmg` from the [Releases page](https://github.com/meridianmcp/Meridian/releases/latest).
 
-    Download the latest binary from the [Releases page](https://github.com/meridianmcp/Meridian/releases/latest).
+    1. Open the DMG and drag **Meridian.app** to **Applications**.
+    2. The app is not notarized. The first time, right-click **Meridian.app** and choose **Open**.
+    3. Choose **Open Dashboard** from the menu-bar icon. It opens **http://127.0.0.1:7878/**.
 
-    Look for `meridian-linux` under **Assets**.
+=== "uv (Linux, macOS, Windows)"
 
-    ```bash
-    # Download (replace X.Y.Z with the latest version)
-    curl -Lo meridian https://github.com/meridianmcp/Meridian/releases/latest/download/meridian-linux
-    chmod +x meridian
-    ./meridian
-    # → Meridian running on http://127.0.0.1:7878
-    ```
-
-=== "macOS arm64"
-
-    Download the latest binary from the [Releases page](https://github.com/meridianmcp/Meridian/releases/latest).
-
-    Look for `meridian-mac-arm64` under **Assets**.
+    Installs the dashboard server from PyPI. Requires [uv](https://docs.astral.sh/uv/).
 
     ```bash
-    # Download (replace X.Y.Z with the latest version)
-    curl -Lo meridian https://github.com/meridianmcp/Meridian/releases/latest/download/meridian-mac-arm64
-    chmod +x meridian
-    # macOS may quarantine the binary — remove the quarantine flag:
-    xattr -d com.apple.quarantine meridian 2>/dev/null || true
-    ./meridian
-    # → Meridian running on http://127.0.0.1:7878
+    uv tool install meridian-server
+    meridian
+    # → Meridian running on http://localhost:7878
     ```
+
+    Linux has no tray app yet, so run `meridian` in a terminal to start the server.
 
 === "pixi (from source)"
 
@@ -109,7 +94,7 @@ meridian_project_create(name="my-project")
 
 ### Claude Code
 
-Add to `.mcp.json` in your project root (or `~/.claude/mcp.json` globally):
+Add to `.mcp.json` in your project root (or under `mcpServers` in `~/.claude.json` for every project):
 
 ```json
 {
@@ -126,6 +111,23 @@ Add to `.mcp.json` in your project root (or `~/.claude/mcp.json` globally):
 !!! tip
     Replace `/absolute/path/to/Meridian` with the actual path where you cloned the repo.
     On Windows use forward slashes: `C:/Users/you/Meridian`.
+
+#### Server already running (tray app or uv)
+
+If `meridian-tray.exe`, the macOS tray app or `meridian` is already running, point Claude Code at its HTTP endpoint:
+
+```json
+{
+  "mcpServers": {
+    "meridian": {
+      "type": "http",
+      "url": "http://127.0.0.1:7878/mcp"
+    }
+  }
+}
+```
+
+A self-hosted server needs no API key. If you set `MERIDIAN_PORT`, change the port in the URL to match.
 
 ### Claude Desktop
 
@@ -146,7 +148,7 @@ Add to `~/Library/Application Support/Claude/claude_desktop_config.json` (macOS)
 
 ### Cursor
 
-Add to `.cursor/mcp.json` in your project root:
+Add to Cursor's user-global config, `~/.cursor/mcp.json`:
 
 ```json
 {
@@ -366,7 +368,7 @@ local server, full session continuity.
 
 ### MCP tools not showing up in Claude Code
 
-1. Make sure the Meridian server is running (`./meridian` or `pixi run start`)
+1. Make sure the Meridian server is running (tray app, `meridian`, or `pixi run start`)
 2. Verify the `cwd` path in your `.mcp.json` is correct and uses absolute path
 3. Restart Claude Code after editing `.mcp.json`
 4. Check Claude Code's MCP panel (⚙️ → MCP) for error messages
@@ -374,14 +376,16 @@ local server, full session continuity.
 ### Server won't start — port already in use
 
 ```bash
-# Change the port (binary)
-MERIDIAN_PORT=7879 ./meridian
+# Change the port (uv install)
+MERIDIAN_PORT=7879 meridian
 
 # Change the port (pixi)
 MERIDIAN_PORT=7879 pixi run start
 ```
 
-Update your `.mcp.json` if you use a non-default port (MCP stdio mode doesn't use HTTP, so port only matters for the dashboard).
+For the tray apps, set `MERIDIAN_PORT` in your environment before launching them.
+
+If you use a non-default port, update the `url` in your HTTP MCP config to match. The stdio (pixi) config does not use a port.
 
 ### Database error on startup
 

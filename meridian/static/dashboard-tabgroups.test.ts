@@ -43,7 +43,8 @@ const EXPECTED_MEMBERSHIP: Record<string, string[]> = {
   planning: ["goal", "insights", "blog"],
   work: ["queue", "experiments", "hitl", "team", "sessions"],
   content: ["files", "notes", "devlog", "documents", "docs", "codeintel"],
-  history: ["timeline", "rewind", "settings"],
+  history: ["timeline", "rewind"],
+  settings: ["settings"],
 };
 
 describe("VTAB_GROUPS structure", () => {
@@ -277,8 +278,9 @@ describe("wireVtabGroups behaviour (jsdom)", () => {
   });
 
   it("revealGroupInStrip works on a plain strip (the waffle's entry point) and ignores a missing group", () => {
+    groupEl(strip, "settings").classList.add("collapsed");
     revealGroupInStrip(strip, "settings"); // not wired: no accordion, just expands
-    expect(groupEl(strip, "history").classList.contains("collapsed")).toBe(false);
+    expect(groupEl(strip, "settings").classList.contains("collapsed")).toBe(false);
     expect(() => revealGroupInStrip(document.createElement("div"), "goal")).not.toThrow();
   });
 });

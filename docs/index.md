@@ -228,7 +228,7 @@ These MCP servers pair with Meridian to give your AI agents codebase context and
     ```
 
 === "Cursor"
-    **File:** `.cursor/mcp.json` at project root
+    **File:** `~/.cursor/mcp.json` (user-global)
 
     ```json
     {

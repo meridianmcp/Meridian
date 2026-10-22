@@ -81,6 +81,15 @@ def test_workspace_module_exports_expected_functions():
         "update_workspace_member",
         "get_workspaces_for_email",
         "get_scoped_project_ids_for_member",
+        # member policy (what a project-scoped member may do)
+        "get_member_policy_rows",
+        "set_member_policy_default",
+        "set_member_policy_override",
+        "clear_member_policy_override",
+        "list_member_policy_overrides",
+        "get_member_roles",
+        "MEMBER_POLICY_DEFAULT_SUBJECT",
+        "MEMBER_POLICY_CHANGED_EVENT",
     ]
 
     all_names = (

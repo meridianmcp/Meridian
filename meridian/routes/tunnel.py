@@ -3790,13 +3790,28 @@ async def add_tunnel_filesystem_root(request: Request) -> Response:
     path = _normalize_root(body.get("path") if body.get("path") is not None else body.get("root"))
     if not path:
         return _json_response({"error": "path is required"}, status_code=400)
+    # Keep the capability check inside this route so it runs before either
+    # project configuration or the live tunnel is changed. The resolved scope
+    # object must stay intact for fail-closed policy evaluation.
+    from .. import _deps as policy_deps
+
     try:
         db = await _db(request)
+        await policy_deps._require_capability(
+            request, policy_deps.member_policy.WRITE_PROJECT
+        )
         # RT-TI-005 (pass 3, F-D3) -- the root is written into a project's executor_config
         # (the newest one handed to the helper): for a project-scoped member that must be
         # one of THEIR projects, never another project of the workspace.
         projects = await _projects_in_scope(request, db)
         roots = await _persist_add_filesystem_root(db, projects, path)
+    except policy_deps.member_policy.MemberPolicyDenied as exc:
+        return _json_response(exc.body(), status_code=exc.status_code)
+    except policy_deps.member_policy.MemberPolicyUnavailable as exc:
+        return _json_response(
+            {"error": "member_policy_unavailable", "detail": exc.detail},
+            status_code=exc.status_code,
+        )
     except Exception as exc:  # noqa: BLE001
         return _json_response({"error": f"could not persist root: {exc}"}, status_code=500)
     live = await send_add_fs_roots_control(tenant["id"], [path])
@@ -3829,12 +3844,25 @@ async def remove_tunnel_filesystem_root(request: Request) -> Response:
             pass
     if not path:
         return _json_response({"error": "path is required"}, status_code=400)
+    # Authorize the whole scoped operation before any persisted or live change.
+    from .. import _deps as policy_deps
+
     try:
         db = await _db(request)
+        await policy_deps._require_capability(
+            request, policy_deps.member_policy.WRITE_PROJECT
+        )
         # RT-TI-005 (pass 3, F-D3) -- strip the root only from the caller's in-scope
         # projects (see the POST route above).
         projects = await _projects_in_scope(request, db)
         roots = await _persist_remove_filesystem_root(db, projects, path)
+    except policy_deps.member_policy.MemberPolicyDenied as exc:
+        return _json_response(exc.body(), status_code=exc.status_code)
+    except policy_deps.member_policy.MemberPolicyUnavailable as exc:
+        return _json_response(
+            {"error": "member_policy_unavailable", "detail": exc.detail},
+            status_code=exc.status_code,
+        )
     except Exception as exc:  # noqa: BLE001
         return _json_response({"error": f"could not persist removal: {exc}"}, status_code=500)
     live = await send_set_fs_roots_control(tenant["id"], roots)
