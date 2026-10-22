@@ -46,7 +46,7 @@ import { createStore } from "zustand/vanilla";
 import { wireVtabGroups, revealGroupInStrip } from "./dashboard-tabgroups";
 // 8a665a03 -- a repaint must never throw away what the user typed: list views that are
 // rebuilt from a fetch carry their half-written inputs across (see paintKeepingDrafts).
-import { paintKeepingDrafts, hasUnsentDrafts } from "./dashboard-utils";
+import { paintKeepingDrafts, hasUnsentDrafts, paintTabBody, setTabBodyMessage } from "./dashboard-utils";
 // 0c30b989 — the sprint arrow button's "move to next / specific version / defer"
 // glue (endpoints, request bodies, toast, repaint). The popover and the
 // next-version rule it previews (mirrors meridian/versioning.py) are in
@@ -9245,25 +9245,26 @@ async function loadExperimentsTab(projectId: any) {
     refreshBtn.onclick = () => loadExperimentsTab(projectId);
   }
 
-  body.innerHTML = `<div class="empty" style="color:var(--muted)">loading experiments…</div>`;
+  // 962d4480 -- a loading / error / empty message never blanks a body that holds an unsent draft.
+  setTabBodyMessage(body, `<div class="empty" style="color:var(--muted)">loading experiments…</div>`);
 
   let data: any;
   try {
     data = await projectApi(projectId, `/projects/${projectId}/experiments`);
   } catch (e: any) {
-    body.innerHTML = `<div style="color:#f87171;padding:10px">Failed to load experiments: ${escapeHtml((e && e.message) || String(e))}</div>`;
+    setTabBodyMessage(body, `<div style="color:#f87171;padding:10px">Failed to load experiments: ${escapeHtml((e && e.message) || String(e))}</div>`);
     return;
   }
 
   const experiments = data.experiments || [];
   if (experiments.length === 0) {
-    body.innerHTML = `<div style="color:var(--muted);padding:14px;text-align:center;border:1px dashed var(--border);border-radius:4px">
+    setTabBodyMessage(body, `<div style="color:var(--muted);padding:14px;text-align:center;border:1px dashed var(--border);border-radius:4px">
       No experiments tracked yet. Start one with <code>start_experiment_run</code> in your research session.
-    </div>`;
+    </div>`);
     return;
   }
 
-  body.innerHTML = experiments.map((exp: any) => {
+  paintTabBody(body, experiments.map((exp: any) => {
     const statusLabel = escapeHtml(exp.status || 'active');
     const hypothesis = exp.hypothesis
       ? `<div style="padding:0 12px 8px;color:var(--muted);font-size:11px">${escapeHtml(exp.hypothesis)}</div>`
@@ -9281,7 +9282,7 @@ async function loadExperimentsTab(projectId: any) {
         <div class="experiment-runs" id="experiment-runs-${escapeHtml(exp.id)}" style="display:none;border-top:1px solid var(--border);padding:8px 12px"></div>
       </div>
     `;
-  }).join('');
+  }).join(''));
 
   body.querySelectorAll('[data-exp-toggle]').forEach((headerEl: any) => {
     headerEl.onclick = async () => {
@@ -9427,7 +9428,7 @@ async function loadTeamTab(projectId: any) {
 
   const render = async () => {
 
-    body.innerHTML = `<div class="empty" style="color:var(--muted)">loading team summary…</div>`;
+    setTabBodyMessage(body, `<div class="empty" style="color:var(--muted)">loading team summary…</div>`);
 
     const days = parseInt((daySel && daySel.value) || '14', 10);
 
@@ -9439,11 +9440,11 @@ async function loadTeamTab(projectId: any) {
 
       if (humans.length === 0) {
 
-        body.innerHTML = `<div style="color:var(--muted);padding:10px;text-align:center;border:1px dashed var(--border);border-radius:4px">
+        setTabBodyMessage(body, `<div style="color:var(--muted);padding:10px;text-align:center;border:1px dashed var(--border);border-radius:4px">
 
           (no human-attributed activity in the last ${data.period_days}d — set <code>MERIDIAN_HUMAN_ID</code> or pass <code>human_id</code> to register_session)
 
-        </div>`;
+        </div>`);
 
         return;
 
@@ -9651,7 +9652,7 @@ async function loadTeamTab(projectId: any) {
 
 
 
-      body.innerHTML = `
+      paintTabBody(body, `
 
         <section>
 
@@ -9669,13 +9670,13 @@ async function loadTeamTab(projectId: any) {
 
         </section>
 
-        ${decisionsHtml}`;
+        ${decisionsHtml}`);
 
       _wireTabSearch(`team-search-${projectId}`, `team-body-${projectId}`, '.team-card');
 
     } catch (e: any) {
 
-      body.innerHTML = renderProjectLoadError(projectId, 'Team summary unavailable', `/team/summary?project_id=${encodeURIComponent(projectId)}&days=${days}`, e);
+      setTabBodyMessage(body, renderProjectLoadError(projectId, 'Team summary unavailable', `/team/summary?project_id=${encodeURIComponent(projectId)}&days=${days}`, e));
 
       wireProjectLoadRetry(body, projectId);
 
@@ -11276,9 +11277,15 @@ async function refreshHitl(_pid?: any) {
 
   if (!bar || !countEl || !list) return;
 
+  // 962d4480 -- refreshes overlap (a hitl_filed burst, a reconnect, a poll that lands on an
+  // event). Each appended the 'recently auto-answered' section after its own repaint, so the
+  // section showed twice. The newest refresh owns the list; an older one stops once stale.
+  const _hitlTok = ((list as any)._hitlRefreshTok = ((list as any)._hitlRefreshTok || 0) + 1);
   try {
 
     const items = await api('/hitl?status=pending&limit=50');
+
+    if ((list as any)._hitlRefreshTok !== _hitlTok) return;
 
     const n = items.length;
 
@@ -11408,6 +11415,7 @@ async function refreshHitl(_pid?: any) {
     try {
 
       const answered = await api('/hitl?status=answered&limit=10');
+      if ((list as any)._hitlRefreshTok !== _hitlTok) return;
 
       const autoHtml = _renderAutoAnsweredHitls(answered);
 
@@ -13358,7 +13366,9 @@ function handleWsEvent(projectId: any, event: any) {
     scheduleLiveRefresh(projectId);
     return;
   }
-  if (event.type === 'hitl_filed') {
+  // 962d4480 -- an answer or dismissal made elsewhere repaints the HITL surfaces too, so the
+  // card (and any draft typed into it) goes at once instead of at the next 10 s poll.
+  if (event.type === 'hitl_filed' || event.type === 'hitl_answered' || event.type === 'hitl_dismissed') {
 
     refreshHitl();
 
