@@ -2129,38 +2129,10 @@ def build_mcp_server():
             # schema/description the HTTP/streamable-HTTP transport advertises so
             # the three transports can no longer drift apart on this tool.
             _shared_tool("start_session"),
-            Tool(
-                name="list_projects",
-                description=(
-                    "Call first when project_id is unknown. Returns the "
-                    "current tenant's projects as [{id, name, sprint, "
-                    "created_at}] newest first."
-                ),
-                inputSchema={"type": "object", "properties": {}},
-            ),
-            Tool(
-                name="get_project_by_name",
-                description=(
-                    "Look up a project by name (exact match, then "
-                    "case-insensitive exact match; not a substring search). "
-                    "Returns the match with id, name, and sprint. "
-                    "Use this when you know the project name but not the UUID."
-                ),
-                inputSchema={
-                    "type": "object",
-                    "properties": {
-                        "name": {
-                            "type": "string",
-                            "description": (
-                                "Full project name — exact match, then "
-                                "case-insensitive exact match (no partial "
-                                "or substring matching)."
-                            ),
-                        }
-                    },
-                    "required": ["name"],
-                },
-            ),
+            # #3 — the stdio server advertised pre-fix descriptions for these two tools because it hand-declared them.
+            # _shared_tool() pulls the same schema the HTTP transport serves, so the transports cannot drift apart.
+            _shared_tool("list_projects"),
+            _shared_tool("get_project_by_name"),
             Tool(
                 name="get_session_brief",
                 description=(

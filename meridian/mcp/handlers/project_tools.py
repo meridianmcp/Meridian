@@ -615,7 +615,7 @@ async def handle_start_session(
                         "Claude Code will not recognise /goal blocks until "
                         "you add a skill file. "
                         "Run: mkdir -p .claude/skills/goal && "
-                        "curl -fsSL https://usemeridian.us/install/goal-skill.md "
+                        "curl -fsSL https://raw.githubusercontent.com/meridianmcp/Meridian/main/.claude/skills/goal/SKILL.md "
                         "-o .claude/skills/goal/SKILL.md "
                         "(or copy the template from the AGENTS.md 'First-time "
                         "executor install' section). "

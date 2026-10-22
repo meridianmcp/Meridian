@@ -98,7 +98,7 @@ blockage in issue #9.
 ```bash
 # From the root of the target repo:
 mkdir -p .claude/skills/goal
-curl -fsSL https://usemeridian.us/install/goal-skill.md \
+curl -fsSL https://raw.githubusercontent.com/meridianmcp/Meridian/main/.claude/skills/goal/SKILL.md \
   -o .claude/skills/goal/SKILL.md
 # or, without curl, copy the content manually — see below.
 ```
