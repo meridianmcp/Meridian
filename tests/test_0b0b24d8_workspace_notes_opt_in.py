@@ -853,7 +853,12 @@ def test_source_scans_cover_the_real_package_and_only_it():
     package = _ROOT / "meridian"
     assert all(package in p.parents for p in files)
     assert {"handoff.py", "server.py", "sessions.py"} <= {p.name for p in files}
-    assert not [p for p in files if ".claude" in p.parts or "tests" in p.parts]
+    # Judge the path inside the package only: a checkout that lives under
+    # .claude/worktrees/ must not make every package file look like a stray.
+    assert not [
+        p for p in files
+        if ".claude" in p.relative_to(package).parts or "tests" in p.relative_to(package).parts
+    ]
 
 
 # ---------------------------------------------------------------------------

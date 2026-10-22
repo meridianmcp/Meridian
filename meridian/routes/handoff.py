@@ -7,7 +7,7 @@ from typing import Any
 
 from fastapi import APIRouter, HTTPException, Request
 
-from .._deps import _db, _data_dir
+from .._deps import _db, _data_dir, _workspace_visible_for_request
 from .. import db as db_module
 from .. import handoff as handoff_module
 from ..db import ai_log as ai_log_module
@@ -260,6 +260,8 @@ async def generate_handoff_endpoint(
                 strict_continuation=_strict_continuation,
                 continuation_status=_continuation_status,
                 pending_goal_receiver=_pending_goal_receiver,
+                # A project-scoped caller never gets the owner's workspace notes/decisions.
+                include_workspace=await _workspace_visible_for_request(request),
             ),
             timeout=90.0,
         )

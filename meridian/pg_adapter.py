@@ -24,7 +24,7 @@ import logging
 import os
 import re
 import uuid
-from typing import Any
+from typing import Any, Callable
 from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
 
 logger = logging.getLogger(__name__)
@@ -430,6 +430,20 @@ class PostgresConnection:
             pending._assert_owner_task()
         return _PendingPgTransaction(self)
 
+    def add_after_commit_callback(self, callback: Callable[[], None]) -> bool:
+        """Register a synchronous callback on the current explicit transaction.
+
+        Nested savepoint commits transfer callbacks to their parent; only the
+        successful outer commit runs them. Returns False when this task has no
+        explicit transaction, since an ordinary autocommit statement needs no
+        deferred work.
+        """
+        pending = self._pending_txn_var.get()
+        if pending is None:
+            return False
+        pending.add_after_commit_callback(callback)
+        return True
+
     async def _finish_pending_txn(self, *, rollback: bool) -> None:
         pending = self._pending_txn_var.get()
         if pending is not None:
@@ -818,7 +832,7 @@ class _PendingPgTransaction:
 
     __slots__ = (
         "_owner", "_conn", "_savepoint", "_started_own_txn", "_done",
-        "_token", "_owner_task",
+        "_token", "_owner_task", "_parent_pending", "_after_commit_callbacks",
     )
 
     def __init__(self, owner: "PostgresConnection") -> None:
@@ -829,15 +843,25 @@ class _PendingPgTransaction:
         self._done = False
         self._token: Any = None
         self._owner_task: Any = None
+        self._parent_pending: _PendingPgTransaction | None = None
+        self._after_commit_callbacks: list[Callable[[], None]] = []
 
     async def __aenter__(self) -> _PinnedExec:
         import psycopg.pq  # local import — keeps SQLite-only installs psycopg-free
 
         self._owner_task = asyncio.current_task()
-        self._conn = await self._owner._pool.getconn()
+        self._parent_pending = self._owner._pending_txn_var.get()
+        if self._parent_pending is not None:
+            self._parent_pending._assert_owner_task()
+            # Nested explicit scopes are savepoints on the parent's pinned
+            # connection. Borrowing another pool connection would make the
+            # child commit independent of the parent rollback it must follow.
+            self._conn = self._parent_pending._conn
+        else:
+            self._conn = await self._owner._pool.getconn()
         savepoint_started = False
         try:
-            self._started_own_txn = (
+            self._started_own_txn = self._parent_pending is None and (
                 self._conn.info.transaction_status == psycopg.pq.TransactionStatus.IDLE
             )
             if self._started_own_txn:
@@ -856,6 +880,24 @@ class _PendingPgTransaction:
             # connection; when an ambient transaction has no confirmed
             # savepoint boundary, discard it rather than risk poisoning the
             # caller's outer transaction.
+            if self._parent_pending is not None:
+                if savepoint_started:
+                    try:
+                        await self._conn.execute(
+                            f"ROLLBACK TO SAVEPOINT {self._savepoint}"
+                        )
+                        await self._conn.execute(
+                            f"RELEASE SAVEPOINT {self._savepoint}"
+                        )
+                    except BaseException:
+                        # The parent still owns the connection and can make
+                        # the final rollback decision if its transaction was
+                        # left in an error state.
+                        pass
+                if self._token is not None:
+                    self._reset_pending_context()
+                self._conn = None
+                raise
             try:
                 if self._started_own_txn:
                     await self._conn.execute("ROLLBACK")
@@ -942,10 +984,40 @@ class _PendingPgTransaction:
             except BaseException:
                 await self._discard_connection()
             else:
+                self._after_commit_callbacks.clear()
                 await self._return_connection()
             raise
         else:
+            callbacks = self._after_commit_callbacks
+            self._after_commit_callbacks = []
+            if rollback:
+                callbacks.clear()
+            elif callbacks:
+                if self._parent_pending is not None:
+                    self._parent_pending._after_commit_callbacks.extend(callbacks)
+                elif self._started_own_txn:
+                    for callback in callbacks:
+                        try:
+                            callback()
+                        except Exception:  # noqa: BLE001 - committed data stays committed
+                            logger.exception("Postgres after-commit callback failed")
+                else:
+                    # An ambient transaction not opened via this adapter has
+                    # no observable completion signal. Dropping the callback
+                    # avoids announcing data that its owner may still roll back.
+                    logger.warning(
+                        "discarding %d after-commit callback(s) for an "
+                        "unmanaged ambient Postgres transaction",
+                        len(callbacks),
+                    )
             await self._return_connection()
+
+    def add_after_commit_callback(self, callback: Callable[[], None]) -> None:
+        """Run ``callback`` only when this transaction's outer commit succeeds."""
+        self._assert_owner_task()
+        if self._done:
+            raise RuntimeError("cannot register a callback on a completed transaction")
+        self._after_commit_callbacks.append(callback)
 
     def _reset_pending_context(self) -> None:
         self._done = True
@@ -957,12 +1029,17 @@ class _PendingPgTransaction:
         self._reset_pending_context()
         conn = self._conn
         self._conn = None
-        await self._owner._pool.putconn(conn)
+        if self._parent_pending is None:
+            await self._owner._pool.putconn(conn)
 
     async def _discard_connection(self) -> None:
         self._reset_pending_context()
         conn = self._conn
         self._conn = None
+        if self._parent_pending is not None:
+            # The outer transaction remains responsible for recovering or
+            # discarding its pinned connection after this savepoint fails.
+            return
         try:
             await conn.close()
         except BaseException:
@@ -1003,6 +1080,7 @@ CREATE TABLE IF NOT EXISTS projects (
     pending_goal TEXT,
     parent_project_id TEXT,
     execution_mode TEXT NOT NULL DEFAULT 'autonomous',
+    use_mode TEXT NOT NULL DEFAULT 'standard_publication',
     status TEXT NOT NULL DEFAULT 'active' CHECK (status IN ('active', 'parked', 'archived')),
     priority TEXT NOT NULL DEFAULT 'P2' CHECK (priority IN ('P0', 'P1', 'P2')),
     created_at TEXT NOT NULL DEFAULT ({_TS})
@@ -1470,12 +1548,26 @@ CREATE TABLE IF NOT EXISTS workspace_members (
     github_access TEXT NOT NULL DEFAULT 'read'
         CHECK (github_access IN ('none','read','write')),
     -- d116642e: project-level invites foundation. NULL = workspace-wide
-    -- (current behavior); set = project-scoped (listing-only scoping for now).
-    -- Airtight per-request enforcement deferred (pin b11c7cf6).
+    -- (current behavior), set = project-scoped (that project and its
+    -- subprojects, with what they may do inside it set by member_policy below).
     project_id TEXT,
     token_hash TEXT,
     invited_at TEXT NOT NULL DEFAULT ({_TS}),
     joined_at TEXT
+);
+
+-- Capability policy for project-scoped members. tenant_id is the workspace
+-- OWNER's tenant id, subject is '*' for the workspace default and LOWER(email)
+-- for one person's override. policy is a JSON object of {{capability_id: bool}}.
+-- Created here (main auth DB only) and never by ALTER: this literal runs on
+-- every boot. Mirrors the SQLite literal in db/__init__.py.
+CREATE TABLE IF NOT EXISTS member_policy (
+    tenant_id TEXT NOT NULL,
+    subject TEXT NOT NULL,
+    policy TEXT NOT NULL DEFAULT '{{}}',
+    updated_by TEXT,
+    updated_at TEXT NOT NULL DEFAULT ({_TS}),
+    PRIMARY KEY (tenant_id, subject)
 );
 
 -- v2.1 dark — per-tenant named environments, not exposed at launch
@@ -1915,11 +2007,9 @@ async def _migrate_pg_workspace_members_project_scope(conn: PostgresConnection) 
     """d116642e — project-level invites foundation.
 
     Adds a nullable ``project_id`` to ``workspace_members``: NULL = workspace-wide
-    member (current behavior), set = project-scoped member (listing-only scoping
-    for now). ADD COLUMN IF NOT EXISTS so re-running is a no-op. Mirrors
-    db._migrate_workspace_members_project_scope. Airtight per-request access
-    enforcement is intentionally deferred pending the product decision (pin
-    b11c7cf6).
+    member (current behavior), set = project-scoped member (that project plus
+    its subprojects). ADD COLUMN IF NOT EXISTS so re-running is a no-op. Mirrors
+    db._migrate_workspace_members_project_scope.
     """
     await conn.executescript(
         "ALTER TABLE workspace_members ADD COLUMN IF NOT EXISTS project_id TEXT"
@@ -2266,6 +2356,21 @@ async def _migrate_pg_project_execution_mode(conn: PostgresConnection) -> None:
     await conn.executescript(
         "ALTER TABLE projects ADD COLUMN IF NOT EXISTS execution_mode "
         "TEXT NOT NULL DEFAULT 'autonomous'"
+    )
+
+
+async def _migrate_pg_project_use_mode(conn: PostgresConnection) -> None:
+    """projects.use_mode: the rights gate's per-project use mode.
+
+    'standard_publication' (default) or 'commercialized'. NOT NULL DEFAULT
+    'standard_publication' so existing rows backfill to standard. No CHECK,
+    same as execution_mode: the Python layer (db.validate_use_mode) validates.
+    ADD COLUMN IF NOT EXISTS so re-running is a no-op. Mirrors
+    db._migrate_project_use_mode.
+    """
+    await conn.executescript(
+        "ALTER TABLE projects ADD COLUMN IF NOT EXISTS use_mode "
+        "TEXT NOT NULL DEFAULT 'standard_publication'"
     )
 
 
@@ -5991,4 +6096,5 @@ _PG_MIGRATIONS_LATE = (
     _migrate_pg_sprint_item_coarse_lock_files,
     _migrate_pg_backfill_finding_note_kind,
     _migrate_pg_project_state_milestones,
+    _migrate_pg_project_use_mode,
 )

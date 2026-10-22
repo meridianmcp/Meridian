@@ -46,6 +46,8 @@ from dataclasses import asdict, dataclass, replace
 from datetime import datetime, timezone
 from typing import Any, Callable
 
+from .path_security import _require_within
+
 _log = logging.getLogger(__name__)
 
 # ---------------------------------------------------------------------------
@@ -7426,7 +7428,12 @@ class OutputsFtsIndex:
         for p in paths:
             if not p:
                 continue
-            pp = _canonical_storage_path(p)
+            try:
+                pp = _require_within(self.outputs_dir, p)
+            except ValueError:
+                _log.debug("index_paths: skipping path outside outputs_dir")
+                continue
+            pp = _canonical_storage_path(pp)
             if not pp:
                 continue
             if is_secret_path(pp):

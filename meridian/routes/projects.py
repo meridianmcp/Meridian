@@ -352,6 +352,8 @@ async def patch_project_settings(
         require_merge_approval=body.require_merge_approval,
         code_intel_enabled=body.code_intel_enabled,
         execution_mode=body.execution_mode,
+        use_mode=body.use_mode,
+        use_mode_actor="http:patch_project_settings",
     )
     if settings is None:
         raise HTTPException(status_code=404, detail="project not found")
@@ -713,12 +715,28 @@ async def set_project_parent(
     # (parent None) needs no extra check.
     await _require_project_in_scope(request, parent_project_id)
     db = await _db(request)
+    from .. import member_policy  # noqa: PLC0415
+
+    authorized = getattr(
+        request.state, "_meridian_member_policy_authorized_parent", None,
+    )
+    compare_and_set: dict[str, Any] = {}
+    if authorized is not None:
+        if not isinstance(authorized, member_policy.AuthorizedParentSnapshot):
+            raise HTTPException(409, "project authorization snapshot is invalid")
+        if authorized.project_id != project_id:
+            raise HTTPException(409, "project authorization snapshot does not match")
+        compare_and_set = {
+            "expect_parent": authorized.parent_project_id,
+            "expect_parent_exists": authorized.parent_exists,
+        }
     try:
         updated = await db_module.set_parent_project(
-            db, project_id, parent_project_id
+            db, project_id, parent_project_id, **compare_and_set,
         )
     except ValueError as exc:
-        raise HTTPException(400, str(exc)) from exc
+        status_code = 409 if str(exc) == "project changed concurrently" else 400
+        raise HTTPException(status_code, str(exc)) from exc
     if updated is None:
         raise HTTPException(404, "project not found")
     db_module.publish_global(
@@ -741,11 +759,17 @@ async def delete_project(project_id: str, request: Request) -> None:
     (batch form, ``delete_projects_batch`` below) — this single-id endpoint
     is unchanged and still the right choice for one project.
     """
-    project = await db_module.get_project(await _db(request), project_id)
-    if project is None:
+    db = await _db(request)
+    family = getattr(
+        request.state, "_meridian_member_policy_authorized_delete_family", None,
+    )
+    if family is None:
+        family = await db_module.get_project_family(db, [project_id])
+    expected = family.get(project_id)
+    if expected is None:
         raise HTTPException(404, "project not found")
     try:
-        await db_module.delete_project(await _db(request), project_id)
+        await db_module.delete_project(db, project_id, expect={project_id: expected})
     except ValueError as exc:
         raise HTTPException(409, str(exc)) from exc
 
@@ -809,11 +833,18 @@ async def delete_projects_batch(
     if scoped is not None and any(pid not in scoped for pid in project_ids):
         raise HTTPException(403, "Project is outside your access scope.")
     db = await _db(request)
-    missing = [pid for pid in project_ids if await db_module.get_project(db, pid) is None]
+    family = getattr(
+        request.state, "_meridian_member_policy_authorized_delete_family", None,
+    )
+    if family is None:
+        family = await db_module.get_project_family(db, project_ids)
+    missing = [pid for pid in project_ids if pid not in family]
     if missing:
         raise HTTPException(404, f"project(s) not found: {', '.join(missing)}")
     try:
-        await db_module.delete_project(db, project_ids)
+        await db_module.delete_project(
+            db, project_ids, expect={pid: family[pid] for pid in project_ids}
+        )
     except ValueError as exc:
         raise HTTPException(409, str(exc)) from exc
     return {"deleted": project_ids, "count": len(project_ids)}
@@ -940,11 +971,17 @@ async def patch_project_organization(
     project = await db_module.get_project(db, project_id)
     if project is None:
         raise HTTPException(status_code=404, detail="project not found")
+    expected_status_snapshot = getattr(
+        request.state, "_meridian_member_policy_authorized_status_snapshot", None,
+    )
     try:
         updated = await db_module.set_project_status(
-            db, project_id, status=body.status, priority=body.priority
+            db, project_id, status=body.status, priority=body.priority,
+            expect_status_snapshot=expected_status_snapshot,
         )
     except ValueError as exc:
+        if str(exc).startswith(db_module._PROJECT_CHANGED_CONCURRENTLY):
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
         raise HTTPException(status_code=422, detail=str(exc))
     return updated
 
@@ -1416,10 +1453,11 @@ async def delete_worktree(
     inside the very repo it coordinates, so it can perform the real removal
     itself here; hosted (multi-tenant) mode has no access to the caller's
     filesystem and stays DB-only, per the local-fs-access architectural law
-    in `meridian/_deps.py`. Either way this remains best-effort: a failed
-    disk removal never blocks the DB update or 404s the caller — see
-    `worktree_cleanup.sweep_stale_worktrees` for the periodic catch-all pass
-    that reclaims anything left behind.
+    in `meridian/_deps.py`. The row is marked removed only once the directory
+    is confirmed gone from disk. A guard refusal (dirty tree, live owning
+    process) or a failed removal leaves the row active and answers 409
+    Conflict with the reason, so `worktree_cleanup.sweep_stale_worktrees`
+    (which only selects active rows) retries it later.
     """
     db = await _db(request)
     # RT-TI-005 (wave 2) — the worktree must belong to the project in the PATH
@@ -1438,13 +1476,24 @@ async def delete_worktree(
             # process still using the worktree (its owning session can be
             # marked terminal for other reasons) never gets its directory
             # nuked out from under it.
-            worktree_cleanup.remove_worktree_on_disk_guarded(
+            disk_outcome = worktree_cleanup.remove_worktree_on_disk_guarded(
                 _REPO_ROOT, wt, expected_worktree_id=worktree_id
             )
-        except Exception as exc:  # noqa: BLE001 — disk cleanup is best-effort
+        except Exception as exc:  # noqa: BLE001 — a crash is not a confirmed removal
             import logging as _l
             _l.getLogger("meridian.server").warning(
                 "delete_worktree: on-disk cleanup failed for %s: %s", wt["path"], exc
+            )
+            disk_outcome = {"removed": False, "detail": f"on-disk cleanup failed: {exc}"}
+        if not disk_outcome.get("removed"):
+            # The directory is still on disk: the guard refused it (dirty tree,
+            # live owning process) or the removal failed. Leave the row active
+            # so the periodic sweep, which only selects removed_at IS NULL rows,
+            # retries it, and tell the caller why it was not removed.
+            parts = [p for p in (disk_outcome.get("reason"), disk_outcome.get("detail")) if p]
+            raise HTTPException(
+                status_code=409,
+                detail="worktree not removed from disk: " + (": ".join(parts) or "removal did not complete"),
             )
     removed = await db_module.remove_worktree(db, worktree_id, project_id=project_id)
     if not removed:
@@ -1452,8 +1501,8 @@ async def delete_worktree(
     # 32ba4125 — clean up the code-intel context tied to this worktree: a
     # stale _tenant_active_repo cache entry must never keep pointing
     # subsequent code-intel calls (search_graph, find_symbol, ...) at a path
-    # whose worktree no longer exists. Same best-effort posture as the
-    # on-disk cleanup above — never blocks or fails the deletion itself.
+    # whose worktree no longer exists. Best-effort: a failure here never
+    # blocks or fails the deletion itself.
     try:
         from ..worktree_code_intel_context import clear_stale_active_repo_cache  # noqa: PLC0415
         clear_stale_active_repo_cache(wt)

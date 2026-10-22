@@ -594,3 +594,64 @@ async def test_concurrent_tasks_do_not_cross_finalize_each_others_transaction():
     assert not any(v.startswith("ROLLBACK") for v in verbs_a)
     assert any(v.startswith("ROLLBACK TO SAVEPOINT") for v in verbs_b)
     assert not any(v.startswith("RELEASE SAVEPOINT") or v == "COMMIT" for v in verbs_b)
+
+
+@pytest.mark.asyncio
+async def test_after_commit_callbacks_transfer_from_nested_savepoint_to_outer_commit():
+    pool = _FakePool(distinct_connections=True)
+    db = PostgresConnection(pool)
+    calls: list[str] = []
+
+    async with db.begin_transaction():
+        assert db.add_after_commit_callback(lambda: calls.append("outer"))
+        async with db.begin_transaction():
+            assert db.add_after_commit_callback(lambda: calls.append("nested"))
+            await db.commit()
+        assert calls == []
+        await db.commit()
+
+    assert calls == ["outer", "nested"]
+    assert len(pool.issued) == 1
+    assert pool.returned == [pool.issued[0]]
+    verbs = [
+        entry[1].strip().upper()
+        for entry in pool.issued[0].log
+        if entry[0] == "conn.execute"
+    ]
+    assert verbs[-1] == "COMMIT"
+
+
+@pytest.mark.asyncio
+async def test_after_commit_callbacks_are_discarded_when_their_scope_rolls_back():
+    pool = _FakePool(distinct_connections=True)
+    db = PostgresConnection(pool)
+    calls: list[str] = []
+
+    async with db.begin_transaction():
+        assert db.add_after_commit_callback(lambda: calls.append("outer"))
+        async with db.begin_transaction():
+            assert db.add_after_commit_callback(lambda: calls.append("rolled-back"))
+            await db.rollback()
+        await db.commit()
+
+    assert calls == ["outer"]
+    assert len(pool.issued) == 1
+    assert pool.returned == [pool.issued[0]]
+
+
+@pytest.mark.asyncio
+async def test_after_commit_callbacks_are_discarded_when_outer_transaction_rolls_back():
+    pool = _FakePool(distinct_connections=True)
+    db = PostgresConnection(pool)
+    calls: list[str] = []
+
+    async with db.begin_transaction():
+        async with db.begin_transaction():
+            assert db.add_after_commit_callback(lambda: calls.append("nested"))
+            await db.commit()
+        assert calls == []
+        await db.rollback()
+
+    assert calls == []
+    assert len(pool.issued) == 1
+    assert pool.returned == [pool.issued[0]]

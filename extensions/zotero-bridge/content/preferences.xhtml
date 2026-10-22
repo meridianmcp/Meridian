@@ -1,0 +1,25 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<vbox xmlns="http://www.mozilla.org/keymaster/gatekeeper/there.is.only.xul"
+      xmlns:html="http://www.w3.org/1999/xhtml"
+      id="meridian-zotero-bridge-pane">
+  <preferences>
+    <preference id="pref-meridian-link-pdfs"
+                name="extensions.zotero.meridianZoteroBridge.linkPdfs"
+                type="bool"/>
+  </preferences>
+  <checkbox id="meridian-link-pdfs"
+            label="Link PDFs instead of copying"
+            preference="pref-meridian-link-pdfs"/>
+  <description>
+    Off (the default): Attach PDFs from folder copies each PDF into Zotero storage.
+    On: the PDF stays where it is and Zotero links to it.
+  </description>
+  <description>
+    Duplicate policy for BibTeX import, applied before anything is written.
+    An entry is skipped as an exact duplicate when its DOI matches an item already
+    in the library, or when neither side has a DOI and the normalised title matches.
+    An entry whose title matches an existing item, but where only one side has a DOI
+    or both DOIs differ, is not imported; it is listed in the report for review.
+    Everything else is imported.
+  </description>
+</vbox>

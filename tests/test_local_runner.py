@@ -37,6 +37,23 @@ from meridian import tunnel_lifecycle
 # ---------------------------------------------------------------------------
 
 
+@pytest.fixture(autouse=True)
+def _isolated_runner_homes(tmp_path, monkeypatch):
+    """Point the lease registry and runner state at this test's tmp_path.
+
+    A runner built without an explicit broker, or a CLI call, uses the process-wide
+    default broker, which persists to the real ~/.meridian/process_leases.json. Left
+    alone, every run adds leases there. The default broker is cached per process, so
+    the env override only takes effect after the cache is reset, on both sides of
+    the test.
+    """
+    monkeypatch.setenv("MERIDIAN_LEASE_REGISTRY_PATH", str(tmp_path / "leases.json"))
+    monkeypatch.setenv("MERIDIAN_LOCAL_RUNNER_STATE_DIR", str(tmp_path / "runner_home"))
+    process_registry.reset_default_broker()
+    yield
+    process_registry.reset_default_broker()
+
+
 @pytest.fixture
 def state_dir(tmp_path):
     return tmp_path / "runner_state"

@@ -2625,6 +2625,12 @@
     if (["ambiguous", "quarantined", "retired"].includes(status)) return "quarantined";
     return "unknown";
   }
+  function nextOffset(page) {
+    return page.hasMore ? page.offset + page.limit : null;
+  }
+  function prevOffset(page) {
+    return page.offset > 0 ? Math.max(0, page.offset - page.limit) : null;
+  }
   function isArtifactsUnavailable(envelope) {
     return !envelope || envelope.available !== true;
   }
@@ -2727,6 +2733,8 @@
     });
     const inviteForm = document.getElementById(`settings-invite-form-${projectId}`);
     if (inviteForm) inviteForm.style.display = "none";
+    const projectInviteForm = document.getElementById(`settings-project-invite-form-${projectId}`);
+    if (projectInviteForm) projectInviteForm.style.display = "none";
     body.querySelectorAll("button").forEach((b2) => {
       if (/^save\b/i.test((b2.textContent || "").trim())) b2.style.display = "none";
     });
@@ -4423,6 +4431,35 @@ project_id = "${displayPid}"`;
           }
         };
       }, 0);
+      const useMode = projectSettings && projectSettings.use_mode === "commercialized" ? "commercialized" : "standard_publication";
+      html += `<div style="margin-bottom:16px">
+
+    <div style="color:var(--accent);font-size:10px;letter-spacing:.06em;text-transform:uppercase;margin-bottom:10px;padding-bottom:4px;border-bottom:1px solid var(--border)">Use Mode</div>
+
+    <select id="use-mode-${projectId}" aria-label="Use mode" style="width:100%;padding:6px 8px;font-size:11px;background:var(--surface-1);color:var(--text);border:1px solid var(--border);border-radius:5px;cursor:pointer">
+      <option value="standard_publication" ${useMode === "standard_publication" ? "selected" : ""}>Standard publication (default)</option>
+      <option value="commercialized" ${useMode === "commercialized" ? "selected" : ""}>Commercialized (restricted images need owner approval)</option>
+    </select>
+    <div style="font-size:10px;color:var(--muted);margin-top:6px">Commercialized projects must have owner approval before restricted images are stored. Standard publication stores them with a credit line and a review flag.</div>
+    <div id="use-mode-status-${projectId}" style="font-size:10px;color:var(--muted);margin-top:6px;min-height:13px"></div>
+
+  </div>`;
+      setTimeout(() => {
+        const umSel = document.getElementById(`use-mode-${projectId}`);
+        const umStatus = document.getElementById(`use-mode-status-${projectId}`);
+        if (umSel) umSel.onchange = async () => {
+          if (umStatus) umStatus.textContent = "Saving\u2026";
+          try {
+            await saveProjectSettings(projectId, { use_mode: umSel.value });
+            if (umStatus) umStatus.textContent = "Saved.";
+            setTimeout(() => {
+              if (umStatus) umStatus.textContent = "";
+            }, 1500);
+          } catch (e3) {
+            if (umStatus) umStatus.textContent = `Save failed: ${String(e3)}`;
+          }
+        };
+      }, 0);
       const autoWorktrees = parseInt((projectSettings && projectSettings.auto_worktrees) != null ? projectSettings.auto_worktrees : 1, 10);
       const requireMergeApproval = parseInt((projectSettings && projectSettings.require_merge_approval) != null ? projectSettings.require_merge_approval : 1, 10);
       html += `<div style="margin-bottom:16px">
@@ -5222,6 +5259,30 @@ project_id = "${displayPid}"`;
             artifacts: document.getElementById("cp-panel-artifacts")
           };
           const loaded = { relationships: false, proposals: false, artifacts: false };
+          const proposalPageSize = 20;
+          const artifactPageSize = 50;
+          let proposalOffset = 0;
+          let artifactOffset = 0;
+          function paginationMarkup(page, itemCount, label, total) {
+            const first = itemCount ? page.offset + 1 : 0;
+            const last = page.offset + itemCount;
+            const summary = itemCount === 0 ? total === 0 ? "No records" : "No records on this page" : `Showing ${first}\u2013${last}${total == null ? "" : ` of ${total}`}`;
+            const previousPage = prevOffset(page);
+            const followingPage = nextOffset(page);
+            return `<div style="display:flex;align-items:center;justify-content:space-between;gap:8px;padding:8px 0 2px;font-size:10px;color:var(--muted)" aria-label="${escapeHtml(label)} pagination"><span>${escapeHtml(summary)}</span><div style="display:flex;gap:6px"><button type="button" class="secondary" data-cp-page="previous" aria-label="Previous ${escapeHtml(label)} page" ${previousPage === null ? "disabled" : ""} style="font-size:9px;padding:3px 8px">Previous</button><button type="button" class="secondary" data-cp-page="next" aria-label="Next ${escapeHtml(label)} page" ${followingPage === null ? "disabled" : ""} style="font-size:9px;padding:3px 8px">Next</button></div></div>`;
+          }
+          function bindPagination(el3, page, onPage) {
+            const previous = el3.querySelector('[data-cp-page="previous"]');
+            const following = el3.querySelector('[data-cp-page="next"]');
+            if (previous) previous.onclick = () => {
+              const offset = prevOffset(page);
+              if (offset !== null) onPage(offset);
+            };
+            if (following) following.onclick = () => {
+              const offset = nextOffset(page);
+              if (offset !== null) onPage(offset);
+            };
+          }
           async function loadRelationships() {
             const el3 = panels.relationships;
             if (!el3) return;
@@ -5237,9 +5298,21 @@ project_id = "${displayPid}"`;
             const el3 = panels.proposals;
             if (!el3) return;
             try {
-              const data = await api(`/control-plane/proposals?project_id=${encodeURIComponent(projectId)}&limit=20`);
-              const items = data.items || [];
-              el3.innerHTML = items.length ? items.map((p3) => `<div style="padding:4px 0;border-bottom:1px solid var(--border)"><div>${escapeHtml(p3.title || "")} <span style="color:var(--muted);font-size:9px">${escapeHtml(p3.status || "")}</span></div><div style="color:var(--muted);font-size:9px">${escapeHtml((p3.body || "").slice(0, 160))}</div></div>`).join("") : '<div style="color:var(--muted)">No proposals in scope.</div>';
+              const data = await api(`/control-plane/proposals?project_id=${encodeURIComponent(projectId)}&limit=${proposalPageSize}&offset=${proposalOffset}`);
+              const items = Array.isArray(data.items) ? data.items : [];
+              const page = {
+                limit: Number(data.limit) || proposalPageSize,
+                offset: Number.isFinite(Number(data.offset)) ? Number(data.offset) : proposalOffset,
+                hasMore: data.has_more === true
+              };
+              const total = Number.isFinite(Number(data.total)) ? Number(data.total) : void 0;
+              proposalOffset = page.offset;
+              const rows = items.length ? items.map((p3) => `<div style="padding:4px 0;border-bottom:1px solid var(--border)"><div>${escapeHtml(p3.title || "")} <span style="color:var(--muted);font-size:9px">${escapeHtml(p3.status || "")}</span></div><div style="color:var(--muted);font-size:9px">${escapeHtml((p3.body || "").slice(0, 160))}</div></div>`).join("") : '<div style="color:var(--muted)">No proposals in scope.</div>';
+              el3.innerHTML = rows + paginationMarkup(page, items.length, "proposals", total);
+              bindPagination(el3, page, (offset) => {
+                proposalOffset = offset;
+                void loadProposals();
+              });
             } catch (e3) {
               el3.innerHTML = '<div style="color:var(--muted)">Failed to load.</div>';
             }
@@ -5248,17 +5321,28 @@ project_id = "${displayPid}"`;
             const el3 = panels.artifacts;
             if (!el3) return;
             try {
-              const data = await api("/control-plane/artifacts?limit=50");
+              const data = await api(`/control-plane/artifacts?limit=${artifactPageSize}&offset=${artifactOffset}`);
               if (isArtifactsUnavailable(data)) {
                 el3.innerHTML = `<div style="color:var(--muted)">${escapeHtml(data && data.reason ? data.reason : "Not available.")}</div>`;
                 return;
               }
-              const items = data.items || [];
-              el3.innerHTML = items.length ? items.map((rec) => {
+              const items = Array.isArray(data.items) ? data.items : [];
+              const page = {
+                limit: Number(data.limit) || artifactPageSize,
+                offset: Number.isFinite(Number(data.offset)) ? Number(data.offset) : artifactOffset,
+                hasMore: data.has_more === true
+              };
+              artifactOffset = page.offset;
+              const rows = items.length ? items.map((rec) => {
                 const health = classifyArtifactHealth(rec);
                 const ident = displaySafe(rec.path || rec.run_id || rec.artifact_id || "(unknown)");
                 return `<div style="display:flex;justify-content:space-between;gap:8px;padding:3px 0;border-bottom:1px solid var(--border)"><span>[${escapeHtml(rec.record_kind)}] ${escapeHtml(ident)}</span><span style="color:var(--muted);font-size:9px;text-transform:uppercase">${escapeHtml(health)}</span></div>`;
               }).join("") : '<div style="color:var(--muted)">No run manifests, provenance records, or registered artifacts found.</div>';
+              el3.innerHTML = rows + paginationMarkup(page, items.length, "artifacts", data.total);
+              bindPagination(el3, page, (offset) => {
+                artifactOffset = offset;
+                void loadArtifacts();
+              });
             } catch (e3) {
               el3.innerHTML = '<div style="color:var(--muted)">Failed to load.</div>';
             }
@@ -5463,9 +5547,110 @@ project_id = "${displayPid}"`;
     </div>`;
       }
       if (isHostedMode()) {
+        const _projectRow = (window.state.projects || []).find((p3) => p3.id === projectId);
+        const _projectName = _projectRow?.name || projectId;
+        html += `<div style="margin-bottom:16px" id="project-invite-section-${projectId}">
+      <div style="color:var(--accent);font-size:10px;letter-spacing:.06em;text-transform:uppercase;margin-bottom:10px;padding-bottom:4px;border-bottom:1px solid var(--border)">Add member to this project</div>
+      <div style="font-size:10px;color:var(--muted);margin-bottom:8px">Access is limited to <strong>${escapeHtml(String(_projectName))}</strong>. Whole-workspace invites are under Account.</div>
+      <div id="settings-project-invite-form-${projectId}" style="display:flex;gap:6px;align-items:center;flex-wrap:wrap">
+        <input id="project-invite-email-${projectId}" type="email" placeholder="teammate@example.com" style="background:var(--surface-1);border:1px solid var(--border);border-radius:3px;color:var(--text);font-size:10px;font-family:var(--font-mono);padding:4px 8px;flex:1;min-width:160px">
+        <select id="project-invite-role-${projectId}" style="background:var(--surface-1);border:1px solid var(--border);border-radius:3px;color:var(--text);font-size:10px;font-family:var(--font-mono);padding:4px 6px">
+          <option value="admin">admin</option>
+          <option value="member" selected>member</option>
+          <option value="viewer">viewer</option>
+        </select>
+        <button id="project-invite-check-${projectId}" class="secondary" style="font-size:10px;padding:4px 10px">Check</button>
+      </div>
+      <div id="project-invite-actions-${projectId}" style="margin-top:6px;display:flex;gap:6px;flex-wrap:wrap"></div>
+      <div id="project-invite-status-${projectId}" style="font-size:10px;color:var(--muted);margin-top:5px;min-height:14px"></div>
+    </div>`;
+        setTimeout(() => {
+          const checkBtn = document.getElementById(`project-invite-check-${projectId}`);
+          const emailEl = document.getElementById(`project-invite-email-${projectId}`);
+          const roleEl = document.getElementById(`project-invite-role-${projectId}`);
+          const actionsEl = document.getElementById(`project-invite-actions-${projectId}`);
+          const statusEl = document.getElementById(`project-invite-status-${projectId}`);
+          if (!checkBtn || !emailEl || !roleEl || !actionsEl) return;
+          const setStatus = (msg) => {
+            if (statusEl) statusEl.textContent = msg;
+          };
+          const projectNameOf = (id) => (window.state.projects || []).find((p3) => p3.id === id)?.name || id;
+          const roleText = (row) => `${row.role}${row.pending ? ", invite pending" : ""}`;
+          const actionButton = (act, label, primary, mid = "") => `<button type="button" data-act="${act}" data-mid="${escapeHtml(mid)}" class="${primary ? "primary" : "secondary"}" style="font-size:10px;padding:4px 10px">${label}</button>`;
+          async function membershipFor(email) {
+            const members = await api("/workspace/members");
+            return (Array.isArray(members) ? members : []).filter((m3) => String(m3.email || "").toLowerCase() === email);
+          }
+          async function runCheck() {
+            const email = (emailEl.value || "").trim().toLowerCase();
+            actionsEl.innerHTML = "";
+            if (!email || !email.includes("@")) {
+              setStatus("Enter an email address.");
+              return;
+            }
+            setStatus("Checking\u2026");
+            let rows;
+            try {
+              rows = await membershipFor(email);
+            } catch (e3) {
+              setStatus(`Error: ${String(e3)}`);
+              return;
+            }
+            const workspaceRow = rows.find((r3) => !r3.project_id);
+            const thisRow = rows.find((r3) => r3.project_id === projectId);
+            const otherRows = rows.filter((r3) => r3.project_id && r3.project_id !== projectId);
+            if (workspaceRow) {
+              setStatus(`${email} is already a workspace member (${roleText(workspaceRow)}), so they can open this project. Nothing to add.`);
+              return;
+            }
+            if (thisRow) {
+              setStatus(`${email} is already a member of this project (${roleText(thisRow)}).`);
+              actionsEl.innerHTML = actionButton("elevate", "Make workspace member", false, thisRow.id);
+              return;
+            }
+            if (otherRows.length) {
+              const names = otherRows.map((r3) => projectNameOf(r3.project_id)).join(", ");
+              setStatus(`${email} is a member of ${names} only. Add them to this project, or make them a workspace member.`);
+              actionsEl.innerHTML = actionButton("add", "Add to this project", true) + actionButton("elevate", "Make workspace member", false, otherRows[0].id);
+              return;
+            }
+            setStatus(`${email} is not in this workspace yet.`);
+            actionsEl.innerHTML = actionButton("add", "Invite to this project", true);
+          }
+          async function doInvite(email) {
+            await api("/workspace/invite", { method: "POST", body: JSON.stringify({ email, role: roleEl.value || "member", project_id: projectId }) });
+            setStatus(`Invite sent to ${email} for this project.`);
+          }
+          async function doElevate(memberId, email) {
+            await api(`/workspace/members/${memberId}`, { method: "PATCH", body: JSON.stringify({ project_id: null }) });
+            setStatus(`${email} is now a workspace member.`);
+          }
+          checkBtn.onclick = () => {
+            void runCheck();
+          };
+          actionsEl.onclick = async (ev) => {
+            const btn = ev.target.closest("button[data-act]");
+            if (!btn) return;
+            const email = (emailEl.value || "").trim().toLowerCase();
+            btn.disabled = true;
+            try {
+              if (btn.dataset.act === "add") await doInvite(email);
+              else if (btn.dataset.act === "elevate") await doElevate(btn.dataset.mid || "", email);
+              window._membersRefresh?.[projectId]?.();
+              await runCheck();
+            } catch (e3) {
+              setStatus(`Error: ${String(e3)}`);
+              btn.disabled = false;
+            }
+          };
+        });
+      }
+      if (isHostedMode()) {
         html += `<div style="margin-bottom:16px" id="members-section-${projectId}">
 
       <div style="color:var(--accent);font-size:10px;letter-spacing:.06em;text-transform:uppercase;margin-bottom:10px;padding-bottom:4px;border-bottom:1px solid var(--border)">Team members</div>
+
+      <div id="member-policy-${projectId}" style="display:none;margin-bottom:12px"></div>
 
       <div id="members-list-${projectId}" style="margin-bottom:10px;font-size:11px;font-family:var(--font-mono)"><div style="color:var(--muted)">loading\u2026</div></div>
 
@@ -5485,9 +5670,9 @@ project_id = "${displayPid}"`;
 
         <select id="invite-scope-${projectId}" title="Scope to project (blank = full workspace access)" style="background:var(--surface-1);border:1px solid var(--border);border-radius:3px;color:var(--text);font-size:10px;font-family:var(--font-mono);padding:4px 6px">
 
-          <option value="">all projects</option>
+          <option value="">whole workspace (all projects)</option>
 
-          ${(window.state.projects || []).map((p3) => `<option value="${escapeHtml(p3.id)}">${escapeHtml(p3.name || p3.id)}</option>`).join("")}
+          ${(window.state.projects || []).map((p3) => `<option value="${escapeHtml(p3.id)}"${p3.id === projectId ? " selected" : ""}>${escapeHtml(p3.name || p3.id)}</option>`).join("")}
 
         </select>
 
@@ -5500,18 +5685,171 @@ project_id = "${displayPid}"`;
     </div>`;
         setTimeout(async () => {
           const listEl = document.getElementById(`members-list-${projectId}`);
+          const policyEl = document.getElementById(`member-policy-${projectId}`);
           const inviteBtn = document.getElementById(`invite-btn-${projectId}`);
           const inviteEmail = document.getElementById(`invite-email-${projectId}`);
           const inviteRole = document.getElementById(`invite-role-${projectId}`);
           const inviteScope = document.getElementById(`invite-scope-${projectId}`);
           const inviteStatus = document.getElementById(`invite-status-${projectId}`);
+          function renderMemberPolicyControls(members, policyState) {
+            if (!policyEl || _activeRole !== "owner") return;
+            policyEl.style.display = "";
+            const catalog = Array.isArray(policyState?.catalog) ? policyState.catalog : [];
+            const records = Array.isArray(policyState?.overrides) ? policyState.overrides : [];
+            const recordById = Object.fromEntries(records.map((record) => [String(record.member_id), record]));
+            const scopedMembers = (members || []).filter((member) => !!member.project_id && !member.pending);
+            const defaultPolicyCorrupt = policyState.default_policy_status === "corrupt";
+            const projectNameById = Object.fromEntries((window.state.projects || []).map((project) => [project.id, project.name || project.id]));
+            const controlStyle = "background:var(--surface-1);border:1px solid var(--border);border-radius:3px;color:var(--text);font-size:10px;font-family:var(--font-mono);padding:3px 5px";
+            const capabilityRows = (values, target, memberId = "") => catalog.map((capability) => {
+              const capId = String(capability.id || "");
+              const raw = values?.[capId];
+              const corrupt = target === "default" ? defaultPolicyCorrupt : recordById[memberId]?.policy_status === "corrupt";
+              const current2 = corrupt ? "corrupt" : target === "member" ? raw === true ? "allow" : raw === false ? "deny" : "inherit" : raw === true ? "allow" : raw === false ? "deny" : "builtin";
+              const choices = target === "member" ? `${corrupt ? '<option value="corrupt" selected disabled>Corrupt \xB7 fail closed</option>' : ""}<option value="inherit" ${current2 === "inherit" ? "selected" : ""}>Inherit</option><option value="allow" ${current2 === "allow" ? "selected" : ""}>Allow</option><option value="deny" ${current2 === "deny" ? "selected" : ""}>Deny</option>` : `${corrupt ? '<option value="corrupt" selected disabled>Corrupt \xB7 fail closed</option>' : ""}<option value="builtin" ${current2 === "builtin" ? "selected" : ""}>Built-in (${policyState.builtin_defaults?.[capId] ? "Allow" : "Deny"})</option><option value="allow" ${current2 === "allow" ? "selected" : ""}>Allow</option><option value="deny" ${current2 === "deny" ? "selected" : ""}>Deny</option>`;
+              const readout = target === "member" ? recordById[memberId]?.effective?.readout?.[capId] : null;
+              const effectiveText = readout ? `Effective: ${readout.allowed ? "Allow" : "Deny"} \xB7 ${escapeHtml(String(readout.source || "policy").replace(/_/g, " "))}${readout.reason ? ` \xB7 ${escapeHtml(String(readout.reason))}` : ""}` : "";
+              return `<div style="display:grid;grid-template-columns:minmax(0,1fr) auto;gap:8px;align-items:center;padding:5px 0;border-top:1px solid var(--border)">
+            <div style="min-width:0"><div style="font-size:10px">${escapeHtml(String(capability.label || capId))}</div><div style="font-size:9px;color:var(--muted);line-height:1.4">${escapeHtml(String(capability.sentence || ""))}${effectiveText ? `<br>${effectiveText}` : ""}</div></div>
+            <select class="member-policy-select" data-target="${target}" data-mid="${escapeHtml(memberId)}" data-cap="${escapeHtml(capId)}" style="${controlStyle}" aria-label="${escapeHtml(String(capability.label || capId))} policy${target === "member" ? ` for ${escapeHtml(String(recordById[memberId]?.email || memberId))}` : " workspace default"}" ${corrupt ? "disabled" : ""}>${choices}</select>
+          </div>`;
+            }).join("");
+            const defaults = `<details style="margin:7px 0;padding:7px 8px;border:1px solid var(--border);border-radius:4px">
+          <summary style="cursor:pointer;font-size:10px">Workspace defaults</summary>
+          <div style="font-size:9px;color:var(--muted);margin:5px 0">These defaults apply to accepted project-scoped members unless a member overrides them.</div>
+          ${defaultPolicyCorrupt ? '<div style="font-size:9px;color:var(--danger, #ff6b6b);margin:5px 0">Stored policy data is corrupt. Access is denied fail closed until you reset it.</div>' : ""}
+          ${capabilityRows(policyState.default_policy || {}, "default")}
+          <button class="member-policy-default-reset secondary" style="font-size:9px;padding:2px 7px;margin-top:6px">Reset workspace policy to built-in defaults</button>
+        </details>`;
+            const memberControls = scopedMembers.length ? scopedMembers.map((member) => {
+              const memberId = String(member.id || "");
+              const record = recordById[memberId];
+              const role = String(record?.effective?.role || member.role || "member");
+              const project = String(member.project_name || projectNameById[member.project_id] || member.project_id || "project");
+              const policyCorrupt = record?.policy_status === "corrupt";
+              return `<details style="margin:6px 0;padding:7px 8px;border:1px solid var(--border);border-radius:4px">
+              <summary style="cursor:pointer;font-size:10px">${escapeHtml(String(member.email || "Member"))} \xB7 ${escapeHtml(role)} \xB7 ${escapeHtml(project)}${policyCorrupt ? " \xB7 Policy corrupt" : ""}</summary>
+              <div style="font-size:9px;color:var(--muted);margin:5px 0">Effective access includes role clamps. An inherited choice follows the workspace default.</div>
+              ${policyCorrupt ? '<div style="font-size:9px;color:var(--danger, #ff6b6b);margin:5px 0">Stored member policy is corrupt. Access is denied fail closed until cleared.</div>' : ""}
+              ${capabilityRows(record?.policy || {}, "member", memberId)}
+              <button class="member-policy-reset secondary" data-mid="${escapeHtml(memberId)}" style="font-size:9px;padding:2px 7px;margin-top:6px">${policyCorrupt ? "Clear corrupt policy and inherit" : "Inherit all"}</button>
+            </details>`;
+            }).join("") : '<div style="font-size:9px;color:var(--muted);padding:5px 0">No accepted project-scoped members.</div>';
+            policyEl.innerHTML = `<div style="padding:8px;border:1px solid var(--border);border-radius:5px;background:var(--surface-1)">
+          <div style="font-size:10px;font-weight:600;color:var(--accent)">Project-scoped member access</div>
+          <div style="font-size:9px;color:var(--muted);line-height:1.5;margin:4px 0">Control project writes, subproject creation and deletion, project deletion, and workspace-level changes.</div>
+          ${defaults}<div style="font-size:10px;font-weight:600;margin:9px 0 4px">Member overrides</div>${memberControls}
+          <div class="member-policy-status" style="font-size:9px;color:var(--muted);min-height:12px;margin-top:5px"></div>
+        </div>`;
+            const statusEl = policyEl.querySelector(".member-policy-status");
+            const showPolicyRefreshFailure = (message) => {
+              const currentStatus = policyEl.querySelector(".member-policy-status");
+              if (currentStatus) {
+                currentStatus.textContent = message;
+              } else {
+                const warning = document.createElement("div");
+                warning.className = "member-policy-status";
+                warning.style.cssText = "font-size:9px;color:var(--danger, #ff6b6b);min-height:12px;margin-top:5px";
+                warning.textContent = message;
+                policyEl.appendChild(warning);
+              }
+            };
+            policyEl.querySelectorAll("select.member-policy-select").forEach((select) => {
+              select.dataset.prev = select.value;
+              select.onchange = async () => {
+                const previous = select.dataset.prev;
+                const target = select.dataset.target;
+                const value = select.value === "builtin" || select.value === "inherit" ? null : select.value === "allow";
+                const url = target === "default" ? "/workspace/member-policy" : `/workspace/members/${encodeURIComponent(select.dataset.mid)}/policy`;
+                select.disabled = true;
+                if (statusEl) statusEl.textContent = "Saving policy\u2026";
+                try {
+                  await api(url, { method: "PATCH", body: JSON.stringify({ policy: { [select.dataset.cap]: value } }) });
+                  select.dataset.prev = select.value;
+                  const refreshed = await renderMembers();
+                  if (!refreshed) {
+                    select.disabled = false;
+                    showPolicyRefreshFailure("Policy saved, but the member and policy views could not refresh. Reload settings to confirm effective access.");
+                    return;
+                  }
+                  if (policyEl) {
+                    const refreshedStatus = policyEl.querySelector(".member-policy-status");
+                    if (refreshedStatus) refreshedStatus.textContent = "Policy saved.";
+                  }
+                } catch (e3) {
+                  select.value = previous;
+                  select.disabled = false;
+                  if (statusEl) statusEl.textContent = `Policy save failed: ${escapeHtml(String(e3))}`;
+                }
+              };
+            });
+            policyEl.querySelectorAll("button.member-policy-reset").forEach((button) => {
+              button.onclick = async () => {
+                button.disabled = true;
+                if (statusEl) statusEl.textContent = "Resetting member overrides\u2026";
+                try {
+                  await api(`/workspace/members/${encodeURIComponent(button.dataset.mid)}/policy`, { method: "DELETE" });
+                  const refreshed = await renderMembers();
+                  if (!refreshed) {
+                    button.disabled = false;
+                    showPolicyRefreshFailure("Member overrides were reset, but the member and policy views could not refresh. Reload settings to confirm effective access.");
+                    return;
+                  }
+                  if (policyEl) {
+                    const refreshedStatus = policyEl.querySelector(".member-policy-status");
+                    if (refreshedStatus) refreshedStatus.textContent = "Member now inherits all workspace defaults.";
+                  }
+                } catch (e3) {
+                  button.disabled = false;
+                  if (statusEl) statusEl.textContent = `Policy reset failed: ${escapeHtml(String(e3))}`;
+                }
+              };
+            });
+            policyEl.querySelectorAll("button.member-policy-default-reset").forEach((button) => {
+              button.onclick = async () => {
+                button.disabled = true;
+                if (statusEl) statusEl.textContent = "Resetting workspace policy\u2026";
+                try {
+                  await api("/workspace/member-policy", { method: "PATCH", body: JSON.stringify({ reset: true }) });
+                  const refreshed = await renderMembers();
+                  if (!refreshed) {
+                    button.disabled = false;
+                    showPolicyRefreshFailure("Workspace defaults were reset, but the member and policy views could not refresh. Reload settings to confirm effective access.");
+                    return;
+                  }
+                  if (policyEl) {
+                    const refreshedStatus = policyEl.querySelector(".member-policy-status");
+                    if (refreshedStatus) refreshedStatus.textContent = "Workspace policy now uses built-in defaults.";
+                  }
+                } catch (e3) {
+                  button.disabled = false;
+                  if (statusEl) statusEl.textContent = `Workspace policy reset failed: ${escapeHtml(String(e3))}`;
+                }
+              };
+            });
+          }
+          window._membersRefresh = window._membersRefresh || {};
+          window._membersRefresh[projectId] = () => renderMembers();
           async function renderMembers() {
-            if (!listEl) return;
+            if (!listEl) return false;
+            let policyLoaded = true;
             try {
               const members = await api("/workspace/members");
+              if (_activeRole === "owner" && policyEl) {
+                try {
+                  const policyState = await api("/workspace/member-policy");
+                  renderMemberPolicyControls(members || [], policyState);
+                } catch (e3) {
+                  policyLoaded = false;
+                  policyEl.style.display = "";
+                  policyEl.innerHTML = `<div style="font-size:9px;color:var(--muted);padding:6px 0">Member policy controls unavailable: ${escapeHtml(String(e3))}</div>`;
+                }
+              } else if (policyEl) {
+                policyEl.style.display = "none";
+              }
               if (!members || members.length === 0) {
                 listEl.innerHTML = '<div style="color:var(--muted);font-size:10px">No team members yet.</div>';
-                return;
+                return policyLoaded;
               }
               const ROLE_CHOICES = ["admin", "member", "viewer"];
               const projectNameById = Object.fromEntries((window.state.projects || []).map((p3) => [p3.id, p3.name || p3.id]));
@@ -5591,8 +5929,10 @@ project_id = "${displayPid}"`;
                   }
                 };
               });
+              return policyLoaded;
             } catch (e3) {
               if (listEl) listEl.innerHTML = '<div style="color:var(--muted);font-size:10px">Members only available in hosted mode.</div>';
+              return false;
             }
           }
           renderMembers();
@@ -9936,7 +10276,8 @@ ${n2.tags || ""}`.toLowerCase();
     // leave an active Experiments tab invisible in the rail (90952bad).
     { id: "work", label: "Work", tabs: ["queue", "experiments", "hitl", "team", "sessions"] },
     { id: "content", label: "Content", tabs: ["files", "notes", "devlog", "documents", "docs", "codeintel"] },
-    { id: "history", label: "History", tabs: ["timeline", "rewind", "settings"] }
+    { id: "history", label: "History", tabs: ["timeline", "rewind"] },
+    { id: "settings", label: "Settings", tabs: ["settings"] }
   ];
   var ALL_GROUPED_TABS = VTAB_GROUPS.flatMap((g2) => g2.tabs);
   function groupForTab(tab) {
@@ -13742,7 +14083,7 @@ Current: ${current2 || "(none)"}`,
 
       <div class="vtab-group" data-vgroup="overview" style="display:flex;flex-direction:column;align-items:center;gap:2px;width:100%">
 
-        <button class="vtab-group-header" data-vgroup-toggle="overview" title="Overview" aria-label="Overview group" aria-expanded="true" style="width:36px;height:20px;border:none;background:transparent;cursor:pointer;font-size:11px;line-height:20px;opacity:0.5;padding:0;border-radius:6px;display:flex;align-items:center;justify-content:center">\u{1F4CA}</button>
+        <button class="vtab-group-header" data-vgroup-toggle="overview" title="Overview" aria-label="Overview group" aria-expanded="true">\u{1F4CA}</button>
 
         <div class="vtab-group-tabs" style="display:flex;flex-direction:column;align-items:center;gap:2px;width:100%">
 
@@ -13756,7 +14097,7 @@ Current: ${current2 || "(none)"}`,
 
       <div class="vtab-group" data-vgroup="planning" style="display:flex;flex-direction:column;align-items:center;gap:2px;width:100%">
 
-        <button class="vtab-group-header" data-vgroup-toggle="planning" title="Planning" aria-label="Planning group" aria-expanded="true" style="width:36px;height:20px;border:none;background:transparent;cursor:pointer;font-size:11px;line-height:20px;opacity:0.5;padding:0;border-radius:6px;display:flex;align-items:center;justify-content:center">\u{1F3AF}</button>
+        <button class="vtab-group-header" data-vgroup-toggle="planning" title="Planning" aria-label="Planning group" aria-expanded="true">\u{1F3AF}</button>
 
         <div class="vtab-group-tabs" style="display:flex;flex-direction:column;align-items:center;gap:2px;width:100%">
 
@@ -13772,7 +14113,7 @@ Current: ${current2 || "(none)"}`,
 
       <div class="vtab-group" data-vgroup="work" style="display:flex;flex-direction:column;align-items:center;gap:2px;width:100%">
 
-        <button class="vtab-group-header" data-vgroup-toggle="work" title="Work" aria-label="Work group" aria-expanded="true" style="width:36px;height:20px;border:none;background:transparent;cursor:pointer;font-size:11px;line-height:20px;opacity:0.5;padding:0;border-radius:6px;display:flex;align-items:center;justify-content:center">\u{1F477}</button>
+        <button class="vtab-group-header" data-vgroup-toggle="work" title="Work" aria-label="Work group" aria-expanded="true">\u{1F477}</button>
 
         <div class="vtab-group-tabs" style="display:flex;flex-direction:column;align-items:center;gap:2px;width:100%">
 
@@ -13792,7 +14133,7 @@ Current: ${current2 || "(none)"}`,
 
       <div class="vtab-group" data-vgroup="content" style="display:flex;flex-direction:column;align-items:center;gap:2px;width:100%">
 
-        <button class="vtab-group-header" data-vgroup-toggle="content" title="Content" aria-label="Content group" aria-expanded="true" style="width:36px;height:20px;border:none;background:transparent;cursor:pointer;font-size:11px;line-height:20px;opacity:0.5;padding:0;border-radius:6px;display:flex;align-items:center;justify-content:center">\u{1F4C1}</button>
+        <button class="vtab-group-header" data-vgroup-toggle="content" title="Content" aria-label="Content group" aria-expanded="true">\u{1F4C1}</button>
 
         <div class="vtab-group-tabs" style="display:flex;flex-direction:column;align-items:center;gap:2px;width:100%">
 
@@ -13814,7 +14155,7 @@ Current: ${current2 || "(none)"}`,
 
       <div class="vtab-group" data-vgroup="history" style="display:flex;flex-direction:column;align-items:center;gap:2px;width:100%">
 
-        <button class="vtab-group-header" data-vgroup-toggle="history" title="History" aria-label="History group" aria-expanded="true" style="width:36px;height:20px;border:none;background:transparent;cursor:pointer;font-size:11px;line-height:20px;opacity:0.5;padding:0;border-radius:6px;display:flex;align-items:center;justify-content:center">\u{1F4C5}</button>
+        <button class="vtab-group-header" data-vgroup-toggle="history" title="History" aria-label="History group" aria-expanded="true">\u{1F4C5}</button>
 
         <div class="vtab-group-tabs" style="display:flex;flex-direction:column;align-items:center;gap:2px;width:100%">
 
@@ -13822,7 +14163,17 @@ Current: ${current2 || "(none)"}`,
 
           <button class="vtab-btn" data-vtab="rewind" title="Rewind \u2014 Last X days">\u21BB</button>
 
-          <button class="vtab-btn" data-vtab="settings" title="Notification Settings">\u2699</button>
+        </div>
+
+      </div>
+
+      <div class="vtab-group" data-vgroup="settings" style="display:flex;flex-direction:column;align-items:center;gap:2px;width:100%">
+
+        <button class="vtab-group-header" data-vgroup-toggle="settings" title="Settings" aria-label="Settings group" aria-expanded="true">\u2699</button>
+
+        <div class="vtab-group-tabs" style="display:flex;flex-direction:column;align-items:center;gap:2px;width:100%">
+
+          <button class="vtab-btn" data-vtab="settings" title="Settings \u2014 notifications, team and project settings">\u2699</button>
 
         </div>
 
@@ -16066,11 +16417,11 @@ Current: ${current2 || "(none)"}`,
   function showCopyPreview(title, content) {
     const overlay = document.createElement("div");
     overlay.style.cssText = "position:fixed;inset:0;background:rgba(0,0,0,0.72);z-index:9998;display:flex;align-items:center;justify-content:center";
-    overlay.innerHTML = `<div style="background:var(--surface-1);border:1px solid var(--border);border-radius:6px;padding:20px;width:620px;max-width:92vw;max-height:80vh;display:flex;flex-direction:column;gap:12px;box-shadow:0 8px 32px #0008">
+    overlay.innerHTML = `<div style="background:var(--surface-1);border:1px solid var(--border);border-radius:6px;padding:20px;width:620px;max-width:92vw;height:80vh;max-height:calc(100vh - 24px);box-sizing:border-box;overflow:hidden;display:flex;flex-direction:column;gap:12px;box-shadow:0 8px 32px #0008">
 
     <div style="font-family:var(--font-mono);font-size:13px;font-weight:600;color:var(--accent)">${escapeHtml(title)}</div>
 
-    <textarea style="width:100%;height:300px;font-family:var(--font-mono);font-size:11px;background:#0d1117;color:#e6edf3;border:1px solid var(--border);padding:10px;border-radius:4px;resize:vertical;outline:none">${escapeHtml(content)}</textarea>
+    <textarea style="width:100%;max-width:100%;min-width:0;flex:1 1 300px;min-height:0;max-height:calc(80vh - 120px);box-sizing:border-box;overflow:auto;font-family:var(--font-mono);font-size:11px;background:#0d1117;color:#e6edf3;border:1px solid var(--border);padding:10px;border-radius:4px;resize:vertical;outline:none">${escapeHtml(content)}</textarea>
 
     <div style="display:flex;gap:8px;justify-content:flex-end">
 

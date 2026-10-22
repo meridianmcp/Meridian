@@ -155,6 +155,31 @@ html, body {
   box-shadow: inset 3px 0 0 var(--accent);
 }
 
+/* Vertical rail groups (dashboard-tabgroups.ts). Each group header is a real,
+   clickable control: a bordered, filled chip. Opacity never drops below 0.6, so
+   no group reads as disabled. */
+.vtab-group + .vtab-group {
+  margin-top: 4px; padding-top: 6px;
+  border-top: 1px solid var(--border);
+}
+.vtab-group-header {
+  box-sizing: border-box;
+  width: 36px; height: 22px; padding: 0;
+  border: 1px solid var(--border); border-radius: 6px;
+  background: var(--surface-2); color: var(--muted);
+  font-size: 11px; line-height: 20px; cursor: pointer;
+  display: flex; align-items: center; justify-content: center;
+  transition: color 0.15s, border-color 0.15s;
+}
+.vtab-group-header:hover { color: var(--text); }
+.vtab-group-header:focus-visible { outline: 2px solid var(--accent); outline-offset: 1px; }
+/* The group that holds the active tab reads as the selected group. */
+.vtab-group:has(.vtab-btn.active) .vtab-group-header {
+  color: var(--accent); border-color: var(--accent);
+}
+/* Collapsed groups are dimmed but stay clickable, not disabled-looking. */
+.vtab-group-header[aria-expanded="false"] { opacity: 0.6; }
+
 .vtab-drawer {
   flex: 1; min-width: 0;
   background: var(--bg); border-right: 1px solid var(--border);

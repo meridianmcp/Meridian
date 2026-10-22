@@ -100,6 +100,14 @@ async def _world(db: Any) -> _World:
 
 
 async def _call(db: Any, tmp_path: Any, name: str, args: "dict[str, Any]", scoped: "list[str] | None") -> Any:
+    if scoped is not None:
+        from meridian.member_policy import CAPABILITY_IDS, EffectivePolicy, ScopedProjectIds
+        from meridian.roles import ROLE_MEMBER
+
+        scoped = ScopedProjectIds(
+            scoped,
+            policy=EffectivePolicy(caps=frozenset(CAPABILITY_IDS), role=ROLE_MEMBER),
+        )
     return await mcp_handler._dispatch_mcp_tool(
         name, args, db, str(tmp_path), tenant=None, scoped_project_ids=scoped,
     )
@@ -483,13 +491,17 @@ async def test_merge_project_between_two_in_scope_projects_still_works(db, tmp_p
     assert await db_module.get_project_note(db, w.own2["note"], project_id=w.mine) is not None
 
 
-async def test_merge_project_with_an_unresolvable_name_is_left_to_the_handler(db, tmp_path):
+async def test_merge_project_with_an_unresolvable_name_is_refused_before_name_lookup(db, tmp_path):
     w = await _world(db)
-    result = await _call(
-        db, tmp_path, "merge_project",
-        {"source_project_name": "no-such-project", "target_project_id": w.mine}, [w.mine],
-    )
-    assert "error" in result
+    try:
+        await _call(
+            db, tmp_path, "merge_project",
+            {"source_project_name": "no-such-project", "target_project_id": w.mine}, [w.mine],
+        )
+    except ValueError as exc:
+        assert str(exc) == "project is outside your access scope"
+    else:
+        raise AssertionError("unknown project names must fail closed for scoped callers")
 
 
 async def test_merge_project_is_unchanged_for_an_unscoped_caller(db, tmp_path):
@@ -839,27 +851,44 @@ async def test_a_resolver_error_fails_closed(db, monkeypatch):
 
 
 async def test_a_refused_call_by_a_scoped_caller_never_writes_a_foreign_sessions_activity_feed(db, tmp_path, monkeypatch):
-    """The dispatcher's error path records 'EXCEPTION ...' into the named
-    executor session's feed; a scoped caller naming ANOTHER project's session
-    must not be able to land a row there (a planner reads the feed as proof of life)."""
+    """A dispatcher exception may be logged only to a session in the caller's scope."""
     w = await _world(db)
     own_sid, foreign_sid = w.own["session"], w.foreign["session"]
     monkeypatch.setattr(mcp_handler, "_EXECUTOR_SESSIONS", {own_sid, foreign_sid})
 
-    async def _rpc(sid: str, scoped: "list[str] | None") -> "dict[str, Any]":
+    from meridian.member_policy import CAPABILITY_IDS, EffectivePolicy, ScopedProjectIds
+    from meridian.roles import ROLE_MEMBER
+
+    scoped = ScopedProjectIds(
+        [w.mine],
+        policy=EffectivePolicy(caps=frozenset(CAPABILITY_IDS), role=ROLE_MEMBER),
+    )
+
+    async def _raise_from_dispatch(*args, **kwargs):
+        raise RuntimeError("synthetic executor dispatch failure")
+
+    monkeypatch.setattr(mcp_handler, "_dispatch_mcp_tool", _raise_from_dispatch)
+
+    async def _rpc(sid: str, scope: "list[str] | None") -> "dict[str, Any]":
+        if scope is not None and not isinstance(scope, ScopedProjectIds):
+            scope = ScopedProjectIds(
+                scope,
+                policy=EffectivePolicy(caps=frozenset(CAPABILITY_IDS), role=ROLE_MEMBER),
+            )
+        request_id = w.own["hitl"] if sid == own_sid else w.foreign["hitl"]
         return await mcp_handler._handle_mcp_request(
             {"jsonrpc": "2.0", "id": 1, "method": "tools/call",
              "params": {"name": "get_hitl_request",
-                        "arguments": {"request_id": "no-such-request", "session_id": sid}}},
-            db, str(tmp_path), tenant=None, scoped_project_ids=scoped,
+                        "arguments": {"request_id": request_id, "session_id": sid}}},
+            db, str(tmp_path), tenant=None, scoped_project_ids=scope,
         )
 
-    assert "error" in await _rpc(foreign_sid, [w.mine])
+    assert "error" in await _rpc(foreign_sid, scoped)
     assert await db_module.get_session_activity(db, foreign_sid) == []
-    # The caller's OWN session still gets its failures recorded.
-    assert "error" in await _rpc(own_sid, [w.mine])
+    # The caller's OWN session still records its dispatch failure.
+    assert "error" in await _rpc(own_sid, scoped)
     assert [a["tool_name"] for a in await db_module.get_session_activity(db, own_sid)] == ["get_hitl_request"]
-    # And an unscoped caller is exactly as before (it may record on any session).
+    # An unscoped caller is exactly as before (it may record on any session).
     assert "error" in await _rpc(foreign_sid, None)
     assert len(await db_module.get_session_activity(db, foreign_sid)) == 1
 
