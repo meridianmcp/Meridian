@@ -2323,6 +2323,21 @@ async def _run_connection_lazy(
                             }))
                             continue
                         _spawn_failures = 0
+                        # b47a7456 — a RESPAWN (idle-kill / re-probe restart: the
+                        # per-connection preflight already ran) whose own cold-spawn
+                        # readiness probe, run inside ensure_running(), missed its
+                        # window. The process is alive but has not answered tools/list,
+                        # so the slot must not stay advertised as healthy. Report it
+                        # unhealthy (the server suppresses its tools) and start the
+                        # background re-probe, which re-advertises on recovery.
+                        # The request is still relayed, matching the first-spawn
+                        # contract pinned by test_run_connection_lazy_preflight_reports_unhealthy.
+                        if (
+                            _preflight_done
+                            and not _was_running
+                            and proxy.diagnostics.state is SlotState.STARTUP_TIMEOUT
+                        ):
+                            await _mark_unhealthy()
                         # Pre-flight the proxy once, the first time we bring it up.
                         if not _preflight_done and not _was_running:
                             _preflight_done = True
