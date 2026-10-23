@@ -22,14 +22,14 @@ You have 28 days after cancellation before your database is deleted. We'll email
 
 ### How is Meridian different from CLAUDE.md?
 
-`CLAUDE.md` is a static text file injected into every Claude session. It's great for standing context but it can't:
+`CLAUDE.md` holds standing instructions that are loaded into every Claude Code session, and Claude Code's auto memory lets Claude keep its own notes between sessions (indexed in a `MEMORY.md` file loaded at startup). Both are plain files. On their own they don't:
 
-- Track what happened in previous sessions
 - Coordinate between two parallel Claude Code terminals
 - Queue HITL requests that need a human decision
-- Maintain a sprint board or decision log
+- Maintain a structured sprint board, or a decision log with supersession
+- Give non-Claude MCP clients the same view of the project
 
-Meridian is live state: sessions read and write to a shared DB in real time. Think of `CLAUDE.md` as a README and Meridian as the project management layer on top.
+Meridian is live state: sessions read and write a shared database. Think of `CLAUDE.md` and auto memory as notes, and Meridian as the project-management layer alongside them.
 
 ### What AI clients can connect to Meridian?
 
@@ -61,13 +61,13 @@ Meridian uses atomic task claiming to prevent conflicts. When a session calls `c
 
 For goal state, the last write wins (Meridian uses an incrementing version number). Session focus updates are non-conflicting by design — each session has its own sprint field.
 
-File-level conflicts (two sessions editing the same file) are outside Meridian's scope. Design sprint items to minimize file overlap; use HITL when overlap happens.
+To keep two sessions from editing the same code, a session can claim a whole file or an individual symbol before editing it (see [Parallel safety](parallel-safety.md)). Claims are advisory and expire after two hours, so still design sprint items to minimize file overlap, and use HITL when overlap happens.
 
 ### Is there performance overhead?
 
-Minimal. MCP calls are async and typically resolve in under 50ms for local SQLite. The DB is read on every `start_session` call and written on `log_task` / `checkpoint`. There is no polling loop in the AI session — Meridian only runs when your session calls a tool.
+Usually small. MCP calls are async and, on local SQLite, each is a local database query. The tool definitions and session-start context do take up some of the model's context window. The DB is read on every `start_session` call and written on `log_task` / `checkpoint`. There is no polling loop in the AI session — Meridian runs when your session calls a tool or when an installed hook fires (for example at session start and stop).
 
-For hosted Postgres (Neon), the first query after scale-to-zero takes ~300ms for cold start. Subsequent queries are fast.
+For hosted Postgres (Neon), the first query after scale-to-zero pays a cold-start delay. Subsequent queries are fast.
 
 ### Does the license allow commercial use?
 
