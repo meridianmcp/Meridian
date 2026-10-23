@@ -2096,30 +2096,10 @@ def build_mcp_server():
             # the three transports can no longer drift apart on this tool.
             _shared_tool("start_session"),
             _shared_tool("meridian_project_list"),
+            # #3 — the stdio server advertised pre-fix descriptions for these two tools because it hand-declared them.
+            # _shared_tool() pulls the same schema the HTTP transport serves, so the transports cannot drift apart.
             _shared_tool("list_projects"),
-            Tool(
-                name="get_project_by_name",
-                description=(
-                    "Look up a project by name (exact match, then "
-                    "case-insensitive exact match; not a substring search). "
-                    "Returns the match with id, name, and sprint. "
-                    "Use this when you know the project name but not the UUID."
-                ),
-                inputSchema={
-                    "type": "object",
-                    "properties": {
-                        "name": {
-                            "type": "string",
-                            "description": (
-                                "Full project name — exact match, then "
-                                "case-insensitive exact match (no partial "
-                                "or substring matching)."
-                            ),
-                        }
-                    },
-                    "required": ["name"],
-                },
-            ),
+            _shared_tool("get_project_by_name"),
             Tool(
                 name="get_session_brief",
                 description=(
