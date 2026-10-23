@@ -801,6 +801,20 @@ def test_module_entrypoint_exits_with_main_result(monkeypatch, capsys):
 _XPI_NAME = "meridian-zotero@usemeridian.us.xpi"
 
 
+@pytest.fixture(autouse=True)
+def _signed_plugin_stand_in(monkeypatch, tmp_path):
+    """The launch hook installs only a signed artifact. This stands one in, with its own hash, so the install paths run as before."""
+    import hashlib
+
+    from meridian import zotero_plugin_sign as sign
+
+    signed = tmp_path / "stand-in-signed.xpi"
+    payload = zpi.build_xpi_bytes()
+    signed.write_bytes(payload)
+    stored = sign.StoredSigned(status="signed", path=signed, sha256=hashlib.sha256(payload).hexdigest())
+    monkeypatch.setattr(zpi, "signed_install_state", lambda source_dir=None: stored)
+
+
 def _zotero_profile(tmp_path, monkeypatch, *, running=False):
     """A fake Zotero data root with one default profile, reachable only through env.
 
@@ -993,6 +1007,37 @@ def test_plugin_is_never_installed_while_zotero_is_running(windows, monkeypatch,
     assert result["action"] == "started"
     assert launched == [exe]
     assert not (profile / "extensions" / _XPI_NAME).exists()
+
+
+# ---------------------------------------------------------------------------
+def test_start_does_not_install_an_unsigned_plugin_and_says_so(windows, monkeypatch, tmp_path, caplog):
+    profile = _zotero_profile(tmp_path, monkeypatch)
+    monkeypatch.setenv("MERIDIAN_ZOTERO_PLUGIN_AUTOINSTALL", "1")
+    _decide(True)
+    from meridian import zotero_plugin_sign as sign
+
+    monkeypatch.setattr(zpi, "signed_install_state", lambda source_dir=None: sign.StoredSigned(status="missing"))
+    with caplog.at_level("INFO"):
+        result, exe, launched = _start_recording_xpi_state(monkeypatch, tmp_path)
+    assert result["action"] == "started"
+    assert launched == [exe]
+    assert not (profile / "extensions" / _XPI_NAME).exists()
+    assert "not signed" in caplog.text
+
+
+def test_start_does_not_install_a_tampered_signed_file_and_says_so(windows, monkeypatch, tmp_path, caplog):
+    profile = _zotero_profile(tmp_path, monkeypatch)
+    monkeypatch.setenv("MERIDIAN_ZOTERO_PLUGIN_AUTOINSTALL", "1")
+    _decide(True)
+    from meridian import zotero_plugin_sign as sign
+
+    monkeypatch.setattr(zpi, "signed_install_state", lambda source_dir=None: sign.StoredSigned(status="tampered"))
+    with caplog.at_level("INFO"):
+        result, exe, launched = _start_recording_xpi_state(monkeypatch, tmp_path)
+    assert result["action"] == "started"
+    assert launched == [exe]
+    assert not (profile / "extensions" / _XPI_NAME).exists()
+    assert "integrity" in caplog.text
 
 
 # ---------------------------------------------------------------------------

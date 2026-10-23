@@ -1,8 +1,8 @@
 {
   "name": "meridian-zotero-bridge",
-  "version": "0.1.0",
+  "version": "0.1.4",
   "private": true,
-  "description": "Meridian Zotero Bridge plugin source. Not installed; untested in Zotero.",
+  "description": "Meridian Zotero Bridge plugin source: menus and a local write API. See README.md for what is verified.",
   "type": "commonjs",
   "scripts": {
     "test": "node --test test/*.test.js"
