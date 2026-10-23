@@ -268,7 +268,7 @@ async def test_generate_handoff_includes_hints_when_toggle_on(db, tmp_path):
     )
 
     _, content, _ = await handoff_module.generate_handoff(
-        db, p["id"], str(tmp_path), skip_ai_summary=True
+        db, p["id"], str(tmp_path), skip_ai_summary=True, mode="full"
     )
     # /goal block should have <model_hints>
     assert "<model_hints>" in content
@@ -288,7 +288,7 @@ async def test_generate_handoff_omits_hints_when_toggle_off(db, tmp_path):
 
     # No executor_config update — toggle stays at default (False).
     _, content, _ = await handoff_module.generate_handoff(
-        db, p["id"], str(tmp_path), skip_ai_summary=True
+        db, p["id"], str(tmp_path), skip_ai_summary=True, mode="full"
     )
     assert "<model_hints>" not in content
     assert "Suggested model:" not in content
@@ -306,7 +306,7 @@ async def test_generate_handoff_toggle_off_explicitly(db, tmp_path):
         executor_config={"model_tier_hints_enabled": False},
     )
     _, content, _ = await handoff_module.generate_handoff(
-        db, p["id"], str(tmp_path), skip_ai_summary=True
+        db, p["id"], str(tmp_path), skip_ai_summary=True, mode="full"
     )
     assert "<model_hints>" not in content
     assert "Suggested model:" not in content
@@ -325,7 +325,7 @@ async def test_generate_handoff_hints_correct_tiers_for_priority(db, tmp_path):
         executor_config={"model_tier_hints_enabled": True},
     )
     _, content, _ = await handoff_module.generate_handoff(
-        db, p["id"], str(tmp_path), skip_ai_summary=True
+        db, p["id"], str(tmp_path), skip_ai_summary=True, mode="full"
     )
     # Low-priority, feature-type board => haiku expected
     assert "haiku" in content
@@ -341,7 +341,7 @@ async def test_generate_handoff_hints_survive_empty_board(db, tmp_path):
         executor_config={"model_tier_hints_enabled": True},
     )
     _, content, _ = await handoff_module.generate_handoff(
-        db, p["id"], str(tmp_path), skip_ai_summary=True
+        db, p["id"], str(tmp_path), skip_ai_summary=True, mode="full"
     )
     # No model_hints tag on an empty board (nothing to annotate).
     assert "<model_hints>" not in content

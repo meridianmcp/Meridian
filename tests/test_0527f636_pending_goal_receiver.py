@@ -110,7 +110,7 @@ async def test_receiver_first_then_sibling_gets_nothing(db, tmp_path):
     p = await _seed_project(db, "recv-order")
     await handoff_module.generate_handoff(
         db, p["id"], str(tmp_path), skip_ai_summary=True,
-        pending_goal_receiver={"session_name": "exec-a"},
+        pending_goal_receiver={"session_name": "exec-a"}, mode="full",
     )
     receiver = await _start(db, p["id"], tmp_path, "EXEC-A")  # case-insensitive
     assert receiver["pending_goal"]
@@ -125,7 +125,7 @@ async def test_unaddressed_handoff_keeps_todays_first_start_wins(db, tmp_path):
     bare body with no header."""
     p = await _seed_project(db, "recv-unaddressed")
     await handoff_module.generate_handoff(
-        db, p["id"], str(tmp_path), skip_ai_summary=True,
+        db, p["id"], str(tmp_path), skip_ai_summary=True, mode="full",
     )
     body = await db_module.get_pending_goal(db, p["id"])
     assert await _raw_cell(db, p["id"]) == body  # nothing wrapped around it
@@ -257,19 +257,19 @@ async def test_new_handoff_replaces_the_address_and_amend_detection_still_works(
     p = await _seed_project(db, "recv-amend")
     _, _, am1 = await handoff_module.generate_handoff(
         db, p["id"], str(tmp_path), skip_ai_summary=True,
-        pending_goal_receiver={"session_name": "exec-a"},
+        pending_goal_receiver={"session_name": "exec-a"}, mode="full",
     )
     assert am1 is False
     # Unconsumed addressed handoff is still detected as "unconsumed" -> amend.
     _, _, am2 = await handoff_module.generate_handoff(
         db, p["id"], str(tmp_path), skip_ai_summary=True,
-        pending_goal_receiver={"session_name": "exec-b"},
+        pending_goal_receiver={"session_name": "exec-b"}, mode="full",
     )
     assert am2 is True
     assert await db_module.get_pending_goal_receiver(db, p["id"]) == {"session_name": "exec-b"}
     # The newest handoff wins wholesale, including dropping the address.
     _, _, am3 = await handoff_module.generate_handoff(
-        db, p["id"], str(tmp_path), skip_ai_summary=True,
+        db, p["id"], str(tmp_path), skip_ai_summary=True, mode="full",
     )
     assert am3 is True
     assert await db_module.get_pending_goal_receiver(db, p["id"]) is None
@@ -280,7 +280,7 @@ async def test_correction_regeneration_keeps_the_receiver_address(db, tmp_path):
     p = await _seed_project(db, "recv-correction")
     await handoff_module.generate_handoff(
         db, p["id"], str(tmp_path), skip_ai_summary=True,
-        pending_goal_receiver={"session_name": "exec-a", "role": "executor"},
+        pending_goal_receiver={"session_name": "exec-a", "role": "executor"}, mode="full",
     )
     source = (await db_module.get_handoffs(db, p["id"], limit=1))[0]
     corr = await handoff_module.record_handoff_correction(
@@ -315,7 +315,7 @@ async def test_invalid_receiver_is_rejected_before_anything_is_persisted(db, tmp
     p = await _seed_project(db, "recv-invalid")
     with pytest.raises(ValueError):
         await handoff_module.generate_handoff(
-            db, p["id"], str(tmp_path), skip_ai_summary=True, pending_goal_receiver=bad,
+            db, p["id"], str(tmp_path), skip_ai_summary=True, pending_goal_receiver=bad, mode="full",
         )
     assert await db_module.get_pending_goal(db, p["id"]) is None
     assert await db_module.get_handoffs(db, p["id"], limit=5) == []

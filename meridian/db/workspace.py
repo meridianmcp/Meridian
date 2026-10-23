@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import logging
 import os
 import re
 import subprocess
@@ -38,6 +39,8 @@ from meridian.db import (  # noqa: PLC0415
     _sprint_item_slug_base,
     _sprint_item_nickname_base,
 )
+
+_log = logging.getLogger(__name__)
 
 
 # ---------------------------------------------------------------------------
@@ -163,8 +166,12 @@ async def get_workspace_notes(
     clauses: list[str] = []
     params: list[Any] = []
     if tag:
-        clauses.append("tags LIKE ?")
-        params.append(f"%{tag}%")
+        # Case-insensitive on both engines: SQLite's LIKE is for ASCII, but
+        # Postgres' is not. The workspace index (0b0b24d8) lists a note tagged
+        # 'Policy' as policy-tagged and prints get_workspace_notes(tag="policy")
+        # as the call that returns it, so that call has to find it on Postgres.
+        clauses.append("LOWER(tags) LIKE ?")
+        params.append(f"%{tag.lower()}%")
     scope, scope_params = _ws_tenant_clause(tenant_id)
     if scope:
         clauses.append(scope)
@@ -3123,15 +3130,21 @@ async def create_workspace_invite(
 
     d116642e — ``project_id`` scopes the invite to a single project. When
     ``None`` (default) the member is workspace-wide and sees every project
-    (current behavior). When set, the member is project-scoped: listing-only
-    scoping applies (they see only that project in listings). Airtight
-    per-request access enforcement is deferred pending the product decision
-    (pin b11c7cf6).
+    (current behavior). When set, the member is project-scoped: they reach only
+    that project and its subprojects, and ``member_policy`` decides what they
+    may do inside it.
+
+    A first invite for an email with no workspace_members row in this tenant
+    also clears any ``member_policy`` override left under that email, so a
+    person who was removed and is invited again starts from the workspace
+    default instead of silently inheriting the rights they used to have.
     """
     from .. import roles as _roles  # noqa: PLC0415
     mid = _new_id()
     if github_access is None:
         github_access = _roles.default_github_access_for_role(role)
+    if await _count_member_rows(db, tenant_id, email) == 0:
+        await _delete_member_policy_override(db, tenant_id, email)
     await db.execute(
         "INSERT INTO workspace_members "
         "(id, tenant_id, email, role, github_access, token_hash, project_id) "
@@ -3191,6 +3204,16 @@ async def get_pending_invites_for_email(
     return [r for r in (_row_to_dict(row) for row in rows) if r]
 
 
+_VALID_WORKSPACE_MEMBER_ROLES = frozenset({"owner", "admin", "member", "viewer"})
+
+
+def _workspace_member_role_or_viewer(role: Any) -> str:
+    """Fail closed when a persisted workspace role is malformed."""
+    if isinstance(role, str) and role in _VALID_WORKSPACE_MEMBER_ROLES:
+        return role
+    return "viewer"
+
+
 async def resolve_member_role(
     db: aiosqlite.Connection,
     tenant_id: str,
@@ -3224,7 +3247,7 @@ async def resolve_member_role(
     if row is None:
         return None
     return (
-        (row["role"] or "member"),
+        _workspace_member_role_or_viewer(row["role"]),
         (row["github_access"] or "read"),
     )
 
@@ -3314,13 +3337,33 @@ async def delete_workspace_member(
     member_id: str,
     tenant_id: str,
 ) -> bool:
-    """Remove a workspace member row. Returns True (no-op on missing row)."""
+    """Remove a workspace member row. Returns True (no-op on missing row).
+
+    When that was the person's last workspace_members row in this tenant (any
+    project, pending or accepted) their ``member_policy`` override goes with it,
+    so a later re-invite starts from the workspace default. Removing one of
+    several rows keeps the override: the person is still a member.
+    """
+    async with db.execute(
+        "SELECT email FROM workspace_members WHERE id = ? AND tenant_id = ?",
+        (member_id, tenant_id),
+    ) as cur:
+        gone = await cur.fetchone()
     await db.execute(
         "DELETE FROM workspace_members WHERE id = ? AND tenant_id = ?",
         (member_id, tenant_id),
     )
     await db.commit()
+    if gone is not None:
+        email = gone["email"] if isinstance(gone, dict) or hasattr(gone, "keys") else gone[0]
+        if await _count_member_rows(db, tenant_id, email) == 0:
+            await _delete_member_policy_override(db, tenant_id, email)
     return True
+
+
+# Sentinel: project_id was not passed, so the member's scope is left alone.
+# A passed None means "whole workspace" (clears the project scope).
+SCOPE_UNCHANGED: Any = object()
 
 
 async def update_workspace_member(
@@ -3330,12 +3373,14 @@ async def update_workspace_member(
     *,
     role: str | None = None,
     github_access: str | None = None,
+    project_id: Any = SCOPE_UNCHANGED,
 ) -> dict[str, Any] | None:
-    """v2.8 — update a member's role and/or github_access (admin-only edit).
+    """v2.8 — update a member's role, github_access, and/or project scope.
 
-    Only the fields passed (non-None) are changed. Scoped by tenant_id so a
-    caller can never touch another workspace's rows. Returns the updated row,
-    or None when no member matched.
+    Only the fields passed are changed. ``project_id=None`` elevates a
+    project-scoped member to the whole workspace; a project id scopes the member
+    to that one project. Scoped by tenant_id so a caller can never touch another
+    workspace's rows. Returns the updated row, or None when no member matched.
     """
     updates: list[str] = []
     params: list[Any] = []
@@ -3345,6 +3390,9 @@ async def update_workspace_member(
     if github_access is not None:
         updates.append("github_access = ?")
         params.append(github_access)
+    if project_id is not SCOPE_UNCHANGED:
+        updates.append("project_id = ?")
+        params.append(project_id)
     if updates:
         params.extend([member_id, tenant_id])
         await db.execute(
@@ -3392,7 +3440,7 @@ async def get_scoped_project_ids_for_member(
     tenant_id: str,
     email: str,
 ) -> list[str] | None:
-    """d116642e — listing-only project scoping for a workspace member.
+    """d116642e — the explicit project grants of a workspace member.
 
     Returns the set of project_ids an accepted member is scoped to within the
     given tenant's workspace, or ``None`` when the member is NOT project-scoped
@@ -3400,13 +3448,12 @@ async def get_scoped_project_ids_for_member(
     see every project.
 
     Semantics:
-      - returns ``None``  → no scoping; caller lists all projects (default).
-      - returns ``[...]`` → list only these project_ids in UI listings.
+      - returns ``None``  → no scoping (default).
+      - returns ``[...]`` → the member reaches these projects. Their subprojects
+        are not listed here: the caller adds them from ``get_subproject_map``.
 
-    NOTE: this is listing-only scoping. It does NOT block direct-by-ID access to
-    other projects in the same workspace — airtight per-request enforcement is
-    deferred pending the open product decision (pin b11c7cf6). Writes remain
-    gated by role enforcement (393eed0a).
+    Which of those projects the member may write to, create under or delete is
+    decided per person by ``member_policy`` (see ``get_member_policy_rows``).
     """
     e = (email or "").strip().lower()
     if not e:
@@ -3427,3 +3474,547 @@ async def get_scoped_project_ids_for_member(
             return None
         scoped.append(pid)
     return scoped
+
+
+# ---------------------------------------------------------------------------
+# Member policy — what a project-scoped member may do inside their scope
+# ---------------------------------------------------------------------------
+#
+# One row per (workspace owner tenant, subject) in the auth DB. Subject '*' is
+# the workspace default, any other subject is LOWER(email) of one person's
+# override. The value is the text of a JSON object. This section stores and
+# returns that text VERBATIM: parsing it, ignoring unknown keys and the rule
+# that an unparseable row denies everything (fail closed) belong to the code
+# that resolves the effective policy, not to storage. Reads never swallow an
+# error either: a missing table or a dead connection must reach the caller.
+
+MEMBER_POLICY_DEFAULT_SUBJECT = "*"
+MEMBER_POLICY_CHANGED_EVENT = "member_policy_changed"
+
+
+class CorruptMemberPolicyRow(ValueError):
+    """A partial policy edit cannot safely merge with malformed stored JSON."""
+
+
+class ConcurrentMemberPolicyUpdate(RuntimeError):
+    """A policy row kept changing while a bounded compare-and-set retried."""
+
+
+def _member_policy_subject(email: str | None) -> str:
+    return (email or "").strip().lower()
+
+
+def _canonical_policy_json(policy_json: Any) -> str:
+    """Return ``policy_json`` (JSON text or a dict) as canonical JSON object
+    text, or raise ``ValueError`` when it is not a JSON object."""
+    parsed = policy_json
+    if isinstance(policy_json, (str, bytes)):
+        try:
+            parsed = json.loads(policy_json)
+        except ValueError as exc:
+            raise ValueError("member policy must be a JSON object") from exc
+    if not isinstance(parsed, dict):
+        raise ValueError("member policy must be a JSON object")
+    try:
+        return json.dumps(parsed, sort_keys=True, separators=(",", ":"))
+    except (TypeError, ValueError) as exc:
+        raise ValueError("member policy must be a JSON object") from exc
+
+
+def _policy_text_for_audit(text: str | None) -> Any:
+    if text is None:
+        return None
+    try:
+        return json.loads(text)
+    except ValueError:
+        return text
+
+
+async def _count_member_rows(
+    db: aiosqlite.Connection, tenant_id: str, email: str | None,
+) -> int:
+    """Every workspace_members row (pending or accepted, any project) the
+    person holds in this tenant."""
+    e = _member_policy_subject(email)
+    if not e:
+        return 0
+    async with db.execute(
+        "SELECT COUNT(*) AS cnt FROM workspace_members "
+        "WHERE tenant_id = ? AND LOWER(email) = ?",
+        (tenant_id, e),
+    ) as cur:
+        row = await cur.fetchone()
+    return int(row["cnt"]) if row else 0
+
+
+async def _delete_member_policy_override(
+    db: aiosqlite.Connection, tenant_id: str, email: str | None,
+) -> bool:
+    """Drop one person's override row. Returns whether a row was removed."""
+    subject = _member_policy_subject(email)
+    if not subject or subject == MEMBER_POLICY_DEFAULT_SUBJECT:
+        return False
+    cur = await db.execute(
+        "DELETE FROM member_policy WHERE tenant_id = ? AND subject = ?",
+        (tenant_id, subject),
+    )
+    await db.commit()
+    return bool(cur.rowcount and cur.rowcount > 0)
+
+
+async def _fetch_member_policy_text(
+    db: aiosqlite.Connection, tenant_id: str, subject: str,
+) -> str | None:
+    async with db.execute(
+        "SELECT policy FROM member_policy WHERE tenant_id = ? AND subject = ?",
+        (tenant_id, subject),
+    ) as cur:
+        row = await cur.fetchone()
+    return row["policy"] if row else None
+
+
+async def _audit_member_policy_change(
+    db: aiosqlite.Connection,
+    tenant_id: str,
+    subject: str,
+    actor: str | None,
+    before: str | None,
+    after: str | None,
+) -> bool:
+    """Best-effort ``member_policy_changed`` row in action_audit_log (it lives in
+    the same auth DB). A failure is logged loudly and reported as ``False`` to
+    the caller; it never rolls the policy edit back."""
+    try:
+        await record_action_audit_event(
+            db,
+            MEMBER_POLICY_CHANGED_EVENT,
+            tenant_id=tenant_id,
+            actor=actor,
+            detail=json.dumps(
+                {
+                    "subject": subject,
+                    "before": _policy_text_for_audit(before),
+                    "after": _policy_text_for_audit(after),
+                },
+                sort_keys=True,
+            ),
+        )
+        return True
+    except Exception:  # noqa: BLE001 - audit is best-effort by design
+        _log.error(
+            "member_policy_changed audit write failed (tenant=%s subject=%s)",
+            tenant_id, subject, exc_info=True,
+        )
+        return False
+
+
+async def _store_member_policy(
+    db: aiosqlite.Connection,
+    tenant_id: str,
+    subject: str,
+    policy_json: Any,
+    updated_by: str | None,
+) -> dict[str, Any]:
+    from datetime import datetime, timezone  # noqa: PLC0415
+
+    policy_text = _canonical_policy_json(policy_json)
+    before = await _fetch_member_policy_text(db, tenant_id, subject)
+    now = datetime.now(timezone.utc).isoformat()
+    await db.execute(
+        "INSERT INTO member_policy (tenant_id, subject, policy, updated_by, updated_at) "
+        "VALUES (?, ?, ?, ?, ?) "
+        "ON CONFLICT (tenant_id, subject) DO UPDATE SET "
+        "policy = excluded.policy, updated_by = excluded.updated_by, "
+        "updated_at = excluded.updated_at",
+        (tenant_id, subject, policy_text, updated_by, now),
+    )
+    await db.commit()
+    audited = await _audit_member_policy_change(
+        db, tenant_id, subject, updated_by, before, policy_text,
+    )
+    return {
+        "tenant_id": tenant_id,
+        "subject": subject,
+        "policy": policy_text,
+        "previous": before,
+        "updated_by": updated_by,
+        "updated_at": now,
+        "audited": audited,
+    }
+
+
+async def get_member_policy_rows(
+    db: aiosqlite.Connection,
+    tenant_id: str,
+    email: str | None,
+) -> dict[str, str | None]:
+    """Return ``{'default': text|None, 'override': text|None}`` in ONE query:
+    the workspace default row and this person's override row, each as the raw
+    stored JSON text (``None`` when there is no such row). An empty ``email``
+    returns the default only."""
+    subject = _member_policy_subject(email)
+    if not subject or subject == MEMBER_POLICY_DEFAULT_SUBJECT:
+        subject = MEMBER_POLICY_DEFAULT_SUBJECT
+    async with db.execute(
+        "SELECT subject, policy FROM member_policy "
+        "WHERE tenant_id = ? AND subject IN ('*', ?)",
+        (tenant_id, subject),
+    ) as cur:
+        rows = await cur.fetchall()
+    out: dict[str, str | None] = {"default": None, "override": None}
+    for r in rows:
+        if r["subject"] == MEMBER_POLICY_DEFAULT_SUBJECT:
+            out["default"] = r["policy"]
+        else:
+            out["override"] = r["policy"]
+    return out
+
+
+async def set_member_policy_default(
+    db: aiosqlite.Connection,
+    tenant_id: str,
+    policy_json: Any,
+    updated_by: str | None,
+) -> dict[str, Any]:
+    """Create or replace the workspace default policy row.
+
+    ``policy_json`` is JSON object text (a dict is accepted and serialised);
+    anything that is not a JSON object raises ``ValueError``. Returns the stored
+    row plus ``previous`` (the replaced text or ``None``) and ``audited``
+    (whether the ``member_policy_changed`` audit row was written)."""
+    return await _store_member_policy(
+        db, tenant_id, MEMBER_POLICY_DEFAULT_SUBJECT, policy_json, updated_by,
+    )
+
+
+async def set_member_policy_override(
+    db: aiosqlite.Connection,
+    tenant_id: str,
+    email: str,
+    policy_json: Any,
+    updated_by: str | None,
+) -> dict[str, Any]:
+    """Create or replace one person's override row (subject = LOWER(email)).
+
+    Same contract as ``set_member_policy_default``. Whether the person may have
+    an override at all (project-scoped, not workspace-wide, not a viewer asking
+    for rights) is the caller's rule: see ``get_member_roles``."""
+    subject = _member_policy_subject(email)
+    if not subject or subject == MEMBER_POLICY_DEFAULT_SUBJECT:
+        raise ValueError("a member policy override needs the member's email")
+    return await _store_member_policy(db, tenant_id, subject, policy_json, updated_by)
+
+
+async def clear_member_policy_override(
+    db: aiosqlite.Connection,
+    tenant_id: str,
+    email: str,
+    *,
+    updated_by: str | None = None,
+) -> dict[str, Any]:
+    """Delete one person's override so they inherit the workspace default.
+
+    Returns ``{'removed': bool, 'previous': text|None, 'audited': bool}``; a
+    missing row is a no-op (``removed`` False, nothing audited)."""
+    subject = _member_policy_subject(email)
+    if not subject or subject == MEMBER_POLICY_DEFAULT_SUBJECT:
+        raise ValueError("a member policy override needs the member's email")
+    before = await _fetch_member_policy_text(db, tenant_id, subject)
+    removed = await _delete_member_policy_override(db, tenant_id, subject)
+    audited = False
+    if removed:
+        audited = await _audit_member_policy_change(
+            db, tenant_id, subject, updated_by, before, None,
+        )
+    return {"removed": removed, "previous": before, "audited": audited}
+
+
+async def list_member_policy_overrides(
+    db: aiosqlite.Connection,
+    tenant_id: str,
+) -> dict[str, str]:
+    """Return ``{email: raw JSON text}`` for every per-person override in the
+    workspace (the default row is not included)."""
+    async with db.execute(
+        "SELECT subject, policy FROM member_policy "
+        "WHERE tenant_id = ? AND subject <> '*' ORDER BY subject ASC",
+        (tenant_id,),
+    ) as cur:
+        rows = await cur.fetchall()
+    return {r["subject"]: r["policy"] for r in rows}
+
+
+async def list_member_policy_members(
+    db: aiosqlite.Connection,
+    tenant_id: str,
+) -> list[dict[str, Any]]:
+    """Return scoped member rows, their overrides and all accepted role rows.
+
+    One bounded query supplies the member-policy summary endpoint. Joining the
+    accepted memberships here preserves the most-restrictive role clamp without
+    issuing a pair of policy/role queries for every member.
+    """
+    async with db.execute(
+        "SELECT 'member' AS row_kind, scoped.id AS member_id, "
+        "scoped.email AS email, scoped.role AS role, "
+        "scoped.project_id AS project_id, NULL AS policy_role, "
+        "NULL AS policy_project_id, overrides.policy AS override_policy "
+        "FROM workspace_members AS scoped "
+        "LEFT JOIN member_policy AS overrides "
+        "ON overrides.tenant_id = scoped.tenant_id "
+        "AND overrides.subject = LOWER(scoped.email) "
+        "WHERE scoped.tenant_id = ? AND scoped.joined_at IS NOT NULL "
+        "AND scoped.project_id IS NOT NULL "
+        "UNION ALL "
+        "SELECT 'role' AS row_kind, NULL AS member_id, roles.email AS email, "
+        "NULL AS role, NULL AS project_id, roles.role AS policy_role, "
+        "roles.project_id AS policy_project_id, NULL AS override_policy "
+        "FROM workspace_members AS roles "
+        "WHERE roles.tenant_id = ? AND roles.joined_at IS NOT NULL "
+        "AND LOWER(roles.email) IN ("
+        "SELECT DISTINCT LOWER(scoped.email) FROM workspace_members AS scoped "
+        "WHERE scoped.tenant_id = ? AND scoped.joined_at IS NOT NULL "
+        "AND scoped.project_id IS NOT NULL) "
+        "ORDER BY email ASC, row_kind ASC, member_id ASC, policy_project_id ASC",
+        (tenant_id, tenant_id, tenant_id),
+    ) as cur:
+        rows = await cur.fetchall()
+    return [
+        {
+            "row_kind": row["row_kind"],
+            "member_id": row["member_id"],
+            "email": row["email"],
+            "role": row["role"],
+            "project_id": row["project_id"],
+            "policy_role": row["policy_role"],
+            "policy_project_id": row["policy_project_id"],
+            "override": row["override_policy"],
+        }
+        for row in rows
+    ]
+
+
+async def _patch_member_policy_row(
+    db: aiosqlite.Connection,
+    tenant_id: str,
+    subject: str,
+    patch: dict[str, bool | None],
+    updated_by: str | None,
+    *,
+    delete_empty: bool,
+) -> dict[str, Any]:
+    """Atomically merge a partial policy patch using compare-and-set retries.
+
+    The conditional UPDATE/DELETE and conflict-safe INSERT are single-statement
+    mutations on both SQLite and Postgres. A concurrent patch therefore retries
+    from the newer JSON row instead of replacing another request's changes.
+    """
+    from datetime import datetime, timezone  # noqa: PLC0415
+
+    if not isinstance(patch, dict) or not patch:
+        raise ValueError("policy patch must be a non-empty object")
+    if any(not isinstance(value, bool) and value is not None for value in patch.values()):
+        raise ValueError("policy patch values must be booleans or null")
+
+    for _attempt in range(8):
+        before = await _fetch_member_policy_text(db, tenant_id, subject)
+        if before is None:
+            merged: dict[str, Any] = {}
+        else:
+            try:
+                decoded = json.loads(before)
+            except (TypeError, ValueError, json.JSONDecodeError) as exc:
+                raise CorruptMemberPolicyRow(
+                    f"stored policy row for {subject!r} is not valid JSON"
+                ) from exc
+            if not isinstance(decoded, dict):
+                raise CorruptMemberPolicyRow(
+                    f"stored policy row for {subject!r} is not a JSON object"
+                )
+            merged = decoded
+
+        for capability, value in patch.items():
+            if value is None:
+                merged.pop(capability, None)
+            else:
+                merged[capability] = value
+
+        if delete_empty and not merged:
+            if before is None:
+                return {
+                    "tenant_id": tenant_id, "subject": subject, "policy": None,
+                    "previous": None, "updated_by": updated_by,
+                    "updated_at": None, "audited": False,
+                }
+            cur = await db.execute(
+                "DELETE FROM member_policy WHERE tenant_id = ? AND subject = ? "
+                "AND policy = ?",
+                (tenant_id, subject, before),
+            )
+            await db.commit()
+            if not cur.rowcount:
+                continue
+            audited = await _audit_member_policy_change(
+                db, tenant_id, subject, updated_by, before, None,
+            )
+            return {
+                "tenant_id": tenant_id, "subject": subject, "policy": None,
+                "previous": before, "updated_by": updated_by,
+                "updated_at": None, "audited": audited,
+            }
+
+        after = _canonical_policy_json(merged)
+        now = datetime.now(timezone.utc).isoformat()
+        if before is None:
+            cur = await db.execute(
+                "INSERT INTO member_policy "
+                "(tenant_id, subject, policy, updated_by, updated_at) "
+                "VALUES (?, ?, ?, ?, ?) ON CONFLICT (tenant_id, subject) DO NOTHING",
+                (tenant_id, subject, after, updated_by, now),
+            )
+        else:
+            cur = await db.execute(
+                "UPDATE member_policy SET policy = ?, updated_by = ?, updated_at = ? "
+                "WHERE tenant_id = ? AND subject = ? AND policy = ?",
+                (after, updated_by, now, tenant_id, subject, before),
+            )
+        await db.commit()
+        if not cur.rowcount:
+            continue
+        audited = await _audit_member_policy_change(
+            db, tenant_id, subject, updated_by, before, after,
+        )
+        return {
+            "tenant_id": tenant_id, "subject": subject, "policy": after,
+            "previous": before, "updated_by": updated_by,
+            "updated_at": now, "audited": audited,
+        }
+
+    raise ConcurrentMemberPolicyUpdate(
+        f"member policy row {subject!r} changed repeatedly during partial update"
+    )
+
+
+async def patch_member_policy_default(
+    db: aiosqlite.Connection,
+    tenant_id: str,
+    patch: dict[str, bool | None],
+    updated_by: str | None,
+) -> dict[str, Any]:
+    """Atomically merge a partial workspace-default policy update."""
+    return await _patch_member_policy_row(
+        db, tenant_id, MEMBER_POLICY_DEFAULT_SUBJECT, patch, updated_by,
+        delete_empty=False,
+    )
+
+
+async def patch_member_policy_override(
+    db: aiosqlite.Connection,
+    tenant_id: str,
+    email: str,
+    patch: dict[str, bool | None],
+    updated_by: str | None,
+) -> dict[str, Any]:
+    """Atomically merge a partial per-member policy update."""
+    subject = _member_policy_subject(email)
+    if not subject or subject == MEMBER_POLICY_DEFAULT_SUBJECT:
+        raise ValueError("a member policy override needs the member's email")
+    return await _patch_member_policy_row(
+        db, tenant_id, subject, patch, updated_by, delete_empty=True,
+    )
+
+
+async def get_member_roles(
+    db: aiosqlite.Connection,
+    tenant_id: str,
+    email: str | None,
+) -> list[tuple[str, str | None]]:
+    """Return ``[(role, project_id), ...]`` for every ACCEPTED workspace_members
+    row (``joined_at`` set) the person holds in this tenant, oldest invite first.
+    ``project_id`` is ``None`` for a workspace-wide row. Pending invites are
+    left out, and so is the tenant owner (who has no workspace_members row).
+    ``resolve_member_role`` returns only the newest row's role; this returns
+    all of them so a caller can apply the most restrictive one."""
+    e = _member_policy_subject(email)
+    if not e:
+        return []
+    async with db.execute(
+        "SELECT role, project_id FROM workspace_members "
+        "WHERE tenant_id = ? AND LOWER(email) = ? AND joined_at IS NOT NULL "
+        "ORDER BY invited_at ASC, id ASC",
+        (tenant_id, e),
+    ) as cur:
+        rows = await cur.fetchall()
+    return [(_workspace_member_role_or_viewer(r["role"]), r["project_id"]) for r in rows]
+
+
+async def get_member_authorization_context(
+    db: aiosqlite.Connection,
+    tenant_id: str,
+    email: str | None,
+) -> dict[str, Any]:
+    """Read explicit scope, role rows, and effective-policy inputs in one query.
+
+    The workspace-member rows are the authority for both explicit project
+    grants and role clamps. Policy rows are returned only when those accepted
+    memberships make the caller project-scoped; a workspace-wide member or a
+    non-member still gets the usual unscoped result. No result is cached, so
+    edits and revocations are visible on the next request.
+
+    ``project_ids`` is ``None`` for an owner/non-member/workspace-wide member,
+    and a list for a project-scoped member. ``memberships`` retains every
+    accepted ``(role, project_id)`` pair for the most-restrictive role clamp.
+    ``policy_rows`` has the same shape as :func:`get_member_policy_rows`.
+    """
+    subject = _member_policy_subject(email)
+    if not subject:
+        return {
+            "project_ids": None,
+            "memberships": [],
+            "policy_rows": {"default": None, "override": None},
+        }
+
+    async with db.execute(
+        "WITH accepted_members AS ("
+        "SELECT role, project_id FROM workspace_members "
+        "WHERE tenant_id = ? AND LOWER(email) = ? AND joined_at IS NOT NULL"
+        ") "
+        "SELECT 'member' AS kind, role, project_id, NULL AS subject, NULL AS policy "
+        "FROM accepted_members "
+        "UNION ALL "
+        "SELECT 'policy' AS kind, NULL AS role, NULL AS project_id, subject, policy "
+        "FROM member_policy "
+        "WHERE tenant_id = ? AND subject IN ('*', ?) "
+        "AND EXISTS (SELECT 1 FROM accepted_members) "
+        "AND NOT EXISTS (SELECT 1 FROM accepted_members WHERE project_id IS NULL)",
+        (tenant_id, subject, tenant_id, subject),
+    ) as cur:
+        rows = await cur.fetchall()
+
+    memberships: list[tuple[str, str | None]] = []
+    policy_rows: dict[str, str | None] = {"default": None, "override": None}
+    for row in rows:
+        if hasattr(row, "keys"):
+            kind = row["kind"]
+            role = row["role"]
+            project_id = row["project_id"]
+            policy_subject = row["subject"]
+            policy = row["policy"]
+        else:
+            kind, role, project_id, policy_subject, policy = row
+        if kind == "member":
+            memberships.append((_workspace_member_role_or_viewer(role), project_id))
+        elif policy_subject == MEMBER_POLICY_DEFAULT_SUBJECT:
+            policy_rows["default"] = policy
+        else:
+            policy_rows["override"] = policy
+
+    if not memberships or any(project_id is None for _, project_id in memberships):
+        project_ids = None
+    else:
+        project_ids = [project_id for _, project_id in memberships]
+    return {
+        "project_ids": project_ids,
+        "memberships": memberships,
+        "policy_rows": policy_rows,
+    }

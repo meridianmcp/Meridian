@@ -69,6 +69,30 @@ async def admin_health_json(request: Request) -> dict[str, Any]:
     }
 
 
+@router.get("/admin/pool-load")
+async def admin_pool_load(request: Request, top_n: int = 10) -> dict[str, Any]:
+    """1b2fbebe -- redacted per-tenant / per-Neon-pool load telemetry (admin only).
+
+    Same gate as /admin/health. In-memory and per server process: with several Fly
+    machines each one reports only the requests it served. Advisory only: nothing here
+    moves a tenant or changes a quota."""
+    from ..hosted import get_current_tenant, is_admin_db, check_admin_password  # noqa: PLC0415
+    from ..pool_telemetry import METER  # noqa: PLC0415
+
+    try:
+        tenant = await get_current_tenant(request)
+    except HTTPException:
+        raise HTTPException(status_code=403, detail="not authenticated")
+    if not await is_admin_db(tenant.get("email", ""), request.app.state.db):
+        raise HTTPException(status_code=403, detail="admin only")
+    if not check_admin_password(request):
+        raise HTTPException(status_code=403, detail="admin password required")
+
+    snapshot = METER.snapshot(top_n=max(1, min(int(top_n), 50)))
+    snapshot["scope"] = "this server process only"
+    return snapshot
+
+
 @router.get("/health/deep")
 async def health_deep(request: Request) -> JSONResponse:
     """4c559d4e — deep health probe for post-deploy checks + external monitoring.
@@ -322,6 +346,63 @@ async def admin_reset_tenant_provisioning(tenant_id: str, request: Request) -> R
     except ValueError as exc:
         raise HTTPException(status_code=404, detail=str(exc)) from exc
     return JSONResponse({"reset": True, **result})
+
+
+@router.post("/admin/tenants/plan")
+async def admin_set_tenant_plan(request: Request) -> Response:
+    """Set or revoke a tenant's plan by account email (grant the playtester plan).
+
+    The ``playtester`` plan is unpaid Pro entitlements with usage still bounded.
+
+    Body: ``{"email": ..., "plan": "playtester"|"free"|"standard"|"pro",
+    "expires_at": "YYYY-MM-DD" | null, "is_internal": false, "confirm": true}``.
+    ``expires_at`` is only for a playtester (omitted keeps its current end date;
+    null clears it). ``is_internal`` may only be ``false``: it clears the staff
+    flag when moving a staff account to playtester and is never set here.
+    Without ``confirm`` nothing is written and the response says what would
+    change (``applied`` is false); with it the change is applied, idempotent and
+    audited. The response carries the plan label and any warning (a staff flag
+    that still exempts the tenant, a tenant with no database yet). A playtester
+    is refused with 409, preview included, when its database is in a Neon pool
+    project other tenants use: the message says to reset its provisioning first,
+    after which its next database is created in a project of its own.
+
+    Hosted operator only (admin session + admin password), like
+    reset-provisioning. See ``meridian/tenant_plan_admin.py``.
+    """
+    from ..tenant_plan_admin import UNSET, PlanChangeError, set_tenant_plan_by_email  # noqa: PLC0415
+
+    if not _hosted_mode():
+        raise HTTPException(status_code=404)
+    await _require_hosted_operator(request)
+    from ..hosted import get_current_tenant  # noqa: PLC0415
+
+    caller = await get_current_tenant(request)
+    try:
+        body = await request.json()
+    except Exception:
+        body = None
+    if not isinstance(body, dict):
+        raise HTTPException(status_code=400, detail="JSON object body required")
+    if "is_internal" in body and body["is_internal"] is not False:
+        raise HTTPException(
+            status_code=400,
+            detail="is_internal can only be false here: the staff flag is never set by this action",
+        )
+    try:
+        result = await set_tenant_plan_by_email(
+            request.app.state.db,
+            body.get("email", ""),
+            body.get("plan", ""),
+            expires_at=body["expires_at"] if "expires_at" in body else UNSET,
+            clear_internal=body.get("is_internal") is False,
+            apply=body.get("confirm") is True,
+            actor=caller.get("email", ""),
+            via="admin_route",
+        )
+    except PlanChangeError as exc:
+        raise HTTPException(status_code=exc.status, detail=exc.message) from exc
+    return JSONResponse(result)
 
 
 @router.get("/admin/snapshot")

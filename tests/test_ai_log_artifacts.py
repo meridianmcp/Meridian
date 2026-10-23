@@ -324,3 +324,86 @@ async def test_mcp_purge_ai_log_is_project_scoped(db, tmp_path):
     assert await db_module.get_event(db, ev_a["id"]) is None
     # pid_b's equally-old row must survive — purge never crosses projects.
     assert await db_module.get_event(db, ev_b["id"]) is not None
+
+
+# ---------------------------------------------------------------------------
+# 5. Tenant ownership (RT-TI-001 / RT-TI-002)
+#
+# The artifact store is a filesystem tree keyed by project id inside a data dir
+# that every tenant shares. A project id the caller's own database does not know
+# (for example another tenant's project) must be refused before any file is read
+# or deleted, and must look exactly like any other unknown project id.
+# ---------------------------------------------------------------------------
+
+_FOREIGN_PROJECT_ID = "00000000-0000-4000-8000-0000000000aa"
+
+
+@pytest.mark.asyncio
+async def test_mcp_export_ai_log_artifacts_refuses_a_project_the_caller_does_not_own(db, tmp_path):
+    data_dir = str(tmp_path)
+    foreign = artifact_store.store_artifact(data_dir, _FOREIGN_PROJECT_ID, b"another tenant's output")
+
+    with pytest.raises(ValueError, match="project not found"):
+        await mcp_handler._handle_task_tools(
+            "export_ai_log_artifacts", {"project_id": _FOREIGN_PROJECT_ID}, db, data_dir,
+            tenant=None, _mcp_tenant_id=None,
+        )
+    with pytest.raises(ValueError, match="project not found"):
+        await mcp_handler._handle_task_tools(
+            "export_ai_log_artifacts",
+            {"project_id": _FOREIGN_PROJECT_ID, "content_hashes": [foreign["content_hash"]]},
+            db, data_dir, tenant=None, _mcp_tenant_id=None,
+        )
+    # The refusal reads nothing and removes nothing.
+    assert artifact_store.get_artifact(data_dir, _FOREIGN_PROJECT_ID, foreign["content_hash"]) == b"another tenant's output"
+
+
+@pytest.mark.asyncio
+async def test_mcp_purge_ai_log_refuses_a_project_the_caller_does_not_own(db, tmp_path):
+    data_dir = str(tmp_path)
+    foreign = artifact_store.store_artifact(data_dir, _FOREIGN_PROJECT_ID, b"another tenant's output")
+
+    with pytest.raises(ValueError, match="project not found"):
+        await mcp_handler._handle_task_tools(
+            "purge_ai_log", {"project_id": _FOREIGN_PROJECT_ID, "cutoff": "2999-01-01T00:00:00Z"},
+            db, data_dir, tenant=None, _mcp_tenant_id=None,
+        )
+    assert artifact_store.get_artifact(data_dir, _FOREIGN_PROJECT_ID, foreign["content_hash"]) == b"another tenant's output"
+
+
+@pytest.mark.asyncio
+async def test_artifact_tools_answer_the_same_for_a_foreign_and_a_missing_project(db, tmp_path):
+    """A foreign project must be indistinguishable from one that never existed."""
+    data_dir = str(tmp_path)
+    artifact_store.store_artifact(data_dir, _FOREIGN_PROJECT_ID, b"present for another tenant")
+    missing_id = "00000000-0000-4000-8000-0000000000bb"
+    messages = []
+    for pid in (_FOREIGN_PROJECT_ID, missing_id):
+        with pytest.raises(ValueError) as excinfo:
+            await mcp_handler._handle_task_tools(
+                "export_ai_log_artifacts", {"project_id": pid}, db, data_dir,
+                tenant=None, _mcp_tenant_id=None,
+            )
+        messages.append(str(excinfo.value))
+    assert messages[0] == messages[1]
+
+
+@pytest.mark.asyncio
+async def test_mcp_artifact_tools_still_work_for_the_callers_own_project(db, tmp_path):
+    pid = await _project(db, "owned-artifact-project")
+    data_dir = str(tmp_path)
+    meta = artifact_store.store_artifact(data_dir, pid, b"my own output")
+
+    exported = await mcp_handler._handle_task_tools(
+        "export_ai_log_artifacts", {"project_id": pid}, db, data_dir,
+        tenant=None, _mcp_tenant_id=None,
+    )
+    assert exported["artifact_count"] == 1
+    assert exported["artifacts"][0]["content_hash"] == meta["content_hash"]
+
+    purged = await mcp_handler._handle_task_tools(
+        "purge_ai_log", {"project_id": pid, "cutoff": "2999-01-01T00:00:00Z"}, db, data_dir,
+        tenant=None, _mcp_tenant_id=None,
+    )
+    assert purged["artifacts_deleted"] == 1
+    assert artifact_store.get_artifact(data_dir, pid, meta["content_hash"]) is None

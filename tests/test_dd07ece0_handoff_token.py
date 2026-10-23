@@ -99,7 +99,7 @@ async def test_generate_handoff_embeds_token_in_goal(db, tmp_path):
     await db_module.add_sprint_item(db, p["id"], "v1", "do the thing")
 
     _path, content, _amended = await handoff_module.generate_handoff(
-        db, p["id"], str(tmp_path), skip_ai_summary=True
+        db, p["id"], str(tmp_path), skip_ai_summary=True, mode="full"
     )
     # The content is the full handoff markdown; the /goal block appears in it.
     assert "<goal_token>" in content, (
@@ -127,7 +127,7 @@ async def test_goal_block_contains_prominent_verification_banner(db, tmp_path):
     await db_module.add_sprint_item(db, p["id"], "v1", "do the thing")
 
     _path, content, _amended = await handoff_module.generate_handoff(
-        db, p["id"], str(tmp_path), skip_ai_summary=True
+        db, p["id"], str(tmp_path), skip_ai_summary=True, mode="full"
     )
 
     # The verification banner must be present in the rendered output.
@@ -374,7 +374,7 @@ async def test_generate_handoff_token_verify_roundtrip(db, tmp_path):
     await db_module.add_sprint_item(db, p["id"], "v1", "implement the thing")
 
     _path, content, _amended = await handoff_module.generate_handoff(
-        db, p["id"], str(tmp_path), skip_ai_summary=True
+        db, p["id"], str(tmp_path), skip_ai_summary=True, mode="full"
     )
 
     token = _extract_token_from_goal(content)
@@ -422,7 +422,7 @@ async def test_token_verifies_even_with_tampered_body_when_caller_omits_body_che
     await db_module.add_sprint_item(db, p["id"], "v1", "real item")
 
     _path, real_content, _amended = await handoff_module.generate_handoff(
-        db, p["id"], str(tmp_path), skip_ai_summary=True
+        db, p["id"], str(tmp_path), skip_ai_summary=True, mode="full"
     )
 
     # Extract the genuine token from the real /goal block.
@@ -899,7 +899,7 @@ async def test_b763d2ba_end_to_end_sibling_claim_and_consume_not_flagged_as_spoo
     item_b = await db_module.add_sprint_item(db, p["id"], "v1", "item B")
 
     _path, content, _amended = await handoff_module.generate_handoff(
-        db, p["id"], str(tmp_path), skip_ai_summary=True
+        db, p["id"], str(tmp_path), skip_ai_summary=True, mode="full"
     )
     token = _extract_token_from_goal(content)
     assert token is not None
@@ -951,10 +951,10 @@ async def test_repeated_generate_handoff_calls_differ_only_by_token(db, tmp_path
     )
 
     _path_a, content_a, _ = await handoff_module.generate_handoff(
-        db, p["id"], str(tmp_path), skip_ai_summary=True
+        db, p["id"], str(tmp_path), skip_ai_summary=True, mode="full"
     )
     _path_b, content_b, _ = await handoff_module.generate_handoff(
-        db, p["id"], str(tmp_path), skip_ai_summary=True
+        db, p["id"], str(tmp_path), skip_ai_summary=True, mode="full"
     )
 
     token_a = _extract_token_from_goal(content_a)
@@ -1028,7 +1028,7 @@ async def test_generate_handoff_binds_token_to_body_hash(db, tmp_path):
     await db_module.add_sprint_item(db, p["id"], "v1", "do the thing")
 
     _path, content, _amended = await handoff_module.generate_handoff(
-        db, p["id"], str(tmp_path), skip_ai_summary=True
+        db, p["id"], str(tmp_path), skip_ai_summary=True, mode="full"
     )
     token = _extract_token_from_goal(content)
     assert token is not None
@@ -1396,7 +1396,7 @@ async def test_stdio_transport_dispatches_load_handoff(monkeypatch, db, tmp_path
     p = await db_module.create_project(db, "stdio-load-handoff-dispatch")
     await db_module.set_goal(db, p["id"], "ship it", sprint="s1")
     await handoff_module.generate_handoff(
-        db, p["id"], str(tmp_path), skip_ai_summary=True
+        db, p["id"], str(tmp_path), skip_ai_summary=True, mode="full"
     )
 
     server = _build_stdio_server(monkeypatch, db)
@@ -1460,7 +1460,7 @@ async def test_load_handoff_content_byte_identical_between_mcp_and_stdio_transpo
     p = await db_module.create_project(db, "load-handoff-cross-transport-parity")
     await db_module.set_goal(db, p["id"], "ship it", sprint="s1")
     await handoff_module.generate_handoff(
-        db, p["id"], str(tmp_path), skip_ai_summary=True
+        db, p["id"], str(tmp_path), skip_ai_summary=True, mode="full"
     )
 
     mcp_result = await mh._handle_task_tools(
@@ -1536,7 +1536,7 @@ async def test_stdio_transport_dispatches_record_handoff_correction_record_only(
     )
     await db_module.set_goal(db, p["id"], "ship it", sprint="s1")
     _path, _content, _ = await handoff_module.generate_handoff(
-        db, p["id"], str(tmp_path), skip_ai_summary=True,
+        db, p["id"], str(tmp_path), skip_ai_summary=True, mode="full",
     )
     rows = await db_module.get_handoffs(db, p["id"], limit=1)
     source_handoff_id = rows[0]["id"]
@@ -1583,7 +1583,7 @@ async def test_stdio_transport_dispatches_record_handoff_correction_with_regener
     )
     await db_module.set_goal(db, p["id"], "ship it", sprint="s1")
     _path, _content, _ = await handoff_module.generate_handoff(
-        db, p["id"], str(tmp_path), skip_ai_summary=True,
+        db, p["id"], str(tmp_path), skip_ai_summary=True, mode="full",
     )
     rows = await db_module.get_handoffs(db, p["id"], limit=1)
     source_handoff_id = rows[0]["id"]

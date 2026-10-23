@@ -8,18 +8,20 @@ from typing import Any
 from fastapi import APIRouter, HTTPException, Query, Request
 from fastapi.responses import Response
 
+from .. import _deps
 from .._deps import (
     _db,
     _data_dir,
     _enforcement_context,
     _get_tenant_from_request,
     _hosted_mode,
-    _scoped_project_ids_for_request,
+    _require_project_in_scope,
     validate_input_size,
 )
 from .. import db as db_module
 from .. import goal_md as goal_md_module
 from ..executor_config import normalize_executor_config
+from ..plans import tenant_entitlement_plan
 from ..roles import PERM_SETTINGS, has_perm
 from ..models import (
     GoalModeSet,
@@ -113,10 +115,12 @@ async def list_projects(request: Request) -> list[dict[str, Any]]:
     d116642e — project-scoped workspace members (invited to a single project,
     not the whole workspace) only see their scoped project(s) here. Workspace
     owners and workspace-wide members see everything. This is listing-only
-    scoping; see _scoped_project_ids_for_request.
+    scoping; see _scoped_project_ids_for_request. The resolver is reached through
+    the ``_deps`` module (like every other scope check in this file), so one
+    patch point covers them all.
     """
     projects = await db_module.list_projects(await _db(request))
-    scoped = await _scoped_project_ids_for_request(request)
+    scoped = await _deps._scoped_project_ids_for_request(request)
     if scoped is not None:
         allowed = set(scoped)
         projects = [p for p in projects if p.get("id") in allowed]
@@ -128,6 +132,11 @@ async def create_project(
     body: ProjectCreate, request: Request
 ) -> dict[str, Any]:
     """Create a new project. 409 if the name is already in use."""
+    # RT-TI-005 (wave 2) — body.parent_project_id names another project outside the
+    # /projects/{uuid} middleware: a project-scoped member may only nest a new
+    # project under a parent inside their own scope. A no-op without a parent and
+    # for owners / workspace-wide members / self-hosted / demo callers.
+    await _require_project_in_scope(request, body.parent_project_id)
     tenant = await _get_tenant_from_request(request)
     try:
         db = await _db(request)
@@ -166,7 +175,9 @@ async def create_project(
         raise HTTPException(
             status_code=409, detail=f"project '{body.name}' already exists"
         )
-    if tenant and tenant.get("plan") == "free":
+    # The one-project cap follows the entitlement in force: a playtester has
+    # Pro's (no cap) until its optional end date passes, then Free's.
+    if tenant and tenant_entitlement_plan(tenant, default="") == "free":
         existing_projects = await db_module.list_projects(db)
         if len(existing_projects) >= 1:
             raise HTTPException(
@@ -222,11 +233,23 @@ async def get_project_by_name(name: str, request: Request) -> dict[str, Any]:
     can confirm it found the right project without a second round-trip.
     """
     db = await _db(request)
+    # RT-TI-005 (wave 2) — this route sits outside the /projects/{uuid}
+    # middleware (it is keyed by NAME), so a project-scoped member is held to
+    # their scope here. Out-of-scope projects are dropped BEFORE the exact match
+    # is accepted and the substring fallback only ever sees in-scope projects,
+    # which makes an out-of-scope name answer exactly like a name that does not
+    # exist (404) — no 403 that would confirm the project is there.
+    scoped = await _deps._scoped_project_ids_for_request(request)
+    allowed = set(scoped) if scoped is not None else None
     # Exact match first (most common case).
     project = await db_module.get_project_by_name(db, name)
+    if project is not None and allowed is not None and project.get("id") not in allowed:
+        project = None
     if project is None:
         # Case-insensitive substring fallback.
         all_projects = await db_module.list_projects(db)
+        if allowed is not None:
+            all_projects = [p for p in all_projects if p.get("id") in allowed]
         lower = name.lower()
         matches = [p for p in all_projects if lower in p["name"].lower()]
         if matches:
@@ -329,6 +352,8 @@ async def patch_project_settings(
         require_merge_approval=body.require_merge_approval,
         code_intel_enabled=body.code_intel_enabled,
         execution_mode=body.execution_mode,
+        use_mode=body.use_mode,
+        use_mode_actor="http:patch_project_settings",
     )
     if settings is None:
         raise HTTPException(status_code=404, detail="project not found")
@@ -684,13 +709,34 @@ async def set_project_parent(
         raise HTTPException(400, "parent_project_id is required (pass null to detach)")
     raw = body.get("parent_project_id")
     parent_project_id = str(raw).strip() if raw else None
+    # RT-TI-005 (wave 2) — {project_id} is checked by the middleware, but the
+    # parent comes from the body: a project-scoped member may not nest a project
+    # under (or re-parent it into) a project outside their scope. Detaching
+    # (parent None) needs no extra check.
+    await _require_project_in_scope(request, parent_project_id)
     db = await _db(request)
+    from .. import member_policy  # noqa: PLC0415
+
+    authorized = getattr(
+        request.state, "_meridian_member_policy_authorized_parent", None,
+    )
+    compare_and_set: dict[str, Any] = {}
+    if authorized is not None:
+        if not isinstance(authorized, member_policy.AuthorizedParentSnapshot):
+            raise HTTPException(409, "project authorization snapshot is invalid")
+        if authorized.project_id != project_id:
+            raise HTTPException(409, "project authorization snapshot does not match")
+        compare_and_set = {
+            "expect_parent": authorized.parent_project_id,
+            "expect_parent_exists": authorized.parent_exists,
+        }
     try:
         updated = await db_module.set_parent_project(
-            db, project_id, parent_project_id
+            db, project_id, parent_project_id, **compare_and_set,
         )
     except ValueError as exc:
-        raise HTTPException(400, str(exc)) from exc
+        status_code = 409 if str(exc) == "project changed concurrently" else 400
+        raise HTTPException(status_code, str(exc)) from exc
     if updated is None:
         raise HTTPException(404, "project not found")
     db_module.publish_global(
@@ -713,11 +759,17 @@ async def delete_project(project_id: str, request: Request) -> None:
     (batch form, ``delete_projects_batch`` below) — this single-id endpoint
     is unchanged and still the right choice for one project.
     """
-    project = await db_module.get_project(await _db(request), project_id)
-    if project is None:
+    db = await _db(request)
+    family = getattr(
+        request.state, "_meridian_member_policy_authorized_delete_family", None,
+    )
+    if family is None:
+        family = await db_module.get_project_family(db, [project_id])
+    expected = family.get(project_id)
+    if expected is None:
         raise HTTPException(404, "project not found")
     try:
-        await db_module.delete_project(await _db(request), project_id)
+        await db_module.delete_project(db, project_id, expect={project_id: expected})
     except ValueError as exc:
         raise HTTPException(409, str(exc)) from exc
 
@@ -771,12 +823,28 @@ async def delete_projects_batch(
             f"Workspace role '{ctx[2]}' lacks permission '{PERM_SETTINGS}'",
         )
     project_ids = list(dict.fromkeys(project_id))  # de-dupe, preserve order
+    # RT-TI-005 (wave 2) — the ids arrive as a query list on a bare /projects
+    # path, which the /projects/{uuid} middleware never sees. A project-scoped
+    # member (an admin/owner role is possible, see 3f4ba195) may delete only
+    # projects inside their scope. Checked BEFORE any existence lookup, so an
+    # unknown id and a foreign id are both the same 403 and nothing is deleted
+    # when any one id is out of scope.
+    scoped = await _deps._scoped_project_ids_for_request(request)
+    if scoped is not None and any(pid not in scoped for pid in project_ids):
+        raise HTTPException(403, "Project is outside your access scope.")
     db = await _db(request)
-    missing = [pid for pid in project_ids if await db_module.get_project(db, pid) is None]
+    family = getattr(
+        request.state, "_meridian_member_policy_authorized_delete_family", None,
+    )
+    if family is None:
+        family = await db_module.get_project_family(db, project_ids)
+    missing = [pid for pid in project_ids if pid not in family]
     if missing:
         raise HTTPException(404, f"project(s) not found: {', '.join(missing)}")
     try:
-        await db_module.delete_project(db, project_ids)
+        await db_module.delete_project(
+            db, project_ids, expect={pid: family[pid] for pid in project_ids}
+        )
     except ValueError as exc:
         raise HTTPException(409, str(exc)) from exc
     return {"deleted": project_ids, "count": len(project_ids)}
@@ -818,6 +886,7 @@ async def get_goal(project_id: str, request: Request) -> dict[str, Any]:
             "version": 0,
             "created_at": "",
             "updated_at": "",
+            "field_updated_at": db_module.goal_field_stamps(None),
             "ambient_tasks": [
                 {
                     "status": t["status"],
@@ -846,6 +915,7 @@ async def get_goal(project_id: str, request: Request) -> dict[str, Any]:
     )
     coherence = db_module.compute_coherence_warning(field_ages)
     goal["field_ages"] = field_ages
+    goal["field_updated_at"] = db_module.goal_field_stamps(goal)
     goal["coherence_warning"] = coherence
     # v1.1.4 — append-only decisions log.
     decisions = await db_module.get_decisions(await _db(request), project_id)
@@ -901,11 +971,17 @@ async def patch_project_organization(
     project = await db_module.get_project(db, project_id)
     if project is None:
         raise HTTPException(status_code=404, detail="project not found")
+    expected_status_snapshot = getattr(
+        request.state, "_meridian_member_policy_authorized_status_snapshot", None,
+    )
     try:
         updated = await db_module.set_project_status(
-            db, project_id, status=body.status, priority=body.priority
+            db, project_id, status=body.status, priority=body.priority,
+            expect_status_snapshot=expected_status_snapshot,
         )
     except ValueError as exc:
+        if str(exc).startswith(db_module._PROJECT_CHANGED_CONCURRENTLY):
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
         raise HTTPException(status_code=422, detail=str(exc))
     return updated
 
@@ -943,11 +1019,28 @@ async def set_goal(
         validate_input_size(body.north_star, "north_star", 10_000)
     if body.sprint is not None:
         validate_input_size(body.sprint, "version_goal", 10_000)
-    result = await db_module.set_goal(
-        await _db(request), project_id, body.content,
-        north_star=body.north_star, sprint=body.sprint,
-        minor=body.minor,
-    )
+    # fc779141 — only the fields the caller sent a stamp for are checked.
+    expected = {
+        field: stamp
+        for field, stamp in (
+            ("version_goal", body.expected_updated_at),
+            ("north_star", body.expected_north_star_updated_at),
+            ("sprint", body.expected_sprint_updated_at),
+        )
+        if stamp is not None
+    }
+    try:
+        result = await db_module.set_goal(
+            await _db(request), project_id, body.content,
+            north_star=body.north_star, sprint=body.sprint,
+            minor=body.minor,
+            expected_updated_at=expected or None,
+            actor=db_module.goal_actor(body.source or "api", body.human_id),
+        )
+    except db_module.GoalConflict as exc:
+        raise HTTPException(
+            status_code=409, detail=db_module.goal_conflict_detail(exc)
+        ) from exc
     await goal_md_module.sync_db_to_goal_md(await _db(request), project_id)
     return result
 
@@ -969,10 +1062,16 @@ async def set_north_star(
     # the caller owns this project. human_id check only applies to local no-auth.
     try:
         result = await db_module.set_north_star(
-            await _db(request), project_id, body.north_star
+            await _db(request), project_id, body.north_star,
+            expected_updated_at=body.expected_updated_at,
+            actor=db_module.goal_actor(body.source or "api", body.human_id),
         )
         await goal_md_module.sync_db_to_goal_md(await _db(request), project_id)
         return result
+    except db_module.GoalConflict as exc:
+        raise HTTPException(
+            status_code=409, detail=db_module.goal_conflict_detail(exc)
+        ) from exc
     except ValueError as exc:
         raise HTTPException(status_code=422, detail=str(exc))
 
@@ -992,10 +1091,16 @@ async def set_sprint(
     validate_input_size(body.sprint, "version_goal", 10_000)
     try:
         result = await db_module.set_sprint(
-            await _db(request), project_id, body.sprint
+            await _db(request), project_id, body.sprint,
+            expected_updated_at=body.expected_updated_at,
+            actor=db_module.goal_actor(body.source or "api", body.session_id),
         )
         await goal_md_module.sync_db_to_goal_md(await _db(request), project_id)
         return result
+    except db_module.GoalConflict as exc:
+        raise HTTPException(
+            status_code=409, detail=db_module.goal_conflict_detail(exc)
+        ) from exc
     except ValueError as exc:
         raise HTTPException(status_code=422, detail=str(exc))
 
@@ -1262,6 +1367,15 @@ async def create_worktree(
     project = await db_module.get_project(db, project_id)
     if project is None:
         raise HTTPException(status_code=404, detail="project not found")
+    # RT-TI-005 (pass 3, F-D6) -- the session and the sprint item in the body must belong to
+    # the project in the path. They were stored unchecked, and GET /projects/{pid}/worktrees
+    # then joined the foreign session's NAME back to the caller. A session / item of another
+    # project is answered like a missing one (404), for every caller.
+    await _deps._reject_foreign_session(db, body.session_id, project_id)
+    if body.item_id:
+        _wt_item = await db_module.get_sprint_item(db, body.item_id)
+        if _wt_item is not None and _wt_item.get("project_id") != project_id:
+            raise HTTPException(status_code=404, detail="sprint item not found")
     wt = await db_module.register_worktree(
         db,
         body.session_id,
@@ -1339,13 +1453,18 @@ async def delete_worktree(
     inside the very repo it coordinates, so it can perform the real removal
     itself here; hosted (multi-tenant) mode has no access to the caller's
     filesystem and stays DB-only, per the local-fs-access architectural law
-    in `meridian/_deps.py`. Either way this remains best-effort: a failed
-    disk removal never blocks the DB update or 404s the caller — see
-    `worktree_cleanup.sweep_stale_worktrees` for the periodic catch-all pass
-    that reclaims anything left behind.
+    in `meridian/_deps.py`. The row is marked removed only once the directory
+    is confirmed gone from disk. A guard refusal (dirty tree, live owning
+    process) or a failed removal leaves the row active and answers 409
+    Conflict with the reason, so `worktree_cleanup.sweep_stale_worktrees`
+    (which only selects active rows) retries it later.
     """
     db = await _db(request)
-    wt = await db_module.get_worktree(db, worktree_id)
+    # RT-TI-005 (wave 2) — the worktree must belong to the project in the PATH
+    # (the only project the scope middleware checks). A worktree id from another
+    # project is answered exactly like a missing one and is never touched,
+    # neither on disk nor in the DB nor in the active-repo cache below.
+    wt = await db_module.get_worktree(db, worktree_id, project_id=project_id)
     if wt is None or wt.get("removed_at") is not None:
         raise HTTPException(status_code=404, detail="worktree not found or already removed")
     if not _hosted_mode():
@@ -1357,22 +1476,33 @@ async def delete_worktree(
             # process still using the worktree (its owning session can be
             # marked terminal for other reasons) never gets its directory
             # nuked out from under it.
-            worktree_cleanup.remove_worktree_on_disk_guarded(
+            disk_outcome = worktree_cleanup.remove_worktree_on_disk_guarded(
                 _REPO_ROOT, wt, expected_worktree_id=worktree_id
             )
-        except Exception as exc:  # noqa: BLE001 — disk cleanup is best-effort
+        except Exception as exc:  # noqa: BLE001 — a crash is not a confirmed removal
             import logging as _l
             _l.getLogger("meridian.server").warning(
                 "delete_worktree: on-disk cleanup failed for %s: %s", wt["path"], exc
             )
-    removed = await db_module.remove_worktree(db, worktree_id)
+            disk_outcome = {"removed": False, "detail": f"on-disk cleanup failed: {exc}"}
+        if not disk_outcome.get("removed"):
+            # The directory is still on disk: the guard refused it (dirty tree,
+            # live owning process) or the removal failed. Leave the row active
+            # so the periodic sweep, which only selects removed_at IS NULL rows,
+            # retries it, and tell the caller why it was not removed.
+            parts = [p for p in (disk_outcome.get("reason"), disk_outcome.get("detail")) if p]
+            raise HTTPException(
+                status_code=409,
+                detail="worktree not removed from disk: " + (": ".join(parts) or "removal did not complete"),
+            )
+    removed = await db_module.remove_worktree(db, worktree_id, project_id=project_id)
     if not removed:
         raise HTTPException(status_code=404, detail="worktree not found or already removed")
     # 32ba4125 — clean up the code-intel context tied to this worktree: a
     # stale _tenant_active_repo cache entry must never keep pointing
     # subsequent code-intel calls (search_graph, find_symbol, ...) at a path
-    # whose worktree no longer exists. Same best-effort posture as the
-    # on-disk cleanup above — never blocks or fails the deletion itself.
+    # whose worktree no longer exists. Best-effort: a failure here never
+    # blocks or fails the deletion itself.
     try:
         from ..worktree_code_intel_context import clear_stale_active_repo_cache  # noqa: PLC0415
         clear_stale_active_repo_cache(wt)
@@ -1496,7 +1626,16 @@ async def get_team_summary_endpoint(
     ``project_id`` optional — omit to roll up across all projects.
     Returns ``{period_days, humans:[...], active_count}``. Used by the
     Team tab cards, swimlane timeline, and standup digest.
+
+    RT-TI-005 (wave 2) — ``/team/summary`` is outside the /projects/{uuid}
+    middleware and, without a ``project_id``, rolls up every project's task
+    log. A project-scoped member must therefore name a project inside their own
+    scope (the dashboard's Team tab always does); an omitted or foreign id is a
+    403, never a workspace-wide fallback (same rule as /control-plane/proposals).
     """
+    scoped = await _deps._scoped_project_ids_for_request(request)
+    if scoped is not None and (not project_id or project_id not in scoped):
+        raise HTTPException(status_code=403, detail="Project is outside your access scope.")
     return await db_module.get_team_summary(await _db(request), project_id, days)
 
 

@@ -221,6 +221,9 @@ def _dispatch_subcommand(raw_argv: list[str]) -> int | None:
       local-only provider output capture and verification.
     * ``zotero sync`` -- run one bounded workstation sync of hosted citation
       markers through authenticated MCP calls; no background loop is started.
+    * ``zotero install-plugin [--profile DIR] [--dry-run] [--keep-zotero-open]`` -- install the
+      Zotero bridge plugin into Zotero's profile. A running Zotero is closed first when the
+      saved setting allows it; ``--keep-zotero-open`` refuses instead.
 
     Returns the exit code, or ``None`` when ``raw_argv`` is not a subcommand.
     """
@@ -247,6 +250,10 @@ def _dispatch_subcommand(raw_argv: list[str]) -> int | None:
 
         return _artifact_cli(raw_argv[1:])
     if raw_argv[0] == "zotero":
+        if len(raw_argv) > 1 and raw_argv[1] == "install-plugin":
+            from .zotero_plugin_install import cli_main as _plugin_cli
+
+            return _plugin_cli(raw_argv[2:])
         from .zotero_sync import cli_main as _zotero_cli
 
         return _zotero_cli(raw_argv[1:])

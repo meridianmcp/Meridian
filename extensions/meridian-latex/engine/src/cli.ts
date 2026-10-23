@@ -134,6 +134,17 @@ interface WriteFieldArgs {
  * long-lived process.
  */
 async function writeField({ projectId, docId: docIdOrPath, nodeId, fieldName, newText }: WriteFieldArgs): Promise<void> {
+  // 189fde6b (RT-LEAD-003) — this subcommand changes a LIVE Overleaf document, so it
+  // must be run by a human at an interactive terminal. Any agent that can run a shell
+  // command could otherwise invoke it, and a non-interactive child process has no TTY on
+  // stdin. Refuse before loading the saved session cookie or touching the network.
+  if (!process.stdin.isTTY) {
+    console.error(
+      "refused: `write` edits a live Overleaf document and only runs from an interactive terminal " +
+        "(stdin is not a TTY). A human must run this command in a terminal.",
+    );
+    process.exit(1);
+  }
   const cookie = loadSavedCookie();
   if (!cookie) {
     console.error("No saved Overleaf session -- run `meridian-latex login` first.");

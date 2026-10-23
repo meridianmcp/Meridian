@@ -234,10 +234,9 @@ async def handle_add_sprint_item(
     # a8550238 — surface code-prospecting context INLINE at add time, so the
     # planner sees which real files/symbols the item touches (and can prospect
     # them) while the sprint is still being shaped — not only later at claim
-    # time. 926bf221 — always report an explicit prospecting_status so the
-    # caller can distinguish prospected / no-targets / skipped / errored.
+    # time. 926bf221 / 19aa84a7 — report an explicit status, with "prospected"
+    # reserved for items that satisfy the durable executable-gate predicate.
     _pc_ctx, _pc_status = _prospecting_result(_new_item)
-    _extra["prospecting_status"] = _pc_status
     if _pc_ctx:
         _extra["code_context"] = _pc_ctx
     # 691f4e1c — persist a DURABLE symbol pointer (not just the inline hint) when
@@ -249,6 +248,15 @@ async def handle_add_sprint_item(
     )
     if _ptr:
         _extra["prospected_pointer"] = _ptr
+    # 19aa84a7 — "prospected" must mean the same thing in this response as
+    # it does in generate_handoff's executable gate.  _prospecting_result
+    # reports transient code context; only a durable pointer lets the shared
+    # predicate below pass for an item that declares resources.
+    if _pc_status == "prospected" and not db_module.is_item_claim_prospected(
+        _new_item, has_pointer_evidence=bool(_ptr),
+    ):
+        _pc_status = "unprospected"
+    _extra["prospecting_status"] = _pc_status
     # 7fe57cea — when the caller declared explicit touches_resources at file-only
     # granularity (file:path.py, no :symbol), emit a non-blocking informational
     # hint suggesting symbol-scoped form instead.  Only fires for explicit caller
@@ -693,7 +701,15 @@ async def handle_set_sprint(
                 "unstarted_ids": [it["id"] for it in _unstarted],
                 "sprint_not_updated": True,
             }
-    result = await db_module.set_sprint(db, args["project_id"], args["sprint"])
+    try:
+        result = await db_module.set_sprint(
+            db, args["project_id"], args["sprint"],
+            expected_updated_at=args.get("expected_updated_at"),
+            actor=db_module.goal_actor("mcp"),
+        )
+    except db_module.GoalConflict as exc:
+        # fc779141 — stale expected_updated_at: nothing was written.
+        return db_module.goal_conflict_detail(exc)
     await goal_md_module.sync_db_to_goal_md(db, args["project_id"])
     return result
 
@@ -1355,7 +1371,14 @@ async def handle_claim_sprint_item(
             # persisted for later merge-time validation.
             "worktree_base_branch": "dev",
             "worktree_setup_cmd": f"git worktree add {wt_path} -b {wt_branch}",
-            "worktree_cleanup_cmd": f"git worktree remove {wt_path} --force",
+            # No --force: `git worktree remove --force` discards modified and
+            # untracked files. Step 1 gates removal on a clean status (the
+            # `test -z` exits non-zero when status prints anything, so the
+            # remove never runs on a dirty tree); step 2 removes the clean tree.
+            "worktree_cleanup_cmd": (
+                f'test -z "$(git -C {wt_path} status --porcelain)" '
+                f"&& git worktree remove {wt_path}"
+            ),
             "worktree_merge_cmd": (
                 f"git checkout dev && git merge {wt_branch} --no-edit "
                 f"&& git branch -d {wt_branch}"

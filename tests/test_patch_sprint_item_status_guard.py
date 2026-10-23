@@ -134,21 +134,41 @@ async def test_patch_sprint_item_status_change_publishes_live_event(db, monkeypa
 
 @pytest.mark.asyncio
 async def test_patch_sprint_item_other_fields_unaffected_when_status_omitted(db, monkeypatch):
-    """Regression: patching non-status fields (the overwhelming majority of
-    real update_sprint_item calls) must not trigger cache/event side effects
-    that didn't exist before, and must continue to work exactly as before."""
+    """Patching non-status fields (the overwhelming majority of real
+    update_sprint_item calls) must keep working exactly as before and must not
+    run any STATUS-transition logic.
+
+    8a665a03 changed one deliberate thing here: a plain field edit now busts the
+    sprint-items cache and publishes ONE ``sprint_item_updated`` event (naming the
+    changed fields, never their values). Before, an edit changed the row silently,
+    so a second dashboard tab / MCP-side edit never repainted the Queue / Live / Goal
+    views until a reload. The event carries no ``status`` -- that key is reserved for
+    a real transition (see the status tests above)."""
     p, item = await _project_with_item(db)
     calls = []
+    events = []
     monkeypatch.setattr(
         db_module.sprint_items, "_invalidate_sprint_items_cache",
         lambda project_id: calls.append(project_id),
+    )
+    monkeypatch.setattr(
+        db_module.sprint_items, "_publish_project_event",
+        lambda project_id, event_type, payload: events.append((project_id, event_type, payload)),
     )
     result = await db_module.patch_sprint_item(
         db, p["id"], item["id"], notes="just a note", human_id="alice",
     )
     assert result["notes"] == "just a note"
     assert result["human_id"] == "alice"
-    assert calls == []  # no status change -> no cache invalidation
+    assert result["status"] == item["status"]  # no status transition happened
+    assert calls == [p["id"]]  # the edit busts the cache exactly once
+    assert len(events) == 1
+    proj, etype, payload = events[0]
+    assert (proj, etype) == (p["id"], "sprint_item_updated")
+    assert payload["item_id"] == item["id"]
+    assert set(payload["fields"]) == {"notes", "human_id"}
+    assert "status" not in payload
+    assert "just a note" not in payload.values()  # field NAMES only, never values
 
 
 @pytest.mark.asyncio

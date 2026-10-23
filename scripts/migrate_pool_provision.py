@@ -86,6 +86,7 @@ async def _file_hitl(message: str) -> None:
 async def run() -> None:
     from meridian.pg_adapter import open_pg_connection
     from meridian import hosted
+    from meridian.plans import effective_entitlement_plan
 
     print("Connecting to MERIDIAN_DB_URL...")
     db = await open_pg_connection(MERIDIAN_DB_URL)
@@ -134,8 +135,9 @@ async def run() -> None:
             stats["skipped_legacy"] += 1
             continue
 
-        # Pro tenants require NEON_API_KEY_PRO — defer if missing.
-        if plan == "pro" and not os.environ.get("NEON_API_KEY_PRO"):
+        # Pro tenants (and aliases of it, e.g. playtester) require
+        # NEON_API_KEY_PRO — defer if missing.
+        if effective_entitlement_plan(plan) == "pro" and not os.environ.get("NEON_API_KEY_PRO"):
             if not pro_key_missing:
                 pro_key_missing = True
                 await _file_hitl(

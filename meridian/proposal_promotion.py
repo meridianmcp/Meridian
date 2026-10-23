@@ -879,6 +879,46 @@ async def commit_proposal_promotion(
             }
             status = "promoted"
 
+        # --- materialize the validated pointers onto the promoted sprint item
+        # (durable sprint_item_pointers rows; the proposal-level
+        # pointer_recorded events above are kept as the audit trail). Runs for
+        # a freshly created item AND a reused one. Entries already present on
+        # the item (same source_type + targets) are skipped so a retry never
+        # duplicates rows. Each write is best-effort and any failure is
+        # reported in committed['sprint_item_pointers']['errors'] -- never
+        # silently dropped.
+        if validated_pointers and sprint_item_id:
+            existing_keys = {
+                (row.get("source_type"), json.dumps(row.get("targets"), sort_keys=True))
+                for row in await db_module.get_sprint_item_pointers(db, sprint_item_id)
+            }
+            mat_ids: list[str] = []
+            mat_skipped = 0
+            mat_errors: list[dict[str, Any]] = []
+            for vp in validated_pointers:
+                key = (vp["source_type"], json.dumps(vp["targets"], sort_keys=True))
+                if key in existing_keys:
+                    mat_skipped += 1
+                    continue
+                try:
+                    row = await db_module.add_sprint_item_pointer(
+                        db, project_id, sprint_item_id, vp["source_type"],
+                        vp["targets"], label=vp.get("label"),
+                    )
+                except Exception as exc:  # noqa: BLE001 -- best-effort, reported below
+                    mat_errors.append({
+                        "source_type": vp["source_type"], "error": str(exc),
+                    })
+                    continue
+                existing_keys.add(key)
+                mat_ids.append(row["id"])
+            committed["sprint_item_pointers"] = {
+                "sprint_item_id": sprint_item_id,
+                "pointer_ids": mat_ids,
+                "skipped_existing": mat_skipped,
+                "errors": mat_errors,
+            }
+
         hitl_result = await _maybe_file_hitl_for_deviation(
             db, project_id, proposal, sprint_item_id, committed,
             tenant_id, actor, depth, override_reason,
@@ -900,8 +940,14 @@ async def commit_proposal_promotion(
                 "— pass the caller's own data_dir through."
             )
         try:
+            # 0b0b24d8 — explicit mode="goal": this handoff exists to give an
+            # executor exactly the one just-promoted item, so it must be the
+            # bounded /goal block (same default proposal_handoff.py uses),
+            # not the 'full' archival dump an omitted mode used to inherit
+            # (which also prepended every workspace decision and note).
             path, content, amended = await handoff_module.generate_handoff(
                 db, project_id, data_dir,
+                mode="goal",
                 session_id=session_id,
                 selected_item_ids=[sprint_item_id],
                 skip_ai_summary=True,

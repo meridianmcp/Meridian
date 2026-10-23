@@ -348,7 +348,7 @@ async def test_handoff_generates_clean_markdown(db, tmp_path):
     await db_module.log_task(db, s1["id"], p["id"], "did A", "done")
     await db_module.log_task(db, s2["id"], p["id"], "did B", "done")
     path, content, _ = await handoff_module.generate_handoff(
-        db, p["id"], str(tmp_path), skip_ai_summary=True
+        db, p["id"], str(tmp_path), skip_ai_summary=True, mode="full"
     )
     assert "MERIDIAN_CONTEXT" in content
     # v2.4 — tier markers replace the old single "Goal State" header.
@@ -384,7 +384,7 @@ async def test_handoff_custom_template(db, tmp_path):
 
     # Default behavior first: no template set → standard L0/L1 handoff.
     _, default_content, _ = await handoff_module.generate_handoff(
-        db, p["id"], str(tmp_path), skip_ai_summary=True
+        db, p["id"], str(tmp_path), skip_ai_summary=True, mode="full"
     )
     assert "MERIDIAN_CONTEXT" in default_content
 
@@ -400,7 +400,7 @@ async def test_handoff_custom_template(db, tmp_path):
     )
     assert (await db_module.get_workspace_settings(db))["handoff_template"]
     _, content, _ = await handoff_module.generate_handoff(
-        db, p["id"], str(tmp_path), skip_ai_summary=True
+        db, p["id"], str(tmp_path), skip_ai_summary=True, mode="full"
     )
     assert "# Custom Handoff" in content
     assert "Goal: ship v1.1 features" in content
@@ -414,7 +414,7 @@ async def test_handoff_custom_template(db, tmp_path):
     await db_module.update_workspace_settings(db, handoff_template="")
     assert (await db_module.get_workspace_settings(db))["handoff_template"] is None
     _, reverted, _ = await handoff_module.generate_handoff(
-        db, p["id"], str(tmp_path), skip_ai_summary=True
+        db, p["id"], str(tmp_path), skip_ai_summary=True, mode="full"
     )
     assert "MERIDIAN_CONTEXT" in reverted
 
@@ -456,7 +456,7 @@ async def test_handoff_lists_pending_sprint_items_in_dependency_order(db, tmp_pa
         db, p["id"], "v1", "Second fix", depends_on=first["id"]
     )
     _, content, _ = await handoff_module.generate_handoff(
-        db, p["id"], str(tmp_path), skip_ai_summary=True
+        db, p["id"], str(tmp_path), skip_ai_summary=True, mode="full"
     )
     assert "1. [pending] First fix" in content
     assert "2. [pending] Second fix" in content
@@ -493,7 +493,7 @@ async def test_handoff_includes_strategic_notes(db, tmp_path):
         "technical",
     )
     _, content, _ = await handoff_module.generate_handoff(
-        db, p["id"], str(tmp_path), skip_ai_summary=True
+        db, p["id"], str(tmp_path), skip_ai_summary=True, mode="full"
     )
     assert "Strategic Notes (1)" in content
     assert "Competitive Landscape" in content
@@ -6181,14 +6181,14 @@ async def test_generate_handoff_appends_and_clears_queue(db, tmp_path):
     p = await db_module.create_project(db, "queue-proj2")
     await db_module.set_queued_session(db, p["id"], "/goal next sprint")
     _, content, _ = await handoff_module.generate_handoff(
-        db, p["id"], str(tmp_path), skip_ai_summary=True
+        db, p["id"], str(tmp_path), skip_ai_summary=True, mode="full"
     )
     assert "=== QUEUED NEXT SESSION ===" in content
     assert "/goal next sprint" in content
     # Cleared after exactly one handoff.
     assert await db_module.get_queued_session(db, p["id"]) is None
     _, content2, _ = await handoff_module.generate_handoff(
-        db, p["id"], str(tmp_path), skip_ai_summary=True
+        db, p["id"], str(tmp_path), skip_ai_summary=True, mode="full"
     )
     assert "=== QUEUED NEXT SESSION ===" not in content2
 
@@ -6223,7 +6223,7 @@ async def test_generate_handoff_persists_pending_goal(db, tmp_path):
     await db_module.add_sprint_item(db, p["id"], "v1", "Do a thing")
     assert await db_module.get_pending_goal(db, p["id"]) is None
     await handoff_module.generate_handoff(
-        db, p["id"], str(tmp_path), skip_ai_summary=True
+        db, p["id"], str(tmp_path), skip_ai_summary=True, mode="full"
     )
     stored = await db_module.get_pending_goal(db, p["id"])
     assert stored is not None
@@ -6641,12 +6641,12 @@ async def test_generate_handoff_prepends_loop_when_workspace_default_on(db, tmp_
     p = await db_module.create_project(db, "loop-proj")
     await db_module.add_sprint_item(db, p["id"], "v1", "an item")
     await db_module.update_workspace_settings(db, loop_enabled_default=True)
-    await handoff_module.generate_handoff(db, p["id"], str(tmp_path), skip_ai_summary=True)
+    await handoff_module.generate_handoff(db, p["id"], str(tmp_path), skip_ai_summary=True, mode="full")
     # 5abf3e12 — XML-structured /goal starts with "/loop /goal\n" / "/goal\n".
     assert (await db_module.get_pending_goal(db, p["id"])).startswith("/loop /goal\n")
     # Workspace default OFF (and no project override) → no /loop.
     await db_module.update_workspace_settings(db, loop_enabled_default=False)
-    await handoff_module.generate_handoff(db, p["id"], str(tmp_path), skip_ai_summary=True)
+    await handoff_module.generate_handoff(db, p["id"], str(tmp_path), skip_ai_summary=True, mode="full")
     stored2 = await db_module.get_pending_goal(db, p["id"])
     assert stored2.startswith("/goal\n") and not stored2.startswith("/loop")
 
@@ -8587,10 +8587,14 @@ def test_pg_migration_registry_matches_historical_order():
         "_migrate_pg_sprint_item_coarse_lock_files",
         "_migrate_pg_backfill_finding_note_kind",
         "_migrate_pg_project_state_milestones",
+        # use_mode (4bfc9293) was added after this order was pinned and is not on main,
+        # so no production database has run it. It is appended at the tail, not mid-list.
+        # Its ADD COLUMN IF NOT EXISTS is idempotent and nothing later depends on it.
+        "_migrate_pg_project_use_mode",
     ]
     # No duplicates across the three groups.
     allnames = core + hosted + late
-    assert len(allnames) == len(set(allnames)) == 175
+    assert len(allnames) == len(set(allnames)) == 176
 
 
 def test_core_schema_literals_have_no_inline_tenant_id_indexes():
@@ -9439,7 +9443,10 @@ def test_roadmap_auto_update_replaces_existing_entry(client, tmp_path, monkeypat
 
 @pytest.mark.asyncio
 async def test_expire_regenerates_claude_md(db, tmp_path, monkeypatch):
-    """_expire_and_generate_handoffs regenerates CLAUDE.md for each project."""
+    """_expire_and_generate_handoffs writes the state block to CLAUDE.local.md.
+
+    The tracked CLAUDE.md must not be created or rewritten (gh-claude-md-state-untracked).
+    """
     from meridian import server as srv
     monkeypatch.setattr(srv, "_REPO_ROOT", tmp_path)
 
@@ -9452,10 +9459,59 @@ async def test_expire_regenerates_claude_md(db, tmp_path, monkeypatch):
     await db.commit()
 
     await srv._expire_and_generate_handoffs(db, str(tmp_path))
-    claude_md = tmp_path / "CLAUDE.md"
-    assert claude_md.exists(), "CLAUDE.md should have been written after session expiry"
-    content = claude_md.read_text(encoding="utf-8")
-    assert "MERIDIAN STATE" in content
+    assert not (tmp_path / "CLAUDE.md").exists(), "tracked CLAUDE.md must not be written on session expiry"
+    local = tmp_path / "CLAUDE.local.md"
+    assert local.exists(), "CLAUDE.local.md should have been written after session expiry"
+    assert "MERIDIAN STATE" in local.read_text(encoding="utf-8")
+
+
+@pytest.mark.asyncio
+async def test_regenerate_claude_md_leaves_tracked_claude_md_bytes_unchanged(db, tmp_path):
+    """Regeneration never rewrites the tracked CLAUDE.md bytes.
+
+    The generated block goes to the gitignored CLAUDE.local.md. The tracked file,
+    with its legacy MERIDIAN STATE marker and human content above it, must come
+    back byte-for-byte identical. The key-files block must name meridian/db/__init__.py.
+    """
+    from meridian import server as srv
+
+    p = await db_module.create_project(db, "untracked-state")
+    tracked = tmp_path / "CLAUDE.md"
+    original = (
+        "# Project notes\n\nHuman-written guidance.\n"
+        + srv._CLAUDE_MD_STATE_MARKER
+        + "## stale legacy state\n"
+    ).encode("utf-8")
+    tracked.write_bytes(original)
+
+    await srv._regenerate_claude_md(db, p["id"], tmp_path)
+
+    assert tracked.read_bytes() == original
+    local = (tmp_path / "CLAUDE.local.md").read_text(encoding="utf-8")
+    assert "MERIDIAN STATE" in local
+    assert "`meridian/db/__init__.py`" in local
+    assert "`meridian/db.py`" not in local
+
+
+@pytest.mark.asyncio
+async def test_regenerate_claude_md_preserves_human_content_in_claude_local(db, tmp_path):
+    """Human content above the marker in CLAUDE.local.md survives regeneration."""
+    from meridian import server as srv
+
+    p = await db_module.create_project(db, "local-human-content")
+    local = tmp_path / "CLAUDE.local.md"
+    local.write_text(
+        "Project ID: 1234\n" + srv._CLAUDE_MD_STATE_MARKER + "## old generated\n",
+        encoding="utf-8",
+    )
+
+    await srv._regenerate_claude_md(db, p["id"], tmp_path)
+    await srv._regenerate_claude_md(db, p["id"], tmp_path)
+
+    content = local.read_text(encoding="utf-8")
+    assert content.startswith("Project ID: 1234\n")
+    assert "## old generated" not in content
+    assert content.count("MERIDIAN STATE") == 1
 
 
 # ---------------------------------------------------------------------------
@@ -11056,11 +11112,29 @@ def test_landing_page_charset_and_emoji_survival(client):
 
 def test_g519_roles_map_grants_expected_permissions():
     """G5.19 — ROLE_PERMS map: owner has everything; admin has invite/
-    settings/HITL but NOT billing/delete; member has read+write only;
-    viewer has read only."""
+    settings/HITL but NOT billing/delete/member-policy; member has read+write
+    only; viewer has read only."""
     from meridian import roles
     assert roles.has_perm("owner",  roles.PERM_DELETE_TENANT)
     assert roles.has_perm("owner",  roles.PERM_BILLING)
+    assert roles.has_perm("owner",  roles.PERM_MANAGE_POLICY)
+    assert not roles.has_perm("admin",  roles.PERM_MANAGE_POLICY)
+    assert not roles.has_perm("member", roles.PERM_MANAGE_POLICY)
+    assert not roles.has_perm("viewer", roles.PERM_MANAGE_POLICY)
+    # Exact sets: a permission added to a role must be a deliberate edit here too.
+    assert roles.ROLE_PERMS == {
+        "owner": frozenset({
+            roles.PERM_READ, roles.PERM_WRITE, roles.PERM_HITL_ANSWER,
+            roles.PERM_INVITE, roles.PERM_SETTINGS, roles.PERM_BILLING,
+            roles.PERM_DELETE_TENANT, roles.PERM_MANAGE_POLICY,
+        }),
+        "admin": frozenset({
+            roles.PERM_READ, roles.PERM_WRITE, roles.PERM_HITL_ANSWER,
+            roles.PERM_INVITE, roles.PERM_SETTINGS,
+        }),
+        "member": frozenset({roles.PERM_READ, roles.PERM_WRITE}),
+        "viewer": frozenset({roles.PERM_READ}),
+    }
     assert roles.has_perm("admin",  roles.PERM_INVITE)
     assert roles.has_perm("admin",  roles.PERM_HITL_ANSWER)
     assert not roles.has_perm("admin",  roles.PERM_BILLING)
@@ -11471,7 +11545,7 @@ async def test_churn_cleanup_drops_only_the_tenants_own_database(monkeypatch):
 
         dropped = []
 
-        async def _fake_drop(tenant):
+        async def _fake_drop(tenant, db=None):
             dropped.append(tenant["id"])
 
         decremented = []
@@ -16342,6 +16416,16 @@ async def test_claim_sprint_item_returns_worktree_fields_when_isolation_set(db):
     assert "git worktree add" in result["worktree_setup_cmd"]
     assert "git worktree remove" in result["worktree_cleanup_cmd"]
     assert "git merge" in result["worktree_merge_cmd"]
+    # The cleanup command must never force-remove: it gates removal on a clean
+    # `git -C <path> status --porcelain` before `git worktree remove`, and
+    # neither handed-out command may carry --force (it discards uncommitted work).
+    assert "git -C" in result["worktree_cleanup_cmd"]
+    assert "status --porcelain" in result["worktree_cleanup_cmd"]
+    assert "--force" not in result["worktree_cleanup_cmd"]
+    assert "--force" not in result["worktree_merge_cmd"]
+    # Merge cleanup keeps the safe branch delete (-d), never the forced -D.
+    assert "git branch -d " in result["worktree_merge_cmd"]
+    assert "git branch -D" not in result["worktree_merge_cmd"]
     # eb2e44f8 — the claim response also names the base branch the worktree
     # is expected to be created from, matching worktree_merge_cmd's target,
     # so an executor can pass it straight to POST /worktrees' base_branch
@@ -16627,7 +16711,7 @@ def test_generate_handoff_accepts_commit_messages(db, tmp_path):
         _, content, _ = await hm.generate_handoff(
             db, p["id"], str(tmp_path),
             skip_ai_summary=True,
-            commit_messages=commits,
+            commit_messages=commits, mode="full",
         )
         return content
 
@@ -21010,7 +21094,7 @@ async def test_handoff_excludes_deferred_from_pending_list(db, tmp_path):
         db, p["id"], "v1", "Backburner task", deferred_until=future
     )
     _, content, _ = await handoff_module.generate_handoff(
-        db, p["id"], str(tmp_path), skip_ai_summary=True
+        db, p["id"], str(tmp_path), skip_ai_summary=True, mode="full"
     )
     assert "Visible task" in content
     assert "Backburner task" not in content
@@ -21029,7 +21113,7 @@ async def test_handoff_force_include_ids_re_adds_deferred(db, tmp_path):
     )
     _, content, _ = await handoff_module.generate_handoff(
         db, p["id"], str(tmp_path), skip_ai_summary=True,
-        force_include_ids=[deferred["id"]],
+        force_include_ids=[deferred["id"]], mode="full",
     )
     assert "Backburner task" in content
     # deferred_until is NOT cleared — the item is still deferred in the DB
@@ -21050,7 +21134,7 @@ async def test_handoff_force_include_ids_does_not_affect_claim_gate(db, tmp_path
     # Generate handoff with force_include_ids — item appears in handoff
     _, content, _ = await handoff_module.generate_handoff(
         db, p["id"], str(tmp_path), skip_ai_summary=True,
-        force_include_ids=[deferred["id"]],
+        force_include_ids=[deferred["id"]], mode="full",
     )
     assert "Deferred task" in content
     # But claiming the item is still blocked
@@ -21081,7 +21165,7 @@ async def test_handoff_force_include_ids_unknown_item_is_ignored(db, tmp_path):
     # Include a made-up id — should not raise, just ignore
     _, content, _ = await handoff_module.generate_handoff(
         db, p["id"], str(tmp_path), skip_ai_summary=True,
-        force_include_ids=["nonexistent-id-00000000"],
+        force_include_ids=["nonexistent-id-00000000"], mode="full",
     )
     assert "Real task" in content
 

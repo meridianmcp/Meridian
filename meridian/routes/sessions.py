@@ -6,7 +6,8 @@ from typing import Any
 
 from fastapi import APIRouter, HTTPException, Request
 
-from .._deps import _db
+from .. import _deps
+from .._deps import _db, _deny_unless_in_scope, _require_project_in_scope, _session_project_id
 from .. import db as db_module
 from .. import handoff as handoff_module
 from ..models import Session, SessionRegister
@@ -14,11 +15,27 @@ from ..models import Session, SessionRegister
 router = APIRouter()
 
 
+async def _require_session_in_scope(request: Request, session_id: str) -> None:
+    """Scope gate for the routes that only receive a session id.
+
+    H7 — the scope is resolved FIRST and the session's project is looked up only
+    when the caller turned out to be project-scoped, so owners, self-hosted and
+    demo callers (the overwhelming majority, and the hot heartbeat path) pay no
+    extra SELECT.
+    """
+    scoped = await _deps._scoped_project_ids_for_request(request)
+    if scoped is not None:
+        _deny_unless_in_scope(scoped, await _session_project_id(request, session_id))
+
+
 @router.post("/sessions/register", response_model=Session, status_code=201)
 async def register_session(
     body: SessionRegister, request: Request
 ) -> dict[str, Any]:
     """Create a session row tied to a project."""
+    # RT-TI-005 — the project arrives in the body, outside the /projects/{uuid}
+    # middleware: a project-scoped member may only register into their own.
+    await _require_project_in_scope(request, body.project_id)
     project = await db_module.get_project(await _db(request), body.project_id)
     if project is None:
         raise HTTPException(status_code=404, detail="project not found")
@@ -32,14 +49,17 @@ async def register_session(
 @router.post("/sessions/{session_id}/close")
 async def close_session(session_id: str, request: Request) -> dict[str, str]:
     """Mark a session closed."""
+    scoped = await _deps._scoped_project_ids_for_request(request)
     _req_db = await _db(request)
     async with _req_db.execute(
         "SELECT id, project_id FROM sessions WHERE id = ?", (session_id,)
     ) as cur:
         row = await cur.fetchone()
     if row is None:
+        _deny_unless_in_scope(scoped, None)  # scoped callers: same 403 as a foreign id
         raise HTTPException(status_code=404, detail="session not found")
     project_id = row["project_id"]
+    _deny_unless_in_scope(scoped, project_id)  # RT-TI-005
     await db_module.close_session(_req_db, session_id)
     try:
         await db_module.delete_session_notes(await _db(request), session_id)
@@ -60,11 +80,31 @@ async def close_session(session_id: str, request: Request) -> dict[str, str]:
     except Exception:
         pass
     # v2.5 — auto-save handoff on session close so the file is always fresh.
+    # 0b0b24d8 — mode="delta" is explicit on purpose: this call used to omit it
+    # and inherit the 'full' default, i.e. an unattended background write of
+    # every cross-project workspace decision AND note on EVERY session close.
+    # delta (not goal) because it still writes the <stem>_handoff.md file this
+    # auto-save exists to keep fresh (goal writes a different file), it is
+    # bounded, and it skips the Haiku summary calls this 30s budget raced.
+    # window_session_id is passed because delta's "Completed since last
+    # handoff" list takes its lower bound from a session (its prior handoff,
+    # else its own start); without one the list has no bound and shows the
+    # OLDEST 20 items the project ever completed under a "since last handoff"
+    # label. It is NOT session_id: a closed session can be reopened (PATCH
+    # status=active), and an unattended write attributed to it would become its
+    # "last handoff", so its next explicit delta would silently drop everything
+    # completed before this close.
+    # refresh_retrospective=True: the old 'full' default also refreshed the
+    # project's Sprint Retrospective note (aef94e4a) on every session close;
+    # delta skips that step, so without this the note silently stopped updating.
+    # It does not bring back the Haiku summary calls or any workspace text.
     async def _auto_save_handoff() -> None:
         try:
             await asyncio.wait_for(
                 handoff_module.generate_handoff(
-                    await _db(request), project_id, request.app.state.data_dir
+                    await _db(request), project_id, request.app.state.data_dir,
+                    mode="delta", window_session_id=session_id,
+                    refresh_retrospective=True,
                 ),
                 timeout=30.0,
             )
@@ -82,6 +122,10 @@ async def patch_session(
     status = (body.get("status") or "").strip()
     if status not in {"active", "idle", "closed"}:
         raise HTTPException(status_code=422, detail="status must be active, idle, or closed")
+    # RT-TI-005 — /sessions/{id} is outside the /projects/{uuid} middleware, so
+    # resolve the session's project and apply the scope rule here (H7: only a
+    # project-scoped caller pays for the lookup; an unknown id stays a 404 below).
+    await _require_session_in_scope(request, session_id)
     db = await _db(request)
     cursor = await db.execute(
         "UPDATE sessions SET status = ? WHERE id = ?",
@@ -90,6 +134,14 @@ async def patch_session(
     await db.commit()
     if cursor.rowcount == 0:
         raise HTTPException(status_code=404, detail="session not found")
+    # 8a665a03 -- "Mark idle" / reopen used to repaint only the acting tab. The event needs the
+    # project id, which is a read of its own (NOT the scope lookup H7 keeps off the unscoped path).
+    async with db.execute("SELECT project_id FROM sessions WHERE id = ?", (session_id,)) as _cur:
+        _row = await _cur.fetchone()
+    if _row is not None and _row["project_id"]:
+        db_module._publish_project_event(
+            _row["project_id"], "session_updated", {"session_id": session_id, "status": status}
+        )
     return {"status": status, "session_id": session_id}
 
 
@@ -101,6 +153,7 @@ async def heartbeat_session(
 
     404 when the session id is unknown or already closed.
     """
+    await _require_session_in_scope(request, session_id)  # RT-TI-005 / H7
     ok = await db_module.heartbeat_session(await _db(request), session_id)
     if not ok:
         raise HTTPException(status_code=404, detail="session not found")
@@ -112,4 +165,5 @@ async def get_session_notes(
     session_id: str, request: Request
 ) -> list[dict[str, Any]]:
     """Return sprint scratch-pad notes for a session (newest first)."""
+    await _require_session_in_scope(request, session_id)  # RT-TI-005 / H7
     return await db_module.get_session_notes(await _db(request), session_id)

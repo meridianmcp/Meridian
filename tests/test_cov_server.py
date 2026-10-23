@@ -593,6 +593,31 @@ def test_hooks_session_start_explicit_project_happy(client):
     assert p["id"] in ctx["additionalContext"]
 
 
+def test_hooks_fail_closed_when_member_policy_is_unavailable(client, monkeypatch):
+    from meridian import member_policy
+    import meridian.server as server_module
+
+    project = _create_project(client, "hooks-policy-unavailable")
+    scoped = member_policy.ScopedProjectIds((project["id"],))
+
+    async def _scope(_request):
+        return scoped
+
+    def _policy_unavailable(_scoped):
+        raise member_policy.MemberPolicyUnavailable()
+
+    monkeypatch.setattr(server_module, "_hook_scoped_project_ids", _scope)
+    monkeypatch.setattr(member_policy, "policy_of", _policy_unavailable)
+
+    for path, body in (
+        ("/hooks/session-start", {"project_id": project["id"]}),
+        ("/hooks/stop", {"project_id": project["id"]}),
+    ):
+        response = client.post(path, json=body)
+        assert response.status_code == 503, (path, response.text)
+        assert response.json()["detail"] == "member policy check unavailable"
+
+
 def test_hooks_session_start_autoroute_single_project(client):
     # Exactly one project, no project_id -> auto-route to it.
     p = _create_project(client, "hooks-ss-only")
@@ -1048,6 +1073,54 @@ def test_workspace_update_member_not_found(monkeypatch, tmp_path):
         _login(client, "ws-upd2@example.com")
         r = client.patch("/workspace/members/no-such-member", json={"role": "member"})
         assert r.status_code == 404
+
+
+def test_workspace_member_scope_elevates_to_whole_workspace(monkeypatch, tmp_path):
+    with _make_hosted_client(monkeypatch, tmp_path) as client:
+        _login(client, "ws-elevate@example.com")
+        invite = client.post(
+            "/workspace/invite",
+            json={"email": "scoped@example.com", "role": "member", "project_id": "proj-a"},
+        )
+        assert invite.status_code == 201
+        member_id = invite.json()["id"]
+        assert invite.json()["project_id"] == "proj-a"
+
+        # project_id null clears the scope: the member becomes a workspace member.
+        r = client.patch(f"/workspace/members/{member_id}", json={"project_id": None})
+        assert r.status_code == 200
+        assert r.json()["project_id"] is None
+        rows = [m for m in client.get("/workspace/members").json() if m["id"] == member_id]
+        assert rows and rows[0]["project_id"] is None
+
+
+def test_workspace_member_scope_change_keeps_role(monkeypatch, tmp_path):
+    with _make_hosted_client(monkeypatch, tmp_path) as client:
+        _login(client, "ws-rescope@example.com")
+        invite = client.post(
+            "/workspace/invite",
+            json={"email": "rescoped@example.com", "role": "member", "project_id": "proj-a"},
+        )
+        member_id = invite.json()["id"]
+        r = client.patch(f"/workspace/members/{member_id}", json={"project_id": "proj-b"})
+        assert r.status_code == 200
+        assert r.json()["role"] == "member"
+        assert r.json()["project_id"] == "proj-b"
+
+
+def test_workspace_member_blank_scope_is_refused(monkeypatch, tmp_path):
+    with _make_hosted_client(monkeypatch, tmp_path) as client:
+        _login(client, "ws-blank@example.com")
+        invite = client.post(
+            "/workspace/invite",
+            json={"email": "blank@example.com", "role": "member", "project_id": "proj-a"},
+        )
+        member_id = invite.json()["id"]
+        # A blank string must not widen the member to the whole workspace.
+        r = client.patch(f"/workspace/members/{member_id}", json={"project_id": "  "})
+        assert r.status_code == 422
+        rows = [m for m in client.get("/workspace/members").json() if m["id"] == member_id]
+        assert rows and rows[0]["project_id"] == "proj-a"
 
 
 def test_workspace_remove_member_hosted(monkeypatch, tmp_path):

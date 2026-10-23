@@ -2265,10 +2265,37 @@ async def _run_connection_lazy(
                         # 0e973e52 — run_verification: spawn test_cmd as a real local
                         # process and send the structured result back to the server.
                         # Only the FS slot handles this; other slots ignore it.
+                        # 189fde6b (RT-LEAD-004) — the hosted server can send run_cmd to
+                        # any connected client, so spawning one needs LOCAL consent: the
+                        # user must set MERIDIAN_TUNNEL_ALLOW_RUN_CMD=1 in the tunnel
+                        # client's own environment. Without it nothing is spawned and the
+                        # server gets an explicit refusal instead.
                         req_id = msg.get("id", "")
                         cmd_val = msg.get("cmd") or ""
                         cwd_val = (msg.get("cwd") or "").strip() or None
-                        run_result = await _handle_run_cmd(cmd_val, cwd_val)
+                        _run_cmd_consent = os.environ.get("MERIDIAN_TUNNEL_ALLOW_RUN_CMD", "")
+                        if _run_cmd_consent.strip().lower() in ("1", "true", "yes", "on"):
+                            run_result = await _handle_run_cmd(cmd_val, cwd_val)
+                        else:
+                            print(
+                                f"tunnel:{label}: refused run_cmd from server (no local consent; "
+                                "set MERIDIAN_TUNNEL_ALLOW_RUN_CMD=1 to allow)",
+                                flush=True,
+                            )
+                            run_result = {
+                                "status": "error",
+                                "refused": True,
+                                "message": (
+                                    "run_cmd refused: this tunnel client has no local consent to "
+                                    "run commands from the hosted server (set "
+                                    "MERIDIAN_TUNNEL_ALLOW_RUN_CMD=1 in the client's environment)"
+                                ),
+                                "exit_code": None,
+                                "passed": None,
+                                "failed": None,
+                                "stdout_tail": "",
+                                "stderr_tail": "",
+                            }
                         run_result["type"] = "run_cmd_result"
                         run_result["id"] = req_id
                         await ws.send(json.dumps(run_result))
@@ -2296,6 +2323,21 @@ async def _run_connection_lazy(
                             }))
                             continue
                         _spawn_failures = 0
+                        # b47a7456 — a RESPAWN (idle-kill / re-probe restart: the
+                        # per-connection preflight already ran) whose own cold-spawn
+                        # readiness probe, run inside ensure_running(), missed its
+                        # window. The process is alive but has not answered tools/list,
+                        # so the slot must not stay advertised as healthy. Report it
+                        # unhealthy (the server suppresses its tools) and start the
+                        # background re-probe, which re-advertises on recovery.
+                        # The request is still relayed, matching the first-spawn
+                        # contract pinned by test_run_connection_lazy_preflight_reports_unhealthy.
+                        if (
+                            _preflight_done
+                            and not _was_running
+                            and proxy.diagnostics.state is SlotState.STARTUP_TIMEOUT
+                        ):
+                            await _mark_unhealthy()
                         # Pre-flight the proxy once, the first time we bring it up.
                         if not _preflight_done and not _was_running:
                             _preflight_done = True
@@ -7700,7 +7742,13 @@ async def run_tunnel(
         return 1
 
     plan = me.get("plan") or "free"
-    if plan not in ("pro", "admin") and not me.get("is_internal"):
+    # /me reports the server's own entitlement verdict (a playtester reads as
+    # 'pro' until its optional end date); an older server omits it, so fall
+    # back to the local alias map.
+    from .plans import effective_entitlement_plan  # noqa: PLC0415
+
+    entitlement = me.get("entitlement_plan") or effective_entitlement_plan(plan)
+    if entitlement not in ("pro", "admin") and not me.get("is_internal"):
         print(
             f"error: the tunnel is a Pro feature; your plan is '{plan}'. "
             "Upgrade at " + base_url + "/pricing",

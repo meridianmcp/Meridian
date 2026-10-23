@@ -95,7 +95,7 @@ Add to `claude_desktop_config.json`:
 
 ## Configuring Cursor
 
-Add to `.cursor/mcp.json`:
+Add to Cursor's user-global config, `~/.cursor/mcp.json`, so the bearer token stays out of project repos:
 
 ```json
 {
@@ -134,7 +134,7 @@ After signing in at `https://usemeridian.us/auth/login`:
 
 ### Decisions tab
 - **Live constitution** — all pinned architectural decisions, newest first
-- **Workspace decisions** — cross-project decisions injected into every session's context
+- **Workspace decisions** — cross-project decisions surfaced in every session's context as a capped list of one-line summaries (full text via `get_workspace_decisions`)
 - **Add / supersede** decisions; AI sessions call `pin_decision` directly
 
 ### Queue tab

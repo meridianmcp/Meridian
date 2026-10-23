@@ -28,6 +28,39 @@ Check server health.
 
 ---
 
+## Access Scope (hosted workspaces)
+
+A hosted workspace member is invited either to the whole workspace or to a single project. A **project-scoped** member (a caller whose `X-Workspace-Tenant-Id` header names a workspace they were invited to, with one project granted) may only reach the project(s) in their scope. The workspace owner, workspace-wide members, self-hosted servers and demo sessions are never scoped and see no change.
+
+For a scoped caller:
+
+- Every `/projects/{project_id}/...` route, and every route that reaches a project through another id (a session, task, HITL request or profile-layer id), a request body field or a name, answers `403 {"detail": "Project is outside your access scope."}` when the project is outside the scope. An id that does not exist gets the same `403` as a foreign one, so existence is not revealed. The exception is `GET /projects/by-name/{name}`: an out-of-scope project is a `404`, exactly like a name that does not exist.
+- `GET /projects` and `GET /hitl` list only in-scope projects and requests. `GET /profile-layers` drops the `project` and `session` layers that belong to other projects.
+- `GET /team/summary` requires a `project_id` inside the scope. Omitting it is a `403` (it would otherwise roll up every project).
+- `DELETE /projects` (batch) checks every id first: if any id is outside the scope the whole call is a `403` and nothing is deleted.
+- `GET /projects/{project_id}/effective-profile?session_id=` is a `403` unless the session belongs to `{project_id}`.
+- `GET /settings/mcp-config` lists only in-scope projects, and the tunnel routes (`GET /tunnel/launch-matrix/{tenant_id}`, `GET`/`POST`/`DELETE /tunnel/filesystem-roots`) read and write the executor config of in-scope projects only.
+- `GET /export/my-data` exports only the in-scope projects, and no workspace-level notes or decisions (they belong to no project).
+- `POST /hooks/session-start` and `POST /hooks/stop`, when called with a browser session plus `X-Workspace-Tenant-Id` (a call with a Bearer token goes to the token's own workspace and is not scoped): a body `project_id` outside the scope is a `403`, project auto-routing by `cwd` / `hostname` only considers in-scope projects, and the stop hook's `session_id` must belong to the project it acts on.
+- `POST /projects/{project_id}/sprint-batch`: a `session_id` (the batch default or a `notes` entry's own) that is outside the scope, or unknown, is a `403` before anything runs.
+- If the scope cannot be resolved (for example the auth database is briefly unavailable) the request fails closed with `503 {"detail": "scope check unavailable"}` (a JSON-RPC error with code `-32603` on `POST /mcp`) instead of being treated as unscoped. Requests without an `X-Workspace-Tenant-Id` header are unaffected.
+
+Project bindings that apply to **every** caller (an id of another project is never legitimate, so it is answered like a missing one with `404`, and the object is left untouched):
+
+- `POST /tasks` -- the `session_id` must belong to `project_id` (`404`).
+- `POST /projects/{project_id}/tasks/claim` -- a `session_id` that belongs to another project is a `404`.
+- `POST /projects/{project_id}/tasks/release` -- a task of another project is a `404`, the same answer as a task the session does not hold.
+- `GET /projects/{project_id}/sessions/{session_id}/tasks/live` -- a task whose recorded session belongs to another project is listed without a `session_name` or `human_id` (the session is joined only within the task's own project).
+- `DELETE /projects/{project_id}/worktrees/{worktree_id}` -- a worktree of another project is a `404`.
+- `POST /projects/{project_id}/worktrees` -- a `session_id` or `item_id` that belongs to another project is a `404`.
+- `POST /projects/{project_id}/hitl` -- a `session_id` that belongs to another project is a `404`.
+- `POST /projects/{project_id}/sprint-batch` (`notes`) -- an entry whose `session_id` belongs to another project fails with a `NOT_FOUND` entry result and writes nothing.
+- `POST /projects/{project_id}/handoff/corrections` -- a `source_handoff_id` of another project is answered exactly like an unknown handoff id (`422`), and no handoff of another project is ever invalidated or regenerated.
+
+Not restricted by project scope (open product questions, not project-keyed): the workspace-level objects (`/workspace/notes`, `/workspace/decisions`, `/workspace/sprint-items`, workspace settings), the `workspace`, `user` and `hosted_default` profile layers, whether a scoped member may create projects, and the OAuth `/mcp` endpoint (it opens the tenant's own database, so it cannot be project-scoped). A subproject inherits context from its parent project, and a parent's search reaches its subprojects, so grant a member a parent or a subproject only when that sharing is intended.
+
+---
+
 ## Projects
 
 ### `GET /projects`
@@ -230,6 +263,8 @@ Log a task.
 }
 ```
 
+The `session_id` must belong to `project_id`; otherwise the call is a `404` (see Access Scope).
+
 ---
 
 ### `PATCH /tasks/{task_id}`
@@ -251,6 +286,8 @@ List unclaimed pending tasks.
 Release a claimed task.
 
 **Body:** `{"task_id": "uuid", "session_id": "uuid"}`
+
+The task must belong to `{project_id}`. A task of another project is a `404`, the same answer as a task the session does not hold, and is left untouched (see Access Scope).
 
 ---
 
@@ -351,7 +388,21 @@ Mark skipped. Body: `{"reason": "..."}` (optional)
 
 ### `POST /projects/{project_id}/sprint-items/{item_id}/push`
 
-Push to future version. Body: `{"to_version": "v2.4"}`
+Defer to the backburner. Body: `{"to_version": "v2.4"}`. The item becomes `pushed` (terminal), `pushed_to` records the target and its own `version` is left alone.
+
+### `POST /projects/{project_id}/sprint-items/{item_id}/move`
+
+Move to another version while staying pending (what the dashboard's arrow button offers first). The title and status are never touched.
+
+**Body:** exactly one of `{"next": true}` (the server computes the version after the item's own: `v2.1` to `v2.2`, `v2.9` to `v2.10`, `v0.2.x` to `v0.3.x`, `1.0.0` to `1.0.1`) or `{"to_version": "v2.5"}`; optional `expected_version` (the version the caller saw; a mismatch is a 409, so a replayed `next` cannot move the item twice).
+
+**Response:** `{item, from_version, to_version, via, unchanged, moved_children, history_recorded}` -- `to_version` is the number actually used. `422` with `detail.code = "next_version_unavailable"` when the item's label has no unambiguous successor (e.g. `current sprint v0.2`); `409` when the item is finished or deferred. Subtasks still in the old version move with the parent. The move is recorded in the audit log as `sprint_item_version_moved`.
+
+### `POST /projects/{project_id}/sprint-items/move`
+
+Bulk move. Body: `{"item_ids": [...], "next": true}` or `{"item_ids": [...], "to_version": "v2.5"}` (at most 100 ids). Each item is moved independently; the response lists one outcome per id.
+
+> Agents: `update_sprint_item(version=...)` (the MCP twin of `PATCH /projects/{project_id}/sprint-items/{item_id}`) also re-versions a single item and keeps it pending, but it is a bare field edit, not this move: it does not work out a next version, does not carry subtasks along (a parent can end up in a newer version than its subtasks), writes no `sprint_item_version_moved` history entry (open dashboards still repaint, as for any edit). The MCP `push_sprint_item` tool is the deferral above.
 
 ### `DELETE /projects/{project_id}/sprint-items/{item_id}`
 
@@ -640,10 +691,12 @@ No auth required.
 | `GET` | `/admin/health` | JSON health check for ops/curl — restricted to admin users |
 | `GET` | `/admin/login` | Admin password gate for the /admin panel |
 | `POST` | `/admin/login` | Validate admin password and set signed cookie |
+| `GET` | `/admin/pool-load` | 1b2fbebe -- redacted per-tenant / per-Neon-pool load telemetry (admin only) |
 | `POST` | `/admin/restart` | Restart the server by spawning a new process then shutting down |
 | `POST` | `/admin/shutdown` | Gracefully stop the server process |
 | `GET` | `/admin/snapshot` | Download the current DB as a SQLite snapshot file |
 | `GET` | `/admin/stats` | d1cb1100 — launch/user stats for the admin Users widget: free-tier count |
+| `POST` | `/admin/tenants/plan` | Set or revoke a tenant's plan by account email (grant the playtester plan) |
 | `POST` | `/admin/tenants/{tenant_id}/reset-provisioning` | Reset a tenant back to a de-novo, never-provisioned state -- admin/ops |
 | `GET` | `/admin/waitlist` | Admin waitlist management page — shows signups, tenant stats, approve/delete buttons |
 | `DELETE` | `/admin/waitlist/{entry_id}` | Delete a waitlist entry by id. Admin only |
@@ -736,6 +789,14 @@ No auth required.
 | `GET` | `/code/mcp/{tenant_id}/{rest:path}` | Same as code_mcp_proxy but for sub-paths |
 | `OPTIONS` | `/code/mcp/{tenant_id}/{rest:path}` | Same as code_mcp_proxy but for sub-paths |
 | `POST` | `/code/mcp/{tenant_id}/{rest:path}` | Same as code_mcp_proxy but for sub-paths |
+
+
+### `/compute`
+
+| Method | Path | Description |
+|--------|------|-------------|
+| `GET` | `/compute/runpod/check` | Check that the default RunPod credential works (one billing call, one pod-listing call) |
+| `GET` | `/compute/runpod/pods` | List one page (up to 1000) of the account's RunPod pods as summaries |
 
 
 ### `/config`
@@ -1113,11 +1174,13 @@ No auth required.
 | `POST` | `/projects/{project_id}/sprint-batch` | Run a homogeneous batch of sprint-management writes |
 | `GET` | `/projects/{project_id}/sprint-items` | List sprint items, optionally filtered by status |
 | `POST` | `/projects/{project_id}/sprint-items` | Append a todo sprint item. Body: ``{version, title, group?, human_id?}`` |
+| `POST` | `/projects/{project_id}/sprint-items/move` | Move several sprint items to another version in one call |
 | `DELETE` | `/projects/{project_id}/sprint-items/{item_id}` | Delete a sprint item permanently |
 | `GET` | `/projects/{project_id}/sprint-items/{item_id}` | 4ef6ce5e — fetch ONE sprint item's live row, scoped to ``project_id`` |
 | `PATCH` | `/projects/{project_id}/sprint-items/{item_id}` | Update editable fields (title, version) of a sprint item |
 | `POST` | `/projects/{project_id}/sprint-items/{item_id}/complete` | Mark a sprint item ``done``. Optional body: ``{task_id}`` |
 | `POST` | `/projects/{project_id}/sprint-items/{item_id}/fail` | Mark a sprint item ``failed``. Optional body: ``{reason}`` |
+| `POST` | `/projects/{project_id}/sprint-items/{item_id}/move` | Move a sprint item to another version, keeping its status and title |
 | `POST` | `/projects/{project_id}/sprint-items/{item_id}/push` | Push a sprint item to a future version. Body: ``{to_version}`` |
 | `POST` | `/projects/{project_id}/sprint-items/{item_id}/skip` | Mark a sprint item ``skipped``. Optional body: ``{reason}`` |
 | `GET` | `/projects/{project_id}/sprint/pending_count` | c0d2356d — count of not-yet-done sprint items for a project. Powers the |
@@ -1282,9 +1345,14 @@ No auth required.
 | `DELETE` | `/workspace/decisions/{decision_id}` | Hard-delete a workspace decision. Returns 204 or 404 |
 | `POST` | `/workspace/invite` | Invite a new workspace member. Sends invite email via Resend |
 | `POST` | `/workspace/invite/{member_id}/resend` | Resend invite email for a pending workspace member |
+| `GET` | `/workspace/member-policy` | Return workspace defaults and effective policies for scoped members |
+| `PATCH` | `/workspace/member-policy` | Patch explicit workspace defaults; null clears a key to its built-in value |
 | `GET` | `/workspace/members` | List all workspace members (pending and accepted) for the current tenant |
 | `DELETE` | `/workspace/members/{member_id}` | Remove a workspace member or revoke a pending invite |
 | `PATCH` | `/workspace/members/{member_id}` | v2.8 — change a workspace member's role (and github_access cap) |
+| `DELETE` | `/workspace/members/{member_id}/policy` | Clear the member override so every capability inherits the workspace default |
+| `GET` | `/workspace/members/{member_id}/policy` | Return one accepted project-scoped member's override and effective policy |
+| `PATCH` | `/workspace/members/{member_id}/policy` | Patch a member override; null clears that key to inherit the workspace default |
 | `GET` | `/workspace/notes` | Workspace notes (newest first). ``?tag=X`` filters by substring match |
 | `POST` | `/workspace/notes` | Create a workspace note. Body: {title, body, tags?} |
 | `DELETE` | `/workspace/notes/{note_id}` | Hard-delete a workspace note. Returns 204 or 404 |
@@ -1302,6 +1370,7 @@ No auth required.
 
 | Method | Path | Description |
 |--------|------|-------------|
+| `POST` | `/zotero/connect` | Run one Zotero approval attempt for a self-hosted loopback caller who explicitly confirmed it |
 | `GET` | `/zotero/mcp/{tenant_id}` | Proxy requests to the tenant's zotero-mcp server over the zotero tunnel |
 | `OPTIONS` | `/zotero/mcp/{tenant_id}` | Proxy requests to the tenant's zotero-mcp server over the zotero tunnel |
 | `POST` | `/zotero/mcp/{tenant_id}` | Proxy requests to the tenant's zotero-mcp server over the zotero tunnel |

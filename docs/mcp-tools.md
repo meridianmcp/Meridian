@@ -1,6 +1,6 @@
 # MCP Tool Reference
 
-Meridian exposes **245 tools** over MCP.
+Meridian exposes **249 tools** over MCP.
 
 They fall into two usage patterns:
 
@@ -149,6 +149,7 @@ get_goal(project_id="abc-123")
 | `project_id` | string | optional |  |
 | `project_name` | string | optional | Project name — an alternative to project_id; resolved to the id internally. project_id wins if both are given. |
 | `content` | string | required |  |
+| `expected_updated_at` | string | optional | Optional optimistic-concurrency stamp: field_updated_at.version_goal from get_goal. If the version goal changed since, returns a goal_conflict error with the current value and writes nothing. Omit for last-write-wins. |
 
 **Example:**
 ```
@@ -774,6 +775,37 @@ read_note(project_id="abc-123", slug="deploy-note")
 | Parameter | Type | Required | Description |
 |-----------|------|----------|-------------|
 | `note_id` | string | required |  |
+
+---
+
+## Compute
+
+### `runpod_check_key`
+[SUPPORT] RunPod key check. Resolves a RunPod API key on this machine and confirms it works with two read-only calls to the RunPod API: one billing call and one pod listing. Returns ok, credential_source (the source kind only: env, keyring or runpodctl), pod_count (pods on the first page, up to 1000), billing_available and error. The key itself is never returned, logged or echoed. Omit credential_ref to try env:RUNPOD_API_KEY, then keyring:meridian-desktop/runpod-api-key, then runpodctl:default. Pass credential_ref to use one reference only; store a reference, never the key. Local only: refused on hosted Meridian.
+
+| Parameter | Type | Required | Description |
+|-----------|------|----------|-------------|
+| `credential_ref` | string | optional | Optional credential reference: env:NAME, keyring:SERVICE/ACCOUNT or runpodctl:default. Give a reference, never the key itself; a raw key is rejected without being echoed. |
+
+**Example:**
+```
+runpod_check_key(credential_ref="env:RUNPOD_API_KEY")
+```
+
+---
+
+
+### `runpod_list_pods`
+[SUPPORT] RunPod pod list. Resolves a RunPod API key on this machine (the same sources as runpod_check_key) and lists one page (up to 1000) of the account's pods as summaries. Each summary has these keys, all always present, with null for a value RunPod does not supply: id (Pod.id); name (Pod.name); status (Pod.status: PROVISIONING, STARTING, RUNNING, EXITED, ERROR or TERMINATED); gpu (Pod.gpu as {id, count}, or null for a CPU pod); costPerHour (Pod.cost, the current cost in USD per hour, 0 when EXITED or TERMINATED); uptimeSeconds (Pod.runtime.uptime, seconds since the container started, null unless the pod is RUNNING). Cluster member pods are not listed: RunPod's includeClusterPods parameter defaults to false and this client never sends it. has_more_pods is true when more pods exist. Raw pod payloads are never returned, so pod environment variables are not exposed. Reads only: it does not create, stop or terminate a pod. Local only: refused on hosted Meridian.
+
+| Parameter | Type | Required | Description |
+|-----------|------|----------|-------------|
+| `credential_ref` | string | optional | Optional credential reference: env:NAME, keyring:SERVICE/ACCOUNT or runpodctl:default. Give a reference, never the key itself; a raw key is rejected without being echoed. |
+
+**Example:**
+```
+runpod_list_pods(credential_ref="keyring:meridian-desktop/runpod-api-key")
+```
 
 ---
 

@@ -41,7 +41,11 @@ from .. import db as db_module
 from .. import process_registry as process_registry_module
 from .. import profile_contract as profile_contract_module
 from .. import redis_bridge as _redis_bridge  # 2cf57fde — runtime diagnostics
-from .._deps import _hosted_mode, _get_tenant_from_request, _db, _authentication_required
+from .._deps import (
+    _hosted_mode, _get_tenant_from_request, _db, _authentication_required,
+    _projects_in_scope,
+)
+from ..plans import tenant_entitlement_plan
 from ..tunnel_plugins import (
     normalize_plugins_config, resolve_plugins, resolve_custom_plugins, builtin_names,
     migrate_retired_overrides, config_fingerprint,
@@ -727,8 +731,8 @@ def _clear_slot_health(tenant_id: str, slot: "str | None" = None) -> None:
 
 
 def _is_tunnel_allowed(tenant: dict) -> bool:
-    """Return True for Pro, admin, and internal tenants."""
-    plan = tenant.get("plan") or "free"
+    """Return True for Pro, admin, and internal tenants (a playtester shares Pro's entitlement)."""
+    plan = tenant_entitlement_plan(tenant, default="free")
     return plan in ("pro", "admin") or bool(tenant.get("is_internal"))
 
 
@@ -2225,12 +2229,23 @@ async def openai_tunnel_diagnostics(tenant_id: str, request: Request) -> Respons
     reported_status = body.get("reported_status")
     if reported_status is not None and not isinstance(reported_status, dict):
         reported_status = None
+    # RT-TI-007 — the route stays public (the adapter diagnostics describe only
+    # what the caller itself supplies), but whether THIS tenant's Meridian tunnel
+    # socket is up is tenant state: GET /tunnel/status/{tenant_id} was hardened
+    # (4bea8629 / 5de3d422) to hide it from anyone but that tenant, so do the
+    # same here. In hosted mode an anonymous or foreign caller gets ``null``
+    # ("unknown", which combined_diagnostics never guesses), not the live flag.
+    meridian_active: "bool | None" = tenant_id in _tunnel_sockets
+    if _hosted_mode():
+        caller = await _get_tenant_from_request(request)
+        if caller is None or caller.get("id") != tenant_id:
+            meridian_active = None
     try:
         diagnostics = combined_diagnostics(
             tenant_id,
             openai_config=openai_config,
             reported_status=reported_status,
-            meridian_tunnel_active=tenant_id in _tunnel_sockets,
+            meridian_tunnel_active=meridian_active,
         )
     except OpenAITunnelAdapterError as exc:
         return _json_response({"error": str(exc)}, status_code=400)
@@ -2348,8 +2363,10 @@ async def get_tunnel_plugins(request: Request) -> Response:
             **{s: tid in _tunnel_custom_sockets[s] for s in _CUSTOM_SLOTS},
         },
         # The tunnel (and thus this section) is Pro/admin-only; the dashboard
-        # uses this to gate the Tunnel Plugins card.
-        "plan": tenant.get("plan") or "free",
+        # uses this to gate the Tunnel Plugins card, so it reports the plan
+        # whose entitlements apply (a playtester reads as 'pro', a lapsed one
+        # as 'free'), the same verdict _is_tunnel_allowed gives.
+        "plan": tenant_entitlement_plan(tenant, default="free"),
         "is_admin": bool(tenant.get("is_internal")),
         # 9a8645c1 — per-slot health + diagnostic so the dashboard can render a
         # warning badge (e.g. Serena access-denied) on a degraded slot's row.
@@ -3021,7 +3038,10 @@ async def tunnel_launch_matrix(tenant_id: str, request: Request) -> Response:
     hostname = (request.query_params.get("hostname") or "").strip() or None
     try:
         db = await _db(request)
-        projects = await db_module.list_projects(db)
+        # RT-TI-005 (pass 3, F-D3) -- only the projects in the caller's scope: the matrix
+        # carries every project's id, name and executor config. A scope-resolution error
+        # degrades to the empty project set below (fails closed, never unfiltered).
+        projects = await _projects_in_scope(request, db)
     except Exception:  # noqa: BLE001 — unprovisioned/unreachable DB → diagnostics-only
         projects = []
     return _json_response(build_launch_matrix(tenant, hostname, projects))
@@ -3481,7 +3501,10 @@ async def get_tunnel_filesystem_roots(request: Request) -> Response:
         })
     try:
         db = await _db(request)
-        projects = await db_module.list_projects(db)
+        # RT-TI-005 (pass 3, F-D3) -- the unions below are built from executor configs
+        # (repo paths, filesystem roots): a project-scoped member only gets their own
+        # projects' paths. Scope errors fall to the empty defaults (fail closed).
+        projects = await _projects_in_scope(request, db)
     except Exception:  # noqa: BLE001 — unprovisioned/unreachable DB → defaults
         projects = []
     return _json_response({
@@ -3767,10 +3790,28 @@ async def add_tunnel_filesystem_root(request: Request) -> Response:
     path = _normalize_root(body.get("path") if body.get("path") is not None else body.get("root"))
     if not path:
         return _json_response({"error": "path is required"}, status_code=400)
+    # Keep the capability check inside this route so it runs before either
+    # project configuration or the live tunnel is changed. The resolved scope
+    # object must stay intact for fail-closed policy evaluation.
+    from .. import _deps as policy_deps
+
     try:
         db = await _db(request)
-        projects = await db_module.list_projects(db)
+        await policy_deps._require_capability(
+            request, policy_deps.member_policy.WRITE_PROJECT
+        )
+        # RT-TI-005 (pass 3, F-D3) -- the root is written into a project's executor_config
+        # (the newest one handed to the helper): for a project-scoped member that must be
+        # one of THEIR projects, never another project of the workspace.
+        projects = await _projects_in_scope(request, db)
         roots = await _persist_add_filesystem_root(db, projects, path)
+    except policy_deps.member_policy.MemberPolicyDenied as exc:
+        return _json_response(exc.body(), status_code=exc.status_code)
+    except policy_deps.member_policy.MemberPolicyUnavailable as exc:
+        return _json_response(
+            {"error": "member_policy_unavailable", "detail": exc.detail},
+            status_code=exc.status_code,
+        )
     except Exception as exc:  # noqa: BLE001
         return _json_response({"error": f"could not persist root: {exc}"}, status_code=500)
     live = await send_add_fs_roots_control(tenant["id"], [path])
@@ -3803,10 +3844,25 @@ async def remove_tunnel_filesystem_root(request: Request) -> Response:
             pass
     if not path:
         return _json_response({"error": "path is required"}, status_code=400)
+    # Authorize the whole scoped operation before any persisted or live change.
+    from .. import _deps as policy_deps
+
     try:
         db = await _db(request)
-        projects = await db_module.list_projects(db)
+        await policy_deps._require_capability(
+            request, policy_deps.member_policy.WRITE_PROJECT
+        )
+        # RT-TI-005 (pass 3, F-D3) -- strip the root only from the caller's in-scope
+        # projects (see the POST route above).
+        projects = await _projects_in_scope(request, db)
         roots = await _persist_remove_filesystem_root(db, projects, path)
+    except policy_deps.member_policy.MemberPolicyDenied as exc:
+        return _json_response(exc.body(), status_code=exc.status_code)
+    except policy_deps.member_policy.MemberPolicyUnavailable as exc:
+        return _json_response(
+            {"error": "member_policy_unavailable", "detail": exc.detail},
+            status_code=exc.status_code,
+        )
     except Exception as exc:  # noqa: BLE001
         return _json_response({"error": f"could not persist removal: {exc}"}, status_code=500)
     live = await send_set_fs_roots_control(tenant["id"], roots)

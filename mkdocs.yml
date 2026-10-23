@@ -15,6 +15,7 @@ exclude_docs: |
   backup-runbook.md
   mcp-directory-listing.md
   mcp-tunnel-slots.md
+  infra-neon-tenant-pool-isolation.md
 
 theme:
   name: material

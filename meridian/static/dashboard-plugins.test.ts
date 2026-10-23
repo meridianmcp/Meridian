@@ -13,7 +13,7 @@
 // not ES exports), so we import it for side effects and read the functions off
 // the global. A stand-in escapeHtml is installed first because the helpers call
 // the bare global at render time.
-import { describe, it, expect, beforeAll } from "vitest";
+import { describe, it, expect, beforeAll, beforeEach, afterEach, vi } from "vitest";
 
 const _escapeHtml = (s: unknown) =>
   String(s).replace(/[&<>"']/g, (c) =>
@@ -250,5 +250,101 @@ describe("_pluginLifecycleState / _renderLifecycleBadge — enabled/active misma
     const dotColor = "var(--success, #3fb950)";
     expect(activeHtml).toContain(dotColor);
     expect(mismatchHtml).toContain(dotColor);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// 8a665a03 -- Save re-renders the section from the server (like Reset does).
+//
+// PUT /tunnel/plugins normalises the config and decides restart_required, but the
+// Save handler used to only toast + write a status line, so the lifecycle badges
+// (derived from `enabled`), the per-host override marker and the restart banner kept
+// their pre-save values until the Settings tab was rebuilt.
+// ---------------------------------------------------------------------------
+describe("tunnel plugins Save refreshes the section", () => {
+  const PID = "p-tunnel-1";
+  let gets: string[];
+  let puts: any[];
+  let banner: ReturnType<typeof vi.fn>;
+  let putResponse: any;
+  const flush = async () => {
+    for (let i = 0; i < 8; i++) await new Promise((r) => setTimeout(r, 0));
+  };
+
+  beforeEach(() => {
+    document.body.innerHTML = `<div id="settings-body-${PID}"></div>`;
+    gets = [];
+    puts = [];
+    putResponse = { ok: true, config: [], config_generation: { generation: 3, restart_required: true } };
+    const api = vi.fn(async (url: string, opts?: any) => {
+      if (opts && opts.method === "PUT") {
+        puts.push({ url, body: JSON.parse(opts.body) });
+        return putResponse;
+      }
+      gets.push(url);
+      return { plan: "admin", is_admin: true, plugins: [], active: {}, custom: [], slot_status: {}, configured_hosts: [] };
+    });
+    (globalThis as any).api = api;
+    (window as any).api = api;
+    (globalThis as any).toast = vi.fn();
+    (window as any).toast = (globalThis as any).toast;
+    banner = vi.fn(async () => {});
+    (window as any)._renderTunnelConfigGenerationBanner = banner;
+  });
+
+  afterEach(() => {
+    delete (window as any)._renderTunnelConfigGenerationBanner;
+  });
+
+  // The section also reads other endpoints (filesystem roots, ...); count the plugin-config reads.
+  const pluginGets = () => gets.filter((u) => u.startsWith("/tunnel/plugins"));
+
+  async function openAndSave() {
+    await (window as any).loadTunnelPluginsSection(PID);
+    expect(pluginGets()).toHaveLength(1);
+    (document.getElementById(`tp-save-${PID}`) as HTMLButtonElement).click();
+    await flush();
+  }
+
+  it("re-fetches the plugin config after the PUT", async () => {
+    await openAndSave();
+    expect(puts).toHaveLength(1);
+    expect(pluginGets()).toHaveLength(2);
+  });
+
+  it("refreshes the restart-required banner", async () => {
+    await openAndSave();
+    expect(banner).toHaveBeenCalledWith(PID);
+  });
+
+  it("re-fetches the SAME machine's config when a per-host config was saved", async () => {
+    await (window as any).loadTunnelPluginsSection(PID, "laptop-1");
+    (document.getElementById(`tp-save-${PID}`) as HTMLButtonElement).click();
+    await flush();
+    expect(puts[0].url).toContain("hostname=laptop-1");
+    const reads = pluginGets();
+    expect(reads).toHaveLength(2);
+    expect(reads[1]).toContain("hostname=laptop-1");
+  });
+
+  it("says a restart is needed only when the server says so", async () => {
+    await openAndSave();
+    expect(document.getElementById(`tp-status-${PID}`)!.textContent).toContain("restart the tunnel");
+    gets.length = 0;
+    putResponse = { ok: true, config: [], config_generation: { generation: 4, restart_required: false } };
+    (document.getElementById(`tp-save-${PID}`) as HTMLButtonElement).click();
+    await flush();
+    expect(document.getElementById(`tp-status-${PID}`)!.textContent).toBe("Saved.");
+  });
+
+  it("a failed save leaves the section as it was and does not refetch", async () => {
+    await (window as any).loadTunnelPluginsSection(PID);
+    (window as any).api = (globalThis as any).api = vi.fn(async () => {
+      throw new Error("500: nope");
+    });
+    (document.getElementById(`tp-save-${PID}`) as HTMLButtonElement).click();
+    await flush();
+    expect(pluginGets()).toHaveLength(1);
+    expect(banner).not.toHaveBeenCalled();
   });
 });

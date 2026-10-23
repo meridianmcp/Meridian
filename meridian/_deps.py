@@ -18,7 +18,9 @@ from typing import Any
 from fastapi import HTTPException, Request
 from fastapi.templating import Jinja2Templates
 
-from .roles import has_perm, PERM_WRITE, PERM_INVITE, PERM_SETTINGS
+from . import member_policy
+from .plans import tenant_entitlement_plan
+from .roles import has_perm, PERM_WRITE, PERM_INVITE, PERM_SETTINGS, PERM_MANAGE_POLICY
 
 
 # ---------------------------------------------------------------------------
@@ -172,6 +174,9 @@ _DEMO_CONTEXT_COOKIE = "meridian_demo"
 # ---------------------------------------------------------------------------
 
 _tenant_db_cache: dict[str, Any] = {}
+# 1b2fbebe -- tenant_id -> Neon pool project id, filled when the tenant DB is opened so the
+# per-request telemetry below can attribute a request to its pool without another lookup.
+_tenant_pool_ids: dict[str, "str | None"] = {}
 
 # Per-tenant provisioning lock (confirmed production bug, matches the
 # already-established fix pattern in routes/tunnel.py's
@@ -218,6 +223,7 @@ async def _open_tenant_db_by_id(request: Request, tenant_id: str) -> Any:
         tenant = await db_module.get_tenant_by_id(auth_db, tenant_id)
         if not tenant:
             raise HTTPException(status_code=401, detail="tenant not found")
+        _tenant_pool_ids[tenant_id] = tenant.get("neon_project_id")
 
         url: str | None = None
         if tenant.get("neon_db_url"):
@@ -280,6 +286,16 @@ def _authentication_required() -> HTTPException:
         detail="authentication required",
         headers=dict(_AUTH_REQUIRED_HEADERS),
     )
+
+
+def _note_pool_tenant(request: Request, tenant_id: str) -> None:
+    """1b2fbebe -- remember which tenant and Neon pool project this request's database belongs
+    to. PoolTimingMiddleware reads it once the response starts and records the request with
+    its latency (in-memory, redacted; see pool_telemetry). It can never fail a request."""
+    try:
+        request.state._pool_attr = (tenant_id, _tenant_pool_ids.get(tenant_id))
+    except Exception:
+        pass
 
 
 async def _db(request: Request) -> Any:
@@ -356,10 +372,12 @@ async def _db(request: Request) -> Any:
             if any(m["tenant_id"] == ws_header for m in memberships):
                 conn = await _open_tenant_db_by_id(request, ws_header)
                 request.state._db_conn = conn
+                _note_pool_tenant(request, ws_header)
                 return conn
 
         conn = await _open_tenant_db_by_id(request, current_tenant_id)
         request.state._db_conn = conn
+        _note_pool_tenant(request, current_tenant_id)
         return conn
 
     conn = request.app.state.db
@@ -480,24 +498,44 @@ async def _tenant_for_credential(auth_db: Any, credential: "tuple[str, str]") ->
     return _NO_SUCH_CREDENTIAL
 
 
+# Sentinel for the per-request scope memo (see _scoped_project_ids_for_request).
+_SCOPE_UNSET = object()
+
+
 async def _scoped_project_ids_for_request(request: Request) -> "list[str] | None":
-    """d116642e — listing-only project scoping for the current request.
+    """The project scope of the current request, or ``None`` when it has none.
 
-    Returns the list of project_ids the caller is scoped to when they are a
-    *project-scoped* member of the workspace they are currently viewing
-    (i.e. they switched into a workspace they were invited to with a specific
-    project_id). Returns ``None`` when scoping does not apply — the caller is
-    the workspace owner, a workspace-wide member, in self-hosted/demo mode, or
-    unauthenticated — meaning every project is listed (current behavior).
+    Returns the project ids the caller may reach when they are a *project-scoped*
+    member of the workspace they are currently viewing (they switched into a
+    workspace they were invited to with a specific project_id): their explicit
+    grants plus the live one-level subprojects of those grants, so a subproject
+    created later is reachable on the next request. The list is a
+    :class:`member_policy.ScopedProjectIds`, which also carries the member's
+    effective policy (what they may do inside the scope); consumers that only
+    test membership use it as the flat list it is.
 
-    Scoping only fires when an ``X-Workspace-Tenant-Id`` header points the
-    caller at a *different* workspace than their own (a true cross-workspace
-    view); a caller in their own workspace always sees everything.
+    Returns ``None`` when scoping does not apply (owner, workspace-wide member,
+    non-member, self-hosted, demo, unauthenticated, no workspace header), meaning
+    every project is in play. Those paths run no statement beyond the membership
+    SELECT; the owner's database is opened only once the caller proved to be
+    project-scoped.
 
-    This is listing-only: it filters what the dashboard shows. It does NOT
-    block direct-by-ID access to sibling projects in the same workspace —
-    airtight per-request enforcement is deferred pending the product decision
-    (pin b11c7cf6). Writes stay gated by role enforcement (393eed0a).
+    Scoping only fires when an ``X-Workspace-Tenant-Id`` header points the caller
+    at a *different* workspace than their own; a caller in their own workspace
+    always sees everything.
+
+    The result is memoized on ``request.state`` for the life of the request, so
+    the middleware, the gate dependency and the route share one resolution. There
+    is deliberately no cross-request cache: a revoked member or an edited policy
+    applies on the very next request, on every machine.
+
+    A project-scoped member is 403'd on any project outside their scope even by
+    direct id (decision 6fe5210c). The ``/projects/{uuid}/*`` routes get that from
+    the ``project_scope_enforcement`` middleware; routes that reach a project only
+    through another object's id (sessions, tasks) call
+    :func:`_require_project_in_scope` themselves. Writes are further gated by role
+    enforcement (393eed0a) and by the member policy. Every error propagates:
+    callers map it to 503, never to "not scoped".
     """
     if not _hosted_mode():
         return None
@@ -508,8 +546,6 @@ async def _scoped_project_ids_for_request(request: Request) -> "list[str] | None
     if not ws_header:
         return None
 
-    from . import db as db_module
-
     caller = await _get_tenant_from_request(request)
     if not caller:
         return None
@@ -518,10 +554,189 @@ async def _scoped_project_ids_for_request(request: Request) -> "list[str] | None
         # Viewing own workspace — never scoped.
         return None
 
+    key = (ws_header, caller_email)
+    memo = getattr(request.state, "_member_scope", _SCOPE_UNSET)
+    if memo is not _SCOPE_UNSET and memo[0] == key:
+        return memo[1]
+
     auth_db = request.app.state.db
-    return await db_module.get_scoped_project_ids_for_member(
-        auth_db, ws_header, caller_email
+    scoped = await member_policy.resolve_member_scope(
+        auth_db, lambda: _db(request), ws_header, caller_email,
     )
+    request.state._member_scope = (key, scoped)
+    return scoped
+
+
+def _deny_unless_in_scope(scoped: "list[str] | None", project_id: "str | None") -> None:
+    """RT-TI-005 — 403 when a project-scoped caller reaches an object outside their scope.
+
+    ``scoped`` is what :func:`_scoped_project_ids_for_request` returned (``None`` =
+    owner / workspace-wide / self-hosted / demo: nothing to enforce). A
+    ``project_id`` of ``None`` (the object does not exist) gets the SAME 403 as a
+    foreign one for a scoped caller, so existence is not leaked; unscoped callers
+    never get here and keep the historical 404. Same status and message as
+    :func:`_require_project_in_scope` and the project middleware.
+
+    Split from :func:`_require_project_in_scope` so a route that already resolved
+    the scope (to skip an object lookup for unscoped callers) does not resolve it
+    a second time.
+    """
+    if scoped is not None and (project_id is None or project_id not in scoped):
+        raise HTTPException(status_code=403, detail="Project is outside your access scope.")
+
+
+async def _require_project_in_scope(request: Request, project_id: "str | None") -> None:
+    """RT-TI-005 — 403 when a project-scoped caller reaches ``project_id`` by another route.
+
+    The ``project_scope_enforcement`` middleware only sees ``/projects/{uuid}/...``
+    paths. Session and task routes identify their project through the session or
+    task id (or a request body), so they call this once they know the project.
+    No-op for owners, workspace-wide members, self-hosted and demo callers
+    (``_scoped_project_ids_for_request`` returns ``None`` for them). Fails closed:
+    an error resolving the scope propagates instead of waving the request through.
+    Same status and message as the middleware so callers cannot tell which
+    layer answered.
+    """
+    if not project_id:
+        return
+    _deny_unless_in_scope(await _scoped_project_ids_for_request(request), project_id)
+
+
+def _deny_unless_capability(scoped: "list[str] | None", capability: str) -> None:
+    """403 (``MemberPolicyDenied``) when a project-scoped caller lacks ``capability``.
+
+    ``scoped`` is what :func:`_scoped_project_ids_for_request` returned; ``None``
+    (owner, workspace-wide member, self-hosted, demo) is never refused. The sync
+    sibling of :func:`_deny_unless_in_scope` for a route that already holds the
+    scope. Check the scope of the project first so a foreign id keeps the scope
+    message, then the capability.
+    """
+    member_policy.require_capability(scoped, capability)
+
+
+async def _require_capability(
+    request: Request, capability: str, *, project_id: "str | None" = None,
+) -> "list[str] | None":
+    """Resolve the request's scope and require ``capability`` of a scoped caller.
+
+    No-op (returns ``None``, no statement beyond what the scope lookup already
+    costs) for callers that are not project-scoped. With ``project_id`` the
+    project must also be in scope; that check runs first so a foreign or unknown
+    id keeps the byte-identical scope refusal. Returns the scope for the caller
+    to reuse.
+    """
+    scoped = await _scoped_project_ids_for_request(request)
+    if scoped is None:
+        return None
+    if project_id is not None:
+        _deny_unless_in_scope(scoped, project_id)
+    member_policy.require_capability(scoped, capability)
+    return scoped
+
+
+def _reject_foreign_workspace_header(request: Request, own_tenant_id: "str | None") -> None:
+    """403 when the request carries an ``X-Workspace-Tenant-Id`` naming ANOTHER
+    workspace than the caller's own.
+
+    For routes that act on the caller's own account whatever workspace the
+    dashboard happens to be showing (member-policy administration): the header is
+    ignored by ``hosted.get_current_tenant``, so without this check a workspace
+    switch would look like it targets the other workspace while the write lands on
+    the caller's own. Refusing it keeps the two readings from diverging. A header
+    equal to the caller's own tenant id, or no header, passes.
+    """
+    ws_header = request.headers.get("x-workspace-tenant-id", "").strip()
+    if ws_header and ws_header != (own_tenant_id or ""):
+        raise HTTPException(
+            status_code=403,
+            detail="This action applies to your own workspace; switch back to it first.",
+        )
+
+
+async def _projects_in_scope(request: Request, db: Any) -> "list[dict[str, Any]]":
+    """RT-TI-005 (pass 3, F-D3) — ``list_projects(db)`` restricted to the caller's scope.
+
+    Every route that enumerates the projects of the workspace DB it was handed
+    (``GET /settings/mcp-config``, the tunnel launch-matrix / filesystem-root routes,
+    the hook auto-router) must not hand a project-scoped member the id, name or
+    executor config of a project outside their scope. This is the one place that
+    does the filtering, exactly like ``GET /projects`` (a list of ids from
+    :func:`_scoped_project_ids_for_request`; ``None`` = owner / workspace-wide /
+    self-hosted / demo = every project, unchanged). Fails closed: an error resolving
+    the scope propagates instead of returning the unfiltered list.
+    """
+    from . import db as db_module
+
+    projects = await db_module.list_projects(db)
+    scoped = await _scoped_project_ids_for_request(request)
+    if scoped is None:
+        return projects
+    allowed = set(scoped)
+    return [p for p in projects if p.get("id") in allowed]
+
+
+async def _reject_foreign_session(db: Any, session_id: "str | None", project_id: str) -> None:
+    """404 ``session not found`` when ``session_id`` names a session of ANOTHER project.
+
+    RT-TI-005 (pass 3, F-D6) -- the integrity rule for a request that names a project in
+    its path and a session in its body (``POST /projects/{pid}/worktrees``, ``POST
+    /projects/{pid}/hitl``): the session must belong to that project. Same answer as the
+    sibling routes (``POST /tasks``, the claim route). An id that names no session (or no id
+    at all) is not this helper's business and is left to the route's own handling, unchanged.
+    Applies to every caller -- a session of one project acting inside another is never
+    legitimate -- so the owner / self-hosted / demo paths pay one primary-key SELECT.
+    """
+    if not session_id:
+        return
+    async with db.execute(
+        "SELECT project_id FROM sessions WHERE id = ?", (session_id,)
+    ) as cur:
+        row = await cur.fetchone()
+    if row is not None and row["project_id"] != project_id:
+        raise HTTPException(status_code=404, detail="session not found")
+
+
+async def _session_projects(request: Request, session_ids: "list[str]") -> "dict[str, str]":
+    """``{session_id: project_id}`` for every id in ``session_ids`` that names a session.
+
+    One ``IN (...)`` lookup per 400 ids (not a query per id); an id that names no session
+    is simply absent from the result. The bulk sibling of :func:`_session_project_id` for
+    routes that receive many session ids at once (the batch endpoint). Like it, call this
+    only once the scope is known to be non-``None`` (or an integrity check is wanted): the
+    owner / self-hosted / demo hot paths must not pay for it.
+    """
+    ids = [s for s in dict.fromkeys(session_ids) if isinstance(s, str) and s]
+    found: "dict[str, str]" = {}
+    if not ids:
+        return found
+    _req_db = await _db(request)
+    for start in range(0, len(ids), 400):
+        chunk = ids[start:start + 400]
+        placeholders = ", ".join("?" for _ in chunk)
+        async with _req_db.execute(
+            f"SELECT id, project_id FROM sessions WHERE id IN ({placeholders})",
+            tuple(chunk),
+        ) as cur:
+            for row in await cur.fetchall():
+                found[row["id"]] = row["project_id"]
+    return found
+
+
+async def _session_project_id(request: Request, session_id: str) -> "str | None":
+    """Project a session belongs to (``sessions.project_id``), or ``None`` for an unknown id.
+
+    A session belongs to exactly one project, so any route that receives only a
+    session id (heartbeat, notes, a session-type profile layer, ...) resolves its
+    project here and applies :func:`_deny_unless_in_scope`. Call it only AFTER the
+    scope is known to be non-``None``: owners, self-hosted and demo callers must
+    not pay for this SELECT.
+    """
+    _req_db = await _db(request)
+    async with _req_db.execute(
+        "SELECT project_id FROM sessions WHERE id = ?", (session_id,)
+    ) as cur:
+        row = await cur.fetchone()
+    return row["project_id"] if row is not None else None
 
 
 # ---------------------------------------------------------------------------
@@ -602,6 +817,21 @@ _TENANT_RL_PER_MINUTE: dict[str, "int | None"] = {
     "pro": None,
     "admin": None,
 }
+
+
+def _tenant_rl_plan(tenant: "dict[str, Any]") -> str:
+    """The plan whose per-minute budget applies to ``tenant`` (lower-cased).
+
+    Goes through ``plans.tenant_entitlement_plan`` so a playtester gets Pro's
+    budget and a playtester past its end date drops to Free's. The result is
+    what ``_tenant_rl_plan_cache`` stores, so the 60 s plan cache already holds
+    the entitlement verdict; an unknown plan stays unknown and falls through to
+    the Free budget at the lookup.
+    """
+    plan = str(tenant.get("plan") or "free").lower()
+    return str(tenant_entitlement_plan({**tenant, "plan": plan}, default="free"))
+
+
 # tenant_id -> monotonic timestamps of requests within the current window
 _tenant_rl_hits: dict[str, list[float]] = {}
 # token_hash -> (cached_at_monotonic, (tenant_id, plan))
@@ -817,9 +1047,12 @@ def _render_workspace_block(
 ) -> str:
     """v3.1 — render workspace-level decisions + notes as a compact text block.
 
-    Workspace decisions/notes are tenant-global (above any single project), so
-    they are prepended to every project's context block + handoff. Returns an
-    empty string when there is nothing to show, so callers can skip the join.
+    Workspace decisions/notes are tenant-global (above any single project).
+    This is the FULL renderer (bodies inline): since 0b0b24d8 a cold session
+    start and get_context_block use it only when ``include_workspace_context``
+    is on, via :func:`_build_workspace_context_block`; the default is the
+    bounded :func:`_render_workspace_index_block`. Returns an empty string
+    when there is nothing to show, so callers can skip the join.
     """
     if not decisions and not notes:
         return ""
@@ -833,6 +1066,155 @@ def _render_workspace_block(
         suffix = f" ({tags})" if tags else ""
         lines.append(f"  • NOTE {n.get('title', '')}: {n.get('body', '')}{suffix}")
     return "\n".join(lines)
+
+
+# 0b0b24d8 — bounded workspace index. The full block above used to be prepended
+# unconditionally to every cold session start and every get_context_block, so
+# unrelated workspace notes (interview notes, another project's findings, ...)
+# led every session. The index keeps the owner's standing policy (decisions)
+# visible but capped, and reduces notes to a count plus policy-tagged titles.
+_WORKSPACE_INDEX_MAX_DECISIONS = 5
+_WORKSPACE_INDEX_DECISION_CHARS = 160
+# Decision title and category are free text too (REST caps neither, MCP caps
+# only the title), so they are clipped like the body: an unclipped one let five
+# decisions with 90k-char titles turn a cold session start into 455k chars.
+_WORKSPACE_INDEX_DECISION_TITLE_CHARS = 120
+_WORKSPACE_INDEX_CATEGORY_CHARS = 40
+_WORKSPACE_INDEX_MAX_POLICY_TITLES = 5
+_WORKSPACE_INDEX_TITLE_CHARS = 80
+# A note is "policy" when any comma-separated tag equals one of these.
+_WORKSPACE_POLICY_TAGS = frozenset({"policy", "workspace-policy"})
+
+
+def _is_policy_note(note: dict) -> bool:
+    tags = {t.strip().lower() for t in (note.get("tags") or "").split(",")}
+    return bool(tags & _WORKSPACE_POLICY_TAGS)
+
+
+def _render_workspace_index_block(
+    decisions: list[dict], notes: list[dict]
+) -> str:
+    """0b0b24d8 — bounded stand-in for :func:`_render_workspace_block`.
+
+    Decisions are the owner's standing policy, so they stay, but capped at
+    ``_WORKSPACE_INDEX_MAX_DECISIONS`` one-line summaries (title, category and
+    body each clipped to their ``_WORKSPACE_INDEX_*_CHARS`` limit). Notes are
+    NOT inlined at all: a count, the titles of up to
+    ``_WORKSPACE_INDEX_MAX_POLICY_TITLES`` policy-tagged ones, and the exact
+    tool calls that fetch the rest. Empty string when there is nothing to
+    show, same as the full renderer. Every variable-length field is clipped,
+    so output size is bounded by the constants above regardless of how many
+    records exist or how long any one of them is, which is the point.
+    """
+    if not decisions and not notes:
+        return ""
+    lines = [
+        "WORKSPACE (applies to all projects) - index only, note bodies not included:"
+    ]
+    fetch: list[str] = []
+    if decisions:
+        shown = decisions[:_WORKSPACE_INDEX_MAX_DECISIONS]
+        clipped = False
+        for d in shown:
+            # Flatten first and compare lengths, so a clipped field also
+            # triggers the "fetch the rest" hint below.
+            cat = " ".join(str(d.get("category") or "").split())
+            title = " ".join(str(d.get("title") or "").split())
+            body = " ".join(str(d.get("body") or "").split())
+            clipped = clipped or (
+                len(cat) > _WORKSPACE_INDEX_CATEGORY_CHARS
+                or len(title) > _WORKSPACE_INDEX_DECISION_TITLE_CHARS
+                or len(body) > _WORKSPACE_INDEX_DECISION_CHARS
+            )
+            cat = _md_one_line(cat, _WORKSPACE_INDEX_CATEGORY_CHARS)
+            prefix = f"[{cat}] " if cat else ""
+            lines.append(
+                f"  - DECISION {prefix}"
+                f"{_md_one_line(title, _WORKSPACE_INDEX_DECISION_TITLE_CHARS)}: "
+                f"{_md_one_line(body, _WORKSPACE_INDEX_DECISION_CHARS)}"
+            )
+        hidden = len(decisions) - len(shown)
+        if hidden > 0:
+            lines.append(f"  - (+{hidden} more decision(s))")
+        if hidden > 0 or clipped:
+            fetch.append("get_workspace_decisions()")
+    if notes:
+        policy = [n for n in notes if _is_policy_note(n)]
+        titles = [
+            _md_one_line(n.get("title") or "(untitled)", _WORKSPACE_INDEX_TITLE_CHARS)
+            for n in policy[:_WORKSPACE_INDEX_MAX_POLICY_TITLES]
+        ]
+        line = f"  - {len(notes)} workspace note(s), bodies not included"
+        if titles:
+            more = len(policy) - len(titles)
+            line += (
+                "; policy-tagged: " + "; ".join(titles)
+                + (f" (+{more} more)" if more > 0 else "")
+            )
+        lines.append(line)
+        if policy:
+            fetch.append('get_workspace_notes(tag="policy")')
+        fetch.append("get_workspace_notes()")
+    if fetch:
+        lines.append("  - Fetch the rest: " + " | ".join(fetch))
+    return "\n".join(lines)
+
+
+#: 403 body for a project-scoped caller on a workspace-level route, read or write. One text
+#: shared by every workspace route and by the ``/workspace`` mutation gate in server.py, so the
+#: refusal is identical wherever it is raised.
+WORKSPACE_SCOPE_DENIED = "Workspace-level data is not available to project-scoped members."
+
+#: Path prefixes of the workspace-level HTTP routes whose data belongs to no project: notes,
+#: decisions, settings, blog posts and the sprint board, and their children (e.g. note move).
+_WORKSPACE_DATA_PREFIXES = (
+    "/workspace/notes",
+    "/workspace/decisions",
+    "/workspace/settings",
+    "/workspace/blog",
+    "/workspace/sprint-items",
+)
+
+
+def _is_workspace_data_path(path: str) -> bool:
+    """True for a workspace-level data route (read or write) under ``/workspace``."""
+    return any(path == prefix or path.startswith(prefix + "/") for prefix in _WORKSPACE_DATA_PREFIXES)
+
+
+async def _workspace_visible_for_request(request: Request) -> bool:
+    """False for a project-scoped member of the workspace being viewed, True otherwise.
+
+    The workspace-level notes, decisions and settings belong to no project, so a
+    project-scoped caller never gets them in a rendered document (handoff, context block,
+    session start). Owners, workspace-wide members and self-hosted callers resolve to
+    ``None`` from the scope resolver and keep the workspace section.
+    """
+    return await _scoped_project_ids_for_request(request) is None
+
+
+async def _build_workspace_context_block(
+    db: Any, *, tenant_id: "str | None" = None, include_workspace: bool = True,
+) -> str:
+    """0b0b24d8 — the workspace block for a cold session start and
+    ``get_context_block``: the bounded index by default, the full text of every
+    decision and note (:func:`_render_workspace_block`, i.e. the behaviour
+    before this change) only when ``include_workspace_context`` is on (see
+    ``toml_config.get_include_workspace_context`` for the sources and for why
+    it is not a ``workspace_settings`` column).
+
+    ``include_workspace=False`` (a project-scoped caller) returns an empty block: no
+    workspace row is read at all.
+    """
+    from . import db as _db_module
+    from . import toml_config as _toml_config
+
+    if not include_workspace:
+        return ""
+    ws_decisions = await _db_module.get_workspace_decisions(db, tenant_id=tenant_id)
+    ws_notes = await _db_module.get_workspace_notes(db, tenant_id=tenant_id)
+    if _toml_config.get_include_workspace_context():
+        return _render_workspace_block(ws_decisions, ws_notes)
+    return _render_workspace_index_block(ws_decisions, ws_notes)
 
 
 def _render_context_block(
@@ -967,6 +1349,15 @@ _ROLE_ENFORCE_SKIP_PREFIXES: tuple[str, ...] = (
 )
 
 
+def _is_member_policy_path(path: str) -> bool:
+    """``/workspace/member-policy[/...]`` and ``/workspace/members/{id}/policy``."""
+    bare = path.rstrip("/")
+    if bare == "/workspace/member-policy" or bare.startswith("/workspace/member-policy/"):
+        return True
+    parts = bare.split("/")
+    return len(parts) == 5 and parts[:3] == ["", "workspace", "members"] and parts[4] == "policy"
+
+
 def _required_perm_for_request(method: str, path: str) -> "str | None":
     """Map a mutating request to the workspace permission it requires, or None
     to skip role enforcement for this path.
@@ -980,6 +1371,10 @@ def _required_perm_for_request(method: str, path: str) -> "str | None":
         return None
     if any(path.startswith(p) for p in _ROLE_ENFORCE_SKIP_PREFIXES):
         return None
+    # Member-policy administration is owner-only and must not fall into the
+    # generic team-management branch below, which an invited admin satisfies.
+    if _is_member_policy_path(path):
+        return PERM_MANAGE_POLICY
     # Team management — add / remove / modify workspace members.
     if path.startswith("/workspace/invite") or path.startswith("/workspace/members"):
         return PERM_INVITE

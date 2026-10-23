@@ -7,8 +7,11 @@ import {
   classifyArtifactHealth,
   displaySafe,
   isArtifactsUnavailable,
+  nextOffset,
+  prevOffset,
   type ArtifactsEnvelope,
   type ControlPlaneRole,
+  type PageInfo,
   type RelationshipProject,
 } from './dashboard-control-plane';
 
@@ -181,6 +184,8 @@ function _applySettingsRoleVisibility(projectId: any, guest: any) {
   // Keep the team-members list visible (read-only), but drop the invite form.
   const inviteForm = document.getElementById(`settings-invite-form-${projectId}`);
   if (inviteForm) inviteForm.style.display = 'none';
+  const projectInviteForm = document.getElementById(`settings-project-invite-form-${projectId}`);
+  if (projectInviteForm) projectInviteForm.style.display = 'none';
   // Hide every Save button so nothing in the tab is editable.
   body.querySelectorAll('button').forEach(b => {
     if (/^save\b/i.test((b.textContent || '').trim())) b.style.display = 'none';
@@ -334,6 +339,131 @@ export async function _loadSettingsAccountPane(projectId: any) {
 }
 window._loadSettingsAccountPane = _loadSettingsAccountPane;
 
+// 8a665a03 -- keep the Account tab's data cache truthful after a save. The cache holds
+// the pre-save GET /projects/{id}/ntfy result; a later repaint of the card (every
+// project-tab switch rebuilds the Settings body) would otherwise show the old value.
+// PATCH /ntfy answers with the same shape as GET, so the response replaces the cached
+// result wholesale.
+function _syncAccountCacheAfterSave(projectId: any, saved: any) {
+  const data = _settingsTabDataCache.get(`${projectId}:account`);
+  if (!data || !saved || typeof saved !== 'object') return;
+  data.ntfyResult = { status: 'fulfilled', value: saved };
+}
+// 8a665a03 -- wire the Account card's handlers (ntfy Save/Test/ack, email Save, the
+// email-notification checkboxes). These used to be wired inside loadSettingsTab, which
+// runs BEFORE the card exists since 116e0245 made it lazy, so every lookup returned
+// null and the buttons did nothing. They are attached from _applySettingsAccountPaneData
+// instead, i.e. right after the card's markup is swapped in -- on first load and on every
+// repaint from the cache. Idempotent: it only assigns on* properties.
+function _wireAccountPaneHandlers(projectId: any) {
+  const body = document.getElementById(`settings-body-${projectId}`);
+  // Wire notification Save button
+  const ntfySaveBtn = document.getElementById(`ntfy-save-${projectId}`);
+  if (ntfySaveBtn) {
+    ntfySaveBtn.onclick = async () => {
+      const inp = document.getElementById(`ntfy-url-${projectId}`);
+      const statusEl = document.getElementById(`ntfy-status-${projectId}`);
+      // G1.7 — send the raw user input; the server canonicalizes ntfy
+      // entries to topic-only and suffixes for per-DB uniqueness. The
+      // response carries the saved value, which we reflect back into
+      // the field so the user sees what we actually stored.
+      const raw = (inp ? inp.value : '').trim() || null;
+      try {
+        const saved = await api(`/projects/${projectId}/ntfy`, {
+          method: 'PATCH',
+          body: JSON.stringify({ notify_url: raw, ntfy_url: raw }),
+        });
+        _syncAccountCacheAfterSave(projectId, saved);
+        const savedVal = saved && (saved.notify_url || saved.ntfy_url || '');
+        const shownVal = displayNotifyTarget(savedVal || '');
+        if (inp) inp.value = shownVal || '';
+        if (statusEl) {
+          statusEl.textContent = shownVal && raw && shownVal.toLowerCase() !== displayNotifyTarget(String(raw)).toLowerCase()
+            ? `saved as ${shownVal}`
+            : 'saved';
+          setTimeout(() => { statusEl.textContent = ''; }, 2400);
+        }
+      } catch (e: any) {
+        if (statusEl) statusEl.textContent = 'error';
+      }
+    };
+  }
+  // Wire notification email Save button
+  const notifyEmailSaveBtn = document.getElementById(`notify-email-save-${projectId}`);
+  if (notifyEmailSaveBtn) {
+    notifyEmailSaveBtn.onclick = async () => {
+      const inp = document.getElementById(`notify-email-${projectId}`);
+      const statusEl = document.getElementById(`notify-email-status-${projectId}`);
+      const raw = (inp ? inp.value : '').trim() || null;
+      try {
+        const savedEmail = await api(`/projects/${projectId}/ntfy`, {
+          method: 'PATCH',
+          body: JSON.stringify({ notify_email: raw }),
+        });
+        _syncAccountCacheAfterSave(projectId, savedEmail);
+        if (statusEl) {
+          statusEl.textContent = 'saved';
+          setTimeout(() => { statusEl.textContent = ''; }, 2400);
+        }
+      } catch (e: any) {
+        if (statusEl) statusEl.textContent = 'error';
+      }
+    };
+  }
+  // Wire notification Test button
+  const ntfyTestBtn = document.getElementById(`ntfy-test-${projectId}`);
+  if (ntfyTestBtn) {
+    ntfyTestBtn.onclick = async () => {
+      const statusEl = document.getElementById(`ntfy-status-${projectId}`);
+      ntfyTestBtn.disabled = true;
+      try {
+        await api(`/projects/${projectId}/notify/test`, { method: 'POST', body: '{}' });
+        if (statusEl) { statusEl.textContent = 'sent!'; setTimeout(() => { statusEl.textContent = ''; }, 3000); }
+      } catch (e: any) {
+        if (statusEl) {
+          const raw = String(e?.message || e || '');
+          let msg = raw.replace(/^\d+:\s*/, '');
+          try {
+            const parsed = JSON.parse(msg);
+            msg = parsed.detail || parsed.message || parsed.error || msg;
+          } catch (_err) {
+            // Keep the plain text message when the server did not return JSON.
+          }
+          statusEl.textContent = msg.includes('No notify URL configured') ? 'save a URL first' : msg;
+        }
+      } finally {
+        ntfyTestBtn.disabled = false;
+      }
+    };
+  }
+  // Wire ntfy security warning acknowledgement checkbox
+  const ntfyWarnAckCb = document.getElementById(`ntfy-warn-ack-${projectId}`);
+  if (ntfyWarnAckCb) {
+    ntfyWarnAckCb.onchange = () => {
+      if (!ntfyWarnAckCb.checked) return;
+      try { localStorage.setItem(STORAGE_KEY('ntfy.warn.dismissed'), '1'); } catch(e) {}
+      const warnEl = document.getElementById(`ntfy-warn-${projectId}`);
+      if (warnEl) warnEl.style.display = 'none';
+      const inp = document.getElementById(`ntfy-url-${projectId}`);
+      const saveBtn = document.getElementById(`ntfy-save-${projectId}`);
+      const testBtn = document.getElementById(`ntfy-test-${projectId}`);
+      [inp, saveBtn, testBtn].forEach(el => { if (el) { el.disabled = false; el.style.opacity = '1'; } });
+    };
+  }
+  if (body) body.querySelectorAll('input[data-pref]').forEach(cb => {
+    cb.onchange = async () => {
+      const statusEl = document.getElementById(`settings-save-status-${projectId}`);
+      const payload: Record<string, any> = {};
+      body.querySelectorAll('input[data-pref]').forEach(c => { payload[c.dataset.pref] = c.checked; });
+      try {
+        await api('/settings/notifications', { method: 'PATCH', body: JSON.stringify(payload) });
+        if (statusEl) { statusEl.textContent = 'saved'; setTimeout(() => { statusEl.textContent = ''; }, 1800); }
+      } catch (e: any) {
+        if (statusEl) statusEl.textContent = `error: ${escapeHtml(String(e))}`;
+      }
+    };
+  });
+}
 function _applySettingsAccountPaneData(projectId: any, data: any) {
   const { notifResult, ntfyResult, mcpResult, PREFS } = data;
   const prefs = (notifResult.status === 'fulfilled') ? (notifResult.value.prefs || {}) : null;
@@ -344,6 +474,7 @@ function _applySettingsAccountPaneData(projectId: any, data: any) {
 
   const prefsPlaceholder = document.getElementById(`settings-prefs-lazy-${projectId}`);
   if (prefsPlaceholder) prefsPlaceholder.outerHTML = _settingsNotificationPrefsHtml(projectId, prefs, PREFS, mcpData);
+  _wireAccountPaneHandlers(projectId);
 }
 window._applySettingsAccountPaneData = _applySettingsAccountPaneData;
 
@@ -353,11 +484,12 @@ function _activateSettingsTab(projectId: any, key: any) {
   body.dataset.activeStab = key;
   _applyActiveTabVisibility(projectId);
   // 116e0245 — lazy-load account tab data only when the Account tab is first clicked.
+  // 8a665a03 -- always go through the loader: it re-applies cached data to a fresh
+  // placeholder WITHOUT refetching, which is what a rebuilt Settings body needs. The old
+  // `if (!cache.has(key))` guard skipped it, so after the first visit a rebuilt body kept
+  // the "Notifications load when you open the Account tab." placeholder forever.
   if (key === 'account') {
-    const cacheKey = `${projectId}:account`;
-    if (!_settingsTabDataCache.has(cacheKey)) {
-      _loadSettingsAccountPane(projectId).catch(() => {});
-    }
+    _loadSettingsAccountPane(projectId).catch(() => {});
   }
 }
 window._activateSettingsTab = _activateSettingsTab;
@@ -446,7 +578,8 @@ export function _settingsAccountCardHtml(projectId: any): string {
     // Admin / internal accounts: no billing UI. Stripe customers: POST portal
     // button (avoids GET redirect leak). Free tier: prominent upgrade link.
 
-    const noUpgrade = plan === 'admin' || !!window.state.tenantIsInternal;
+    // A playtester has no Stripe relationship, so it never gets a billing button.
+    const noUpgrade = plan === 'admin' || plan === 'playtester' || !!window.state.tenantIsInternal;
 
     let billingBtn = '';
 
@@ -495,6 +628,18 @@ export function _settingsAccountCardHtml(projectId: any): string {
       const payLink = window.state.serverConfig?.stripe_payment_link || '/pricing';
 
       resubBtn = `<a href="${escapeHtml(payLink)}" class="primary" style="padding:4px 10px;font-size:10px;text-decoration:none;background:var(--accent);color:#001020;border-radius:4px;font-weight:600">${window.state.tenantExpired ? 'Resubscribe' : 'Upgrade to Standard'}</a>`;
+
+    }
+
+    // A playtester's optional end date (the server's inactivity_expires_at): say
+    // when access ends, with no purchase button.
+    if (plan === 'playtester' && !window.state.tenantIsInternal && (expiresAt || window.state.tenantExpired)) {
+
+      const ptDate = expiresAt ? String(expiresAt).slice(0, 10) : '';
+
+      expiryLine = window.state.tenantExpired
+        ? `<div style="color:#f87171">Playtester access ended${ptDate ? ` on ${escapeHtml(ptDate)}` : ''}.</div>`
+        : `<div>Playtester access ends${ptDate ? ` on <span style="color:var(--text)">${escapeHtml(ptDate)}</span>` : ''}${days != null ? ` <span style="color:var(--muted)">(${days} day${days === 1 ? '' : 's'} left)</span>` : ''}.</div>`;
 
     }
 
@@ -2370,6 +2515,45 @@ export async function loadSettingsTab(projectId: any, { force = false } = {}) {
 
 
 
+  // Use Mode section: per-project publication posture, a sibling of Execution Mode.
+  // standard_publication (default) stores restricted images with a credit line and a review flag;
+  // commercialized requires owner approval before restricted images are stored.
+
+  const useMode = (projectSettings && projectSettings.use_mode === 'commercialized') ? 'commercialized' : 'standard_publication';
+
+  html += `<div style="margin-bottom:16px">
+
+    <div style="color:var(--accent);font-size:10px;letter-spacing:.06em;text-transform:uppercase;margin-bottom:10px;padding-bottom:4px;border-bottom:1px solid var(--border)">Use Mode</div>
+
+    <select id="use-mode-${projectId}" aria-label="Use mode" style="width:100%;padding:6px 8px;font-size:11px;background:var(--surface-1);color:var(--text);border:1px solid var(--border);border-radius:5px;cursor:pointer">
+      <option value="standard_publication" ${useMode === 'standard_publication' ? 'selected' : ''}>Standard publication (default)</option>
+      <option value="commercialized" ${useMode === 'commercialized' ? 'selected' : ''}>Commercialized (restricted images need owner approval)</option>
+    </select>
+    <div style="font-size:10px;color:var(--muted);margin-top:6px">Commercialized projects must have owner approval before restricted images are stored. Standard publication stores them with a credit line and a review flag.</div>
+    <div id="use-mode-status-${projectId}" style="font-size:10px;color:var(--muted);margin-top:6px;min-height:13px"></div>
+
+  </div>`;
+
+  setTimeout(() => {
+
+    const umSel = document.getElementById(`use-mode-${projectId}`);
+    const umStatus = document.getElementById(`use-mode-status-${projectId}`);
+
+    if (umSel) umSel.onchange = async () => {
+      if (umStatus) umStatus.textContent = 'Saving…';
+      try {
+        await saveProjectSettings(projectId, { use_mode: umSel.value });
+        if (umStatus) umStatus.textContent = 'Saved.';
+        setTimeout(() => { if (umStatus) umStatus.textContent = ''; }, 1500);
+      } catch (e: any) {
+        if (umStatus) umStatus.textContent = `Save failed: ${String(e)}`;
+      }
+    };
+
+  }, 0);
+
+
+
   // 0716c9e0 — Parallel Safety section
 
   const autoWorktrees = parseInt((projectSettings && projectSettings.auto_worktrees) != null ? projectSettings.auto_worktrees : 1, 10);
@@ -3364,6 +3548,39 @@ export async function loadSettingsTab(projectId: any, { force = false } = {}) {
         artifacts: document.getElementById('cp-panel-artifacts'),
       };
       const loaded: Record<string, boolean> = { relationships: false, proposals: false, artifacts: false };
+      const proposalPageSize = 20;
+      const artifactPageSize = 50;
+      let proposalOffset = 0;
+      let artifactOffset = 0;
+
+      function paginationMarkup(page: PageInfo, itemCount: number, label: string, total?: number): string {
+        const first = itemCount ? page.offset + 1 : 0;
+        const last = page.offset + itemCount;
+        const summary = itemCount === 0
+          ? (total === 0 ? 'No records' : 'No records on this page')
+          : `Showing ${first}–${last}${total == null ? '' : ` of ${total}`}`;
+        const previousPage = prevOffset(page);
+        const followingPage = nextOffset(page);
+        return `<div style="display:flex;align-items:center;justify-content:space-between;gap:8px;padding:8px 0 2px;font-size:10px;color:var(--muted)" aria-label="${escapeHtml(label)} pagination">`
+          + `<span>${escapeHtml(summary)}</span>`
+          + `<div style="display:flex;gap:6px">`
+          + `<button type="button" class="secondary" data-cp-page="previous" aria-label="Previous ${escapeHtml(label)} page" ${previousPage === null ? 'disabled' : ''} style="font-size:9px;padding:3px 8px">Previous</button>`
+          + `<button type="button" class="secondary" data-cp-page="next" aria-label="Next ${escapeHtml(label)} page" ${followingPage === null ? 'disabled' : ''} style="font-size:9px;padding:3px 8px">Next</button>`
+          + `</div></div>`;
+      }
+
+      function bindPagination(el: HTMLElement, page: PageInfo, onPage: (offset: number) => void) {
+        const previous = el.querySelector<HTMLButtonElement>('[data-cp-page="previous"]');
+        const following = el.querySelector<HTMLButtonElement>('[data-cp-page="next"]');
+        if (previous) previous.onclick = () => {
+          const offset = prevOffset(page);
+          if (offset !== null) onPage(offset);
+        };
+        if (following) following.onclick = () => {
+          const offset = nextOffset(page);
+          if (offset !== null) onPage(offset);
+        };
+      }
 
       async function loadRelationships() {
         const el = panels.relationships;
@@ -3386,14 +3603,23 @@ export async function loadSettingsTab(projectId: any, { force = false } = {}) {
         const el = panels.proposals;
         if (!el) return;
         try {
-          const data = await api(`/control-plane/proposals?project_id=${encodeURIComponent(projectId)}&limit=20`);
-          const items = data.items || [];
-          el.innerHTML = items.length
+          const data = await api(`/control-plane/proposals?project_id=${encodeURIComponent(projectId)}&limit=${proposalPageSize}&offset=${proposalOffset}`);
+          const items = Array.isArray(data.items) ? data.items : [];
+          const page: PageInfo = {
+            limit: Number(data.limit) || proposalPageSize,
+            offset: Number.isFinite(Number(data.offset)) ? Number(data.offset) : proposalOffset,
+            hasMore: data.has_more === true,
+          };
+          const total = Number.isFinite(Number(data.total)) ? Number(data.total) : undefined;
+          proposalOffset = page.offset;
+          const rows = items.length
             ? items.map((p: any) => `<div style="padding:4px 0;border-bottom:1px solid var(--border)">`
                 + `<div>${escapeHtml(p.title || '')} <span style="color:var(--muted);font-size:9px">${escapeHtml(p.status || '')}</span></div>`
                 + `<div style="color:var(--muted);font-size:9px">${escapeHtml((p.body || '').slice(0, 160))}</div>`
                 + `</div>`).join('')
             : '<div style="color:var(--muted)">No proposals in scope.</div>';
+          el.innerHTML = rows + paginationMarkup(page, items.length, 'proposals', total);
+          bindPagination(el, page, offset => { proposalOffset = offset; void loadProposals(); });
         } catch (e: any) {
           el.innerHTML = '<div style="color:var(--muted)">Failed to load.</div>';
         }
@@ -3403,13 +3629,19 @@ export async function loadSettingsTab(projectId: any, { force = false } = {}) {
         const el = panels.artifacts;
         if (!el) return;
         try {
-          const data = (await api('/control-plane/artifacts?limit=50')) as ArtifactsEnvelope;
+          const data = (await api(`/control-plane/artifacts?limit=${artifactPageSize}&offset=${artifactOffset}`)) as ArtifactsEnvelope;
           if (isArtifactsUnavailable(data)) {
             el.innerHTML = `<div style="color:var(--muted)">${escapeHtml(data && data.reason ? data.reason : 'Not available.')}</div>`;
             return;
           }
-          const items = data.items || [];
-          el.innerHTML = items.length
+          const items = Array.isArray(data.items) ? data.items : [];
+          const page: PageInfo = {
+            limit: Number(data.limit) || artifactPageSize,
+            offset: Number.isFinite(Number(data.offset)) ? Number(data.offset) : artifactOffset,
+            hasMore: data.has_more === true,
+          };
+          artifactOffset = page.offset;
+          const rows = items.length
             ? items.map((rec: any) => {
                 const health = classifyArtifactHealth(rec);
                 const ident = displaySafe(rec.path || rec.run_id || rec.artifact_id || '(unknown)');
@@ -3419,6 +3651,8 @@ export async function loadSettingsTab(projectId: any, { force = false } = {}) {
                   + `</div>`;
               }).join('')
             : '<div style="color:var(--muted)">No run manifests, provenance records, or registered artifacts found.</div>';
+          el.innerHTML = rows + paginationMarkup(page, items.length, 'artifacts', data.total);
+          bindPagination(el, page, offset => { artifactOffset = offset; void loadArtifacts(); });
         } catch (e: any) {
           el.innerHTML = '<div style="color:var(--muted)">Failed to load.</div>';
         }
@@ -3483,7 +3717,7 @@ export async function loadSettingsTab(projectId: any, { force = false } = {}) {
 
   html += `<div style="margin-bottom:16px" id="workspace-section-${projectId}">
     <div style="color:var(--accent);font-size:10px;letter-spacing:.06em;text-transform:uppercase;margin-bottom:10px;padding-bottom:4px;border-bottom:1px solid var(--border)">Workspace</div>
-    <div style="font-size:10px;color:var(--muted);margin-bottom:10px">Applies across <strong>all projects</strong> in this workspace. Notes and decisions here are injected at the top of every project's context block.</div>
+    <div style="font-size:10px;color:var(--muted);margin-bottom:10px">Applies across <strong>all projects</strong> in this workspace. A session's start and the context block show only a short index of these (the newest few decisions as one-line summaries, a note count and the titles of notes tagged <code>policy</code>), not note bodies. Fetch the full text with <code>get_workspace_notes</code> and <code>get_workspace_decisions</code>.</div>
     <div style="margin-bottom:12px">
       <div style="font-size:10px;color:var(--text);margin-bottom:4px">Default settings</div>
       <label style="display:flex;gap:8px;align-items:flex-start;font-size:11px;color:var(--text);cursor:pointer;margin-bottom:6px">
@@ -3641,6 +3875,105 @@ export async function loadSettingsTab(projectId: any, { force = false } = {}) {
     </div>`;
   }
 
+  // Project-scoped member add (hosted mode). Lives in the Project tab so adding
+  // someone to this project does not depend on the Account tab's workspace invite.
+  // Posts the same /workspace/invite call with project_id pinned to this project.
+  if (isHostedMode()) {
+    const _projectRow: any = (window.state.projects || []).find((p: any) => p.id === projectId);
+    const _projectName = _projectRow?.name || projectId;
+    html += `<div style="margin-bottom:16px" id="project-invite-section-${projectId}">
+      <div style="color:var(--accent);font-size:10px;letter-spacing:.06em;text-transform:uppercase;margin-bottom:10px;padding-bottom:4px;border-bottom:1px solid var(--border)">Add member to this project</div>
+      <div style="font-size:10px;color:var(--muted);margin-bottom:8px">Access is limited to <strong>${escapeHtml(String(_projectName))}</strong>. Whole-workspace invites are under Account.</div>
+      <div id="settings-project-invite-form-${projectId}" style="display:flex;gap:6px;align-items:center;flex-wrap:wrap">
+        <input id="project-invite-email-${projectId}" type="email" placeholder="teammate@example.com" style="background:var(--surface-1);border:1px solid var(--border);border-radius:3px;color:var(--text);font-size:10px;font-family:var(--font-mono);padding:4px 8px;flex:1;min-width:160px">
+        <select id="project-invite-role-${projectId}" style="background:var(--surface-1);border:1px solid var(--border);border-radius:3px;color:var(--text);font-size:10px;font-family:var(--font-mono);padding:4px 6px">
+          <option value="admin">admin</option>
+          <option value="member" selected>member</option>
+          <option value="viewer">viewer</option>
+        </select>
+        <button id="project-invite-check-${projectId}" class="secondary" style="font-size:10px;padding:4px 10px">Check</button>
+      </div>
+      <div id="project-invite-actions-${projectId}" style="margin-top:6px;display:flex;gap:6px;flex-wrap:wrap"></div>
+      <div id="project-invite-status-${projectId}" style="font-size:10px;color:var(--muted);margin-top:5px;min-height:14px"></div>
+    </div>`;
+    setTimeout(() => {
+      const checkBtn = document.getElementById(`project-invite-check-${projectId}`) as HTMLButtonElement | null;
+      const emailEl = document.getElementById(`project-invite-email-${projectId}`) as HTMLInputElement | null;
+      const roleEl = document.getElementById(`project-invite-role-${projectId}`) as HTMLSelectElement | null;
+      const actionsEl = document.getElementById(`project-invite-actions-${projectId}`);
+      const statusEl = document.getElementById(`project-invite-status-${projectId}`);
+      if (!checkBtn || !emailEl || !roleEl || !actionsEl) return;
+      const setStatus = (msg: string) => { if (statusEl) statusEl.textContent = msg; };
+      const projectNameOf = (id: string) => ((window.state.projects || []).find((p: any) => p.id === id) as any)?.name || id;
+      const roleText = (row: any) => `${row.role}${row.pending ? ', invite pending' : ''}`;
+      const actionButton = (act: string, label: string, primary: boolean, mid = '') =>
+        `<button type="button" data-act="${act}" data-mid="${escapeHtml(mid)}" class="${primary ? 'primary' : 'secondary'}" style="font-size:10px;padding:4px 10px">${label}</button>`;
+
+      // Workspace membership rows for this email (a member can have one row per scope).
+      async function membershipFor(email: string): Promise<any[]> {
+        const members: any = await api('/workspace/members');
+        return (Array.isArray(members) ? members : []).filter((m: any) => String(m.email || '').toLowerCase() === email);
+      }
+
+      async function runCheck(): Promise<void> {
+        const email = (emailEl!.value || '').trim().toLowerCase();
+        actionsEl!.innerHTML = '';
+        if (!email || !email.includes('@')) { setStatus('Enter an email address.'); return; }
+        setStatus('Checking…');
+        let rows: any[];
+        try { rows = await membershipFor(email); } catch (e: any) { setStatus(`Error: ${String(e)}`); return; }
+        const workspaceRow = rows.find((r: any) => !r.project_id);
+        const thisRow = rows.find((r: any) => r.project_id === projectId);
+        const otherRows = rows.filter((r: any) => r.project_id && r.project_id !== projectId);
+        if (workspaceRow) {
+          setStatus(`${email} is already a workspace member (${roleText(workspaceRow)}), so they can open this project. Nothing to add.`);
+          return;
+        }
+        if (thisRow) {
+          setStatus(`${email} is already a member of this project (${roleText(thisRow)}).`);
+          actionsEl!.innerHTML = actionButton('elevate', 'Make workspace member', false, thisRow.id);
+          return;
+        }
+        if (otherRows.length) {
+          const names = otherRows.map((r: any) => projectNameOf(r.project_id)).join(', ');
+          setStatus(`${email} is a member of ${names} only. Add them to this project, or make them a workspace member.`);
+          actionsEl!.innerHTML = actionButton('add', 'Add to this project', true)
+            + actionButton('elevate', 'Make workspace member', false, otherRows[0].id);
+          return;
+        }
+        setStatus(`${email} is not in this workspace yet.`);
+        actionsEl!.innerHTML = actionButton('add', 'Invite to this project', true);
+      }
+
+      async function doInvite(email: string): Promise<void> {
+        await api('/workspace/invite', { method: 'POST', body: JSON.stringify({ email, role: roleEl!.value || 'member', project_id: projectId }) });
+        setStatus(`Invite sent to ${email} for this project.`);
+      }
+
+      async function doElevate(memberId: string, email: string): Promise<void> {
+        await api(`/workspace/members/${memberId}`, { method: 'PATCH', body: JSON.stringify({ project_id: null }) });
+        setStatus(`${email} is now a workspace member.`);
+      }
+
+      checkBtn.onclick = () => { void runCheck(); };
+      actionsEl.onclick = async (ev: Event) => {
+        const btn = (ev.target as HTMLElement).closest('button[data-act]') as HTMLButtonElement | null;
+        if (!btn) return;
+        const email = (emailEl.value || '').trim().toLowerCase();
+        btn.disabled = true;
+        try {
+          if (btn.dataset.act === 'add') await doInvite(email);
+          else if (btn.dataset.act === 'elevate') await doElevate(btn.dataset.mid || '', email);
+          (window as any)._membersRefresh?.[projectId]?.();
+          await runCheck();
+        } catch (e: any) {
+          setStatus(`Error: ${String(e)}`);
+          btn.disabled = false;
+        }
+      };
+    });
+  }
+
   // Team members section (hosted mode only) — always visible for all plan tiers (ecdae392)
 
   if (isHostedMode()) {
@@ -3648,6 +3981,8 @@ export async function loadSettingsTab(projectId: any, { force = false } = {}) {
     html += `<div style="margin-bottom:16px" id="members-section-${projectId}">
 
       <div style="color:var(--accent);font-size:10px;letter-spacing:.06em;text-transform:uppercase;margin-bottom:10px;padding-bottom:4px;border-bottom:1px solid var(--border)">Team members</div>
+
+      <div id="member-policy-${projectId}" style="display:none;margin-bottom:12px"></div>
 
       <div id="members-list-${projectId}" style="margin-bottom:10px;font-size:11px;font-family:var(--font-mono)"><div style="color:var(--muted)">loading…</div></div>
 
@@ -3667,9 +4002,9 @@ export async function loadSettingsTab(projectId: any, { force = false } = {}) {
 
         <select id="invite-scope-${projectId}" title="Scope to project (blank = full workspace access)" style="background:var(--surface-1);border:1px solid var(--border);border-radius:3px;color:var(--text);font-size:10px;font-family:var(--font-mono);padding:4px 6px">
 
-          <option value="">all projects</option>
+          <option value="">whole workspace (all projects)</option>
 
-          ${(window.state.projects || []).map((p: any) => `<option value="${escapeHtml(p.id)}">${escapeHtml(p.name || p.id)}</option>`).join('')}
+          ${(window.state.projects || []).map((p: any) => `<option value="${escapeHtml(p.id)}"${p.id === projectId ? ' selected' : ''}>${escapeHtml(p.name || p.id)}</option>`).join('')}
 
         </select>
 
@@ -3687,6 +4022,8 @@ export async function loadSettingsTab(projectId: any, { force = false } = {}) {
 
       const listEl = document.getElementById(`members-list-${projectId}`)!;
 
+      const policyEl = document.getElementById(`member-policy-${projectId}`);
+
       const inviteBtn = document.getElementById(`invite-btn-${projectId}`);
 
       const inviteEmail = document.getElementById(`invite-email-${projectId}`);
@@ -3697,21 +4034,307 @@ export async function loadSettingsTab(projectId: any, { force = false } = {}) {
 
       const inviteStatus = document.getElementById(`invite-status-${projectId}`);
 
+      function renderMemberPolicyControls(members: any[], policyState: any) {
+
+        if (!policyEl || _activeRole !== 'owner') return;
+
+        policyEl.style.display = '';
+
+        const catalog = Array.isArray(policyState?.catalog) ? policyState.catalog : [];
+
+        const records = Array.isArray(policyState?.overrides) ? policyState.overrides : [];
+
+        const recordById: Record<string, any> = Object.fromEntries(records.map((record: any) => [String(record.member_id), record]));
+
+        const scopedMembers = (members || []).filter((member: any) => !!member.project_id && !member.pending);
+
+        const defaultPolicyCorrupt = policyState.default_policy_status === 'corrupt';
+
+        const projectNameById = Object.fromEntries((window.state.projects || []).map((project: any) => [project.id, project.name || project.id]));
+
+        const controlStyle = 'background:var(--surface-1);border:1px solid var(--border);border-radius:3px;color:var(--text);font-size:10px;font-family:var(--font-mono);padding:3px 5px';
+
+        const capabilityRows = (values: any, target: string, memberId = '') => catalog.map((capability: any) => {
+
+          const capId = String(capability.id || '');
+
+          const raw = values?.[capId];
+
+          const corrupt = target === 'default'
+            ? defaultPolicyCorrupt
+            : recordById[memberId]?.policy_status === 'corrupt';
+
+          const current = corrupt
+            ? 'corrupt'
+            : target === 'member'
+              ? (raw === true ? 'allow' : raw === false ? 'deny' : 'inherit')
+              : (raw === true ? 'allow' : raw === false ? 'deny' : 'builtin');
+
+          const choices = target === 'member'
+            ? `${corrupt ? '<option value="corrupt" selected disabled>Corrupt · fail closed</option>' : ''}<option value="inherit" ${current === 'inherit' ? 'selected' : ''}>Inherit</option><option value="allow" ${current === 'allow' ? 'selected' : ''}>Allow</option><option value="deny" ${current === 'deny' ? 'selected' : ''}>Deny</option>`
+            : `${corrupt ? '<option value="corrupt" selected disabled>Corrupt · fail closed</option>' : ''}<option value="builtin" ${current === 'builtin' ? 'selected' : ''}>Built-in (${policyState.builtin_defaults?.[capId] ? 'Allow' : 'Deny'})</option><option value="allow" ${current === 'allow' ? 'selected' : ''}>Allow</option><option value="deny" ${current === 'deny' ? 'selected' : ''}>Deny</option>`;
+
+          const readout = target === 'member'
+            ? recordById[memberId]?.effective?.readout?.[capId]
+            : null;
+
+          const effectiveText = readout
+            ? `Effective: ${readout.allowed ? 'Allow' : 'Deny'} · ${escapeHtml(String(readout.source || 'policy').replace(/_/g, ' '))}${readout.reason ? ` · ${escapeHtml(String(readout.reason))}` : ''}`
+            : '';
+
+          return `<div style="display:grid;grid-template-columns:minmax(0,1fr) auto;gap:8px;align-items:center;padding:5px 0;border-top:1px solid var(--border)">
+            <div style="min-width:0"><div style="font-size:10px">${escapeHtml(String(capability.label || capId))}</div><div style="font-size:9px;color:var(--muted);line-height:1.4">${escapeHtml(String(capability.sentence || ''))}${effectiveText ? `<br>${effectiveText}` : ''}</div></div>
+            <select class="member-policy-select" data-target="${target}" data-mid="${escapeHtml(memberId)}" data-cap="${escapeHtml(capId)}" style="${controlStyle}" aria-label="${escapeHtml(String(capability.label || capId))} policy${target === 'member' ? ` for ${escapeHtml(String(recordById[memberId]?.email || memberId))}` : ' workspace default'}" ${corrupt ? 'disabled' : ''}>${choices}</select>
+          </div>`;
+
+        }).join('');
+
+        const defaults = `<details style="margin:7px 0;padding:7px 8px;border:1px solid var(--border);border-radius:4px">
+          <summary style="cursor:pointer;font-size:10px">Workspace defaults</summary>
+          <div style="font-size:9px;color:var(--muted);margin:5px 0">These defaults apply to accepted project-scoped members unless a member overrides them.</div>
+          ${defaultPolicyCorrupt ? '<div style="font-size:9px;color:var(--danger, #ff6b6b);margin:5px 0">Stored policy data is corrupt. Access is denied fail closed until you reset it.</div>' : ''}
+          ${capabilityRows(policyState.default_policy || {}, 'default')}
+          <button class="member-policy-default-reset secondary" style="font-size:9px;padding:2px 7px;margin-top:6px">Reset workspace policy to built-in defaults</button>
+        </details>`;
+
+        const memberControls = scopedMembers.length
+          ? scopedMembers.map((member: any) => {
+            const memberId = String(member.id || '');
+            const record = recordById[memberId];
+            const role = String(record?.effective?.role || member.role || 'member');
+            const project = String(member.project_name || projectNameById[member.project_id] || member.project_id || 'project');
+            const policyCorrupt = record?.policy_status === 'corrupt';
+            return `<details style="margin:6px 0;padding:7px 8px;border:1px solid var(--border);border-radius:4px">
+              <summary style="cursor:pointer;font-size:10px">${escapeHtml(String(member.email || 'Member'))} · ${escapeHtml(role)} · ${escapeHtml(project)}${policyCorrupt ? ' · Policy corrupt' : ''}</summary>
+              <div style="font-size:9px;color:var(--muted);margin:5px 0">Effective access includes role clamps. An inherited choice follows the workspace default.</div>
+              ${policyCorrupt ? '<div style="font-size:9px;color:var(--danger, #ff6b6b);margin:5px 0">Stored member policy is corrupt. Access is denied fail closed until cleared.</div>' : ''}
+              ${capabilityRows(record?.policy || {}, 'member', memberId)}
+              <button class="member-policy-reset secondary" data-mid="${escapeHtml(memberId)}" style="font-size:9px;padding:2px 7px;margin-top:6px">${policyCorrupt ? 'Clear corrupt policy and inherit' : 'Inherit all'}</button>
+            </details>`;
+          }).join('')
+          : '<div style="font-size:9px;color:var(--muted);padding:5px 0">No accepted project-scoped members.</div>';
+
+        policyEl.innerHTML = `<div style="padding:8px;border:1px solid var(--border);border-radius:5px;background:var(--surface-1)">
+          <div style="font-size:10px;font-weight:600;color:var(--accent)">Project-scoped member access</div>
+          <div style="font-size:9px;color:var(--muted);line-height:1.5;margin:4px 0">Control project writes, subproject creation and deletion, project deletion, and workspace-level changes.</div>
+          ${defaults}<div style="font-size:10px;font-weight:600;margin:9px 0 4px">Member overrides</div>${memberControls}
+          <div class="member-policy-status" style="font-size:9px;color:var(--muted);min-height:12px;margin-top:5px"></div>
+        </div>`;
+
+        const statusEl = policyEl.querySelector('.member-policy-status');
+
+        const showPolicyRefreshFailure = (message: string) => {
+
+          const currentStatus = policyEl.querySelector('.member-policy-status');
+
+          if (currentStatus) {
+
+            currentStatus.textContent = message;
+
+          } else {
+
+            const warning = document.createElement('div');
+
+            warning.className = 'member-policy-status';
+
+            warning.style.cssText = 'font-size:9px;color:var(--danger, #ff6b6b);min-height:12px;margin-top:5px';
+
+            warning.textContent = message;
+
+            policyEl.appendChild(warning);
+
+          }
+
+        };
+
+        policyEl.querySelectorAll('select.member-policy-select').forEach((select: any) => {
+
+          select.dataset.prev = select.value;
+
+          select.onchange = async () => {
+
+            const previous = select.dataset.prev;
+
+            const target = select.dataset.target;
+
+            const value = select.value === 'builtin' || select.value === 'inherit' ? null : select.value === 'allow';
+
+            const url = target === 'default'
+              ? '/workspace/member-policy'
+              : `/workspace/members/${encodeURIComponent(select.dataset.mid)}/policy`;
+
+            select.disabled = true;
+
+            if (statusEl) statusEl.textContent = 'Saving policy…';
+
+            try {
+
+              await api(url, { method: 'PATCH', body: JSON.stringify({ policy: { [select.dataset.cap]: value } }) });
+
+              // The write succeeded; if the follow-up read fails, keep this
+              // selected value as the rollback baseline rather than reverting
+              // a policy change the server has already stored.
+              select.dataset.prev = select.value;
+
+              const refreshed = await renderMembers();
+
+              if (!refreshed) {
+
+                select.disabled = false;
+
+                showPolicyRefreshFailure('Policy saved, but the member and policy views could not refresh. Reload settings to confirm effective access.');
+
+                return;
+
+              }
+
+              if (policyEl) {
+                const refreshedStatus = policyEl.querySelector('.member-policy-status');
+                if (refreshedStatus) refreshedStatus.textContent = 'Policy saved.';
+              }
+
+            } catch (e: any) {
+
+              select.value = previous;
+
+              select.disabled = false;
+
+              if (statusEl) statusEl.textContent = `Policy save failed: ${escapeHtml(String(e))}`;
+
+            }
+
+          };
+
+        });
+
+        policyEl.querySelectorAll('button.member-policy-reset').forEach((button: any) => {
+
+          button.onclick = async () => {
+
+            button.disabled = true;
+
+            if (statusEl) statusEl.textContent = 'Resetting member overrides…';
+
+            try {
+
+              await api(`/workspace/members/${encodeURIComponent(button.dataset.mid)}/policy`, { method: 'DELETE' });
+
+              const refreshed = await renderMembers();
+
+              if (!refreshed) {
+
+                button.disabled = false;
+
+                showPolicyRefreshFailure('Member overrides were reset, but the member and policy views could not refresh. Reload settings to confirm effective access.');
+
+                return;
+
+              }
+
+              if (policyEl) {
+                const refreshedStatus = policyEl.querySelector('.member-policy-status');
+                if (refreshedStatus) refreshedStatus.textContent = 'Member now inherits all workspace defaults.';
+              }
+
+            } catch (e: any) {
+
+              button.disabled = false;
+
+              if (statusEl) statusEl.textContent = `Policy reset failed: ${escapeHtml(String(e))}`;
+
+            }
+
+          };
+
+        });
+
+        policyEl.querySelectorAll('button.member-policy-default-reset').forEach((button: any) => {
+
+          button.onclick = async () => {
+
+            button.disabled = true;
+
+            if (statusEl) statusEl.textContent = 'Resetting workspace policy…';
+
+            try {
+
+              await api('/workspace/member-policy', { method: 'PATCH', body: JSON.stringify({ reset: true }) });
+
+              const refreshed = await renderMembers();
+
+              if (!refreshed) {
+
+                button.disabled = false;
+
+                showPolicyRefreshFailure('Workspace defaults were reset, but the member and policy views could not refresh. Reload settings to confirm effective access.');
+
+                return;
+
+              }
+
+              if (policyEl) {
+                const refreshedStatus = policyEl.querySelector('.member-policy-status');
+                if (refreshedStatus) refreshedStatus.textContent = 'Workspace policy now uses built-in defaults.';
+              }
+
+            } catch (e: any) {
+
+              button.disabled = false;
+
+              if (statusEl) statusEl.textContent = `Workspace policy reset failed: ${escapeHtml(String(e))}`;
+
+            }
+
+          };
+
+        });
+
+      }
 
 
-      async function renderMembers() {
 
-        if (!listEl) return;
+      // Exposed so the Project-tab add form can refresh this list after an invite.
+      (window as any)._membersRefresh = (window as any)._membersRefresh || {};
+      (window as any)._membersRefresh[projectId] = () => renderMembers();
+      async function renderMembers(): Promise<boolean> {
+
+        if (!listEl) return false;
+
+        let policyLoaded = true;
 
         try {
 
           const members = await api('/workspace/members');
 
+          if (_activeRole === 'owner' && policyEl) {
+
+            try {
+
+              const policyState = await api('/workspace/member-policy');
+
+              renderMemberPolicyControls(members || [], policyState);
+
+            } catch (e: any) {
+
+              policyLoaded = false;
+
+              policyEl.style.display = '';
+
+              policyEl.innerHTML = `<div style="font-size:9px;color:var(--muted);padding:6px 0">Member policy controls unavailable: ${escapeHtml(String(e))}</div>`;
+
+            }
+
+          } else if (policyEl) {
+
+            policyEl.style.display = 'none';
+
+          }
+
           if (!members || members.length === 0) {
 
             listEl.innerHTML = '<div style="color:var(--muted);font-size:10px">No team members yet.</div>';
 
-            return;
+            return policyLoaded;
 
           }
 
@@ -3841,9 +4464,13 @@ export async function loadSettingsTab(projectId: any, { force = false } = {}) {
 
           });
 
+          return policyLoaded;
+
         } catch(e) {
 
           if (listEl) listEl.innerHTML = '<div style="color:var(--muted);font-size:10px">Members only available in hosted mode.</div>';
+
+          return false;
 
         }
 
@@ -4128,6 +4755,13 @@ export async function loadSettingsTab(projectId: any, { force = false } = {}) {
           </div>`;
 
 
+
+        // A playtester is never billed: there is no overage budget to set, so the
+        // budget row is replaced by a note (the Save wiring below then finds no button).
+        if (u.overage_billing === false) {
+          const capsRow = document.getElementById(`save-caps-${projectId}`)?.parentElement;
+          if (capsRow) capsRow.innerHTML = '<span style="font-size:10px;color:var(--muted)">These limits are fixed for this account and there is no overage budget; you are emailed when usage passes them.</span>';
+        }
 
         const saveBtn = document.getElementById(`save-caps-${projectId}`);
 
@@ -4941,223 +5575,8 @@ export async function loadSettingsTab(projectId: any, { force = false } = {}) {
 
 
 
-  // Wire notification Save button
-
-  const ntfySaveBtn = document.getElementById(`ntfy-save-${projectId}`);
-
-  if (ntfySaveBtn) {
-
-    ntfySaveBtn.onclick = async () => {
-
-      const inp = document.getElementById(`ntfy-url-${projectId}`);
-
-      const statusEl = document.getElementById(`ntfy-status-${projectId}`);
-
-      // G1.7 — send the raw user input; the server canonicalizes ntfy
-
-      // entries to topic-only and suffixes for per-DB uniqueness. The
-
-      // response carries the saved value, which we reflect back into
-
-      // the field so the user sees what we actually stored.
-
-      const raw = (inp ? inp.value : '').trim() || null;
-
-      try {
-
-        const saved = await api(`/projects/${projectId}/ntfy`, {
-
-          method: 'PATCH',
-
-          body: JSON.stringify({ notify_url: raw, ntfy_url: raw }),
-
-        });
-
-        const savedVal = saved && (saved.notify_url || saved.ntfy_url || '');
-
-        const shownVal = displayNotifyTarget(savedVal || '');
-
-        if (inp) inp.value = shownVal || '';
-
-        if (statusEl) {
-
-          statusEl.textContent = shownVal && raw && shownVal.toLowerCase() !== displayNotifyTarget(String(raw)).toLowerCase()
-
-            ? `saved as ${shownVal}`
-
-            : 'saved';
-
-          setTimeout(() => { statusEl.textContent = ''; }, 2400);
-
-        }
-
-      } catch (e: any) {
-
-        if (statusEl) statusEl.textContent = 'error';
-
-      }
-
-    };
-
-  }
-
-
-
-  // Wire notification email Save button
-
-  const notifyEmailSaveBtn = document.getElementById(`notify-email-save-${projectId}`);
-
-  if (notifyEmailSaveBtn) {
-
-    notifyEmailSaveBtn.onclick = async () => {
-
-      const inp = document.getElementById(`notify-email-${projectId}`);
-
-      const statusEl = document.getElementById(`notify-email-status-${projectId}`);
-
-      const raw = (inp ? inp.value : '').trim() || null;
-
-      try {
-
-        await api(`/projects/${projectId}/ntfy`, {
-
-          method: 'PATCH',
-
-          body: JSON.stringify({ notify_email: raw }),
-
-        });
-
-        if (statusEl) {
-
-          statusEl.textContent = 'saved';
-
-          setTimeout(() => { statusEl.textContent = ''; }, 2400);
-
-        }
-
-      } catch (e: any) {
-
-        if (statusEl) statusEl.textContent = 'error';
-
-      }
-
-    };
-
-  }
-
-
-
-  // Wire notification Test button
-
-  const ntfyTestBtn = document.getElementById(`ntfy-test-${projectId}`);
-
-  if (ntfyTestBtn) {
-
-    ntfyTestBtn.onclick = async () => {
-
-      const statusEl = document.getElementById(`ntfy-status-${projectId}`);
-
-      ntfyTestBtn.disabled = true;
-
-      try {
-
-        await api(`/projects/${projectId}/notify/test`, { method: 'POST', body: '{}' });
-
-        if (statusEl) { statusEl.textContent = 'sent!'; setTimeout(() => { statusEl.textContent = ''; }, 3000); }
-
-      } catch (e: any) {
-
-        if (statusEl) {
-
-          const raw = String(e?.message || e || '');
-
-          let msg = raw.replace(/^\d+:\s*/, '');
-
-          try {
-
-            const parsed = JSON.parse(msg);
-
-            msg = parsed.detail || parsed.message || parsed.error || msg;
-
-          } catch (_err) {
-
-            // Keep the plain text message when the server did not return JSON.
-
-          }
-
-          statusEl.textContent = msg.includes('No notify URL configured') ? 'save a URL first' : msg;
-
-        }
-
-      } finally {
-
-        ntfyTestBtn.disabled = false;
-
-      }
-
-    };
-
-  }
-
-
-
-  // Wire ntfy security warning acknowledgement checkbox
-
-  const ntfyWarnAckCb = document.getElementById(`ntfy-warn-ack-${projectId}`);
-
-  if (ntfyWarnAckCb) {
-
-    ntfyWarnAckCb.onchange = () => {
-
-      if (!ntfyWarnAckCb.checked) return;
-
-      try { localStorage.setItem(STORAGE_KEY('ntfy.warn.dismissed'), '1'); } catch(e) {}
-
-      const warnEl = document.getElementById(`ntfy-warn-${projectId}`);
-
-      if (warnEl) warnEl.style.display = 'none';
-
-      const inp = document.getElementById(`ntfy-url-${projectId}`);
-
-      const saveBtn = document.getElementById(`ntfy-save-${projectId}`);
-
-      const testBtn = document.getElementById(`ntfy-test-${projectId}`);
-
-      [inp, saveBtn, testBtn].forEach(el => { if (el) { el.disabled = false; el.style.opacity = '1'; } });
-
-    };
-
-  }
-
-
-
-  body.querySelectorAll('input[data-pref]').forEach(cb => {
-
-    cb.onchange = async () => {
-
-      const statusEl = document.getElementById(`settings-save-status-${projectId}`);
-
-      const payload: Record<string, any> = {};
-
-      body.querySelectorAll('input[data-pref]').forEach(c => { payload[c.dataset.pref] = c.checked; });
-
-      try {
-
-        await api('/settings/notifications', { method: 'PATCH', body: JSON.stringify(payload) });
-
-        if (statusEl) { statusEl.textContent = 'saved'; setTimeout(() => { statusEl.textContent = ''; }, 1800); }
-
-      } catch (e: any) {
-
-        if (statusEl) statusEl.textContent = `error: ${escapeHtml(String(e))}`;
-
-      }
-
-    };
-
-  });
-
-
+  // Account-card handlers (ntfy / email Save, Test, acknowledge, notification prefs)
+  // are wired by _wireAccountPaneHandlers once the lazy card is rendered.
 
   // Wire GitHub OAuth connect button
 

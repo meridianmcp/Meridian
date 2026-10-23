@@ -1572,8 +1572,15 @@ def build_mcp_server():
                 description=(
                     "v3.1 — add a workspace-level note that applies across ALL "
                     "projects (onboarding, shared conventions, cross-cutting "
-                    "infra). Injected at the top of every project's context "
-                    "block + handoff. Tags are comma-separated."
+                    "infra). Its body is NOT inlined by default: session start "
+                    "and get_context_block carry only a short index (a note "
+                    "count plus the titles of notes tagged policy or "
+                    "workspace-policy), and a handoff carries notes only when "
+                    "generate_handoff(mode=\"full\") is requested explicitly. "
+                    "Read bodies with get_workspace_notes (tag=\"policy\" for "
+                    "the policy-tagged ones); the operator setting "
+                    "include_workspace_context inlines them into session "
+                    "start and get_context_block. Tags are comma-separated."
                 ),
                 inputSchema={
                     "type": "object",
@@ -1607,8 +1614,14 @@ def build_mcp_server():
                 description=(
                     "v3.1 — pin a workspace-level decision that applies across "
                     "ALL projects (shared architecture, org-wide standards). "
-                    "Injected at the top of every project's context block + "
-                    "handoff. category is free-text."
+                    "Session start and get_context_block show only a short "
+                    "index of the newest few decisions (one clipped line each, "
+                    "plus a count of the rest); a handoff carries none unless "
+                    "generate_handoff(mode=\"full\") is requested explicitly. "
+                    "Read the full text with get_workspace_decisions; the "
+                    "operator setting include_workspace_context inlines it "
+                    "into session start and get_context_block. category is "
+                    "free-text."
                 ),
                 inputSchema={
                     "type": "object",
@@ -1956,7 +1969,15 @@ def build_mcp_server():
                     "scope creep means the item won't fit this sprint. "
                     "``to_version`` records where it was moved (e.g. 'v2.0'). "
                     "The item status becomes 'pushed'; the next sprint can "
-                    "add it fresh with add_sprint_item."
+                    "add it fresh with add_sprint_item. This DEFERS the item to "
+                    "the backburner and leaves its own version unchanged. To "
+                    "keep an item pending and only put it in another version, "
+                    "update_sprint_item(version=...) re-versions that one item "
+                    "and nothing else: unlike the dashboard's 'Move to next "
+                    "version' it does not work out the next number for you, does "
+                    "not carry the item's subtasks along (they stay in the old "
+                    "version unless you re-version them too), writes no "
+                    "version-move history entry (open dashboards still repaint, as for any edit)."
                 ),
                 inputSchema={
                     "type": "object",
@@ -2108,38 +2129,10 @@ def build_mcp_server():
             # schema/description the HTTP/streamable-HTTP transport advertises so
             # the three transports can no longer drift apart on this tool.
             _shared_tool("start_session"),
-            Tool(
-                name="list_projects",
-                description=(
-                    "Call first when project_id is unknown. Returns the "
-                    "current tenant's projects as [{id, name, sprint, "
-                    "created_at}] newest first."
-                ),
-                inputSchema={"type": "object", "properties": {}},
-            ),
-            Tool(
-                name="get_project_by_name",
-                description=(
-                    "Look up a project by name (exact match, then "
-                    "case-insensitive exact match; not a substring search). "
-                    "Returns the match with id, name, and sprint. "
-                    "Use this when you know the project name but not the UUID."
-                ),
-                inputSchema={
-                    "type": "object",
-                    "properties": {
-                        "name": {
-                            "type": "string",
-                            "description": (
-                                "Full project name — exact match, then "
-                                "case-insensitive exact match (no partial "
-                                "or substring matching)."
-                            ),
-                        }
-                    },
-                    "required": ["name"],
-                },
-            ),
+            # #3 — the stdio server advertised pre-fix descriptions for these two tools because it hand-declared them.
+            # _shared_tool() pulls the same schema the HTTP transport serves, so the transports cannot drift apart.
+            _shared_tool("list_projects"),
+            _shared_tool("get_project_by_name"),
             Tool(
                 name="get_session_brief",
                 description=(
@@ -2250,6 +2243,7 @@ def build_mcp_server():
                     )
                     coherence = db_module.compute_coherence_warning(field_ages)
                     goal["field_ages"] = field_ages
+                    goal["field_updated_at"] = db_module.goal_field_stamps(goal)
                     goal["coherence_warning"] = coherence
                     decisions_raw = await db_module.get_decisions(
                         db, arguments["project_id"]
@@ -2274,14 +2268,23 @@ def build_mcp_server():
                         goal["meridian_instructions"] = meridian_md
                     result = goal
             elif name == "set_goal":
-                result = await db_module.set_goal(
-                    db,
-                    arguments["project_id"],
-                    arguments["content"],
-                    north_star=arguments.get("north_star"),
-                    sprint=arguments.get("sprint"),
-                    minor=bool(arguments.get("minor", False)),
-                )
+                _expected = arguments.get("expected_updated_at")
+                try:
+                    result = await db_module.set_goal(
+                        db,
+                        arguments["project_id"],
+                        arguments["content"],
+                        north_star=arguments.get("north_star"),
+                        sprint=arguments.get("sprint"),
+                        minor=bool(arguments.get("minor", False)),
+                        expected_updated_at=(
+                            {"version_goal": _expected}
+                            if _expected is not None else None
+                        ),
+                        actor=db_module.goal_actor("mcp"),
+                    )
+                except db_module.GoalConflict as exc:
+                    result = db_module.goal_conflict_detail(exc)
             elif name == "set_north_star":
                 owner = await db_module.get_project_owner(
                     db, arguments["project_id"]
@@ -2294,21 +2297,29 @@ def build_mcp_server():
                 else:
                     try:
                         result = await db_module.set_north_star(
-                            db, arguments["project_id"], arguments["north_star"]
+                            db, arguments["project_id"], arguments["north_star"],
+                            expected_updated_at=arguments.get("expected_updated_at"),
+                            actor=db_module.goal_actor("mcp", arguments.get("human_id")),
                         )
                         await goal_md_module.sync_db_to_goal_md(
                             db, arguments["project_id"]
                         )
+                    except db_module.GoalConflict as exc:
+                        result = db_module.goal_conflict_detail(exc)
                     except ValueError as exc:
                         result = {"error": str(exc)}
             elif name == "set_sprint":
                 try:
                     result = await db_module.set_sprint(
-                        db, arguments["project_id"], arguments["sprint"]
+                        db, arguments["project_id"], arguments["sprint"],
+                        expected_updated_at=arguments.get("expected_updated_at"),
+                        actor=db_module.goal_actor("mcp"),
                     )
                     await goal_md_module.sync_db_to_goal_md(
                         db, arguments["project_id"]
                     )
+                except db_module.GoalConflict as exc:
+                    result = db_module.goal_conflict_detail(exc)
                 except ValueError as exc:
                     result = {"error": str(exc)}
             elif name == "set_executor_config":

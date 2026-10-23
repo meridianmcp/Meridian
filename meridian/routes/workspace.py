@@ -2,13 +2,21 @@
 projects in a workspace. Backs the dashboard Settings → Workspace section."""
 from __future__ import annotations
 
+import json
 from typing import Any
 
 from fastapi import APIRouter, HTTPException, Request
 from fastapi.responses import Response
 
-from .._deps import _db, _get_tenant_from_request
+from .. import _deps
+from .._deps import (
+    WORKSPACE_SCOPE_DENIED,
+    _db,
+    _get_tenant_from_request,
+    _require_project_in_scope,
+)
 from .. import db as db_module
+from ..db import workspace as workspace_db
 
 router = APIRouter()
 
@@ -20,6 +28,347 @@ async def _tenant_id(request: Request) -> str | None:
     return tenant["id"] if tenant else None
 
 
+async def _deny_project_scoped_workspace(request: Request) -> None:
+    """403 when the caller is a project-scoped member of the workspace they are viewing.
+
+    Used by every workspace-level route, reads and writes alike. Workspace notes, decisions,
+    settings, blog posts and the workspace sprint board belong to no project, so a project
+    grant (and its subprojects) does not cover them, and a ``write_workspace_level`` grant
+    does not either: that capability is not consulted here. Owners, workspace-wide members,
+    self-hosted and demo callers resolve to ``None`` and are unchanged. A failure resolving
+    the scope propagates (callers map it to 503). The ``/workspace`` mutation gate in server.py
+    refuses the same routes with the same body before they reach a handler.
+    """
+    if await _deps._scoped_project_ids_for_request(request) is not None:
+        raise HTTPException(status_code=403, detail=WORKSPACE_SCOPE_DENIED)
+
+
+async def _member_policy_owner_context(request: Request) -> tuple[str, str, Any]:
+    """Return selected workspace identity after verifying its authenticated owner."""
+    from .._deps import _hosted_mode
+
+    if not _hosted_mode():
+        raise HTTPException(status_code=404, detail="Member policies require hosted mode")
+    caller = await _get_tenant_from_request(request)
+    if caller is None:
+        raise HTTPException(status_code=401, detail="Authentication required")
+    tenant_id = (
+        request.headers.get("x-workspace-tenant-id", "").strip()
+        or str(caller.get("id") or "")
+    )
+    if not tenant_id:
+        raise HTTPException(status_code=404, detail="Workspace not found")
+    auth_db = request.app.state.db
+    workspace = await db_module.get_tenant_by_id(auth_db, tenant_id)
+    if workspace is None:
+        raise HTTPException(status_code=404, detail="Workspace not found")
+    caller_email = str(caller.get("email") or "").strip().casefold()
+    owner_email = str(workspace.get("email") or "").strip().casefold()
+    if not caller_email or caller_email != owner_email:
+        raise HTTPException(status_code=403, detail="Workspace owner access required")
+    return tenant_id, caller_email, auth_db
+
+
+def _decode_policy_row(raw: str | None) -> dict[str, Any]:
+    if raw is None:
+        return {}
+    value = json.loads(raw)
+    if not isinstance(value, dict):
+        raise ValueError("stored member policy must be a JSON object")
+    return value
+
+
+def _is_policy_reset(body: dict[str, Any]) -> bool:
+    """Recognize the explicit reset operation without accepting mixed bodies."""
+    if "reset" not in body:
+        return False
+    if set(body) == {"reset"} and body["reset"] is True:
+        return True
+    raise HTTPException(status_code=400, detail="reset must be the only field and true")
+
+
+def _policy_patch(body: dict[str, Any], *, allow_null: bool) -> dict[str, bool | None]:
+    from .. import member_policy
+
+    patch = body.get("policy")
+    if not isinstance(patch, dict) or not patch:
+        raise HTTPException(status_code=400, detail="policy must be a non-empty object")
+    known = set(member_policy.CAPABILITY_IDS)
+    if set(patch) - known:
+        raise HTTPException(status_code=400, detail="policy contains an unknown capability")
+    if any(
+        not isinstance(value, bool) and not (allow_null and value is None)
+        for value in patch.values()
+    ):
+        raise HTTPException(status_code=400, detail="policy values must be booleans")
+    return patch
+
+
+def _stored_policy_view(raw: str | None) -> dict[str, bool | None]:
+    from .. import member_policy
+
+    try:
+        explicit = _decode_policy_row(raw)
+    except (TypeError, ValueError, json.JSONDecodeError):
+        # Preserve a useful owner view of corrupt rows without treating the
+        # corrupt value as a built-in default.
+        return {cid: None for cid in member_policy.CAPABILITY_IDS}
+    return {
+        cid: explicit[cid] if isinstance(explicit.get(cid), bool) else None
+        for cid in member_policy.CAPABILITY_IDS
+    }
+
+
+def _default_policy_status(raw: str | None) -> str:
+    """Distinguish corrupt defaults from an absent/empty built-in policy."""
+    if raw is None:
+        return "built_in"
+    try:
+        explicit = _decode_policy_row(raw)
+    except (TypeError, ValueError, json.JSONDecodeError):
+        return "corrupt"
+    return "configured" if explicit else "built_in"
+
+
+def _member_override_status(raw: str | None) -> str:
+    """Make a corrupt override visibly different from a clean inherited row."""
+    if raw is None:
+        return "inherited"
+    try:
+        explicit = _decode_policy_row(raw)
+    except (TypeError, ValueError, json.JSONDecodeError):
+        return "corrupt"
+    return "explicit" if explicit else "inherited"
+
+
+def _member_policy_view_from_rows(
+    email: str,
+    rows: dict[str, str | None],
+    roles: list[tuple[str, str | None]],
+    *,
+    member_id: str | None = None,
+    role: str | None = None,
+    project_id: str | None = None,
+) -> dict[str, Any]:
+    from .. import member_policy
+
+    effective = member_policy.compute_effective_policy(
+        rows.get("default"), rows.get("override"), roles,
+    )
+    result: dict[str, Any] = {
+        "email": email,
+        "policy": _stored_policy_view(rows.get("override")),
+        "policy_status": _member_override_status(rows.get("override")),
+        "effective": {
+            "capabilities": effective.as_dict(),
+            "readout": effective.readout(),
+            "sources": dict(effective.sources),
+            "role": effective.role,
+        },
+    }
+    if member_id is not None:
+        result["member_id"] = member_id
+    if role is not None:
+        result["role"] = role
+    if project_id is not None:
+        result["project_id"] = project_id
+    return result
+
+
+async def _member_policy_view(
+    auth_db: Any, tenant_id: str, email: str, *, member_id: str | None = None,
+    role: str | None = None, project_id: str | None = None,
+) -> dict[str, Any]:
+    rows = await db_module.get_member_policy_rows(auth_db, tenant_id, email)
+    roles = await db_module.get_member_roles(auth_db, tenant_id, email)
+    return _member_policy_view_from_rows(
+        email, rows, roles, member_id=member_id, role=role, project_id=project_id,
+    )
+
+
+def _raise_policy_patch_error(error: Exception) -> None:
+    if isinstance(error, workspace_db.CorruptMemberPolicyRow):
+        raise HTTPException(
+            status_code=409,
+            detail='Stored policy is corrupt; send {"reset":true} to safely reset it',
+        ) from error
+    if isinstance(error, workspace_db.ConcurrentMemberPolicyUpdate):
+        raise HTTPException(
+            status_code=409,
+            detail="Policy changed repeatedly during this update; retry the patch",
+        ) from error
+    raise error
+
+
+async def _require_policy_member(
+    auth_db: Any, tenant_id: str, member_id: str,
+) -> dict[str, Any]:
+    member = await db_module.get_workspace_member_by_id(auth_db, member_id, tenant_id)
+    if (
+        member is None
+        or member.get("joined_at") is None
+        or not member.get("project_id")
+        or not member.get("email")
+    ):
+        raise HTTPException(
+            status_code=404,
+            detail="Accepted project-scoped workspace member not found",
+        )
+    return member
+
+
+@router.get("/workspace/member-policy")
+async def get_workspace_member_policy(request: Request) -> dict[str, Any]:
+    """Return workspace defaults and effective policies for scoped members."""
+    from .. import member_policy
+
+    tenant_id, _owner_email, auth_db = await _member_policy_owner_context(request)
+    defaults = await db_module.get_member_policy_rows(auth_db, tenant_id, None)
+    raw_default = defaults.get("default")
+    default_policy = _stored_policy_view(raw_default)
+    members = await workspace_db.list_member_policy_members(auth_db, tenant_id)
+    grouped: dict[str, dict[str, Any]] = {}
+    for member in members:
+        email = str(member.get("email") or "").strip().casefold()
+        if not email:
+            continue
+        entry = grouped.get(email)
+        if entry is None:
+            entry = {
+                "members": [],
+                "roles": [],
+            }
+            grouped[email] = entry
+        if member.get("row_kind") == "member":
+            # A person-level policy can have multiple project-scoped membership
+            # rows. Preserve every id so the owner UI can key each project's
+            # control/readout to its own membership.
+            entry["members"].append({
+                "member_id": str(member["member_id"]),
+                "role": str(member.get("role") or "member"),
+                "project_id": str(member["project_id"]),
+                "override": member.get("override"),
+            })
+        else:
+            entry["roles"].append((
+                str(member.get("policy_role") or "member"),
+                member.get("policy_project_id"),
+            ))
+    result_overrides = []
+    for email, entry in grouped.items():
+        for scoped_member in entry["members"]:
+            result_overrides.append(_member_policy_view_from_rows(
+                email,
+                {"default": raw_default, "override": scoped_member["override"]},
+                entry["roles"],
+                member_id=scoped_member["member_id"],
+                role=scoped_member["role"],
+                project_id=scoped_member["project_id"],
+            ))
+    return {
+        "workspace_tenant_id": tenant_id,
+        "default_policy": default_policy,
+        "default_policy_status": _default_policy_status(raw_default),
+        "catalog": [
+            {
+                "id": capability.id,
+                "label": capability.label,
+                "sentence": capability.sentence,
+                "builtin_default": capability.builtin_default,
+            }
+            for capability in member_policy.CAPABILITIES
+        ],
+        "builtin_defaults": dict(member_policy.BUILTIN_DEFAULTS),
+        "overrides": result_overrides,
+    }
+
+
+@router.patch("/workspace/member-policy")
+async def patch_workspace_member_policy(
+    body: dict[str, Any], request: Request,
+) -> dict[str, Any]:
+    """Patch explicit workspace defaults; null clears a key to its built-in value."""
+    tenant_id, owner_email, auth_db = await _member_policy_owner_context(request)
+    if _is_policy_reset(body):
+        await db_module.set_member_policy_default(auth_db, tenant_id, {}, owner_email)
+        defaults = await db_module.get_member_policy_rows(auth_db, tenant_id, None)
+        return {
+            "workspace_tenant_id": tenant_id,
+            "default_policy": _stored_policy_view(defaults.get("default")),
+        }
+    patch = _policy_patch(body, allow_null=True)
+    try:
+        await workspace_db.patch_member_policy_default(
+            auth_db, tenant_id, patch, owner_email,
+        )
+    except (workspace_db.CorruptMemberPolicyRow, workspace_db.ConcurrentMemberPolicyUpdate) as exc:
+        _raise_policy_patch_error(exc)
+    defaults = await db_module.get_member_policy_rows(auth_db, tenant_id, None)
+    return {
+        "workspace_tenant_id": tenant_id,
+        "default_policy": _stored_policy_view(defaults.get("default")),
+    }
+
+
+@router.get("/workspace/members/{member_id}/policy")
+async def get_workspace_member_policy_override(
+    member_id: str, request: Request,
+) -> dict[str, Any]:
+    """Return one accepted project-scoped member's override and effective policy."""
+    tenant_id, _owner_email, auth_db = await _member_policy_owner_context(request)
+    member = await _require_policy_member(auth_db, tenant_id, member_id)
+    return await _member_policy_view(
+        auth_db, tenant_id, str(member["email"]).strip().casefold(),
+        member_id=member_id, role=str(member.get("role") or "member"),
+        project_id=str(member["project_id"]),
+    )
+
+
+@router.patch("/workspace/members/{member_id}/policy")
+async def patch_workspace_member_policy_override(
+    member_id: str, body: dict[str, Any], request: Request,
+) -> dict[str, Any]:
+    """Patch a member override; null clears that key to inherit the workspace default."""
+    tenant_id, owner_email, auth_db = await _member_policy_owner_context(request)
+    member = await _require_policy_member(auth_db, tenant_id, member_id)
+    email = str(member["email"]).strip().casefold()
+    if _is_policy_reset(body):
+        await db_module.clear_member_policy_override(
+            auth_db, tenant_id, email, updated_by=owner_email,
+        )
+        return await _member_policy_view(
+            auth_db, tenant_id, email, member_id=member_id,
+            role=str(member.get("role") or "member"),
+            project_id=str(member["project_id"]),
+        )
+    patch = _policy_patch(body, allow_null=True)
+    try:
+        await workspace_db.patch_member_policy_override(
+            auth_db, tenant_id, email, patch, owner_email,
+        )
+    except (workspace_db.CorruptMemberPolicyRow, workspace_db.ConcurrentMemberPolicyUpdate) as exc:
+        _raise_policy_patch_error(exc)
+    return await _member_policy_view(
+        auth_db, tenant_id, email, member_id=member_id,
+        role=str(member.get("role") or "member"),
+        project_id=str(member["project_id"]),
+    )
+
+
+@router.delete("/workspace/members/{member_id}/policy", status_code=204)
+async def clear_workspace_member_policy_override(
+    member_id: str, request: Request,
+) -> Response:
+    """Clear the member override so every capability inherits the workspace default."""
+    tenant_id, owner_email, auth_db = await _member_policy_owner_context(request)
+    member = await _require_policy_member(auth_db, tenant_id, member_id)
+    await db_module.clear_member_policy_override(
+        auth_db, tenant_id, str(member["email"]).strip().casefold(),
+        updated_by=owner_email,
+    )
+    return Response(status_code=204)
+
+
 # --- Workspace notes -------------------------------------------------------
 
 @router.get("/workspace/notes")
@@ -27,6 +376,7 @@ async def list_workspace_notes_endpoint(
     request: Request, tag: str | None = None
 ) -> list[dict[str, Any]]:
     """Workspace notes (newest first). ``?tag=X`` filters by substring match."""
+    await _deny_project_scoped_workspace(request)
     return await db_module.get_workspace_notes(
         await _db(request), tag=tag, tenant_id=await _tenant_id(request)
     )
@@ -37,6 +387,7 @@ async def create_workspace_note_endpoint(
     body: dict[str, Any], request: Request
 ) -> dict[str, Any]:
     """Create a workspace note. Body: {title, body, tags?}."""
+    await _deny_project_scoped_workspace(request)
     title = (body.get("title") or "").strip()
     text = (body.get("body") or "").strip()
     if not title or not text:
@@ -52,6 +403,7 @@ async def update_workspace_note_endpoint(
     note_id: str, body: dict[str, Any], request: Request
 ) -> dict[str, Any]:
     """Patch title/body/tags on a workspace note."""
+    await _deny_project_scoped_workspace(request)
     result = await db_module.update_workspace_note(
         await _db(request), note_id,
         title=body.get("title"),
@@ -69,6 +421,7 @@ async def delete_workspace_note_endpoint(
     note_id: str, request: Request
 ) -> Response:
     """Hard-delete a workspace note. Returns 204 or 404."""
+    await _deny_project_scoped_workspace(request)
     ok = await db_module.delete_workspace_note(
         await _db(request), note_id, tenant_id=await _tenant_id(request)
     )
@@ -83,9 +436,18 @@ async def move_workspace_note_endpoint(
 ) -> dict[str, Any]:
     """Move a workspace note to a project (converts it to a project note and
     removes it from the workspace). Body: {project_id}. Returns the new note."""
+    # Moving a workspace note hands its content to the destination project, which a
+    # project-scoped caller can then read. Refused for them whatever the
+    # write_workspace_level grant (the MCP twin is in scope_guard.WORKSPACE_DENY).
+    await _deny_project_scoped_workspace(request)
     project_id = (body.get("project_id") or "").strip()
     if not project_id:
         raise HTTPException(status_code=400, detail="project_id required")
+    # RT-TI-005 (wave 2) — the destination project comes from the body, outside the
+    # /projects/{uuid} middleware, and the db helper only checks that it exists:
+    # a project-scoped member could otherwise plant a note in any other project
+    # (and delete it from the workspace store). Same rule the MCP twin applies.
+    await _require_project_in_scope(request, project_id)
     moved = await db_module.move_workspace_note_to_project(
         await _db(request), note_id, project_id,
         tenant_id=await _tenant_id(request),
@@ -103,6 +465,7 @@ async def list_workspace_decisions_endpoint(
 ) -> list[dict[str, Any]]:
     """Active workspace decisions (newest first). ``?include_superseded=true``
     returns full history."""
+    await _deny_project_scoped_workspace(request)
     return await db_module.get_workspace_decisions(
         await _db(request), include_superseded=include_superseded,
         tenant_id=await _tenant_id(request),
@@ -114,6 +477,7 @@ async def create_workspace_decision_endpoint(
     body: dict[str, Any], request: Request
 ) -> dict[str, Any]:
     """Pin a workspace decision. Body: {title, body, category?}."""
+    await _deny_project_scoped_workspace(request)
     title = (body.get("title") or "").strip()
     text = (body.get("body") or "").strip()
     category = body.get("category", "TECHNICAL")
@@ -130,6 +494,7 @@ async def delete_workspace_decision_endpoint(
     decision_id: str, request: Request
 ) -> Response:
     """Hard-delete a workspace decision. Returns 204 or 404."""
+    await _deny_project_scoped_workspace(request)
     ok = await db_module.delete_workspace_decision(
         await _db(request), decision_id, tenant_id=await _tenant_id(request)
     )
@@ -143,6 +508,7 @@ async def delete_workspace_decision_endpoint(
 @router.get("/workspace/settings")
 async def get_workspace_settings_endpoint(request: Request) -> dict[str, Any]:
     """Read the workspace-global default settings (singleton)."""
+    await _deny_project_scoped_workspace(request)
     return await db_module.get_workspace_settings(
         await _db(request), tenant_id=await _tenant_id(request)
     )
@@ -164,6 +530,7 @@ async def update_workspace_settings_endpoint(
     available through the MCP update_workspace_settings tool, which calls
     db.update_workspace_settings directly and does not go through this route.
     """
+    await _deny_project_scoped_workspace(request)
     nudge_thresh = body.get("log_task_sprint_nudge_threshold")
     interval = body.get("refresh_interval_turns")
     trigger_min_interval = body.get("refresh_trigger_min_interval")
@@ -205,6 +572,7 @@ async def list_workspace_blog_endpoint(
 ) -> list[dict[str, Any]]:
     """Workspace-scoped blog posts (newest first). ``?status=`` filters to
     draft|published|archived. Each post carries a ``/blog/<slug>`` url (8843250f)."""
+    await _deny_project_scoped_workspace(request)
     return await db_module.get_blog_posts(
         await _db(request), tenant_id=await _tenant_id(request), status=status
     )
@@ -216,6 +584,7 @@ async def create_workspace_blog_endpoint(
 ) -> dict[str, Any]:
     """Create or update a workspace blog post. Body: {title, body?, status?,
     slug?, id?}. Pass ``id`` to update an existing post."""
+    await _deny_project_scoped_workspace(request)
     title = (body.get("title") or "").strip()
     if not title:
         raise HTTPException(status_code=400, detail="title required")
@@ -236,6 +605,7 @@ async def list_workspace_sprint_items_endpoint(
 ) -> list[dict[str, Any]]:
     """Workspace sprint items, grouped by item_group. ``?status=`` and
     ``?group=`` filter. Not tied to any project."""
+    await _deny_project_scoped_workspace(request)
     return await db_module.get_workspace_sprint_items(
         await _db(request), status=status, item_group=group,
         tenant_id=await _tenant_id(request),
@@ -247,6 +617,7 @@ async def create_workspace_sprint_item_endpoint(
     body: dict[str, Any], request: Request
 ) -> dict[str, Any]:
     """Add a workspace sprint item. Body: {title, group?, human_id?}."""
+    await _deny_project_scoped_workspace(request)
     title = (body.get("title") or "").strip()
     if not title:
         raise HTTPException(status_code=400, detail="title required")
@@ -263,6 +634,7 @@ async def patch_workspace_sprint_item_endpoint(
     item_id: str, body: dict[str, Any], request: Request
 ) -> dict[str, Any]:
     """Patch title/status/group/human_id on a workspace sprint item."""
+    await _deny_project_scoped_workspace(request)
     item = await db_module.update_workspace_sprint_item(
         await _db(request), item_id,
         title=body.get("title"),
@@ -281,6 +653,7 @@ async def complete_workspace_sprint_item_endpoint(
     item_id: str, request: Request
 ) -> dict[str, Any]:
     """Mark a workspace sprint item done (stamps completed_at)."""
+    await _deny_project_scoped_workspace(request)
     item = await db_module.complete_workspace_sprint_item(
         await _db(request), item_id, tenant_id=await _tenant_id(request)
     )

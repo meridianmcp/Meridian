@@ -550,12 +550,11 @@ async def _compensate_sprint_item_entry(
         kind = comp_state[0]
         if kind == "create":
             item_id = comp_state[1]
-            await db.execute(
-                "DELETE FROM sprint_items WHERE id = ? AND project_id = ?",
-                (item_id, project_id),
-            )
-            await db.commit()
-            db_module._invalidate_sprint_items_cache(project_id)
+            # 8a665a03 -- delete_sprint_item busts the cache AND announces the removal.
+            # The raw DELETE this replaced only busted the cache, so a dashboard that
+            # refetched between the create's sprint_item_added event and the rollback kept
+            # the phantom row of a batch that never happened.
+            await db_module.delete_sprint_item(db, project_id, item_id)
         elif kind == "update":
             _, item_id, changed_fields, snapshot = comp_state
             revert_kwargs: dict[str, Any] = {}
@@ -653,6 +652,19 @@ async def _validate_note_entry(
     if not isinstance(body, str):
         raise _EntryError(ERROR_VALIDATION, "note entry requires a string 'body'")
     note_kind = raw.get("note_kind")
+    # RT-TI-005 (pass 3, F-D4) -- a note entry writes into a SESSION, and add_session_note
+    # writes to any session id it is handed, so without this check a batch addressed to
+    # project A planted notes (re-injected into that agent's next context) in a session of
+    # project B. A session that exists but belongs to another project is refused exactly
+    # like a sprint item of another project (NOT_FOUND, nothing written, in either mode).
+    # An id that names no session at all is not this check's business: it is left to
+    # add_session_note exactly as before (its foreign key refuses it).
+    async with db.execute(
+        "SELECT project_id FROM sessions WHERE id = ?", (session_id,)
+    ) as cur:
+        session_row = await cur.fetchone()
+    if session_row is not None and session_row["project_id"] != project_id:
+        raise _EntryError(ERROR_NOT_FOUND, f"session not found in project: {session_id}")
     return {"session_id": session_id, "title": title, "body": body, "note_kind": note_kind}
 
 
@@ -946,9 +958,10 @@ async def execute_batch(
         Scopes every entry exactly the way the underlying single-entry
         functions already do (``sprint_item``/``sprint_item_pointer`` entries
         are written with this ``project_id``; ``sprint_note`` entries are
-        scoped by their own ``session_id`` instead, matching
-        ``add_session_note``'s existing, unmodified contract -- this function
-        does not add a project check ``add_session_note`` never had).
+        scoped by their own ``session_id`` instead -- RT-TI-005 pass 3 (F-D4)
+        adds the one project check ``add_session_note`` never had: a note
+        entry whose ``session_id`` names a session of ANOTHER project is
+        rejected with ``NOT_FOUND`` and nothing is written).
     entry_kind:
         One of :data:`BATCH_ENTRY_KINDS`. Every entry in ``entries`` is
         processed by the SAME adapter -- mixed kinds in one call are not

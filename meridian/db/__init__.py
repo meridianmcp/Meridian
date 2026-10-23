@@ -21,18 +21,128 @@ import os
 import re
 import time
 import uuid
+from contextlib import asynccontextmanager
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
 
 import aiosqlite
 
 from meridian import capability_manifest as _capability_manifest
 from meridian import capability_profile as _capability_profile
 from meridian.finding_identity import finding_identity as _finding_identity
+from meridian.rights_policy import COMMERCIALIZED, STANDARD_PUBLICATION, RightsPolicyError
 
 _log = logging.getLogger(__name__)
 
 _UNSET = object()  # sentinel for "not passed" in optional keyword args
+
+# SQLite connections are shared by async requests in the self-hosted server.
+# Serialize the three operations that can change project hierarchy membership
+# on a given connection; BEGIN IMMEDIATE cannot protect against another task
+# interleaving statements on that very same connection.
+_PROJECT_HIERARCHY_WRITE_LOCKS: dict[tuple[int, int], asyncio.Lock] = {}
+
+
+def _project_hierarchy_write_lock(db: aiosqlite.Connection) -> asyncio.Lock:
+    key = (id(asyncio.get_running_loop()), id(db))
+    lock = _PROJECT_HIERARCHY_WRITE_LOCKS.get(key)
+    if lock is None:
+        lock = _PROJECT_HIERARCHY_WRITE_LOCKS[key] = asyncio.Lock()
+    return lock
+
+
+@asynccontextmanager
+async def _project_hierarchy_write_guard(
+    db: aiosqlite.Connection, *, postgres_serialization: bool = False
+):
+    begin_transaction = getattr(db, "begin_transaction", None)
+    if callable(begin_transaction):
+        if not postgres_serialization:
+            yield
+            return
+        # Row-level CAS predicates cannot serialize writes to different rows
+        # when one statement checks the other's membership subquery. Pin a
+        # transaction and take the same table lock used by expected deletes;
+        # it conflicts with every INSERT/UPDATE/DELETE on projects, including
+        # writes from another process that do not use this helper.
+        async with begin_transaction():
+            try:
+                await db.execute("LOCK TABLE projects IN SHARE ROW EXCLUSIVE MODE")
+                yield
+            except BaseException:
+                try:
+                    await db.rollback()
+                except BaseException:  # preserve the error that caused rollback
+                    _log.exception("could not roll back project hierarchy write")
+                raise
+        return
+    # SQLite's database write lock serializes independent connections; this
+    # asyncio lock also prevents tasks sharing one connection from interleaving.
+    async with _project_hierarchy_write_lock(db):
+        yield
+
+
+@asynccontextmanager
+async def _expected_project_delete_transaction(db: aiosqlite.Connection):
+    """Hold the hierarchy stable from the final check through every delete."""
+    begin_transaction = getattr(db, "begin_transaction", None)
+    if callable(begin_transaction):
+        # PostgresConnection normally autocommits one statement at a time.
+        # Its explicit transaction pins one connection, and this table lock
+        # conflicts with all project INSERT/UPDATE/DELETE statements on every
+        # server process, including operations that do not know about this lock.
+        async with begin_transaction():
+            try:
+                await db.execute("LOCK TABLE projects IN SHARE ROW EXCLUSIVE MODE")
+                yield
+            except BaseException:
+                try:
+                    await db.rollback()
+                except BaseException:  # preserve the error that caused rollback
+                    _log.exception("could not roll back expected project delete")
+                raise
+        return
+
+    # SQLite's reserved write lock stops writers on other connections. A
+    # savepoint composes with callers/tests that already own a transaction;
+    # the no-op UPDATE upgrades an existing deferred read transaction before
+    # the hierarchy snapshot is re-read.
+    nested = bool(getattr(db, "in_transaction", False))
+    savepoint = f"sp_project_delete_{uuid.uuid4().hex}"
+    if nested:
+        await db.execute(f"SAVEPOINT {savepoint}")
+    else:
+        await db.execute("BEGIN IMMEDIATE")
+    try:
+        if nested:
+            await db.execute("UPDATE projects SET id = id WHERE 0")
+        yield
+    except BaseException:
+        try:
+            if nested:
+                await db.execute(f"ROLLBACK TO SAVEPOINT {savepoint}")
+                await db.execute(f"RELEASE SAVEPOINT {savepoint}")
+            else:
+                await db.execute("ROLLBACK")
+        except BaseException:  # preserve the error that caused rollback
+            _log.exception("could not roll back expected project delete")
+        raise
+    else:
+        try:
+            if nested:
+                await db.execute(f"RELEASE SAVEPOINT {savepoint}")
+            else:
+                await db.execute("COMMIT")
+        except BaseException:
+            try:
+                if nested:
+                    await db.execute(f"ROLLBACK TO SAVEPOINT {savepoint}")
+                    await db.execute(f"RELEASE SAVEPOINT {savepoint}")
+                else:
+                    await db.execute("ROLLBACK")
+            except BaseException:
+                _log.exception("could not roll back expected project delete")
+            raise
 
 # ecf69de8 — per-project executor posture. 'autonomous' (default): claim and run
 # pending sprint items immediately without asking for direction. 'interactive':
@@ -53,6 +163,29 @@ def normalize_execution_mode(mode: str | None) -> str:
         if candidate in EXECUTION_MODES:
             return candidate
     return DEFAULT_EXECUTION_MODE
+
+
+# Project use mode: the rights gate's per-project input (meridian.rights_policy).
+# Unlike execution_mode this is STRICT. A bad value raises and writes nothing and
+# is never coerced to the default, so a typo cannot silently relax the gate.
+USE_MODES = (STANDARD_PUBLICATION, COMMERCIALIZED)
+DEFAULT_USE_MODE = STANDARD_PUBLICATION
+#: action_audit_log.event_type written by set_project_use_mode.
+PROJECT_USE_MODE_EVENT_TYPE = "project_use_mode_changed"
+
+
+def validate_use_mode(mode: Any) -> str:
+    """Return ``mode`` unchanged when it is exactly one of USE_MODES, else raise.
+
+    Refuses None, blanks, other case and surrounding whitespace. Raises
+    RightsPolicyError (a ValueError subclass) with code USE_MODE_INVALID.
+    """
+    if isinstance(mode, str) and mode in USE_MODES:
+        return mode
+    raise RightsPolicyError(
+        "USE_MODE_INVALID",
+        f"use_mode must be {STANDARD_PUBLICATION!r} or {COMMERCIALIZED!r}, not {mode!r}",
+    )
 
 # ---------------------------------------------------------------------------
 # Transparent field encryption (Fernet, MERIDIAN_ENCRYPTION_KEY env var).
@@ -169,6 +302,77 @@ def _publish_project_event(project_id: str, event_type: str, payload: dict[str, 
         except asyncio.QueueFull:
             _log.warning("WS broadcast queue full for project %s — event dropped", project_id[:8])
 
+
+# 8a665a03 -- the ACCOUNT stream. ``_TASK_LISTENERS`` is keyed by project_id and a dashboard
+# opens one socket per open project TAB, so a dashboard with no project tab open (the last
+# one closed, a fresh account) held no socket at all and never heard that the project LIST
+# changed. This registry is keyed by the DATABASE the dashboard reads instead: self-hosted
+# has one database, hosted has one per tenant (and a workspace member reads the owner's).
+# An announcement published for a database therefore reaches exactly the sockets whose
+# caller can read that database's project list -- the boundary GET /projects applies --
+# and never another tenant's, which the process-wide per-project registry cannot promise.
+# The entry holds the database object itself so its ``id()`` cannot be recycled for another
+# connection while a socket is still registered under it.
+_ACCOUNT_LISTENERS: dict[int, tuple[Any, set[asyncio.Queue]]] = {}
+
+
+def subscribe_account(db: Any) -> asyncio.Queue:
+    """Register a listener queue for the account-level stream of ``db``'s project list."""
+    q: asyncio.Queue = asyncio.Queue()
+    _ACCOUNT_LISTENERS.setdefault(id(db), (db, set()))[1].add(q)
+    return q
+
+
+def unsubscribe_account(db: Any, queue: asyncio.Queue) -> None:
+    """Drop a listener registered by :func:`subscribe_account`. Safe to call twice."""
+    entry = _ACCOUNT_LISTENERS.get(id(db))
+    if entry and queue in entry[1]:
+        entry[1].discard(queue)
+        if not entry[1]:
+            _ACCOUNT_LISTENERS.pop(id(db), None)
+
+
+def _publish_account_event(db: Any, event_type: str, payload: dict[str, Any]) -> None:
+    """Fan an account-level event out to the sockets reading ``db``'s project list.
+
+    Synchronous and non-blocking like :func:`_publish_project_event`: a full queue means
+    the socket is wedged, so the event is dropped rather than back-pressuring the writer.
+    """
+    entry = _ACCOUNT_LISTENERS.get(id(db))
+    if not entry:
+        return
+    event = {"type": event_type, **payload}
+    for q in list(entry[1]):
+        try:
+            q.put_nowait(event)
+        except asyncio.QueueFull:
+            _log.warning("account WS broadcast queue full -- %s event dropped", event_type)
+
+
+def _publish_projects_changed(db: aiosqlite.Connection, change: str) -> None:
+    """8a665a03 -- tell every open dashboard that the PROJECT LIST changed.
+
+    The sidebar's project list is a view like any other, but a project is not owned by any
+    one project's event stream: creating one has no listeners yet and deleting one removes
+    the very stream it would be announced on. So it rides the account stream of ``db``
+    (see ``_ACCOUNT_LISTENERS``), which the dashboard holds open for as long as the page
+    is, with or without a project tab. The client refetches ``GET /projects`` (which
+    applies the caller's workspace scoping), so the event carries no project name or id.
+
+    It deliberately does NOT use :func:`publish_global`: ``_TASK_LISTENERS`` is one
+    process-wide registry, so on hosted Meridian a global event reaches every tenant's open
+    dashboards. ``db`` is the caller's own database (the tenant's own Neon DB on hosted),
+    which is what keeps the announcement inside the tenant. Call it AFTER the change
+    commits; a deleted project is told separately (``project_deleted``, on its own stream)
+    so the tab showing it can close. Never raises: an announcement failure must never undo
+    the change that already committed.
+    """
+    try:
+        _publish_account_event(db, "projects_changed", {"change": change})
+    except Exception:  # noqa: BLE001 -- notification only
+        _log.debug("projects_changed: could not announce", exc_info=True)
+
+
 CREATE_TABLES = """
 CREATE TABLE IF NOT EXISTS projects (
     id TEXT PRIMARY KEY,
@@ -185,6 +389,8 @@ CREATE TABLE IF NOT EXISTS projects (
     parent_project_id TEXT,
     execution_mode TEXT NOT NULL DEFAULT 'autonomous'
         CHECK (execution_mode IN ('autonomous', 'interactive')),
+    use_mode TEXT NOT NULL DEFAULT 'standard_publication'
+        CHECK (use_mode IN ('standard_publication', 'commercialized')),
     status TEXT NOT NULL DEFAULT 'active'
         CHECK (status IN ('active', 'parked', 'archived')),
     priority TEXT NOT NULL DEFAULT 'P2'
@@ -509,13 +715,27 @@ CREATE TABLE IF NOT EXISTS workspace_members (
     github_access TEXT NOT NULL DEFAULT 'read',
     -- d116642e: project-level invites foundation.
     -- NULL = workspace-wide member (sees all projects, current behavior);
-    -- set = project-scoped member (listing-only scoping, see get_workspaces_for_email).
-    -- Airtight per-request access enforcement is intentionally NOT implemented
-    -- here — it is gated on the open product decision in pin b11c7cf6.
+    -- set = project-scoped member (reads and writes limited to that project and
+    -- its subprojects, with what they may do inside it set by member_policy below).
     project_id TEXT,
     token_hash TEXT,
     invited_at TEXT NOT NULL DEFAULT (datetime('now')),
     joined_at TEXT
+);
+
+-- Capability policy for project-scoped members. tenant_id is the workspace
+-- OWNER's tenant id. subject is '*' for the workspace default, otherwise
+-- LOWER(email) for one person's override (an email can never equal '*').
+-- policy is a JSON object of {capability_id: bool}. Per person, not per
+-- workspace_members row, because that table has one row per (email, project).
+-- No ALTER anywhere: this is a new table, created idempotently on every boot.
+CREATE TABLE IF NOT EXISTS member_policy (
+    tenant_id TEXT NOT NULL,
+    subject TEXT NOT NULL,
+    policy TEXT NOT NULL DEFAULT '{}',
+    updated_by TEXT,
+    updated_at TEXT NOT NULL DEFAULT (datetime('now')),
+    PRIMARY KEY (tenant_id, subject)
 );
 
 -- v2.1 dark — per-tenant named environments (prod/staging/dev), not exposed at launch
@@ -1060,6 +1280,7 @@ async def init_db(db_path: str) -> aiosqlite.Connection:
     await _migrate_note_source(db)
     await _migrate_session_sprint_version(db)
     await _migrate_project_execution_mode(db)
+    await _migrate_project_use_mode(db)
     await _migrate_decision_code_anchor(db)
     await _migrate_session_graph_snapshots(db)
     await _migrate_agent_tasks_table(db)
@@ -1181,7 +1402,7 @@ async def init_db(db_path: str) -> aiosqlite.Connection:
     return db
 
 
-async def create_project(
+async def _create_project_unlocked(
     db: aiosqlite.Connection,
     name: str,
     human_id: str | None = None,
@@ -1235,13 +1456,32 @@ async def create_project(
         execution_mode = _ws["execution_mode_default"]
     pid = _new_id()
     mode = normalize_execution_mode(execution_mode)
-    await db.execute(
-        "INSERT INTO projects "
-        "(id, name, creator_human_id, execution_mode, parent_project_id) "
-        "VALUES (?, ?, ?, ?, ?)",
-        (pid, name, human_id, mode, parent_project_id),
-    )
-    await db.commit()
+    if parent_project_id is None:
+        await db.execute(
+            "INSERT INTO projects "
+            "(id, name, creator_human_id, execution_mode, parent_project_id) "
+            "VALUES (?, ?, ?, ?, ?)",
+            (pid, name, human_id, mode, parent_project_id),
+        )
+        await db.commit()
+    else:
+        # The check above and this write are two statements. Make the INSERT itself
+        # conditional on the parent still being top-level, so a set_parent_project
+        # that nested the parent in between cannot leave a two-level chain behind.
+        cur = await db.execute(
+            "INSERT INTO projects "
+            "(id, name, creator_human_id, execution_mode, parent_project_id) "
+            "SELECT ?, ?, ?, ?, ? "
+            "WHERE EXISTS (SELECT 1 FROM projects "
+            "WHERE id = ? AND COALESCE(parent_project_id, '') = '')",
+            (pid, name, human_id, mode, parent_project_id, parent_project_id),
+        )
+        await db.commit()
+        if not cur.rowcount:
+            raise ValueError(
+                f"parent project '{parent_project_id}' changed concurrently - "
+                "it is no longer a top-level project"
+            )
     # Seed the remaining cascade defaults onto the fresh project row.
     _ci_default = _ws.get("code_intel_enabled_default")
     if _ci_default is not None:
@@ -1251,7 +1491,28 @@ async def create_project(
         await update_project_settings(db, pid, hitl_auto_answer=1)
     project = await get_project(db, pid)
     assert project is not None
+    # 8a665a03 -- another open dashboard's sidebar never learned of the new project.
+    _publish_projects_changed(db, "created")
     return project
+
+
+async def create_project(
+    db: aiosqlite.Connection,
+    name: str,
+    human_id: str | None = None,
+    execution_mode: str | None = None,
+    tenant_id: str | None = None,
+    parent_project_id: str | None = None,
+) -> dict[str, Any]:
+    """Create a project, serializing child membership changes across writers."""
+    if parent_project_id is None:
+        return await _create_project_unlocked(
+            db, name, human_id, execution_mode, tenant_id, parent_project_id
+        )
+    async with _project_hierarchy_write_guard(db, postgres_serialization=True):
+        return await _create_project_unlocked(
+            db, name, human_id, execution_mode, tenant_id, parent_project_id
+        )
 
 
 async def set_project_execution_mode(
@@ -1267,6 +1528,69 @@ async def set_project_execution_mode(
     )
     await db.commit()
     return await get_project(db, project_id)
+
+
+async def get_project_use_mode(db: aiosqlite.Connection, project_id: str) -> str:
+    """Return the stored use mode for a project.
+
+    The stored value is returned as written. Callers that gate on it normalise
+    it (rights_policy.normalize_use_mode), so an unknown stored value fails
+    closed there. Raises ValueError('project not found') for a missing project.
+    """
+    async with db.execute(
+        "SELECT use_mode FROM projects WHERE id = ?", (project_id,)
+    ) as cur:
+        row = await cur.fetchone()
+    if row is None:
+        raise ValueError("project not found")
+    return row["use_mode"] if isinstance(row, dict) else row[0]
+
+
+async def set_project_use_mode(
+    db: aiosqlite.Connection,
+    project_id: str,
+    use_mode: str,
+    *,
+    actor: str,
+    reason: str | None = None,
+) -> dict[str, Any]:
+    """Set a project's use mode and audit the change. Returns the updated project.
+
+    Strict: a value other than standard_publication or commercialized raises
+    ValueError (RightsPolicyError, code USE_MODE_INVALID) and nothing is written.
+    A missing project raises ValueError('project not found') before any write.
+    On success one action_audit_log row (event_type project_use_mode_changed)
+    records the old and new values and the actor. If that audit row cannot be
+    written, the mode is restored to its old value and the error is re-raised,
+    so a change and its audit row never disagree. Postgres autocommit means the
+    restore is a compensating UPDATE, not a rollback.
+    """
+    new_mode = validate_use_mode(use_mode)
+    old_mode = await get_project_use_mode(db, project_id)
+    await db.execute(
+        "UPDATE projects SET use_mode = ? WHERE id = ?", (new_mode, project_id),
+    )
+    await db.commit()
+    detail: dict[str, Any] = {"old": old_mode, "new": new_mode}
+    if reason and reason.strip():
+        detail["reason"] = reason.strip()
+    try:
+        await record_action_audit_event(
+            db,
+            PROJECT_USE_MODE_EVENT_TYPE,
+            project_id=project_id,
+            actor=actor,
+            detail=json.dumps(detail, default=str),
+        )
+    except Exception:
+        await db.execute(
+            "UPDATE projects SET use_mode = ? WHERE id = ?", (old_mode, project_id),
+        )
+        await db.commit()
+        raise
+    project = await get_project(db, project_id)
+    assert project is not None
+    return project
 
 
 async def set_project_repo_identity(
@@ -1330,9 +1654,15 @@ async def set_project_status(
     project_id: str,
     status: str | None = None,
     priority: str | None = None,
+    expect_status_snapshot: dict[str, Any] | None = None,
 ) -> dict[str, Any] | None:
-    """8db00fcb — update a project's organization fields (status/priority).
-    Validates the enums; only the provided fields change."""
+    """8db00fcb -- update a project's organization fields (status/priority).
+
+    Validates the enums; only the provided fields change. When a status
+    authorization snapshot is supplied, hierarchy and current status are
+    revalidated under the hierarchy write guard in the same transaction as
+    the update.
+    """
     sets: list[str] = []
     params: list[Any] = []
     if status is not None:
@@ -1349,12 +1679,67 @@ async def set_project_status(
             )
         sets.append("priority = ?")
         params.append(priority)
-    if sets:
+
+    if expect_status_snapshot is not None:
+        required = {
+            "project_id", "current_status", "requested_status",
+            "parent_project_id", "parent_exists", "child_ids",
+        }
+        if not isinstance(expect_status_snapshot, dict):
+            raise ValueError(
+                f"{_PROJECT_CHANGED_CONCURRENTLY}: invalid status snapshot"
+            )
+        child_ids = expect_status_snapshot.get("child_ids")
+        expected_parent = expect_status_snapshot.get("parent_project_id")
+        if (
+            not required.issubset(expect_status_snapshot)
+            or status is None
+            or expect_status_snapshot.get("project_id") != project_id
+            or expect_status_snapshot.get("requested_status") != status
+            or not isinstance(expected_parent, (str, type(None)))
+            or not isinstance(expect_status_snapshot.get("parent_exists"), bool)
+            or not isinstance(child_ids, (list, tuple, set))
+            or any(not isinstance(child_id, str) for child_id in child_ids)
+        ):
+            raise ValueError(
+                f"{_PROJECT_CHANGED_CONCURRENTLY}: invalid status snapshot"
+            )
+        expected_children = set(child_ids)
+        expected_parent = expected_parent or None
+        async with _project_hierarchy_write_guard(db):
+            async with _expected_project_delete_transaction(db):
+                family = await get_project_family(db, [project_id])
+                current = family.get(project_id)
+                if current is None:
+                    raise ValueError(
+                        f"{_PROJECT_CHANGED_CONCURRENTLY}: project no longer exists"
+                    )
+                if (
+                    current.get("status")
+                    != expect_status_snapshot.get("current_status")
+                    or (current.get("parent_project_id") or None) != expected_parent
+                    or bool(current.get("parent_exists"))
+                    != bool(expect_status_snapshot.get("parent_exists"))
+                    or set(current.get("child_ids") or ()) != expected_children
+                ):
+                    raise ValueError(
+                        f"{_PROJECT_CHANGED_CONCURRENTLY}: project status or hierarchy changed"
+                    )
+                if sets:
+                    params.append(project_id)
+                    await db.execute(
+                        f"UPDATE projects SET {', '.join(sets)} WHERE id = ?", params
+                    )
+    elif sets:
         params.append(project_id)
         await db.execute(
             f"UPDATE projects SET {', '.join(sets)} WHERE id = ?", params
         )
         await db.commit()
+
+    if sets:
+        # 8a665a03 -- status / priority decide how the sidebar groups and badges a project.
+        _publish_projects_changed(db, "organization")
     return await get_project(db, project_id)
 
 
@@ -1453,13 +1838,21 @@ async def rename_project(
         (new_name, project_id),
     )
     await db.commit()
+    # 8a665a03 -- the REST route also publishes project_renamed (it updates the open tab
+    # label at once); this covers the MCP rename_project tool, which had no announcement.
+    _publish_projects_changed(db, "renamed")
     return await get_project(db, project_id)
 
 
-async def set_parent_project(
+_PROJECT_CHANGED_CONCURRENTLY = "project changed concurrently"
+
+
+async def _set_parent_project_unlocked(
     db: aiosqlite.Connection,
     project_id: str,
     parent_project_id: str | None,
+    expect_parent: "str | None | object" = _UNSET,
+    expect_parent_exists: "bool | object" = _UNSET,
 ) -> dict[str, Any] | None:
     """7acb8563 — set / change / clear a project's parent AFTER creation.
 
@@ -1474,10 +1867,45 @@ async def set_parent_project(
     detach (make it top-level again). Validates BEFORE any write; raises
     ``ValueError`` on any violation. Returns the updated project, or ``None`` if
     ``project_id`` does not exist.
+
+    ``expect_parent`` makes the write a compare-and-set for a caller that decided
+    what to allow from the project's parent as it saw it: pass the parent id it
+    classified (``None`` or ``""`` for top-level). ``expect_parent_exists`` can
+    additionally bind that decision to whether that parent row existed, so a
+    concurrent parent deletion/recreation cannot change a subproject into an
+    orphan (or vice versa) after authorization. If either value differs by the
+    time of the write, nothing is changed and ``ValueError("project changed
+    concurrently")`` is raised. Leave both out for the legacy behavior.
+
+    The write itself is ONE conditional UPDATE (not the validation above followed by
+    a blind UPDATE): when nesting it only matches while the project still has no
+    subprojects and the new parent still exists and is top-level, so a project that
+    gained a child, or a parent that was nested, between validation and write is
+    refused with the same ``ValueError`` instead of building a two-level chain.
+    On Postgres (read committed) the subquery conditions are evaluated against the
+    statement's snapshot, which narrows that window to a single statement rather
+    than closing it entirely; the parent comparison is a plain row predicate and
+    is exact on both backends.
     """
     project = await get_project(db, project_id)
     if project is None:
         return None
+    if expect_parent is not _UNSET and (
+        (project.get("parent_project_id") or "") != (expect_parent or "")
+    ):
+        raise ValueError(_PROJECT_CHANGED_CONCURRENTLY)
+    if expect_parent_exists is not _UNSET:
+        if not isinstance(expect_parent_exists, bool) or expect_parent is _UNSET:
+            raise ValueError("expect_parent_exists requires a parent compare-and-set")
+        current_parent_id = project.get("parent_project_id")
+        current_parent_exists = False
+        if current_parent_id:
+            async with db.execute(
+                "SELECT 1 FROM projects WHERE id = ?", (current_parent_id,)
+            ) as cur:
+                current_parent_exists = await cur.fetchone() is not None
+        if current_parent_exists is not expect_parent_exists:
+            raise ValueError(_PROJECT_CHANGED_CONCURRENTLY)
     if parent_project_id is not None:
         if parent_project_id == project_id:
             raise ValueError("a project cannot be its own parent")
@@ -1501,12 +1929,136 @@ async def set_parent_project(
                 f"project '{project_id}' has subprojects of its own — cannot make "
                 "it a subproject (subprojects are one level deep)"
             )
-    await db.execute(
-        "UPDATE projects SET parent_project_id = ? WHERE id = ?",
-        (parent_project_id, project_id),
-    )
+    sql = "UPDATE projects SET parent_project_id = ? WHERE id = ?"
+    params: list[Any] = [parent_project_id, project_id]
+    if expect_parent is not _UNSET:
+        sql += " AND COALESCE(parent_project_id, '') = ?"
+        params.append(expect_parent or "")
+    if expect_parent_exists is not _UNSET:
+        current_parent_id = project.get("parent_project_id")
+        if current_parent_id:
+            existence_clause = "EXISTS" if expect_parent_exists else "NOT EXISTS"
+            sql += (
+                f" AND {existence_clause} "
+                "(SELECT 1 FROM projects expected_parent WHERE expected_parent.id = ?)"
+            )
+            params.append(current_parent_id)
+    if parent_project_id is not None:
+        sql += (
+            " AND NOT EXISTS (SELECT 1 FROM projects c WHERE c.parent_project_id = ?)"
+            " AND EXISTS (SELECT 1 FROM projects p WHERE p.id = ?"
+            " AND COALESCE(p.parent_project_id, '') = '')"
+        )
+        params.extend([project_id, parent_project_id])
+    cur = await db.execute(sql, tuple(params))
     await db.commit()
+    if not cur.rowcount:
+        raise ValueError(_PROJECT_CHANGED_CONCURRENTLY)
+    # 8a665a03 -- see rename_project: the REST route publishes project_parent_changed,
+    # the MCP set_parent_project tool published nothing.
+    _publish_projects_changed(db, "reparented")
     return await get_project(db, project_id)
+
+
+async def set_parent_project(
+    db: aiosqlite.Connection,
+    project_id: str,
+    parent_project_id: str | None,
+    expect_parent: "str | None | object" = _UNSET,
+    expect_parent_exists: "bool | object" = _UNSET,
+) -> dict[str, Any] | None:
+    """Set a project's parent under the backend's hierarchy write lock."""
+    async with _project_hierarchy_write_guard(db, postgres_serialization=True):
+        return await _set_parent_project_unlocked(
+            db, project_id, parent_project_id, expect_parent, expect_parent_exists
+        )
+
+
+# Ids per IN (...) list. Stays well under SQLite's bound-variable limit and keeps
+# a Postgres statement small however many projects a caller names.
+_PROJECT_ID_CHUNK = 400
+
+
+def _id_chunks(ids: "list[str]") -> "list[list[str]]":
+    return [ids[i:i + _PROJECT_ID_CHUNK] for i in range(0, len(ids), _PROJECT_ID_CHUNK)]
+
+
+async def get_project_family(
+    db: aiosqlite.Connection, ids: "list[str] | tuple[str, ...] | set[str]",
+) -> dict[str, dict[str, Any]]:
+    """Return what the hierarchy looks like around each of ``ids``.
+
+    ``{id: {name, parent_project_id, status, parent_exists, child_ids}}`` for every
+    id that exists (an unknown id is simply absent). ``parent_project_id`` is the
+    stored value (``None``, ``""`` or an id). ``parent_exists`` is whether a project
+    row with that id is there: a non-empty ``parent_project_id`` with
+    ``parent_exists`` False is a dangling parent (its parent was deleted), which a
+    caller should classify as neither top-level nor a healthy subproject.
+    ``child_ids`` lists the projects whose ``parent_project_id`` is this id.
+
+    Two reads per chunk of 400 ids (rows + parents in one LEFT JOIN, then
+    children). Read-only; takes ids from the caller, never from a name.
+    """
+    wanted = list(dict.fromkeys(i for i in ids if i))
+    family: dict[str, dict[str, Any]] = {}
+    for chunk in _id_chunks(wanted):
+        ph = ", ".join("?" for _ in chunk)
+        async with db.execute(
+            "SELECT c.id AS id, c.name AS name, c.status AS status, "
+            "c.parent_project_id AS parent_project_id, p.id AS parent_row_id "
+            "FROM projects c LEFT JOIN projects p ON p.id = c.parent_project_id "
+            f"WHERE c.id IN ({ph})",
+            tuple(chunk),
+        ) as cur:
+            rows = await cur.fetchall()
+        for r in rows:
+            family[r["id"]] = {
+                "name": r["name"],
+                "parent_project_id": r["parent_project_id"],
+                "status": r["status"],
+                "parent_exists": r["parent_row_id"] is not None,
+                "child_ids": [],
+            }
+    found = list(family)
+    for chunk in _id_chunks(found):
+        ph = ", ".join("?" for _ in chunk)
+        async with db.execute(
+            "SELECT id, parent_project_id FROM projects "
+            f"WHERE parent_project_id IN ({ph}) ORDER BY id ASC",
+            tuple(chunk),
+        ) as cur:
+            rows = await cur.fetchall()
+        for r in rows:
+            family[r["parent_project_id"]]["child_ids"].append(r["id"])
+    return family
+
+
+async def get_subproject_map(
+    db: aiosqlite.Connection, parent_ids: "list[str] | tuple[str, ...] | set[str]",
+) -> dict[str, str]:
+    """Return ``{child_id: parent_id}`` for the subprojects of ``parent_ids``.
+
+    One level, and only under a parent that still exists AND is top-level: the
+    JOIN means the orphans of a deleted parent grant nothing, and a project that
+    was nested after it gained children (a two-level chain) drops out too, so a
+    caller expanding a member's scope with this fails closed. Uses
+    ``idx_projects_parent``; chunked like ``get_project_family``.
+    """
+    wanted = list(dict.fromkeys(i for i in parent_ids if i))
+    out: dict[str, str] = {}
+    for chunk in _id_chunks(wanted):
+        ph = ", ".join("?" for _ in chunk)
+        async with db.execute(
+            "SELECT c.id AS id, c.parent_project_id AS parent_project_id "
+            "FROM projects c JOIN projects p ON p.id = c.parent_project_id "
+            f"WHERE c.parent_project_id IN ({ph}) "
+            "AND (p.parent_project_id IS NULL OR p.parent_project_id = '')",
+            tuple(chunk),
+        ) as cur:
+            rows = await cur.fetchall()
+        for r in rows:
+            out[r["id"]] = r["parent_project_id"]
+    return out
 
 
 # d6bd60e0 — every table that carries a project_id FK to projects(id) and whose
@@ -1618,6 +2170,18 @@ async def merge_project(
 
     await conn.commit()
 
+    # 8a665a03 -- a merge re-parents every child row at once (items, notes, decisions,
+    # sessions, HITL, insights ...), so each of those views in the target (now fuller) and
+    # the source (now empty) is stale. One event per stream makes the client resync them
+    # all; the cache bust keeps the next list read from serving the pre-merge board.
+    for _pid in (source_project_id, target_project_id):
+        _invalidate_sprint_items_cache(_pid)
+        _publish_project_event(
+            _pid, "project_merged",
+            {"source_project_id": source_project_id, "target_project_id": target_project_id},
+        )
+    _publish_projects_changed(conn, "merged")
+
     return {
         "source_project_id": source_project_id,
         "target_project_id": target_project_id,
@@ -1633,7 +2197,7 @@ async def get_project_settings(
     async with db.execute(
         "SELECT id, max_pinned_decisions, executor_config, hitl_auto_answer, "
         "auto_worktrees, require_merge_approval, code_intel_enabled, "
-        "execution_mode "
+        "execution_mode, use_mode "
         "FROM projects WHERE id = ?",
         (project_id,),
     ) as cur:
@@ -1662,6 +2226,8 @@ async def get_project_settings(
         "code_intel_enabled": int(data.get("code_intel_enabled") or 0),
         # ecf69de8 — executor posture: 'autonomous' (default) | 'interactive'.
         "execution_mode": normalize_execution_mode(data.get("execution_mode")),
+        # Rights-gate use mode. The column is NOT NULL, so this is the stored value.
+        "use_mode": data.get("use_mode") or DEFAULT_USE_MODE,
     }
 
 
@@ -1676,6 +2242,8 @@ async def update_project_settings(
     require_merge_approval: int | None = None,
     code_intel_enabled: int | None = None,
     execution_mode: str | None = None,
+    use_mode: str | None = None,
+    use_mode_actor: str = "dashboard",
     github_repo: str | None = _UNSET,
     github_branch: str | None = _UNSET,
     github_account_login: str | None = _UNSET,
@@ -1684,6 +2252,9 @@ async def update_project_settings(
     project = await get_project(db, project_id)
     if project is None:
         return None
+    if use_mode is not None:
+        # Refuse a bad value before anything is written (strict, never coerced).
+        validate_use_mode(use_mode)
     updates: list[str] = []
     params: list[Any] = []
     if max_pinned_decisions is not None:
@@ -1729,6 +2300,9 @@ async def update_project_settings(
             tuple(params),
         )
         await db.commit()
+    if use_mode is not None:
+        # Routed through the setter so an HTTP change is audited like any other.
+        await set_project_use_mode(db, project_id, use_mode, actor=use_mode_actor)
     return await get_project_settings(db, project_id)
 
 
@@ -2248,14 +2822,197 @@ def _is_no_such_table(exc: Exception) -> bool:
     return False
 
 
+PROJECT_CLASS_TOP = "top"
+PROJECT_CLASS_SUBPROJECT = "subproject"
+PROJECT_CLASS_ORPHAN = "orphan"
+_PROJECT_CLASSES = (PROJECT_CLASS_TOP, PROJECT_CLASS_SUBPROJECT, PROJECT_CLASS_ORPHAN)
+
+
+def _project_class(entry: dict[str, Any]) -> str:
+    """Classify a ``get_project_family`` entry: no parent is ``top``, a parent
+    that exists is ``subproject``, a parent id with no row is ``orphan``."""
+    if not entry.get("parent_project_id"):
+        return PROJECT_CLASS_TOP
+    return PROJECT_CLASS_SUBPROJECT if entry.get("parent_exists") else PROJECT_CLASS_ORPHAN
+
+
+async def _verify_delete_expectations(
+    db: aiosqlite.Connection,
+    project_ids: list[str],
+    expect: "str | dict[str, str | dict[str, Any]]",
+) -> list[str]:
+    """Validate existing projects and return the subset that still exists.
+
+    Missing ids are an idempotent expected delete. Existing rows still have
+    their complete hierarchy snapshot checked so a stale delete cannot pass.
+    """
+    if isinstance(expect, str):
+        expected = {pid: expect for pid in project_ids}
+    else:
+        expected = dict(expect)
+    if set(expected) != set(project_ids):
+        raise ValueError(f"{_PROJECT_CHANGED_CONCURRENTLY}: incomplete hierarchy expectation")
+    bad = [
+        value for value in expected.values()
+        if isinstance(value, str) and value not in _PROJECT_CLASSES
+    ]
+    if bad:
+        raise ValueError(f"unknown project class {bad[0]!r} (expected one of {_PROJECT_CLASSES})")
+    for pid, value in expected.items():
+        if isinstance(value, str):
+            continue
+        if not isinstance(value, dict) or not {
+            "parent_project_id", "parent_exists", "child_ids"
+        }.issubset(value):
+            raise ValueError(
+                f"{_PROJECT_CHANGED_CONCURRENTLY}: invalid hierarchy expectation for '{pid}'"
+            )
+        if not isinstance(value["child_ids"], (list, tuple, set)):
+            raise ValueError(
+                f"{_PROJECT_CHANGED_CONCURRENTLY}: invalid child membership for '{pid}'"
+            )
+        _project_class(value)
+    family = await get_project_family(db, project_ids)
+    in_batch = set(project_ids)
+    existing_ids: list[str] = []
+    for pid in project_ids:
+        entry = family.get(pid)
+        if entry is None:
+            continue
+        existing_ids.append(pid)
+        want = expected[pid]
+        if isinstance(want, str):
+            want_class = want
+        elif isinstance(want, dict):
+            if not {"parent_project_id", "parent_exists", "child_ids"}.issubset(want):
+                raise ValueError(f"{_PROJECT_CHANGED_CONCURRENTLY}: invalid hierarchy expectation for '{pid}'")
+            want_class = _project_class(want)
+            expected_parent = want.get("parent_project_id") or None
+            actual_parent = entry.get("parent_project_id") or None
+            expected_children = want.get("child_ids")
+            if not isinstance(expected_children, (list, tuple, set)):
+                raise ValueError(f"{_PROJECT_CHANGED_CONCURRENTLY}: invalid child membership for '{pid}'")
+            if (
+                actual_parent != expected_parent
+                or bool(entry.get("parent_exists")) != bool(want.get("parent_exists"))
+                or set(entry["child_ids"]) != set(expected_children)
+            ):
+                raise ValueError(
+                    f"{_PROJECT_CHANGED_CONCURRENTLY}: hierarchy membership for '{entry['name']}' changed"
+                )
+        else:
+            raise ValueError(f"{_PROJECT_CHANGED_CONCURRENTLY}: invalid hierarchy expectation for '{pid}'")
+        if _project_class(entry) != want_class:
+            raise ValueError(
+                f"{_PROJECT_CHANGED_CONCURRENTLY}: '{entry['name']}' is no longer a {want_class}"
+            )
+        left_behind = [c for c in entry["child_ids"] if c not in in_batch]
+        if left_behind:
+            raise ValueError(
+                f"{_PROJECT_CHANGED_CONCURRENTLY}: '{entry['name']}' now has "
+                f"{len(left_behind)} subproject(s) that are not part of this delete"
+            )
+    return existing_ids
+
+
 async def delete_project(
-    db: aiosqlite.Connection, project_id: "str | list[str]"
+    db: aiosqlite.Connection,
+    project_id: "str | list[str]",
+    expect: "str | dict[str, str | dict[str, Any]] | None" = None,
+) -> None:
+    """Delete one or more projects, rechecking a supplied hierarchy snapshot atomically."""
+    project_ids = [project_id] if isinstance(project_id, str) else list(project_id)
+    if not project_ids:
+        return
+    async with _project_hierarchy_write_guard(db):
+        if expect is None:
+            # Keep the legacy no-expect behavior for existing callers.
+            nested = bool(getattr(db, "in_transaction", False))
+            await _delete_project_data(db, project_ids, finalize=not nested)
+            if _defer_project_deleted_notifications(db, project_ids):
+                return
+            _notify_deleted_projects(db, project_ids)
+            return
+        async with _expected_project_delete_transaction(db):
+            existing_ids = await _verify_delete_expectations(db, project_ids, expect)
+            if not existing_ids:
+                return
+            await _delete_project_data(
+                db, existing_ids, finalize=False, savepoint_table_errors=True
+            )
+            register_after_commit = getattr(db, "add_after_commit_callback", None)
+            deferred = callable(register_after_commit) and register_after_commit(
+                lambda: _notify_deleted_projects(db, existing_ids)
+            )
+    if deferred or _defer_project_deleted_notifications(db, existing_ids):
+        return
+    _notify_deleted_projects(db, existing_ids)
+
+
+def _notify_deleted_projects(db: aiosqlite.Connection, project_ids: list[str]) -> None:
+    """Publish invalidations only after the project rows are durably deleted."""
+    for _pid in project_ids:
+        _invalidate_sprint_items_cache(_pid)
+        _publish_project_event(_pid, "project_deleted", {})
+    _publish_projects_changed(db, "deleted")
+
+
+def _defer_project_deleted_notifications(
+    db: aiosqlite.Connection, project_ids: list[str]
+) -> bool:
+    """Defer invalidations to the outer commit when one is observable."""
+    callback = lambda: _notify_deleted_projects(db, list(project_ids))
+    register_after_commit = getattr(db, "add_after_commit_callback", None)
+    if callable(register_after_commit) and register_after_commit(callback):
+        return True
+    if not bool(getattr(db, "in_transaction", False)):
+        return False
+
+    # aiosqlite has no transaction callback API. Wrap its public commit and
+    # rollback methods once per connection so callers using the existing API
+    # cannot publish a delete event before their transaction is durable.
+    state = getattr(db, "_meridian_after_commit_state", None)
+    if state is None:
+        callbacks: list[Callable[[], None]] = []
+        state = {"callbacks": callbacks}
+        setattr(db, "_meridian_after_commit_state", state)
+        commit = db.commit
+        rollback = db.rollback
+
+        async def commit_with_callbacks() -> None:
+            pending_count = len(callbacks)
+            pending = callbacks[:pending_count]
+            await commit()
+            del callbacks[:pending_count]
+            for after_commit in pending:
+                try:
+                    after_commit()
+                except Exception:  # noqa: BLE001 - committed data stays committed
+                    _log.exception("SQLite after-commit callback failed")
+
+        async def rollback_without_callbacks() -> None:
+            pending_count = len(callbacks)
+            await rollback()
+            del callbacks[:pending_count]
+
+        db.commit = commit_with_callbacks
+        db.rollback = rollback_without_callbacks
+    state["callbacks"].append(callback)
+    return True
+
+
+async def _delete_project_data(
+    db: aiosqlite.Connection,
+    project_ids: list[str],
+    *,
+    finalize: bool = True,
+    savepoint_table_errors: bool = False,
 ) -> None:
     """Delete one or more projects and all associated data.
 
-    ``project_id`` accepts either a single id (``str``, the original shape —
-    all existing callers are unaffected) or a list of ids to batch-delete
-    many projects in one call (0e4980d4). Batching runs each table's DELETE
+    This internal helper receives normalized IDs. The public wrapper owns
+    hierarchy validation, locking, and transaction boundaries when requested.
+    Batching runs each table's DELETE
     once with a single ``WHERE project_id IN (...)`` across every id in the
     batch, rather than looping the whole per-table statement list once per
     project — the same number of round trips regardless of batch size.
@@ -2288,9 +3045,6 @@ async def delete_project(
     constraint error, connection failure — is re-raised so the caller sees a
     real failure rather than a silent false-success.
     """
-    project_ids = [project_id] if isinstance(project_id, str) else list(project_id)
-    if not project_ids:
-        return
     placeholders = ", ".join("?" for _ in project_ids)
     ids_params = tuple(project_ids)
 
@@ -2370,17 +3124,29 @@ async def delete_project(
         (f"DELETE FROM projects WHERE id IN ({placeholders})", ids_params),
     ]
 
-    for stmt, params in stmts:
+    for index, (stmt, params) in enumerate(stmts):
+        savepoint = f"sp_project_delete_stmt_{index}"
+        if savepoint_table_errors:
+            await db.execute(f"SAVEPOINT {savepoint}")
         try:
             await db.execute(stmt, params)
         except Exception as exc:  # noqa: BLE001
             if _is_no_such_table(exc):
+                if savepoint_table_errors:
+                    await db.execute(f"ROLLBACK TO SAVEPOINT {savepoint}")
+                    await db.execute(f"RELEASE SAVEPOINT {savepoint}")
                 # Table added in a later schema version — safe to skip on older installs.
                 _log.debug("delete_project: skipping missing table in: %s", stmt)
             else:
                 # Real error (FK violation, connection failure, …) — propagate.
                 raise
-    await db.commit()
+        else:
+            if savepoint_table_errors:
+                await db.execute(f"RELEASE SAVEPOINT {savepoint}")
+    if finalize and not callable(getattr(db, "begin_transaction", None)):
+        # SQLite uses this to finish its implicit transaction. Postgres runs in
+        # autocommit mode, so each statement is already durable.
+        await db.execute("COMMIT")
 
 
 def _stale_collapse_map(
@@ -2820,6 +3586,141 @@ async def _inherited_north_star(
     return parent_ns, parent_id
 
 
+# ---------------------------------------------------------------------------
+# fc779141 — optimistic concurrency for the three goal fields.
+#
+# The dashboard used to save the version goal / north star / current focus
+# last-write-wins, so a person editing in the browser could silently overwrite
+# (or be overwritten by) an agent's set_goal / set_north_star / set_sprint.
+# Callers may now pass the per-field ``updated_at`` stamp their edit was based
+# on; when the stored stamp has moved the write is refused with GoalConflict
+# (HTTP 409) and nothing changes.  Omitting the stamp keeps the historical
+# last-write-wins behaviour exactly, so MCP tools, agents and every pre-existing
+# caller are unaffected.
+# ---------------------------------------------------------------------------
+
+GOAL_FIELDS = ("version_goal", "north_star", "sprint")
+
+_GOAL_FIELD_LABELS = {
+    "version_goal": "version goal",
+    "north_star": "north star",
+    "sprint": "current focus",
+}
+
+
+class GoalConflict(Exception):
+    """A stale ``expected_updated_at`` was supplied for a goal field.
+
+    Deliberately NOT a ValueError: the HTTP routes and MCP handlers catch
+    ValueError for "no goal set yet" (422 / error dict) and a conflict must
+    never be mistaken for that.  ``current`` is the goal as it is stored now.
+    """
+
+    def __init__(self, field: str, expected: str, current: dict[str, Any] | None):
+        super().__init__(f"goal field {field!r} changed since {expected!r}")
+        self.field = field
+        self.expected = expected
+        self.current = current
+
+
+def goal_field_stamps(goal: dict[str, Any] | None) -> dict[str, str]:
+    """Per-field ``updated_at`` stamps, exactly as the 409 check compares them.
+
+    Rows written before the per-field columns existed carry NULLs; those fall
+    back to the row's ``updated_at`` (the same fallback set_goal uses when it
+    carries a stamp forward), so a stamp read here is always one set_goal will
+    accept.  A project with no goal row of its own yields empty strings.
+    """
+    if not goal or "id" not in goal:
+        return {f: "" for f in GOAL_FIELDS}
+    base = goal.get("updated_at") or ""
+    return {
+        "version_goal": goal.get("content_updated_at") or base,
+        "north_star": goal.get("ns_updated_at") or base,
+        "sprint": goal.get("sprint_updated_at") or base,
+    }
+
+
+def goal_conflict_detail(exc: GoalConflict) -> dict[str, Any]:
+    """The 409 body: the CURRENT value of the contested field plus metadata."""
+    goal = exc.current or {}
+    values = {
+        "version_goal": goal.get("content"),
+        "north_star": goal.get("north_star"),
+        "sprint": goal.get("sprint"),
+    }
+    stamps = goal_field_stamps(exc.current)
+    label = _GOAL_FIELD_LABELS.get(exc.field, exc.field)
+    return {
+        "error": "goal_conflict",
+        "message": (
+            f"The {label} was changed by someone else after you loaded it. "
+            "Nothing was saved."
+        ),
+        "field": exc.field,
+        "expected_updated_at": exc.expected,
+        "current": {
+            "value": values.get(exc.field),
+            "updated_at": stamps.get(exc.field, ""),
+            "version": goal.get("version", 0),
+        },
+        "field_updated_at": stamps,
+    }
+
+
+_GOAL_SOURCE_KINDS = {"dashboard": "human", "goal_md": "human", "mcp": "agent"}
+
+
+def goal_actor(source: str | None, actor_id: str | None = None) -> dict[str, Any] | None:
+    """Who made a goal write, for the ``goal_updated`` event (display only).
+
+    ``source`` is a label the caller's entry point supplies ("dashboard" for a
+    person using the UI, "mcp" for an agent tool call, "goal_md" for a GOAL.md
+    file edit, "api" for any other REST client).  It is a hint for the
+    "changed by an agent 2m ago" banner, never an authorization input, and it
+    is not persisted — goal_states has no per-field author column.
+    """
+    src = str(source or "").strip().lower()[:32] or None
+    ident = str(actor_id or "").strip()[:128] or None
+    if src is None and ident is None:
+        return None
+    return {"kind": _GOAL_SOURCE_KINDS.get(src or "", "unknown"), "source": src, "id": ident}
+
+
+def _changed_goal_fields(before: dict[str, Any] | None, after: dict[str, Any]) -> list[str]:
+    """Which of the three goal fields differ between two get_goal() results."""
+
+    def _own_ns(g: dict[str, Any] | None) -> Any:
+        # An inherited (parent's) north star is not this project's own value.
+        if not g or g.get("north_star_inherited"):
+            return None
+        return g.get("north_star") or None
+
+    pairs = {
+        "version_goal": ((before or {}).get("content") or None, after.get("content") or None),
+        "north_star": (_own_ns(before), _own_ns(after)),
+        "sprint": ((before or {}).get("sprint") or None, after.get("sprint") or None),
+    }
+    return [f for f, (old, new) in pairs.items() if old != new]
+
+
+# One write lock per project, process-wide.  set_north_star / set_sprint read the
+# stored goal and write it back with one field changed, so two interleaved saves
+# of DIFFERENT fields could otherwise resurrect a stale copy of the field the
+# other one just wrote, and a stamp check made before a concurrent write lands
+# would not protect anything.  This serialises writers inside one server process
+# (the hosted deployment and the self-hosted server); separate processes sharing
+# one database still rely on the stamp check alone.
+_GOAL_WRITE_LOCKS: dict[str, asyncio.Lock] = {}
+
+
+def _goal_write_lock(project_id: str) -> asyncio.Lock:
+    lock = _GOAL_WRITE_LOCKS.get(project_id)
+    if lock is None:
+        lock = _GOAL_WRITE_LOCKS[project_id] = asyncio.Lock()
+    return lock
+
+
 async def set_goal(
     db: aiosqlite.Connection,
     project_id: str,
@@ -2827,6 +3728,8 @@ async def set_goal(
     north_star: str | None = None,
     sprint: str | None = None,
     minor: bool = False,
+    expected_updated_at: dict[str, str | None] | None = None,
+    actor: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     """Upsert the goal state for a project.
 
@@ -2837,8 +3740,34 @@ async def set_goal(
     When ``minor=True``, the latest row is updated in-place without
     incrementing the version counter. Use this for AUTO BLOCKS appends
     that should not pollute the goal history.
+
+    ``expected_updated_at`` (fc779141) maps a field name (``version_goal`` /
+    ``north_star`` / ``sprint``) to the per-field stamp the caller based its
+    edit on.  A stamp that no longer matches raises :class:`GoalConflict` and
+    writes nothing; fields absent from the map (and a ``None`` map) are not
+    checked.  ``actor`` (see :func:`goal_actor`) only labels the broadcast
+    ``goal_updated`` event.
     """
+    async with _goal_write_lock(project_id):
+        return await _set_goal_locked(
+            db, project_id, content, north_star=north_star, sprint=sprint,
+            minor=minor, expected_updated_at=expected_updated_at, actor=actor,
+        )
+
+
+async def _set_goal_locked(
+    db: aiosqlite.Connection,
+    project_id: str,
+    content: Any,
+    north_star: str | None = None,
+    sprint: str | None = None,
+    minor: bool = False,
+    expected_updated_at: dict[str, str | None] | None = None,
+    actor: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    """set_goal's body; the caller holds this project's goal write lock."""
     existing = await get_goal(db, project_id)
+    _current_goal = existing  # fc779141 — pre-normalisation view, returned on a 409
     # 3b6ff466 — a subproject with no goal row of its own gets a *synthesised*
     # goal dict back from get_goal (parent's inherited north_star, no real
     # goal_states row → no "id"). That is NOT a row to update or version off
@@ -2847,6 +3776,13 @@ async def set_goal(
     # inherited north_star would be materialised into the child's first row.
     if existing is not None and "id" not in existing:
         existing = None
+    if expected_updated_at:
+        _stamps = goal_field_stamps(existing)
+        for _field, _expected in expected_updated_at.items():
+            if _field not in GOAL_FIELDS:
+                raise ValueError(f"unknown goal field {_field!r}")
+            if _expected is not None and _stamps[_field] != str(_expected):
+                raise GoalConflict(_field, str(_expected), _current_goal)
     encoded = _encode_content(content)
     # Never carry forward an INHERITED north_star as if it were the child's own.
     # get_goal flags a borrowed parent north_star with north_star_inherited;
@@ -2984,43 +3920,78 @@ async def set_goal(
         await db.commit()
     goal = await get_goal(db, project_id)
     assert goal is not None
+    goal["field_updated_at"] = goal_field_stamps(goal)
     # Broadcast to dashboard WebSocket subscribers so the goal panel refreshes live.
-    _publish_project_event(project_id, "goal_updated", {"version": goal.get("version")})
+    # fc779141 — additive fields only: which goal fields this write touched, who
+    # made it (None when the caller did not say) and the new per-field stamps, so
+    # a panel can say "changed by an agent 2m ago" next to a conflicting edit.
+    _publish_project_event(project_id, "goal_updated", {
+        "version": goal.get("version"),
+        "changed_fields": _changed_goal_fields(_current_goal, goal),
+        "changed_by": actor,
+        "updated_at": goal.get("updated_at"),
+        "field_updated_at": goal["field_updated_at"],
+    })
     return goal
 
 
 async def set_north_star(
-    db: aiosqlite.Connection, project_id: str, north_star: str
+    db: aiosqlite.Connection,
+    project_id: str,
+    north_star: str,
+    expected_updated_at: str | None = None,
+    actor: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     """Update only the north_star field, preserving current content and sprint.
 
     Creates a new goal row (increments version). 404-equivalent: raises
     ValueError if no goal exists yet — set the version goal first.
+    ``expected_updated_at`` is the north star's stamp the caller based its edit
+    on (see :func:`set_goal`); a stale one raises :class:`GoalConflict`.
     """
-    existing = await get_goal(db, project_id)
-    if existing is None:
-        raise ValueError("no goal set — call set_goal before set_north_star")
-    return await set_goal(
-        db, project_id, existing["content"],
-        north_star=north_star, sprint=existing.get("sprint")
-    )
+    # The lock spans the read of the stored goal AND the write-back, so a
+    # concurrent version-goal save cannot be reverted by this stale copy of it.
+    async with _goal_write_lock(project_id):
+        existing = await get_goal(db, project_id)
+        if existing is None:
+            raise ValueError("no goal set — call set_goal before set_north_star")
+        return await _set_goal_locked(
+            db, project_id, existing["content"],
+            north_star=north_star, sprint=existing.get("sprint"),
+            expected_updated_at=(
+                {"north_star": expected_updated_at}
+                if expected_updated_at is not None else None
+            ),
+            actor=actor,
+        )
 
 
 async def set_sprint(
-    db: aiosqlite.Connection, project_id: str, sprint: str
+    db: aiosqlite.Connection,
+    project_id: str,
+    sprint: str,
+    expected_updated_at: str | None = None,
+    actor: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     """Update only the sprint field, preserving current content and north_star.
 
     Any team member can call this (no ownership check at the db layer).
-    Creates a new goal row (increments version).
+    Creates a new goal row (increments version).  ``expected_updated_at`` is the
+    current focus's stamp the caller based its edit on (see :func:`set_goal`).
     """
-    existing = await get_goal(db, project_id)
-    if existing is None:
-        raise ValueError("no goal set — call set_goal before set_sprint")
-    return await set_goal(
-        db, project_id, existing["content"],
-        north_star=existing.get("north_star"), sprint=sprint
-    )
+    async with _goal_write_lock(project_id):
+        existing = await get_goal(db, project_id)
+        if existing is None:
+            raise ValueError("no goal set — call set_goal before set_sprint")
+        return await _set_goal_locked(
+            db, project_id, existing["content"],
+            north_star=existing.get("north_star"), sprint=sprint,
+            expected_updated_at=(
+                {"sprint": expected_updated_at}
+                if expected_updated_at is not None else None
+            ),
+            actor=actor,
+        )
 
 
 async def register_session(
@@ -3632,6 +4603,10 @@ async def set_decision(
         (updated, project_id),
     )
     await db.commit()
+    # 8a665a03 -- this log is what the Goal tab's Decisions table renders (refreshGoal ->
+    # renderDecisionsTable), and nothing announced an entry added by an MCP session, so
+    # the table stayed one decision behind until a reload. goal_updated re-runs refreshGoal.
+    _publish_project_event(project_id, "goal_updated", {"field": "decisions"})
     return updated
 
 
@@ -3864,6 +4839,20 @@ async def close_session(db: aiosqlite.Connection, session_id: str) -> None:
     await release_resource_locks_for_session(db, session_id)
     await release_symbol_claims_for_session(db, session_id)
     await db.commit()
+    # 8a665a03 -- only a session STARTING was announced, so a closed session stayed in
+    # every other dashboard's "Active Sessions" / Live lists until a reload.
+    try:
+        async with db.execute(
+            "SELECT project_id FROM sessions WHERE id = ?", (session_id,)
+        ) as _cur:
+            _row = await _cur.fetchone()
+        if _row is not None and _row["project_id"]:
+            _publish_project_event(
+                _row["project_id"], "session_updated",
+                {"session_id": session_id, "status": "closed"},
+            )
+    except Exception:  # noqa: BLE001 -- best-effort notification, never blocks the close
+        pass
     try:
         await handle_session_stall(db, session_id)
     except Exception:  # noqa: BLE001 — stall recovery must never block session close
@@ -3922,7 +4911,44 @@ async def archive_stale_sessions(
         (project_id, cutoff),
     )
     await db.commit()
+    # 8a665a03 -- this runs inside start_session and silently dropped sessions from the
+    # Active Sessions / Live lists and put their claimed tasks and items back to pending,
+    # without telling any open dashboard.
+    await _announce_released_claims(db, project_id, stale_task_ids, linked_item_ids)
+    if cursor.rowcount:
+        _publish_project_event(
+            project_id, "session_updated", {"status": "archived", "count": cursor.rowcount},
+        )
     return cursor.rowcount
+
+
+async def _announce_released_claims(
+    db: aiosqlite.Connection,
+    project_id: str | None,
+    task_ids: list[str],
+    item_ids: list[str],
+) -> None:
+    """8a665a03 -- announce tasks / sprint items a stale-session sweep put back to pending.
+
+    The sweeps (archive_stale_sessions, release_stale_task_claims) reset rows with plain
+    UPDATEs, so neither the Devlog (task_updated) nor the Queue / Goal board / Live tab
+    (sprint_item_updated) heard about it and every open dashboard kept showing the dead
+    session's claims until a reload. Best effort: an announcement failure must never
+    undo or mask the sweep that already committed.
+    """
+    try:
+        if item_ids and project_id:
+            _invalidate_sprint_items_cache(project_id)
+            _publish_project_event(
+                project_id, "sprint_item_updated",
+                {"item_ids": list(item_ids), "status": "pending", "reason": "stale_claim_released"},
+            )
+        for task_id in task_ids:
+            task = await get_task(db, task_id)
+            if task is not None:
+                _publish_task("task_updated", task)
+    except Exception:  # noqa: BLE001 -- notification only
+        _log.debug("announce released claims failed", exc_info=True)
 
 
 async def archive_empty_sessions(
@@ -6238,21 +7264,34 @@ async def release_stale_task_claims(
             tuple(linked_item_ids),
         )
     await db.commit()
+    await _announce_released_claims(db, project_id, task_ids, linked_item_ids)
     return len(task_ids)
 
 
 async def release_task(
-    db: aiosqlite.Connection, task_id: str, session_id: str
+    db: aiosqlite.Connection,
+    task_id: str,
+    session_id: str,
+    *,
+    project_id: str | None = None,
 ) -> bool:
     """Release a claim previously taken by ``session_id``.
 
     Returns True if a claim was released; False if the task wasn't held
     by that session (someone else's claim is left untouched).
+
+    ``project_id`` (RT-TI-005 wave 2) is an optional binding, like
+    :func:`update_task`'s: when supplied, the UPDATE (and the linked sprint-item
+    reset) only matches rows of that project, so a task id of another project
+    behaves exactly like a task that is not claimed by this session. The HTTP
+    route passes the path project; without it (stdio, tests) nothing changes.
     """
+    bound = " AND project_id = ?" if project_id is not None else ""
+    bound_params: tuple[Any, ...] = (project_id,) if project_id is not None else ()
     cursor = await db.execute(
         "UPDATE task_log SET status = 'pending', claimed_by = NULL, claimed_at = NULL "
-        "WHERE id = ? AND claimed_by = ?",
-        (task_id, session_id),
+        "WHERE id = ? AND claimed_by = ?" + bound,
+        (task_id, session_id, *bound_params),
     )
     await db.commit()
     if cursor.rowcount == 0:
@@ -6261,11 +7300,19 @@ async def release_task(
     if updated is not None and updated.get("sprint_item_id"):
         await db.execute(
             "UPDATE sprint_items SET status = 'pending', completed_at = NULL "
-            "WHERE id = ? AND status = 'in_progress'",
-            (updated["sprint_item_id"],),
+            "WHERE id = ? AND status = 'in_progress'" + bound,
+            (updated["sprint_item_id"], *bound_params),
         )
         await db.commit()
         updated = await get_task(db, task_id)
+        # 8a665a03 -- only the task was announced; the linked sprint item went back to
+        # pending silently, so the Queue / Goal board kept it in progress.
+        if updated is not None and updated.get("project_id"):
+            _invalidate_sprint_items_cache(updated["project_id"])
+            _publish_project_event(
+                updated["project_id"], "sprint_item_updated",
+                {"item_id": updated["sprint_item_id"], "status": "pending"},
+            )
     if updated is not None:
         _publish_task("task_updated", updated)
     return True
@@ -6295,20 +7342,27 @@ async def expire_idle_sessions(
 ) -> dict[str, Any]:
     """Mark sessions idle when their last_seen is older than *max_age_minutes*.
 
-    Returns ``{"count": n, "project_ids": [...]}`` where ``project_ids`` is
-    the list of distinct projects that had at least one session expire. The
-    caller can use this to trigger handoff generation for affected projects
-    (v0.4.5). Only 'active' sessions are considered; 'idle' and 'closed'
+    Returns ``{"count": n, "project_ids": [...], "session_ids_by_project":
+    {...}}`` where ``project_ids`` is the list of distinct projects that had at
+    least one session expire. The caller can use this to trigger handoff
+    generation for affected projects (v0.4.5). ``session_ids_by_project`` maps
+    each of those projects to the sessions that expired, most recently seen
+    first (0b0b24d8): a delta handoff needs a session to bound its "completed
+    since" list. Only 'active' sessions are considered; 'idle' and 'closed'
     sessions are left untouched.
     """
     async with db.execute(
-        "SELECT DISTINCT project_id FROM sessions "
+        "SELECT id, project_id FROM sessions "
         "WHERE status = 'active' "
-        "AND last_seen < datetime('now', ? || ' minutes')",
+        "AND last_seen < datetime('now', ? || ' minutes') "
+        "ORDER BY last_seen DESC",
         (f"-{max_age_minutes}",),
     ) as cur:
         rows = await cur.fetchall()
-    affected_project_ids: list[str] = [row["project_id"] for row in rows]
+    session_ids_by_project: dict[str, list[str]] = {}
+    for row in rows:
+        session_ids_by_project.setdefault(row["project_id"], []).append(row["id"])
+    affected_project_ids: list[str] = list(session_ids_by_project)
 
     cursor = await db.execute(
         "UPDATE sessions SET status = 'idle' "
@@ -6317,7 +7371,16 @@ async def expire_idle_sessions(
         (f"-{max_age_minutes}",),
     )
     await db.commit()
-    return {"count": cursor.rowcount, "project_ids": affected_project_ids}
+    # 8a665a03 -- sessions going idle were never announced, so every open dashboard kept
+    # showing them as active until a reload.
+    for _pid in affected_project_ids:
+        if _pid:
+            _publish_project_event(_pid, "session_updated", {"status": "idle"})
+    return {
+        "count": cursor.rowcount,
+        "project_ids": affected_project_ids,
+        "session_ids_by_project": session_ids_by_project,
+    }
 
 
 async def expire_inactive_sessions(
@@ -6382,6 +7445,14 @@ async def expire_inactive_sessions(
         (cutoff,),
     )
     await db.commit()
+    # 8a665a03 -- the sweep reset the dead sessions' tasks and archived the sessions with
+    # no announcement (the sprint items already went through requeue_or_fail_stalled_item,
+    # which publishes). Without these the Active Sessions list and the Devlog kept the
+    # dead workers' rows until a reload.
+    await _announce_released_claims(db, None, stale_task_ids, [])
+    for _pid in affected_project_ids:
+        if _pid:
+            _publish_project_event(_pid, "session_updated", {"status": "archived"})
     return {"count": cursor.rowcount, "project_ids": affected_project_ids}
 
 
@@ -7453,7 +8524,12 @@ async def update_tenant(
     tenant_id: str,
     **fields: object,
 ) -> dict[str, Any] | None:
-    """Update arbitrary columns on a tenant row. Returns updated dict or None."""
+    """Update arbitrary columns on a tenant row. Returns updated dict or None.
+
+    Raises ``ValueError`` for a plan no gate recognises, and ``plans.SharedPoolError``
+    (a ``ValueError``) when an unbilled plan (playtester) is set on a tenant whose
+    database is in a Neon project other tenants use.
+    """
     allowed = {
         "neon_project_id", "neon_db_url", "stripe_customer_id", "plan", "pool_project_id",
         "stripe_metered_item_id", "notification_prefs",
@@ -7468,6 +8544,19 @@ async def update_tenant(
     updates = {k: v for k, v in fields.items() if k in allowed}
     if not updates:
         return await get_tenant_by_id(db, tenant_id)
+    if "plan" in updates:
+        # tenants.plan has no CHECK constraint, so this is the one write-side
+        # guard: a typo must not park a tenant on a value no gate recognises
+        # (see plans.py for the legal values).
+        from ..plans import is_unbilled_plan, validate_plan  # noqa: PLC0415
+        validate_plan(updates["plan"])
+        if is_unbilled_plan(updates["plan"]):
+            # The project the database will be in once this write is done.
+            if "neon_project_id" in updates:
+                pool = updates["neon_project_id"]
+            else:
+                pool = ((await get_tenant_by_id(db, tenant_id)) or {}).get("neon_project_id")
+            await require_dedicated_pool(db, tenant_id, pool if isinstance(pool, str) else None)
     set_clause = ", ".join(f"{k} = ?" for k in updates)
     await db.execute(
         f"UPDATE tenants SET {set_clause} WHERE id = ?",
@@ -7919,14 +9008,20 @@ async def register_pool_project(
     db: aiosqlite.Connection,
     neon_project_id: str,
     tier: str = "standard",
+    customer_count: int = 0,
 ) -> dict[str, Any]:
-    """Register a newly created Neon project as an available pool project."""
+    """Register a newly created Neon project as an available pool project.
+
+    ``customer_count`` starts at 0 for an ordinary pool that tenants are placed
+    in one by one. A project made for a single tenant (a playtester, see
+    ``plans.py``) is registered already full, so nobody else is ever placed in it.
+    """
     import uuid
     pid = str(uuid.uuid4())
     await db.execute(
         "INSERT INTO neon_pool_projects (id, neon_project_id, tier, customer_count) "
-        "VALUES (?, ?, ?, 0)",
-        (pid, neon_project_id, tier),
+        "VALUES (?, ?, ?, ?)",
+        (pid, neon_project_id, tier, customer_count),
     )
     await db.commit()
     async with db.execute(
@@ -7971,17 +9066,28 @@ async def claim_pool_project_slot(
     runs against the locked row, so the second concurrent UPDATE harmlessly
     no-ops once T1 has bumped the count to the cap.
 
+    A project that holds an unbilled-plan tenant (a playtester, see
+    ``plans.py``) is never picked, however many slots it has left: a playtester
+    stays alone on its project, which is what keeps its usage its own.
+
     Returns the updated pool project row (with the post-increment count), or
     ``None`` if no pool has room — caller should create a new pool project
     and try again.
     """
+    from ..plans import UNBILLED_PLANS  # noqa: PLC0415
+
+    unbilled = ", ".join(f"'{p}'" for p in sorted(UNBILLED_PLANS))
     async with db.execute(
         "UPDATE neon_pool_projects "
         "SET customer_count = customer_count + 1 "
         "WHERE id = ("
-        "  SELECT id FROM neon_pool_projects "
-        "  WHERE tier = ? AND customer_count < ? "
-        "  ORDER BY customer_count DESC LIMIT 1"
+        "  SELECT p.id FROM neon_pool_projects p "
+        "  WHERE p.tier = ? AND p.customer_count < ? "
+        "  AND NOT EXISTS ("
+        "    SELECT 1 FROM tenants t "
+        f"    WHERE t.neon_project_id = p.neon_project_id AND t.plan IN ({unbilled})"
+        "  ) "
+        "  ORDER BY p.customer_count DESC LIMIT 1"
         ") "
         "AND customer_count < ? "
         "RETURNING *",
@@ -8005,6 +9111,46 @@ async def decrement_pool_project_count(
         (neon_project_id,),
     )
     await db.commit()
+
+
+async def count_pool_mates(
+    db: aiosqlite.Connection,
+    tenant_id: str,
+    neon_project_id: str | None,
+) -> int:
+    """How many OTHER tenants have their database in the Neon project ``neon_project_id``.
+
+    0 when there is no project (a tenant that has no database yet is alone by
+    definition). Any plan counts: Neon reports usage per project, so staff and
+    free tenants mix into a figure just as paying ones do.
+    """
+    if not neon_project_id:
+        return 0
+    async with db.execute(
+        "SELECT COUNT(*) AS n FROM tenants WHERE neon_project_id = ? AND id != ?",
+        (neon_project_id, tenant_id),
+    ) as cur:
+        row = await cur.fetchone()
+    return int((_row_to_dict(row) or {}).get("n") or 0) if row else 0
+
+
+async def require_dedicated_pool(
+    db: aiosqlite.Connection,
+    tenant_id: str,
+    neon_project_id: str | None,
+) -> None:
+    """Raise ``plans.SharedPoolError`` unless the tenant is alone in ``neon_project_id``.
+
+    The check behind the playtester plan: it is only granted on a project of the
+    tenant's own (or to a tenant with no database yet, which gets one). Used by
+    ``update_tenant`` for every write of an unbilled plan, and by the admin
+    action so a preview reports the refusal too.
+    """
+    mates = await count_pool_mates(db, tenant_id, neon_project_id)
+    if mates:
+        from ..plans import SharedPoolError  # noqa: PLC0415
+
+        raise SharedPoolError(tenant_id, str(neon_project_id), mates)
 
 
 async def get_pool_project_counts(
@@ -8788,11 +9934,22 @@ async def register_worktree(
 async def get_worktree(
     db: aiosqlite.Connection,
     worktree_id: str,
+    *,
+    project_id: str | None = None,
 ) -> dict[str, Any] | None:
-    """Return a single active_worktrees row by id, or None."""
-    async with db.execute(
-        "SELECT * FROM active_worktrees WHERE id = ?", (worktree_id,)
-    ) as cur:
+    """Return a single active_worktrees row by id, or None.
+
+    RT-TI-005 (wave 2) — ``project_id`` optionally binds the lookup to the
+    project the caller named: a worktree owned by another project is answered
+    exactly like a missing one. ``None`` (the default) keeps the historical
+    id-only lookup for callers that have no project in hand.
+    """
+    sql = "SELECT * FROM active_worktrees WHERE id = ?"
+    params: tuple[Any, ...] = (worktree_id,)
+    if project_id is not None:
+        sql += " AND project_id = ?"
+        params = (worktree_id, project_id)
+    async with db.execute(sql, params) as cur:
         row = await cur.fetchone()
     return _row_to_dict(row) if row is not None else None
 
@@ -8800,13 +9957,24 @@ async def get_worktree(
 async def remove_worktree(
     db: aiosqlite.Connection,
     worktree_id: str,
+    *,
+    project_id: str | None = None,
 ) -> bool:
-    """Mark a worktree as removed. Returns True when a row was updated."""
-    cursor = await db.execute(
+    """Mark a worktree as removed. Returns True when a row was updated.
+
+    RT-TI-005 (wave 2) — ``project_id`` optionally binds the UPDATE to the
+    owning project, so a worktree id from another project can never be marked
+    removed through a path that names a different project.
+    """
+    sql = (
         "UPDATE active_worktrees SET removed_at = datetime('now') "
-        "WHERE id = ? AND removed_at IS NULL",
-        (worktree_id,),
+        "WHERE id = ? AND removed_at IS NULL"
     )
+    params: tuple[Any, ...] = (worktree_id,)
+    if project_id is not None:
+        sql += " AND project_id = ?"
+        params = (worktree_id, project_id)
+    cursor = await db.execute(sql, params)
     await db.commit()
     return (cursor.rowcount or 0) > 0
 
@@ -8819,7 +9987,10 @@ async def list_active_worktrees(
     async with db.execute(
         "SELECT aw.*, s.name AS session_name "
         "FROM active_worktrees aw "
-        "LEFT JOIN sessions s ON s.id = aw.session_id "
+        # RT-TI-005 (pass 3, F-D6) -- join the session only within the worktree's own
+        # project, so a row that (wrongly) carries another project's session id can never
+        # surface that session's name.
+        "LEFT JOIN sessions s ON s.id = aw.session_id AND s.project_id = aw.project_id "
         "WHERE aw.project_id = ? AND aw.removed_at IS NULL "
         "ORDER BY aw.created_at DESC",
         (project_id,),
@@ -9170,9 +10341,14 @@ async def update_pinned_decision(
     priority: str | None = None,
     assumption: str | None = None,
     assumption_status: str | None = None,
+    project_id: str | None = None,
 ) -> dict[str, Any] | None:
     """Patch any combination of body / category / title / status / superseded_by /
     priority / assumption / assumption_status.
+
+    RT-TI-004 — ``project_id`` binds the decision to the project the caller
+    named; a decision owned by a different project is answered like a missing
+    one (``None``).
 
     Use ``status='superseded'`` + ``superseded_by=<new_id>`` to retire a
     decision while preserving the audit trail. Pass only the fields you
@@ -9187,6 +10363,8 @@ async def update_pinned_decision(
     from datetime import datetime, timezone
     existing = await get_pinned_decision(db, decision_id)
     if existing is None:
+        return None
+    if project_id is not None and existing.get("project_id") != project_id:
         return None
     now_iso = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
     fields: dict[str, Any] = {}
@@ -9230,6 +10408,13 @@ async def update_pinned_decision(
         f"UPDATE decisions_pinned SET {set_clause} WHERE id = ?", args
     )
     await db.commit()
+    # 8a665a03 -- edit / archive (supersede) / priority / category changes used to
+    # be silent, so an open Decisions view only learned about a NEW pin
+    # (decision_pinned) and stayed stale after any other change made from another
+    # tab, session or MCP client.
+    _publish_project_event(
+        existing["project_id"], "decision_updated", {"decision_id": decision_id}
+    )
     return await get_pinned_decision(db, decision_id)
 
 
@@ -9240,15 +10425,19 @@ async def supersede_pinned_decision(
     new_body: str,
     category: str | None = None,
     priority: str | None = None,
+    project_id: str | None = None,
 ) -> dict[str, Any]:
     """Atomic supersede: create a new active decision and mark the old as superseded.
 
     Returns the new decision row. The old row keeps the back-link via
     ``superseded_by`` so the dashboard can render the chain. The new row inherits
     the old decision's priority unless ``priority`` overrides it (366317e9).
+
+    RT-TI-004 — ``project_id`` binds the old decision to the project the caller
+    named (a mismatch raises the same "decision not found" as a missing id).
     """
     old = await get_pinned_decision(db, old_decision_id)
-    if old is None:
+    if old is None or (project_id is not None and old.get("project_id") != project_id):
         raise ValueError("decision not found")
     new = await pin_decision(
         db,
@@ -9277,14 +10466,35 @@ async def count_decisions(db: aiosqlite.Connection, project_id: str) -> int:
 
 
 async def delete_pinned_decision(
-    db: aiosqlite.Connection, decision_id: str
+    db: aiosqlite.Connection, decision_id: str, *, project_id: str | None = None
 ) -> bool:
-    """Hard-delete a pinned decision by id. Returns True if deleted, False if not found."""
-    cur = await db.execute(
-        "DELETE FROM decisions_pinned WHERE id = ?", (decision_id,)
-    )
+    """Hard-delete a pinned decision by id. Returns True if deleted, False if not found.
+
+    RT-TI-004 — with ``project_id`` the delete only matches a decision that
+    belongs to that project (a mismatch is answered like a missing decision).
+    """
+    # 8a665a03 -- the event is routed by project, and the MCP path passes no
+    # project_id, so resolve the owner before the row disappears.
+    owner_project_id = project_id
+    if owner_project_id is None:
+        existing = await get_pinned_decision(db, decision_id)
+        owner_project_id = existing.get("project_id") if existing else None
+    if project_id is None:
+        cur = await db.execute(
+            "DELETE FROM decisions_pinned WHERE id = ?", (decision_id,)
+        )
+    else:
+        cur = await db.execute(
+            "DELETE FROM decisions_pinned WHERE id = ? AND project_id = ?",
+            (decision_id, project_id),
+        )
     await db.commit()
-    return cur.rowcount > 0
+    deleted = cur.rowcount > 0
+    if deleted and owner_project_id:
+        _publish_project_event(
+            owner_project_id, "decision_deleted", {"decision_id": decision_id}
+        )
+    return deleted
 
 
 # ---------------------------------------------------------------------------
@@ -10975,10 +12185,19 @@ async def update_project_note(
     body: str | None = None,
     tags: str | None = None,
     priority: str | None = None,
+    project_id: str | None = None,
 ) -> dict[str, Any] | None:
-    """Patch any combination of title/body/tags/priority. Returns updated row."""
+    """Patch any combination of title/body/tags/priority. Returns updated row.
+
+    RT-TI-003 — ``project_id`` binds the note to the project the caller named:
+    a note that belongs to a different project is answered exactly like a
+    missing one (``None``). Omit it only for callers that already resolved the
+    note through their own project-scoped lookup.
+    """
     existing = await get_project_note(db, note_id)
     if existing is None:
+        return None
+    if project_id is not None and existing.get("project_id") != project_id:
         return None
     fields: dict[str, Any] = {}
     if title is not None:
@@ -11001,18 +12220,40 @@ async def update_project_note(
         f"UPDATE project_notes SET {set_clause} WHERE id = ?", args
     )
     await db.commit()
+    # 8a665a03 -- only note_added used to be announced, so an edit made through the
+    # API, MCP, a handoff retrospective rewrite or a document re-ingest left an open
+    # Notes tab showing the old text.
+    _publish_project_event(existing["project_id"], "note_updated", {"note_id": note_id})
     return await get_project_note(db, note_id)
 
 
 async def delete_project_note(
-    db: aiosqlite.Connection, note_id: str
+    db: aiosqlite.Connection, note_id: str, *, project_id: str | None = None
 ) -> bool:
-    """Hard-delete a note. Returns True if a row was removed."""
-    async with db.execute(
-        "DELETE FROM project_notes WHERE id = ?", (note_id,)
-    ) as cur:
+    """Hard-delete a note. Returns True if a row was removed.
+
+    RT-TI-003 — with ``project_id`` the delete only matches a note that belongs
+    to that project, so naming one project while passing another project's note
+    id removes nothing (same answer as a missing note).
+    """
+    # 8a665a03 -- the event is routed by project, and the MCP path passes no
+    # project_id, so resolve the owner before the row disappears.
+    owner_project_id = project_id
+    if owner_project_id is None:
+        existing = await get_project_note(db, note_id)
+        owner_project_id = existing.get("project_id") if existing else None
+    if project_id is None:
+        sql, params = "DELETE FROM project_notes WHERE id = ?", (note_id,)
+    else:
+        sql, params = (
+            "DELETE FROM project_notes WHERE id = ? AND project_id = ?",
+            (note_id, project_id),
+        )
+    async with db.execute(sql, params) as cur:
         rc = cur.rowcount or 0
     await db.commit()
+    if rc > 0 and owner_project_id:
+        _publish_project_event(owner_project_id, "note_deleted", {"note_id": note_id})
     return rc > 0
 
 
@@ -12010,6 +13251,7 @@ async def export_tenant_data(
     db: aiosqlite.Connection,
     tenant_id: str,
     project_db: aiosqlite.Connection | None = None,
+    project_ids: list[str] | None = None,
 ) -> dict[str, Any]:
     """Collect all data belonging to a tenant as a plain dict for GDPR export.
 
@@ -12018,10 +13260,18 @@ async def export_tenant_data(
     per-tenant Neon DB — pass it as ``project_db`` so the export actually
     contains the projects. When omitted (self-hosted, single DB) the project
     data is read from ``db`` like before.
+
+    ``project_ids`` (RT-TI-005 pass 3, F-D2) -- ``None`` (the default, and what every
+    owner / workspace-wide / self-hosted caller passes) exports every project exactly
+    as before. A list restricts the export to those projects and leaves out the
+    workspace-global notes and decisions, which belong to no project: a project-scoped
+    workspace member downloading "their" data must not receive the other projects (or
+    the workspace notebook) of the workspace they were invited into.
     """
     from datetime import datetime, timezone
 
     pdb = project_db if project_db is not None else db
+    _only_projects = set(project_ids) if project_ids is not None else None
 
     async with db.execute(
         "SELECT id, email, google_sub, microsoft_sub, plan, created_at FROM tenants WHERE id = ?",
@@ -12042,6 +13292,18 @@ async def export_tenant_data(
     ) as cur:
         members = [_row_to_dict(r) for r in await cur.fetchall()]
 
+    # What each project-scoped member may do. Workspace-wide like the notebook below,
+    # so a project-restricted export (a scoped member downloading their data) leaves
+    # it out rather than hand over the other members' emails and rights.
+    member_policy: list[dict[str, Any]] = []
+    if _only_projects is None:
+        async with db.execute(
+            "SELECT subject, policy, updated_by, updated_at FROM member_policy "
+            "WHERE tenant_id = ? ORDER BY subject ASC",
+            (tenant_id,),
+        ) as cur:
+            member_policy = [_row_to_dict(r) for r in await cur.fetchall()]
+
     async with pdb.execute(
         "SELECT id, name, creator_human_id, decisions, created_at FROM projects ORDER BY created_at DESC",
     ) as cur:
@@ -12051,6 +13313,8 @@ async def export_tenant_data(
     for pr in project_rows:
         p = _row_to_dict(pr)
         pid = p["id"]
+        if _only_projects is not None and pid not in _only_projects:
+            continue
 
         async with pdb.execute(
             "SELECT content, goal_north_star, goal_sprint, version, updated_at FROM goal_states WHERE project_id = ?",
@@ -12102,21 +13366,26 @@ async def export_tenant_data(
         p["hitl_requests"] = hitl
         projects.append(p)
 
-    # Workspace-global notes/decisions live in the project DB too.
-    try:
-        ws_notes = await get_workspace_notes(pdb)
-    except Exception:
-        ws_notes = []
-    try:
-        ws_decisions = await get_workspace_decisions(pdb)
-    except Exception:
-        ws_decisions = []
+    # Workspace-global notes/decisions live in the project DB too (and are not part of
+    # a project-restricted export, see ``project_ids`` above).
+    ws_notes: list[dict[str, Any]] = []
+    ws_decisions: list[dict[str, Any]] = []
+    if _only_projects is None:
+        try:
+            ws_notes = await get_workspace_notes(pdb)
+        except Exception:
+            ws_notes = []
+        try:
+            ws_decisions = await get_workspace_decisions(pdb)
+        except Exception:
+            ws_decisions = []
 
     return {
         "exported_at": datetime.now(timezone.utc).isoformat(),
         "tenant": tenant_data,
         "api_tokens": tokens,
         "workspace_members": members,
+        "member_policy": member_policy,
         "workspace_notes": ws_notes,
         "workspace_decisions": ws_decisions,
         "projects": projects,
@@ -12155,6 +13424,7 @@ async def delete_tenant_records(
         ("DELETE FROM user_sessions WHERE tenant_id = ?", (tenant_id,)),
         ("DELETE FROM api_tokens WHERE tenant_id = ?", (tenant_id,)),
         ("DELETE FROM workspace_members WHERE tenant_id = ?", (tenant_id,)),
+        ("DELETE FROM member_policy WHERE tenant_id = ?", (tenant_id,)),
         ("DELETE FROM oauth_tokens WHERE tenant_id = ?", (tenant_id,)),
         ("DELETE FROM tenant_environments WHERE tenant_id = ?", (tenant_id,)),
         ("DELETE FROM oauth_codes WHERE tenant_id = ?", (tenant_id,)),
@@ -12685,12 +13955,22 @@ async def amend_handoff(
 
 
 async def get_handoff(
-    db: aiosqlite.Connection, handoff_id: str
+    db: aiosqlite.Connection, handoff_id: str, *, project_id: str | None = None
 ) -> dict[str, Any] | None:
-    """Fetch a single handoff row by id."""
-    async with db.execute(
-        "SELECT * FROM handoffs WHERE id = ?", (handoff_id,)
-    ) as cur:
+    """Fetch a single handoff row by id.
+
+    ``project_id`` (RT-TI-005 pass 3, F-D5) binds the lookup to one project: a handoff
+    of another project then behaves exactly like an unknown id (``None``). Every caller
+    that took the id from a request (a correction's ``source_handoff_id``) passes it;
+    ``None`` (the default) keeps the historical unbound lookup for internal callers that
+    already hold a row they own.
+    """
+    if project_id is None:
+        sql, params = "SELECT * FROM handoffs WHERE id = ?", (handoff_id,)
+    else:
+        sql = "SELECT * FROM handoffs WHERE id = ? AND project_id = ?"
+        params = (handoff_id, project_id)
+    async with db.execute(sql, params) as cur:
         row = await cur.fetchone()
     return _row_to_dict(row)
 
@@ -13160,6 +14440,7 @@ from .sprint_items import (  # noqa: F401
     count_new_sprint_items_since,
     count_pending_sprint_items,
     count_sprint_items_awaiting_verification,
+    delete_sprint_item,
     delete_sprint_item_pointer,
     relocate_sprint_item_pointer,
     evaluate_board_blockers,
@@ -13193,6 +14474,13 @@ from .sprint_items import (  # noqa: F401
     link_sprint_item_github_issue,
     merge_sprint_items,
     move_sprint_item_to_project,
+    # 0c30b989 — move an item to another version (vs push_sprint_item = defer)
+    move_sprint_item_to_version,
+    move_sprint_items_to_version,
+    MAX_BULK_MOVE_ITEMS,
+    SPRINT_ITEM_VERSION_MOVED_AUDIT_EVENT,
+    NextVersionUnavailable,
+    SprintItemVersionConflict,
     patch_sprint_item,
     provisional_complete_sprint_item,
     push_sprint_item,
@@ -13533,6 +14821,16 @@ from .workspace import (  # noqa: F401
     update_workspace_member,
     get_workspaces_for_email,
     get_scoped_project_ids_for_member,
+    # Member policy: per-workspace default + per-person override of what a
+    # project-scoped member may do (member_policy table)
+    MEMBER_POLICY_DEFAULT_SUBJECT,
+    MEMBER_POLICY_CHANGED_EVENT,
+    get_member_policy_rows,
+    set_member_policy_default,
+    set_member_policy_override,
+    clear_member_policy_override,
+    list_member_policy_overrides,
+    get_member_roles,
 )
 
 # 5dfe34b2 — manual-issue content-screening extension. Imported last (after

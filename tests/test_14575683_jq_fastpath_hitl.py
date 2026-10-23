@@ -301,7 +301,10 @@ def _run_ps1_hook(payload: str, env: dict[str, str] | None = None) -> subprocess
         cwd=str(_REPO),
         capture_output=True,
         text=True,
-        timeout=15,
+        # pwsh cold-starts in ~1s locally but took >15s on a loaded CI runner (dev run
+        # fa3cd3e1: TimeoutExpired, passed on re-run). The timeout only has to catch a
+        # hung hook, so give a slow runner room.
+        timeout=60,
         env=env,
     )
 

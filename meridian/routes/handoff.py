@@ -7,7 +7,7 @@ from typing import Any
 
 from fastapi import APIRouter, HTTPException, Request
 
-from .._deps import _db, _data_dir
+from .._deps import _db, _data_dir, _workspace_visible_for_request
 from .. import db as db_module
 from .. import handoff as handoff_module
 from ..db import ai_log as ai_log_module
@@ -260,6 +260,8 @@ async def generate_handoff_endpoint(
                 strict_continuation=_strict_continuation,
                 continuation_status=_continuation_status,
                 pending_goal_receiver=_pending_goal_receiver,
+                # A project-scoped caller never gets the owner's workspace notes/decisions.
+                include_workspace=await _workspace_visible_for_request(request),
             ),
             timeout=90.0,
         )
@@ -510,7 +512,8 @@ async def record_handoff_correction_endpoint(
         result = await handoff_module.regenerate_handoff_correction(
             db, project_id, correction["id"], body.get("output_dir") or data_dir,
             session_id=body.get("session_id"),
-            mode=body.get("mode") or "full",
+            # 0b0b24d8 — omitted mode resolves by intent, never a silent 'full'.
+            mode=body.get("mode") or None,
         )
     except handoff_module.HandoffCorrectionError as exc:
         raise HTTPException(status_code=422, detail=str(exc)) from exc
