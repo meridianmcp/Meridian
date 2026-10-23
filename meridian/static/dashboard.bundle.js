@@ -1710,11 +1710,14 @@
       if (stale && !hint) {
         (row.querySelector(".sprint-item-main") || row).insertAdjacentHTML(
           "beforeend",
-          // Visually hidden, so the hint takes no layout space; the status icon carries the visible tooltip.
-          '<span class="sprint-changed-meanwhile" style="position:absolute;width:1px;height:1px;overflow:hidden;clip:rect(0 0 0 0);white-space:nowrap">changed meanwhile</span>'
+          '<span class="sprint-changed-meanwhile" hidden>changed meanwhile</span>'
         );
       } else if (!stale && hint) {
         hint.remove();
+      }
+      if (icon) {
+        if (stale) icon.setAttribute("title", "changed meanwhile");
+        else icon.removeAttribute("title");
       }
     });
   }
