@@ -129,7 +129,7 @@ langchain-protocol==0.0.19
 langchain-tavily==0.2.18
 langchain-text-splitters==1.1.2
 langchain==1.4.2
-langgraph-api==0.7.27
+langgraph-api==0.10.0
 langgraph-checkpoint==4.2.0
 langgraph-cli==0.4.32
 langgraph-prebuilt==1.1.0
