@@ -53,9 +53,12 @@ async def test_legacy_fan_out_rejects_a_malformed_tool_requirement_before_writin
     with pytest.raises(ToolRequirementError):
         await db_module.fan_out_sprint_items(db, p["id"], [{"title": "ok"}, bad])
 
-    async with db.execute("SELECT COUNT(*) FROM sprint_items WHERE project_id = ?", (p["id"],)) as cur:
-        (count,) = await cur.fetchone()
-    assert count == 0
+    async with db.execute(
+        "SELECT COUNT(*) AS c FROM sprint_items WHERE project_id = ?", (p["id"],)
+    ) as cur:
+        row = await cur.fetchone()
+    # Postgres rows come back as dicts and SQLite rows as tuples, so read the value either way.
+    assert (row["c"] if isinstance(row, dict) else row[0]) == 0
 
 
 def test_strict_batch_mapper_passes_the_tool_pins_through():
