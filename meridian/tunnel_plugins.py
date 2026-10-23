@@ -434,7 +434,9 @@ BUILTIN_PLUGINS: list[dict[str, Any]] = [
         "enabled": False,
         "builtin": True,
         "core": False,
-        "command": ["uvx", "zotero-mcp"],
+        "command": ["uvx", "zotero-mcp==0.3.1"],
+        # The unpinned command shipped before the pin, so an existing install still matches it.
+        "previous_defaults": [["uvx", "zotero-mcp"]],
         "env": {"ZOTERO_LOCAL": "true"},
         # zotero-mcp exposes bare tool names — no self-prefix, so the server
         # bridge namespaces them via SLOT_DISPLAY_NAMES ("zotero" → "zotero-mcp__…").
