@@ -252,29 +252,6 @@ export function paintKeepingDrafts(root: Element, html: string, units: DraftUnit
   return carried;
 }
 
-// ---------------------------------------------------------------------------
-// 962d4480 -- the Team, Experiments and Settings tab bodies keep their drafts too. Those
-// bodies are repainted when the tab opens, on Refresh, and after a save. Any text field with
-// an id that the user has typed into survives such a repaint, and a loading or error message
-// does not blank a body that still holds one.
-// ---------------------------------------------------------------------------
-export const TAB_BODY_DRAFTS: DraftUnit[] = [
-  { selector: 'input[id], textarea[id]', key: (el) => el.id },
-];
-
-/** Repaint a tab body with `html`, keeping its unsent drafts (see paintKeepingDrafts). */
-export function paintTabBody(body: Element, html: string): number {
-  return paintKeepingDrafts(body, html, TAB_BODY_DRAFTS);
-}
-
-/** Replace a tab body with a loading or error message, unless it holds an unsent draft: then
- * the body, draft included, is left as it is. Returns false when it was left alone. */
-export function setTabBodyMessage(body: Element, html: string): boolean {
-  if (hasUnsentDrafts(body, TAB_BODY_DRAFTS)) return false;
-  body.innerHTML = html;
-  return true;
-}
-
 // --- ITEM 4 esbuild: re-expose top-level symbols as globals so inline handlers
 // and cross-file references keep resolving after IIFE bundling.
 try {
