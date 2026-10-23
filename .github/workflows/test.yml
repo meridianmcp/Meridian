@@ -283,7 +283,10 @@ jobs:
     # ModuleNotFoundError buried in this job's own pytest collection.
     needs: extension-dependency-preflight
     runs-on: ubuntu-latest
-    timeout-minutes: 15
+    # 2026-10-23 -- raised 15 -> 30. The apt install of libreoffice-writer took past 15 minutes on a normal runner
+    # (run 40027945056: every job passed except this one, cancelled in its LibreOffice install step), and a cancelled
+    # job blocks the auto-promote the same as a failure.
+    timeout-minutes: 30
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
       - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5
