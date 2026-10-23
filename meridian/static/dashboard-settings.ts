@@ -14,8 +14,6 @@ import {
   type PageInfo,
   type RelationshipProject,
 } from './dashboard-control-plane';
-// 962d4480 -- the settings body keeps an unsent draft across its own repaints.
-import { paintTabBody, setTabBodyMessage } from './dashboard-utils';
 
 // 02dbd8b4 — runtime configuration generation status (tunnel/executor
 // settings). Pure formatter for the `config_generation` record the server
@@ -937,7 +935,7 @@ export async function loadSettingsTab(projectId: any, { force = false } = {}) {
   if (body._settingsObs) { body._settingsObs.disconnect(); body._settingsObs = null; }
   delete body.dataset.tabbed;
 
-  setTabBodyMessage(body, '<div style="color:var(--muted);font-size:11px">loading…</div>');
+  body.innerHTML = '<div style="color:var(--muted);font-size:11px">loading…</div>';
 
   // 9b8261e4 — when viewing a workspace you were invited to as a viewer/member,
   // hide owner-only sections (server enforcement lives in 393eed0a).
@@ -4848,7 +4846,7 @@ export async function loadSettingsTab(projectId: any, { force = false } = {}) {
   if ((body as any)._loadTok !== _myTok) return;
 
   try {
-    paintTabBody(body, html);
+    body.innerHTML = html;
   } catch (renderErr) {
     console.error('Settings render failed:', renderErr);
     body.innerHTML = `<div style="color:var(--error);font-size:11px">Failed to render settings: ${escapeHtml(String(renderErr))}</div>`;
@@ -5875,7 +5873,7 @@ export async function loadSettingsTab(projectId: any, { force = false } = {}) {
   }
 
   } catch (e: any) {
-    setTabBodyMessage(body, `<div style="color:var(--error);font-size:11px">Failed to load settings: ${escapeHtml(String(e))}</div>`);
+    body.innerHTML = `<div style="color:var(--error);font-size:11px">Failed to load settings: ${escapeHtml(String(e))}</div>`;
   }
 
 }

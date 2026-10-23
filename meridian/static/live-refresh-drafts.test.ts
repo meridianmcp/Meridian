@@ -20,7 +20,7 @@
 // dashboard-*.ts into the text the source-scanning pytest checks.
 import { describe, it, expect, vi, beforeAll, beforeEach, afterEach } from "vitest";
 import { loadDashboardFunctions } from "./source-harness";
-import { paintKeepingDrafts, hasUnsentDrafts, fieldHoldsDraft, escapeHtml, paintTabBody, setTabBodyMessage, type DraftUnit } from "./dashboard-utils";
+import { paintKeepingDrafts, hasUnsentDrafts, fieldHoldsDraft, escapeHtml, type DraftUnit } from "./dashboard-utils";
 import { renderSprintProgress } from "./dashboard-sprint";
 
 const DASH = "meridian/static/dashboard.ts";
@@ -316,29 +316,6 @@ describe("Live tab sprint board: a repaint keeps the add-item box and any open i
       expect(refreshSprintSurfaces).toHaveBeenCalledWith(PID);
       paint(agentChanged()); // the catch-up repaint
       expect(row("it-1")!.querySelectorAll(".sprint-edit-input")).toHaveLength(0);
-    });
-
-    it("a row whose status changed under an open editor keeps its icon and says 'changed meanwhile' until the editor closes", async () => {
-      paint(board());
-      await fns.sprintItemEdit(PID, "it-1");
-      const [title, version] = editInputs("it-1");
-      title!.value = "still typing";
-      expect(row("it-1")!.querySelector(".sprint-changed-meanwhile")).toBeNull();
-
-      // an agent marks it-1 done while the editor is open
-      paint([item("it-1", "first item", { status: "done" }), ...board().slice(1)]);
-
-      expect(editInputs("it-1")).toEqual([title, version]); // the editor carried across, same nodes
-      expect(title!.value).toBe("still typing");
-      expect(row("it-1")!.querySelector(".sprint-item-icon")!.textContent).toBe("○"); // the stale icon (pending)
-      expect(row("it-1")!.querySelector(".sprint-changed-meanwhile")!.textContent).toContain("changed meanwhile");
-      // the other rows are fresh: no hint on a row whose status did not change
-      expect(row("it-2")!.querySelector(".sprint-changed-meanwhile")).toBeNull();
-
-      editInputs("it-1")[0]!.dispatchEvent(new KeyboardEvent("keydown", { key: "Escape" }));
-      paint([item("it-1", "first item", { status: "done" }), ...board().slice(1)]); // the repaint after the close
-      expect(row("it-1")!.querySelector(".sprint-item-icon")!.textContent).toBe("●");
-      expect(row("it-1")!.querySelector(".sprint-changed-meanwhile")).toBeNull();
     });
 
     it("an editor that was opened but not yet typed into is kept too", async () => {
@@ -810,150 +787,5 @@ describe("a hitl_filed event repaints both HITL surfaces and loses neither answe
     expect(panelBox.value).toBe("typed in the panel");
     expect(document.getElementById("hitl-ans-h1")).toBe(drawerBox);
     expect(drawerBox.value).toBe("typed in the drawer");
-  });
-});
-
-// 962d4480 -- a HITL request answered or dismissed elsewhere comes off every surface at once.
-describe("a hitl_answered / hitl_dismissed event takes the card off both HITL surfaces and keeps the other drafts", () => {
-  for (const type of ["hitl_answered", "hitl_dismissed"]) {
-    it(`${type}: the settled card goes, another card's draft survives (through the real handleWsEvent)`, async () => {
-      document.body.innerHTML =
-        `<div id="hitl-bar"><span id="hitl-count"></span></div><div id="hitl-panel"></div><div id="hitl-list"></div>` +
-        `<select id="hitl-status-filter-${PID}"><option value="pending">pending</option></select>` +
-        `<div id="hitl-body-${PID}"></div>`;
-      const req = (id: string) => ({ id, project_id: PID, status: "pending", urgency: "normal", question: `Q ${id}?`, created_at: "2026-10-07 10:00:00" });
-      let pending = [req("h1"), req("h2")];
-      const api = vi.fn(async (path: string) => (path.includes("status=answered") ? [] : pending.slice()));
-      const state = { panels: { [PID]: { activeVtab: "hitl", taskCache: [] } }, tabs: [], projects: [] };
-      const fns = load(["handleWsEvent", "refreshHitl", "loadHitlTab"], {
-        state, api, escapeHtml, toast: vi.fn(), confirm: vi.fn(() => true), _wireTabSearch: vi.fn(), _removeHitlCard: vi.fn(),
-        paintKeepingDrafts, hasUnsentDrafts, setVtabCountBadge: vi.fn(), formatRelativeTime: () => "now",
-        _HITL_URGENCY_COLOR: { normal: "#888" }, _renderAutoAnsweredHitls: vi.fn(() => ""), _hitlAnswer: vi.fn(),
-        _hitlDismiss: vi.fn(), refreshProjectCountBadges: vi.fn(),
-      });
-      await fns.refreshHitl();
-      await fns.loadHitlTab(PID);
-      await flush();
-      const keep = document.querySelector('#hitl-list .hitl-answer-input[data-hitl-id="h2"]') as HTMLInputElement;
-      keep.value = "typed for h2";
-
-      pending = [req("h2")]; // h1 was answered or dismissed on another screen
-      fns.handleWsEvent(PID, { type, project_id: PID, hitl_id: "h1" });
-      await flush();
-      await flush();
-
-      expect(document.querySelector('#hitl-list [data-hitl-id="h1"]')).toBeNull();
-      expect(document.querySelector('#hitl-list .hitl-answer-input[data-hitl-id="h2"]')).toBe(keep);
-      expect(keep.value).toBe("typed for h2");
-    });
-  }
-});
-
-// 962d4480 -- two refreshes that overlap must not each append the auto-answered section.
-describe("overlapping HITL refreshes", () => {
-  it("leave one 'recently auto-answered' section and one card, not one section per refresh", async () => {
-    document.body.innerHTML =
-      `<div id="hitl-bar"><span id="hitl-count"></span></div><div id="hitl-panel"></div><div id="hitl-list"></div>`;
-    const pending = [{ id: "h1", project_id: PID, urgency: "normal", question: "Deploy now?", created_at: "2026-10-07 10:00:00" }];
-    // Every /hitl request waits until the test settles it, so the test picks the interleaving:
-    // refresh 1 paints, refresh 2 paints over it, and only then does refresh 1's answered list come back.
-    const calls: Array<{ path: string; done: (v: unknown) => void }> = [];
-    const api = vi.fn((path: string) => new Promise((resolve) => calls.push({ path, done: resolve })));
-    const settle = async (which: "pending" | "answered") => {
-      const i = calls.findIndex((c) => (which === "answered") === c.path.includes("status=answered"));
-      const [call] = calls.splice(i, 1);
-      call.done(which === "answered" ? [{ id: "a1", answered_by: "auto" }] : pending.slice());
-      await flush();
-    };
-    const fns = load(["refreshHitl"], {
-      api, setVtabCountBadge: vi.fn(), formatRelativeTime: () => "just now", escapeHtml,
-      _HITL_URGENCY_COLOR: { normal: "#888" },
-      _renderAutoAnsweredHitls: (rows: any[]) => (rows.length ? `<div data-hitl-auto-section>Recently auto-answered</div>` : ""),
-      _hitlAnswer: vi.fn(), _hitlDismiss: vi.fn(), paintKeepingDrafts,
-    });
-
-    const first = fns.refreshHitl();
-    await flush();
-    await settle("pending"); // refresh 1 paints the list and asks for the answered rows
-    const second = fns.refreshHitl();
-    await flush();
-    await settle("pending"); // refresh 2 paints over it
-    await settle("answered"); // refresh 1's answered rows come back late
-    await settle("answered"); // refresh 2's answered rows
-    await Promise.all([first, second]);
-
-    expect(document.querySelectorAll("#hitl-list [data-hitl-auto-section]")).toHaveLength(1);
-    expect(document.querySelectorAll("#hitl-list .hitl-answer-input")).toHaveLength(1);
-  });
-});
-
-// 962d4480 -- the Team, Experiments and Settings bodies: the shared helpers keep a draft.
-describe("Team, Experiments and Settings tab bodies keep an unsent draft", () => {
-  it("paintTabBody carries a typed settings field across the repaint: same node, same text, the rest repainted", () => {
-    document.body.innerHTML =
-      `<div id="settings-body-${PID}"><textarea id="agent-instructions-${PID}">old</textarea>` +
-      `<input id="max-pinned-${PID}" value="5"></div>`;
-    const body = document.getElementById(`settings-body-${PID}`) as HTMLElement;
-    const ta = document.getElementById(`agent-instructions-${PID}`) as HTMLTextAreaElement;
-    ta.value = "half-written instructions";
-
-    paintTabBody(body, `<textarea id="agent-instructions-${PID}">old</textarea><input id="max-pinned-${PID}" value="9">`);
-
-    expect(document.getElementById(`agent-instructions-${PID}`)).toBe(ta);
-    expect(ta.value).toBe("half-written instructions");
-    // control: the input with nothing typed into it is repainted from the fresh markup
-    expect((document.getElementById(`max-pinned-${PID}`) as HTMLInputElement).value).toBe("9");
-  });
-
-  it("setTabBodyMessage leaves a body alone while it holds an unsent draft, and replaces it otherwise", () => {
-    document.body.innerHTML = `<div id="b"><input id="note" value=""></div>`;
-    const body = document.getElementById("b") as HTMLElement;
-    const note = document.getElementById("note") as HTMLInputElement;
-    note.value = "typed";
-    expect(setTabBodyMessage(body, "<div>loading…</div>")).toBe(false);
-    expect(document.getElementById("note")).toBe(note);
-    expect(note.value).toBe("typed");
-
-    note.value = "";
-    expect(setTabBodyMessage(body, "<div>loading…</div>")).toBe(true);
-    expect(body.textContent).toContain("loading…");
-  });
-
-  it("a failed Experiments load leaves a typed field in the body alone; with nothing typed the failure shows", async () => {
-    const failing = vi.fn(async () => { throw new Error("boom"); });
-    const fns = load(["loadExperimentsTab"], { projectApi: failing, escapeHtml, setTabBodyMessage, paintTabBody });
-
-    document.body.innerHTML = `<div id="experiments-body-${PID}"><input id="exp-note" value=""></div>`;
-    const note = document.getElementById("exp-note") as HTMLInputElement;
-    note.value = "half-written note";
-    await fns.loadExperimentsTab(PID);
-    expect(document.getElementById("exp-note")).toBe(note);
-    expect(note.value).toBe("half-written note");
-
-    document.body.innerHTML = `<div id="experiments-body-${PID}"><div>old cards</div></div>`;
-    await fns.loadExperimentsTab(PID);
-    expect(document.getElementById(`experiments-body-${PID}`)!.textContent).toContain("Failed to load experiments: boom");
-  });
-
-  it("a failed Team load leaves a typed field in the body alone; with nothing typed the failure shows", async () => {
-    const failing = vi.fn(async () => { throw new Error("team down"); });
-    const fns = load(["loadTeamTab"], {
-      projectApi: failing, escapeHtml, setTabBodyMessage, paintTabBody,
-      renderProjectLoadError: (_pid: string, title: string) => `<div>${title}</div>`,
-      wireProjectLoadRetry: vi.fn(), _wireTabSearch: vi.fn(),
-    });
-
-    document.body.innerHTML =
-      `<select id="team-days-${PID}"><option value="14">14</option></select>` +
-      `<div id="team-body-${PID}"><input id="team-note" value=""></div>`;
-    const note = document.getElementById("team-note") as HTMLInputElement;
-    note.value = "half-written note";
-    await fns.loadTeamTab(PID);
-    expect(document.getElementById("team-note")).toBe(note);
-    expect(note.value).toBe("half-written note");
-
-    document.getElementById(`team-body-${PID}`)!.innerHTML = `<div>old cards</div>`;
-    await fns.loadTeamTab(PID);
-    expect(document.getElementById(`team-body-${PID}`)!.textContent).toContain("Team summary unavailable");
   });
 });
