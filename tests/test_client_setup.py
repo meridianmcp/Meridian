@@ -302,12 +302,14 @@ def test_default_paths_follow_environment(tmp_path, monkeypatch):
 def test_cli_plan_is_a_dry_run(tmp_path, monkeypatch, capsys):
     config = tmp_path / "claude_desktop_config.json"
     codex = tmp_path / "config.toml"
+    claude_code = tmp_path / ".claude.json"
     monkeypatch.setattr(cs, "find_executable", lambda name, fallbacks=(): f"/fake/{name}")
 
-    code = cs.main(["plan", "--claude-config", str(config), "--codex-config", str(codex)])
+    code = cs.main(["plan", "--claude-config", str(config), "--codex-config", str(codex),
+                    "--claude-code-config", str(claude_code)])
 
     assert code == 0
-    assert not config.exists() and not codex.exists()
+    assert not config.exists() and not codex.exists() and not claude_code.exists()
     out = capsys.readouterr()
     assert '"would_write"' in out.out
     assert "Nothing written" in out.err
