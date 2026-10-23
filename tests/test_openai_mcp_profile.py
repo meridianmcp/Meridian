@@ -17,12 +17,11 @@ def test_openai_profile_is_known_and_subset_of_native_tools() -> None:
     native_names = {tool["name"] for tool in _MCP_TOOLS_LIST}
     assert get_tool_allowlist("openai") == OPENAI_PUBLIC_TOOL_NAMES
     assert OPENAI_PUBLIC_TOOL_NAMES <= native_names
-    # af74d41e ("feat(research): add zotero_search as a keyless-where-possible
-    # research-module subtool") added zotero_search to OPENAI_PUBLIC_TOOL_NAMES
-    # as a sibling of paper_search/social_search/github_search, and it is fully
-    # registered in _MCP_TOOLS_LIST (the subset assertion above still holds) --
-    # 64 -> 65 is a genuine addition, not drift.
-    assert len(OPENAI_PUBLIC_TOOL_NAMES) == 65
+    # The collision-safe Meridian project-creation name is public alongside
+    # its deprecated compatibility alias.
+    assert "meridian_project_create" in OPENAI_PUBLIC_TOOL_NAMES
+    assert "create_project" in OPENAI_PUBLIC_TOOL_NAMES
+    assert len(OPENAI_PUBLIC_TOOL_NAMES) == 66
     assert len(OPENAI_PUBLIC_TOOL_NAMES) < 70
 
 

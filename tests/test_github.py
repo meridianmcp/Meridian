@@ -80,11 +80,71 @@ def test_new_github_tools_registered():
     for expected in (
         "get_workflow_runs", "get_workflow_run_logs", "trigger_workflow",
         "git_diff", "list_branches", "list_issues", "create_issue", "get_issue",
+        "meridian_github_search_code", "meridian_github_get_commit",
+        "meridian_github_search_commits", "meridian_github_list_branches",
+        "meridian_github_list_issues", "meridian_github_create_issue",
     ):
         assert expected in names
         assert expected in server_module._GITHUB_TOOL_NAMES
+    by_name = {tool["name"]: tool for tool in server_module._github_tools_for_tenant(tenant)}
+    for legacy, canonical in (
+        ("search_code", "meridian_github_search_code"),
+        ("get_commit", "meridian_github_get_commit"),
+        ("search_commits", "meridian_github_search_commits"),
+        ("list_branches", "meridian_github_list_branches"),
+        ("list_issues", "meridian_github_list_issues"),
+        ("create_issue", "meridian_github_create_issue"),
+    ):
+        assert by_name[legacy]["description"].startswith(f"DEPRECATED: use `{canonical}`")
+        assert f"canonical Meridian GitHub tool name" in by_name[canonical]["description"]
+    assert by_name["create_issue"]["annotations"]["destructiveHint"] is True
+    assert by_name["meridian_github_create_issue"]["annotations"]["destructiveHint"] is True
     # No PAT → no tools.
     assert server_module._github_tools_for_tenant({"github_pat": None}) == []
+
+
+@pytest.mark.parametrize(
+    ("public_name", "internal_name"),
+    [
+        ("meridian_project_create", "create_project"),
+        ("meridian.meridian_project_create", "create_project"),
+        ("meridian.create_project", "create_project"),
+        ("meridian_project_list", "list_projects"),
+        ("meridian.meridian_project_list", "list_projects"),
+        ("meridian_github_search_code", "search_code"),
+        ("meridian.meridian_github_search_code", "search_code"),
+        ("meridian_github_get_commit", "get_commit"),
+        ("meridian_github_search_commits", "search_commits"),
+        ("meridian_github_list_branches", "list_branches"),
+        ("meridian_github_list_issues", "list_issues"),
+        ("meridian_github_create_issue", "create_issue"),
+        ("meridian.meridian_github_create_issue", "create_issue"),
+        ("meridian.create_issue", "create_issue"),
+    ],
+)
+def test_hosted_dispatch_normalizes_canonical_and_qualified_names(
+    public_name, internal_name, monkeypatch
+):
+    """Public names route to existing authorization/dispatch names."""
+    captured = []
+
+    async def _capture(body, _db, _data_dir, **_kwargs):
+        captured.append(body)
+        return {"ok": True}
+
+    monkeypatch.setattr(server_module, "_handle_mcp_request_internal", _capture)
+    body = {
+        "jsonrpc": "2.0",
+        "id": 1,
+        "method": "tools/call",
+        "params": {"name": public_name, "arguments": {"project_id": "p1"}},
+    }
+    result = asyncio.run(server_module._handle_mcp_request(body, object(), "/tmp"))
+
+    assert result == {"ok": True}
+    assert captured[0]["params"]["name"] == internal_name
+    assert captured[0]["params"]["arguments"] == {"project_id": "p1"}
+    assert body["params"]["name"] == public_name  # input is left untouched
 
 
 def test_patch_file_tool_registered_as_writeable():
@@ -672,8 +732,10 @@ def test_mcp_tools_list_includes_github_tools_when_connected(tmp_path, monkeypat
         assert "read_file" in tool_names_after
         assert "list_files" in tool_names_after
         assert "search_code" in tool_names_after
+        assert "meridian_github_search_code" in tool_names_after
         assert "get_commits" in tool_names_after
         assert "get_commit" in tool_names_after
+        assert "meridian_github_get_commit" in tool_names_after
 
 
 def test_mcp_tools_list_no_github_tools_when_disconnected(tmp_path, monkeypatch):
@@ -709,15 +771,21 @@ _REPO_SCOPED_GITHUB_TOOLS = (
     "patch_file",
     "list_files",
     "search_code",
+    "meridian_github_search_code",
     "get_commits",
     "search_commits",
+    "meridian_github_search_commits",
     "get_commit",
+    "meridian_github_get_commit",
     "git_diff",
     "list_branches",
+    "meridian_github_list_branches",
     "get_workflow_runs",
     "get_workflow_run_logs",
     "trigger_workflow",
     "list_issues",
+    "meridian_github_create_issue",
+    "meridian_github_list_issues",
     "create_issue",
     "get_issue",
 )
