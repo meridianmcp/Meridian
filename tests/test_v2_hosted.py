@@ -957,12 +957,16 @@ def test_remote_mcp_tools_list_returns_full_tool_surface(client):
     names = {t["name"] for t in tools}
     # No GitHub connected for this tenant → exactly the base tool list.
     assert len(tools) == len(_MCP_TOOLS_LIST)
-    for expected in ("create_project", "register_session", "log_task", "generate_handoff", "list_projects", "get_project_by_name"):
+    for expected in (
+        "meridian_project_create", "create_project", "register_session",
+        "log_task", "generate_handoff", "meridian_project_list",
+        "list_projects", "get_project_by_name",
+    ):
         assert expected in names
 
 
 def test_remote_mcp_tools_call_create_project(client):
-    """POST /mcp tools/call create_project creates a project."""
+    """POST /mcp supports canonical project names and deprecated aliases."""
     from meridian import db as db_module
 
     async def _setup():
@@ -973,21 +977,25 @@ def test_remote_mcp_tools_call_create_project(client):
 
     raw_token = _run(_setup())
 
-    r = client.post(
-        "/mcp",
-        json={
-            "jsonrpc": "2.0", "id": 3, "method": "tools/call",
-            "params": {
-                "name": "create_project",
-                "arguments": {"name": "mcp-remote-proj-v2"},
+    for request_id, tool_name, project_name in (
+        (3, "meridian_project_create", "mcp-remote-proj-canonical"),
+        (4, "create_project", "mcp-remote-proj-legacy"),
+    ):
+        r = client.post(
+            "/mcp",
+            json={
+                "jsonrpc": "2.0", "id": request_id, "method": "tools/call",
+                "params": {
+                    "name": tool_name,
+                    "arguments": {"name": project_name},
+                },
             },
-        },
-        headers={"Authorization": f"Bearer {raw_token}"},
-    )
-    assert r.status_code == 200
-    result = r.json()["result"]
-    content = json.loads(result["content"][0]["text"])
-    assert content["name"] == "mcp-remote-proj-v2"
+            headers={"Authorization": f"Bearer {raw_token}"},
+        )
+        assert r.status_code == 200
+        result = r.json()["result"]
+        content = json.loads(result["content"][0]["text"])
+        assert content["name"] == project_name
 
 
 def test_remote_mcp_project_discovery_tools_return_sprint(client):
@@ -1008,7 +1016,7 @@ def test_remote_mcp_project_discovery_tools_return_sprint(client):
         "/mcp",
         json={
             "jsonrpc": "2.0", "id": 10, "method": "tools/call",
-            "params": {"name": "list_projects", "arguments": {}},
+            "params": {"name": "meridian_project_list", "arguments": {}},
         },
         headers={"Authorization": f"Bearer {raw_token}"},
     )
@@ -1020,6 +1028,18 @@ def test_remote_mcp_project_discovery_tools_return_sprint(client):
         and item["sprint"] == "v1.0.4"
         for item in list_payload
     )
+
+    legacy_list_resp = client.post(
+        "/mcp",
+        json={
+            "jsonrpc": "2.0", "id": 12, "method": "tools/call",
+            "params": {"name": "list_projects", "arguments": {}},
+        },
+        headers={"Authorization": f"Bearer {raw_token}"},
+    )
+    assert legacy_list_resp.status_code == 200
+    legacy_list_payload = json.loads(legacy_list_resp.json()["result"]["content"][0]["text"])
+    assert any(item["id"] == project["id"] for item in legacy_list_payload)
 
     by_name_resp = client.post(
         "/mcp",
