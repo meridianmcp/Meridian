@@ -1,8 +1,11 @@
 'use strict';
 
-// Design-line checks. These read the plugin's own source files and fail the
-// build if the code gains a network path, a server, a watcher, a timer, or an
-// embedded personal email or secret.
+// Design-line checks. These read the plugin's own source files and fail the build when:
+//   - runtime code gains a network client, a watcher, an observer, or a URL literal,
+//   - anything other than api/listener.js opens a socket, starts a timer, or names the loopback address,
+//   - the listener stops binding the loopback interface only,
+//   - any code path can permanently delete data,
+//   - an email address, a secret-shaped string, or a machine-local path is written into the plugin.
 
 const test = require('node:test');
 const assert = require('node:assert/strict');
@@ -11,6 +14,7 @@ const path = require('node:path');
 
 const PLUGIN_ROOT = path.resolve(__dirname, '..');
 const PLUGIN_ID = 'meridian-zotero@usemeridian.us';
+const LISTENER = path.join(PLUGIN_ROOT, 'api', 'listener.js');
 
 function walk(dir, skipDirs) {
   const out = [];
@@ -25,38 +29,50 @@ function walk(dir, skipDirs) {
   return out;
 }
 
-// Code that runs inside Zotero: bootstrap glue, the lib modules, the pane.
+// Code that runs inside Zotero: bootstrap glue, the lib modules, the listener, the pane.
 function runtimeFiles() {
   assert.ok(fs.existsSync(path.join(PLUGIN_ROOT, 'bootstrap.js')), 'bootstrap.js must exist');
+  assert.ok(fs.existsSync(LISTENER), 'api/listener.js must exist');
   const libs = walk(path.join(PLUGIN_ROOT, 'lib'), []).filter((f) => f.endsWith('.js'));
   const pane = walk(path.join(PLUGIN_ROOT, 'content'), []).filter((f) => f.endsWith('.xhtml'));
-  return [path.join(PLUGIN_ROOT, 'bootstrap.js'), path.join(PLUGIN_ROOT, 'prefs.js'), ...libs, ...pane];
+  return [path.join(PLUGIN_ROOT, 'bootstrap.js'), path.join(PLUGIN_ROOT, 'prefs.js'), LISTENER, ...libs, ...pane];
 }
 
-const FORBIDDEN_IN_RUNTIME = [
+// Forbidden in every runtime file, the listener included.
+const EVERYWHERE = [
   [/\bfetch\s*\(/, 'fetch()'],
   [/XMLHttpRequest/, 'XMLHttpRequest'],
   [/\bZotero\.HTTP\b/, 'Zotero.HTTP'],
   [/\bZotero\.API\b/, 'Zotero.API'],
   [/\bZotero\.Connector\b/, 'Zotero.Connector'],
-  [/\bsetInterval\s*\(/, 'setInterval()'],
-  [/\bsetTimeout\s*\(/, 'setTimeout()'],
-  [/\bserverSocket\b|ServerSocket|createServerSocket|HttpServer/, 'server socket'],
   [/require\(\s*['"](?:http|https|net|dgram|tls|ws|chokidar)['"]\s*\)/, 'network or watcher module'],
   [/\bfs\.watch\b|\bwatchFile\b|\bFileWatcher\b/, 'file watcher'],
   [/\bregisterObserver\s*\(|\baddObserver\s*\(|Services\.obs\b/, 'observer or notifier hook'],
-  [/localhost|127\.0\.0\.1|\[::1\]/, 'local host address'],
+  [/localhost/, 'localhost name'],
 ];
 
-// XML namespace declarations in the pane XHTML are identifiers, not requests.
+// Allowed only in api/listener.js.
+const LISTENER_ONLY = [
+  [/nsIServerSocket|server-socket;1|createServerSocket|\bServerSocket\b/, 'server socket'],
+  [/nsITransport|nsIAsyncInputStream|nsIBinaryInputStream|nsIBinaryOutputStream|openInputStream|openOutputStream/, 'socket stream'],
+  [/setTimeout\s*\(|setInterval\s*\(|nsITimer|timer;1/, 'timer'],
+  [/127\.0\.0\.1|\[::1\]/, 'loopback address'],
+];
+
+// Permanent deletion. Items and collections go to the trash and come back with restore.
+const PERMANENT_DELETE = [
+  [/\.erase(Tx)?\s*\(/, 'erase()'],
+  [/\bemptyTrash\b/, 'emptyTrash'],
+  [/\bDELETE FROM\b/i, 'SQL DELETE'],
+];
+
 const XML_NAMESPACE_OK = /https?:\/\/(?:www\.w3\.org\/1999\/xhtml|www\.mozilla\.org\/keymaster\/gatekeeper\/there\.is\.only\.xul)/g;
 
-test('runtime code has no network, server, watcher, timer or observer path', () => {
+test('runtime code has no network client, watcher, observer, localhost name, or URL literal', () => {
   for (const file of runtimeFiles()) {
     const text = fs.readFileSync(file, 'utf8');
     const relative = path.relative(PLUGIN_ROOT, file);
-    for (const [pattern, label] of FORBIDDEN_IN_RUNTIME) {
-      if (label === 'URL literal') continue;
+    for (const [pattern, label] of EVERYWHERE) {
       assert.equal(pattern.test(text), false, `${relative} contains ${label}`);
     }
     if (file.endsWith('.js')) {
@@ -64,6 +80,37 @@ test('runtime code has no network, server, watcher, timer or observer path', () 
     } else {
       const withoutNamespaces = text.replace(XML_NAMESPACE_OK, '');
       assert.equal(/https?:\/\//.test(withoutNamespaces), false, `${relative} contains a URL outside an XML namespace`);
+    }
+  }
+});
+
+test('only api/listener.js holds the socket, the stream, the timer, and the loopback address', () => {
+  const listenerText = fs.readFileSync(LISTENER, 'utf8');
+  for (const [pattern, label] of LISTENER_ONLY) {
+    assert.equal(pattern.test(listenerText), true, `the listener should contain ${label}; this check would be vacuous otherwise`);
+  }
+  for (const file of runtimeFiles()) {
+    if (file === LISTENER) continue;
+    const text = fs.readFileSync(file, 'utf8');
+    const relative = path.relative(PLUGIN_ROOT, file);
+    for (const [pattern, label] of LISTENER_ONLY) {
+      assert.equal(pattern.test(text), false, `${relative} contains ${label}; only api/listener.js may`);
+    }
+  }
+});
+
+test('the listener binds the loopback interface only', () => {
+  const text = fs.readFileSync(LISTENER, 'utf8');
+  assert.match(text, /server\.init\(\s*options\.port\s*,\s*true\s*,/, 'server.init must pass loopbackOnly = true');
+  assert.equal(/server\.init\(\s*options\.port\s*,\s*false/.test(text), false);
+});
+
+test('no code path can permanently delete a library item or collection', () => {
+  for (const file of runtimeFiles()) {
+    const text = fs.readFileSync(file, 'utf8');
+    const relative = path.relative(PLUGIN_ROOT, file);
+    for (const [pattern, label] of PERMANENT_DELETE) {
+      assert.equal(pattern.test(text), false, `${relative} contains ${label}`);
     }
   }
 });
@@ -82,7 +129,8 @@ test('no email address other than the plugin id appears anywhere in the plugin f
 test('no secret-shaped strings or machine-local absolute paths in the plugin folder', () => {
   const files = walk(PLUGIN_ROOT, ['node_modules']);
   const secret = /sk_meridian_|BEARER_TOKEN|api[_-]?key\s*[:=]|-----BEGIN [A-Z ]*PRIVATE KEY/i;
-  const localPath = /[A-Za-z]:\\\\|[A-Za-z]:\/Users\/|\/Users\/[A-Za-z0-9_]+\/|\/home\/[A-Za-z0-9_]+\//;
+  // A drive letter must start a token, so a letter before the colon (as in the regex doi:\s) does not count.
+  const localPath = /(^|[^A-Za-z])[A-Za-z]:\\|[A-Za-z]:\/Users\/|\/Users\/[A-Za-z0-9_]+\/|\/home\/[A-Za-z0-9_]+\//;
   for (const file of files) {
     // This file holds the patterns as literals, so it cannot scan itself.
     if (path.basename(file) === 'static-checks.test.js') continue;

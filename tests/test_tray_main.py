@@ -2769,6 +2769,12 @@ def zotero_faked(monkeypatch):
     monkeypatch.setattr(zpi, "zotero_process_state", lambda runner=None: False)
     monkeypatch.setattr(tray_main, "_show_info_dialog", _fake_info)
     monkeypatch.setattr(tray_main, "_show_error_dialog", _fake_error)
+    # The install's registration step starts and closes Zotero. These tests check the tray's dialogs, so it is stubbed here.
+    monkeypatch.setattr(zpi, "_register_default", lambda *args, **kwargs: {"status": "not_exercised", "message": ""})
+    # Some tests replace the file copy with a fake, and the profile here is a relative folder. The scan line must not
+    # be written into the repository from a test, so it is stubbed too.
+    monkeypatch.setattr(zpi, "ensure_scan_pref", lambda profile: "present")
+    monkeypatch.setattr(zpi, "_ensure_api", lambda profile: "present")
     return recorded
 
 
@@ -3562,4 +3568,110 @@ def test_the_tray_finds_the_profile_and_builds_the_bundle_before_it_closes_zoter
     assert text == (
         "Meridian closed Zotero, installed the Zotero bridge plugin to P, and restarted Zotero."
         + _CLOSED_AND_RESTARTED_TAIL
+    )
+
+
+@pytest.fixture(autouse=True)
+def zotero_plugin_signed_stand_in(monkeypatch, tmp_path):
+    """The install paths copy only a signed artifact. This stands one in with the bundle's own bytes and its own hash."""
+    import hashlib
+
+    from meridian import zotero_plugin_sign as sign
+
+    signed = tmp_path / "stand-in-signed.xpi"
+    payload = zpi.build_xpi_bytes()
+    signed.write_bytes(payload)
+    stored = sign.StoredSigned(status="signed", path=signed, sha256=hashlib.sha256(payload).hexdigest())
+    monkeypatch.setattr(zpi, "signed_install_state", lambda source_dir=None: stored)
+    return signed
+
+
+def test_the_tray_says_an_unsigned_plugin_needs_a_signature_and_closes_nothing(monkeypatch, tmp_path):
+    from meridian import zotero_plugin_sign as sign
+
+    profile = tmp_path / "Zotero" / "Profiles" / "unsigned.default"
+    profile.mkdir(parents=True)
+    (profile / "prefs.js").write_text('user_pref("keep", true);\n', encoding="utf-8")
+    monkeypatch.setattr(zpi, "find_default_profile_dir", lambda data_dir: profile)
+    monkeypatch.setattr(zpi, "signed_install_state", lambda source_dir=None: sign.StoredSigned(status="missing"))
+    monkeypatch.setattr(zpi, "zotero_process_state", lambda runner=None: True)
+    monkeypatch.setattr(
+        zpi, "close_zotero_gracefully", lambda **kwargs: pytest.fail("no close for an unsigned plugin"),
+    )
+    before = sorted(path.name for path in profile.iterdir())
+    text = tray_main.zotero_plugin_install_message(lambda: zpi.install_default_with_close(_CLOSE_ON_SETTINGS))
+    assert text.startswith("This plugin version is not signed yet.")
+    assert "Sign the plugin from a source checkout of Meridian, then install again here." in text
+    assert "python -m meridian" not in text
+    assert "Tools > Plugins" in text
+    assert "Install Plugin From File" in text
+    assert sorted(path.name for path in profile.iterdir()) == before
+    assert not (profile / "extensions").exists()
+
+
+def test_the_tray_says_a_tampered_stored_file_failed_its_integrity_check_and_closes_nothing(monkeypatch, tmp_path):
+    from meridian import zotero_plugin_sign as sign
+
+    profile = tmp_path / "Zotero" / "Profiles" / "tampered.default"
+    profile.mkdir(parents=True)
+    (profile / "prefs.js").write_text('user_pref("keep", true);\n', encoding="utf-8")
+    monkeypatch.setattr(zpi, "find_default_profile_dir", lambda data_dir: profile)
+    monkeypatch.setattr(zpi, "signed_install_state", lambda source_dir=None: sign.StoredSigned(status="tampered"))
+    monkeypatch.setattr(zpi, "zotero_process_state", lambda runner=None: True)
+    monkeypatch.setattr(
+        zpi, "close_zotero_gracefully", lambda **kwargs: pytest.fail("no close for a tampered file"),
+    )
+    text = tray_main.zotero_plugin_install_message(lambda: zpi.install_default_with_close(_CLOSE_ON_SETTINGS))
+    assert text == "The stored signed file failed its integrity check. Bump the version in manifest.json to sign a new build."
+    assert not (profile / "extensions").exists()
+
+
+_VERSION_USED_TRAY_TEXT = (
+    "This plugin version was already submitted to Mozilla, and no verified signed file is stored for it. "
+    "Bump the version in manifest.json to sign a new build. Nothing was written."
+)
+_RECORD_UNREADABLE_TRAY_TEXT = (
+    "The signing record is unreadable, so nothing will be submitted. Check "
+    "%USERPROFILE%\\.meridian\\local_runner\\zotero_plugin\\signed.json (or zotero_plugin\\signed.json in the folder "
+    "named by MERIDIAN_LOCAL_RUNNER_STATE_DIR, when that is set), then try again."
+)
+
+
+@pytest.mark.parametrize(
+    ("state_status", "expected"),
+    [("used", _VERSION_USED_TRAY_TEXT), ("unreadable", _RECORD_UNREADABLE_TRAY_TEXT)],
+    ids=["version_used", "record_unreadable"],
+)
+def test_the_tray_says_a_used_version_or_an_unreadable_record_and_closes_nothing(
+    monkeypatch, tmp_path, state_status, expected,
+):
+    from meridian import zotero_plugin_sign as sign
+
+    profile = tmp_path / "Zotero" / "Profiles" / f"{state_status}.default"
+    profile.mkdir(parents=True)
+    (profile / "prefs.js").write_text('user_pref("keep", true);\n', encoding="utf-8")
+    monkeypatch.setattr(zpi, "find_default_profile_dir", lambda data_dir: profile)
+    monkeypatch.setattr(
+        zpi, "signed_install_state", lambda source_dir=None: sign.StoredSigned(status=state_status),
+    )
+    monkeypatch.setattr(zpi, "zotero_process_state", lambda runner=None: True)
+    monkeypatch.setattr(
+        zpi, "close_zotero_gracefully", lambda **kwargs: pytest.fail("no close for a refused install"),
+    )
+    text = tray_main.zotero_plugin_install_message(lambda: zpi.install_default_with_close(_CLOSE_ON_SETTINGS))
+    assert text == expected
+    assert not (profile / "extensions").exists()
+
+
+def test_the_tray_text_for_a_needs_signature_result_is_the_tray_message():
+    path = "U:/unsigned/meridian-zotero@usemeridian.us.xpi"
+    message = zpi.tray_needs_signature_message(path)
+    result = {
+        "status": "needs_signature", "path": None, "message": zpi.needs_signature_message(path),
+        "unsigned_path": path, "closed_zotero": False, "restart": None,
+    }
+    assert tray_main.zotero_plugin_install_text(result) == message
+    assert "python -m meridian" not in message
+    assert tray_main.zotero_plugin_install_text(result, first_run=True) == (
+        "Your choice was saved. " + message
     )
