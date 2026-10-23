@@ -272,14 +272,19 @@ function _markChangedMeanwhile(root: HTMLElement, html: string) {
     const now = freshIcon.get(row.dataset.item!);
     const hint = row.querySelector('.sprint-changed-meanwhile');
     const stale = !!icon && now !== undefined && icon.textContent !== now;
+    // The hint is a hidden marker: no inline style, so it cannot touch the row layout. The status icon carries the
+    // visible tooltip instead.
     if (stale && !hint) {
       (row.querySelector('.sprint-item-main') || row).insertAdjacentHTML(
         'beforeend',
-        // Visually hidden, so the hint takes no layout space; the status icon carries the visible tooltip.
-        '<span class="sprint-changed-meanwhile" style="position:absolute;width:1px;height:1px;overflow:hidden;clip:rect(0 0 0 0);white-space:nowrap">changed meanwhile</span>',
+        '<span class="sprint-changed-meanwhile" hidden>changed meanwhile</span>',
       );
     } else if (!stale && hint) {
       hint.remove();
+    }
+    if (icon) {
+      if (stale) icon.setAttribute('title', 'changed meanwhile');
+      else icon.removeAttribute('title');
     }
   });
 }
