@@ -61,7 +61,7 @@ cloudpickle==3.1.2
 colorama==0.4.6
 comm==0.2.3
 croniter==6.2.4
-cryptography==46.0.7
+cryptography==50.0.0
 debugpy==1.8.22
 deprecation==2.1.0
 distro==1.9.0
