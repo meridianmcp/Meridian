@@ -59,6 +59,7 @@ nav:
   - Safety Limits: safety-limits.md
   - Data Handling: data-handling.md
   - API Reference: api-reference.md
+  - Desktop Research Search: desktop-research-search.md
   - FAQ: faq.md
 
 markdown_extensions:
