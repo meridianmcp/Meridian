@@ -1709,8 +1709,9 @@
       const stale = !!icon && now !== void 0 && icon.textContent !== now;
       if (stale && !hint) {
         (row.querySelector(".sprint-item-main") || row).insertAdjacentHTML(
-          "afterbegin",
-          '<span class="sprint-changed-meanwhile" style="font-size:9px;font-weight:600;color:var(--accent);margin-right:6px">changed meanwhile</span>'
+          "beforeend",
+          // Visually hidden, so the hint takes no layout space; the status icon carries the visible tooltip.
+          '<span class="sprint-changed-meanwhile" style="position:absolute;width:1px;height:1px;overflow:hidden;clip:rect(0 0 0 0);white-space:nowrap">changed meanwhile</span>'
         );
       } else if (!stale && hint) {
         hint.remove();
