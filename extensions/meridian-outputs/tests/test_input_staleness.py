@@ -427,7 +427,7 @@ class TestProvenanceStatusInputStaleness:
 
         status = PS.get_provenance_status(str(tmp_path), str(out))
         assert status["provenance_type"] == PS.EXACT
-        assert set(status) == self._EXACT_KEYS | {"input_staleness"}
+        assert set(status) == self._EXACT_KEYS | {"input_staleness", "staleness_record"}
         assert status["input_staleness"]["stale"] is False
         assert [r["run_id"] for r in status["input_staleness"]["runs"]] == ["r1"]
         assert status["staleness"]["stale"] is False

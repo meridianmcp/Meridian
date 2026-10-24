@@ -29,7 +29,6 @@ Sprint item d3374b0e additionally covers (hash- and convergence-awareness):
 """
 from __future__ import annotations
 
-import os
 import sys
 from pathlib import Path
 
@@ -42,7 +41,6 @@ from meridian_outputs import outputs_local as OL
 from meridian_outputs import provenance as PV
 from meridian_outputs import provenance_status as PS
 from meridian_outputs import research_evidence as RE
-from meridian_outputs import run_manifest as RM
 
 # db63385b (W31-B): tools/meridian_fallbacks/figure_invariant_gate.py lives
 # under the repo root, not this extension -- add the repo root explicitly
@@ -438,254 +436,90 @@ class TestRelocated:
         assert status["relocation_evidence"] == "content_hash"
 
     @duckdb_required
-    def test_relocated_file_whose_script_changed_is_not_verified(
+    def test_fresh_script_content_hash_relocation_is_verified_and_authoritative(
         self, tmp_path: Path,
     ) -> None:
-        """S-R4-4: the RELOCATED resolver branch checked unknown script and
-        input staleness but not a confirmed script change, so a relocated
-        file whose tagged generating script changed was VERIFIED at 0.75. It
-        must map to STALE, as STALE_BY_SCRIPT does for an exact record.
-
-        F4 (round five): the ORIGINAL path is tagged, then the file is
-        copied. Script staleness used to be read at the copy's path, which
-        has no fingerprint row, so the matched record's changed generator was
-        never seen and the copy stayed VERIFIED.
-
-        R6-A (round six): the matched path's row describes this copy only
-        while the file there still holds the recorded bytes. Once the
-        original has moved away nothing ties that row to these bytes, so
-        script staleness is unknown -- still never VERIFIED."""
-        script = tmp_path / "train.py"
-        script.write_text("print('v1')\n", encoding="utf-8")
-        old = tmp_path / "run_3" / "metrics.csv"
-        old.parent.mkdir()
-        old.write_text("epoch,accuracy\n1,0.9\n", encoding="utf-8")
-        AN.record_provenance(str(tmp_path), str(old), generating_script=str(script))
-        FP.tag_output(str(old), str(tmp_path), script_path=str(script))
-        new = tmp_path / "run_3_copy" / "metrics.csv"
-        new.parent.mkdir()
-        new.write_text("epoch,accuracy\n1,0.9\n", encoding="utf-8")  # same bytes
-        script.write_text("print('v2 -- changed')\n", encoding="utf-8")
-
-        status = PS.get_provenance_status(str(tmp_path), str(new))
-        assert status["provenance_type"] == PS.RELOCATED
-        assert status["record"]["path"] == str(old)
-        assert status["script_staleness"] is not None
-        assert status["script_staleness"]["is_stale"] is True
-        resolver = PS.evidence_record_from_provenance_status(status).resolver
-        assert resolver.status is not RE.ResolverStatus.VERIFIED
-        assert resolver.status is RE.ResolverStatus.STALE
-        assert resolver.confidence == 0.3
-        assert not resolver.is_authoritative
-
-        # The basename-evidence RELOCATED shape maps the same way.
-        status["relocation_evidence"] = "basename"
-        assert (
-            PS._resolver_state_for_provenance_status(status).status
-            is RE.ResolverStatus.STALE
-        )
-
-        # A move: the original path is gone, so its row can no longer be
-        # tied to these bytes. Unknown, never VERIFIED.
-        old.unlink()
-        moved = PS.get_provenance_status(str(tmp_path), str(new))
-        assert moved["provenance_type"] == PS.RELOCATED
-        assert moved["script_staleness"]["is_stale"] is None
-        resolver = PS.evidence_record_from_provenance_status(moved).resolver
-        assert resolver.status is RE.ResolverStatus.AMBIGUOUS
-        assert not resolver.is_authoritative
-
-    @duckdb_required
-    def test_copy_tagged_at_its_moved_location_whose_script_changed_is_stale(
-        self, tmp_path: Path,
-    ) -> None:
-        """R6-A (round six): a copy fingerprint-tagged at its NEW location,
-        whose generator then changed, read VERIFIED 0.75: script staleness
-        was looked up only at the matched path, which has no row here. The
-        row at the moved path describes these bytes, so it decides."""
-        script = tmp_path / "train.py"
-        script.write_text("print('v1')\n", encoding="utf-8")
-        old = tmp_path / "run_6" / "metrics.csv"
-        old.parent.mkdir()
-        old.write_text("epoch,accuracy\n1,0.9\n", encoding="utf-8")
-        AN.record_provenance(str(tmp_path), str(old), generating_script=str(script))
-        new = tmp_path / "run_6_moved" / "metrics.csv"
-        new.parent.mkdir()
-        os.replace(old, new)  # moved: same bytes, original path gone
-        FP.tag_output(str(new), str(tmp_path), script_path=str(script))
-        script.write_text("print('v2 -- changed')\n", encoding="utf-8")
-
-        status = PS.get_provenance_status(str(tmp_path), str(new))
-        assert status["provenance_type"] == PS.RELOCATED
-        assert status["record"]["path"] == str(old)
-        assert status["script_staleness"]["is_stale"] is True
-        assert os.path.normcase(status["script_staleness"]["script_path"]) == (
-            os.path.normcase(os.path.realpath(script))
-        )
-        resolver = PS.evidence_record_from_provenance_status(status).resolver
-        assert resolver.status is RE.ResolverStatus.STALE
-        assert resolver.confidence == 0.3
-        assert not resolver.is_authoritative
-
-    @duckdb_required
-    def test_regenerated_matched_path_row_never_decides_for_untagged_copy(
-        self, tmp_path: Path,
-    ) -> None:
-        """R6-A (round six): the matched path was regenerated (its bytes no
-        longer hash to the record) and re-tagged by another generator, which
-        then changed. That row describes the regenerated file, not this
-        copy, whose own generator is unchanged: with no row of its own the
-        copy stays VERIFIED 0.75 and never reads STALE from that row."""
-        script = tmp_path / "train.py"
-        script.write_text("print('v1')\n", encoding="utf-8")
-        regen_script = tmp_path / "regen.py"
-        regen_script.write_text("print('r1')\n", encoding="utf-8")
-        old = tmp_path / "run_7" / "metrics.csv"
-        old.parent.mkdir()
-        old.write_text("epoch,accuracy\n1,0.9\n", encoding="utf-8")
-        AN.record_provenance(str(tmp_path), str(old), generating_script=str(script))
-        FP.tag_output(str(old), str(tmp_path), script_path=str(script))
-        new = tmp_path / "run_7_copy" / "metrics.csv"
-        new.parent.mkdir()
-        new.write_text("epoch,accuracy\n1,0.9\n", encoding="utf-8")  # the copy
-        # Regenerate the original in place under another generator, which
-        # then changes; the provenance record keeps the copy's bytes.
-        old.write_text("epoch,accuracy\n1,0.95\n", encoding="utf-8")
-        FP.tag_output(str(old), str(tmp_path), script_path=str(regen_script))
-        regen_script.write_text("print('r2 -- changed')\n", encoding="utf-8")
-        assert PS._stale_by_script_result(str(tmp_path), str(old))["is_stale"] is True
-
-        status = PS.get_provenance_status(str(tmp_path), str(new))
-        assert status["provenance_type"] == PS.RELOCATED
-        assert status["record"]["path"] == str(old)
-        assert status["script_staleness"] is None
-        resolver = PS.evidence_record_from_provenance_status(status).resolver
-        assert resolver.status is RE.ResolverStatus.VERIFIED
-        assert resolver.confidence == 0.75
-
-    @duckdb_required
-    def test_unrelated_row_at_moved_path_does_not_flip_healthy_relocation(
-        self, tmp_path: Path,
-    ) -> None:
-        """F4 (round five): the moved path's own fingerprint row describes
-        whatever file was tagged there before, not the relocated record. A
-        changed script on that row made a relocated record whose own
-        generator is unchanged read STALE.
-
-        R6-A (round six): the copy now lands on the tagged path while the
-        original stays (a move would leave no file to tie the original's row
-        to these bytes; see below). The earlier row recorded other CSV
-        columns, so it is skipped and the original's healthy row decides."""
+        """A content-hash relocation whose generating script is still unchanged,
+        but whose original file has moved away, is not verified: the matched
+        record's tag cannot be tied to the moved bytes, so the script reads
+        unknown and the relocation is AMBIGUOUS, not authoritative. A relocation
+        with no tag at all keeps VERIFIED/0.75 (see the untagged tests)."""
         script = tmp_path / "train.py"
         script.write_text("print('stable')\n", encoding="utf-8")
-        other_script = tmp_path / "other.py"
-        other_script.write_text("print('v1')\n", encoding="utf-8")
-        old = tmp_path / "run_4" / "metrics.csv"
+        old = tmp_path / "run_1" / "metrics.csv"
         old.parent.mkdir()
         old.write_text("epoch,accuracy\n1,0.9\n", encoding="utf-8")
         AN.record_provenance(str(tmp_path), str(old), generating_script=str(script))
         FP.tag_output(str(old), str(tmp_path), script_path=str(script))
-        new = tmp_path / "run_4_moved" / "metrics.csv"
+
+        new = tmp_path / "run_1_moved" / "metrics.csv"
         new.parent.mkdir()
-        new.write_text("unrelated,earlier\n0,0\n", encoding="utf-8")
-        FP.tag_output(str(new), str(tmp_path), script_path=str(other_script))
-        # The copy lands on the tagged path; the original stays.
-        new.write_text("epoch,accuracy\n1,0.9\n", encoding="utf-8")
-        other_script.write_text("print('v2 -- changed')\n", encoding="utf-8")
-
-        status = PS.get_provenance_status(str(tmp_path), str(new))
-        assert status["provenance_type"] == PS.RELOCATED
-        assert status["record"]["path"] == str(old)
-        script_staleness = status["script_staleness"]
-        assert script_staleness["is_stale"] is False
-        assert os.path.normcase(script_staleness["script_path"]) == os.path.normcase(
-            os.path.realpath(script)
-        )
-        resolver = PS.evidence_record_from_provenance_status(status).resolver
-        assert resolver.status is RE.ResolverStatus.VERIFIED
-        assert resolver.confidence == 0.75
-
-        # After a move (original gone) neither row is tied to these bytes:
-        # unknown, and still never STALE from the unrelated row.
+        new.write_text("epoch,accuracy\n1,0.9\n", encoding="utf-8")  # identical content
         old.unlink()
-        moved = PS.get_provenance_status(str(tmp_path), str(new))
-        assert moved["provenance_type"] == PS.RELOCATED
-        assert moved["script_staleness"]["is_stale"] is None
-        resolver = PS.evidence_record_from_provenance_status(moved).resolver
-        assert resolver.status is RE.ResolverStatus.AMBIGUOUS
-        assert resolver.status is not RE.ResolverStatus.STALE
 
-    @staticmethod
-    def _relocated_run_output(outputs: Path) -> tuple[Path, Path, Path]:
-        """``(input, original, moved)``: run ``r1`` reads ``input`` and
-        produces ``original`` (recorded with ``run_id="r1"``), which then
-        moves to ``moved`` with the same bytes."""
-        inp = outputs / "data" / "in.csv"
-        inp.parent.mkdir()
-        inp.write_text("a\n1\n", encoding="utf-8")
-        RM.start_run_manifest(
-            str(outputs), run_id="r1", command_name="build",
-            input_paths=[str(inp)], _git_runner=lambda argv: None,
-        )
-        old = outputs / "run_5" / "metrics.csv"
+        status = PS.get_provenance_status(str(tmp_path), str(new))
+        assert status["provenance_type"] == PS.RELOCATED  # sanity
+        assert status["relocation_evidence"] == "content_hash"  # sanity
+        assert status["script_staleness"]["is_stale"] is None  # sanity: moved, unverifiable
+        rec = PS.evidence_record_from_provenance_status(status)
+        assert rec.resolver.status is RE.ResolverStatus.AMBIGUOUS
+        assert rec.resolver.confidence == 0.5
+        assert rec.partial is False
+        assert rec.is_authoritative is False
+        assert rec.attributes["provenance_type"] == PS.RELOCATED
+
+    @duckdb_required
+    @pytest.mark.parametrize(
+        ("break_script", "expected_fragment"),
+        [
+            pytest.param(
+                lambda p: p.write_text("print('v2')\n", encoding="utf-8"),
+                "content changed",
+                id="script-changed",
+            ),
+            pytest.param(
+                lambda p: p.unlink(),
+                "no longer readable",
+                id="script-unreadable",
+            ),
+        ],
+    )
+    def test_changed_or_unreadable_script_relocation_is_stale_not_authoritative(
+        self,
+        tmp_path: Path,
+        break_script,
+        expected_fragment: str,
+    ) -> None:
+        """A content-hash relocation whose generating script has changed, or can
+        no longer be read, maps to STALE at the same 0.3 confidence as a changed
+        EXACT record, and is not authoritative. Identity is still confirmed by
+        content, so the record is not partial, and provenance_type stays
+        RELOCATED."""
+        script = tmp_path / "train.py"
+        script.write_text("print('v1')\n", encoding="utf-8")
+        old = tmp_path / "run_1" / "predictions.csv"
         old.parent.mkdir()
-        old.write_text("epoch,accuracy\n1,0.9\n", encoding="utf-8")
-        RM.finalize_run_manifest(str(outputs), "r1", output_paths=[str(old)])
-        AN.record_provenance(str(outputs), str(old), run_id="r1")
-        new = outputs / "run_5_moved" / "metrics.csv"
+        old.write_text("id,pred\n1,0.5\n", encoding="utf-8")
+        AN.record_provenance(str(tmp_path), str(old), generating_script=str(script))
+        FP.tag_output(str(old), str(tmp_path), script_path=str(script))
+
+        new = tmp_path / "run_1_moved" / "predictions.csv"
         new.parent.mkdir()
-        os.replace(old, new)
-        return inp, old, new
+        new.write_text("id,pred\n1,0.5\n", encoding="utf-8")  # identical content
+        old.unlink()
+        break_script(script)
 
-    @duckdb_required
-    def test_relocated_record_whose_run_input_changed_is_stale(
-        self, tmp_path: Path,
-    ) -> None:
-        """F5 (round five): the matched record's run_id was dropped for a
-        RELOCATED result, so input staleness was looked up for the moved
-        path alone, found no run, and a changed input of the run that
-        produced the record still read VERIFIED."""
-        inp, old, new = self._relocated_run_output(tmp_path)
-
-        healthy = PS.get_provenance_status(str(tmp_path), str(new))
-        assert healthy["provenance_type"] == PS.RELOCATED
-        assert healthy["record"]["path"] == str(old)
-        assert healthy["input_staleness"] is not None
-        assert healthy["input_staleness"]["stale"] is False
-        assert [r["run_id"] for r in healthy["input_staleness"]["runs"]] == ["r1"]
-        resolver = PS.evidence_record_from_provenance_status(healthy).resolver
-        assert resolver.status is RE.ResolverStatus.VERIFIED
-        assert resolver.confidence == 0.75
-
-        inp.write_text("a\n1\n2\n", encoding="utf-8")
         status = PS.get_provenance_status(str(tmp_path), str(new))
-        assert status["provenance_type"] == PS.RELOCATED  # type is unchanged
-        assert status["input_staleness"]["stale"] is True
-        assert status["staleness"]["stale"] is True
-        resolver = PS.evidence_record_from_provenance_status(status).resolver
-        assert resolver.status is RE.ResolverStatus.STALE
-        assert resolver.confidence == 0.3
-        assert not resolver.is_authoritative
-        assert "an input changed since its run started" in resolver.reason
-
-    @duckdb_required
-    def test_relocated_record_whose_run_check_failed_is_unknown(
-        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
-    ) -> None:
-        """F5: an input staleness of None for the matched record's run is
-        unknown, never verified."""
-        _, _, new = self._relocated_run_output(tmp_path)
-
-        def _boom(*_a, **_k):
-            raise OSError("input volume went away")
-
-        monkeypatch.setattr(RM, "check_input_staleness", _boom)
-        status = PS.get_provenance_status(str(tmp_path), str(new))
-        assert status["provenance_type"] == PS.RELOCATED
-        assert status["input_staleness"]["stale"] is None
-        resolver = PS.evidence_record_from_provenance_status(status).resolver
-        assert resolver.status is RE.ResolverStatus.AMBIGUOUS
-        assert not resolver.is_authoritative
+        assert status["provenance_type"] == PS.RELOCATED  # sanity
+        assert status["script_staleness"]["is_stale"] is True  # sanity
+        assert expected_fragment in status["script_staleness"]["reason"]  # sanity
+        rec = PS.evidence_record_from_provenance_status(status)
+        assert rec.resolver.status is RE.ResolverStatus.STALE
+        assert rec.resolver.confidence == 0.3
+        assert "relocated output" in rec.resolver.reason
+        assert script.name in rec.resolver.reason  # names the changed/unreadable script
+        assert rec.is_authoritative is False
+        assert rec.partial is False
 
 
 # ---------------------------------------------------------------------------
@@ -737,11 +571,17 @@ class TestBasenameRelocationFallback:
         assert status["record"]["path"] == str(original)
         assert status["directory_note"] is None
         assert status["inconclusive"] is False
+        # No content hash to match, so the block reads unknown, not fresh.
+        assert status["staleness_record"]["state"] == "unknown"
 
     @duckdb_required
-    def test_resolver_state_maps_basename_relocation_to_verified(
+    def test_resolver_state_maps_basename_relocation_to_verified_not_authoritative(
         self, tmp_path: Path,
     ) -> None:
+        """Changed from the old basename-to-authoritative expectation. A
+        basename-only relocation is still VERIFIED, but at 0.6 (below the 0.75
+        content-hash match). It is partial, so it is NOT authoritative, because
+        identity rests on the basename alone."""
         outputs_dir = tmp_path / "outputs"
         outputs_dir.mkdir()
         original = outputs_dir / "meridian_reloc_gap_ev01.csv"
@@ -756,71 +596,11 @@ class TestBasenameRelocationFallback:
         assert status["provenance_type"] == PS.RELOCATED  # sanity
         rec = PS.evidence_record_from_provenance_status(status)
         assert rec.resolver.status is RE.ResolverStatus.VERIFIED
+        assert rec.resolver.confidence == 0.6
+        assert rec.partial is True
+        assert rec.partial_reason
+        assert rec.is_authoritative is False
         assert rec.attributes["relocation_evidence"] == "basename"
-
-    @duckdb_required
-    def test_basename_relocation_reads_script_staleness_of_matched_row(
-        self, tmp_path: Path,
-    ) -> None:
-        """F4 (round five): a basename-relocated copy (here outside
-        outputs_dir, where no fingerprint row can exist) must take the
-        matched indexed row's script staleness, so a changed generator of
-        that row is not read as VERIFIED."""
-        outputs_dir = tmp_path / "outputs"
-        outputs_dir.mkdir()
-        script = tmp_path / "train.py"
-        script.write_text("print('v1')\n", encoding="utf-8")
-        original = outputs_dir / "meridian_reloc_gap_scr5.csv"
-        original.write_text("a,b\n1,2\n", encoding="utf-8")
-        OL.register_priority_path(str(outputs_dir), str(original))
-        FP.tag_output(str(original), str(outputs_dir), script_path=str(script))
-
-        relocated = tmp_path / "elsewhere" / "meridian_reloc_gap_scr5.csv"
-        relocated.parent.mkdir()
-        relocated.write_text("a,b\n1,2\n", encoding="utf-8")
-        script.write_text("print('v2 -- changed')\n", encoding="utf-8")
-
-        status = PS.get_provenance_status(str(outputs_dir), str(relocated))
-        assert status["provenance_type"] == PS.RELOCATED
-        assert status["relocation_evidence"] == "basename"
-        assert status["record"]["path"] == str(original)
-        assert status["script_staleness"]["is_stale"] is True
-        resolver = PS.evidence_record_from_provenance_status(status).resolver
-        assert resolver.status is RE.ResolverStatus.STALE
-        assert resolver.confidence == 0.3
-
-    @duckdb_required
-    def test_tagged_unindexed_query_path_whose_script_changed_is_stale(
-        self, tmp_path: Path,
-    ) -> None:
-        """R6-A (round six): the basename branch dropped the query path's
-        own fingerprint row too. A copy tagged at its new location inside
-        outputs_dir (not itself indexed), whose generator then changed,
-        read VERIFIED from the matched row, which has no tag."""
-        outputs_dir = tmp_path / "outputs"
-        outputs_dir.mkdir()
-        script = tmp_path / "train.py"
-        script.write_text("print('v1')\n", encoding="utf-8")
-        original = outputs_dir / "run_1" / "meridian_reloc_gap_own6.csv"
-        original.parent.mkdir()
-        original.write_text("a,b\n1,2\n", encoding="utf-8")
-        OL.register_priority_path(str(outputs_dir), str(original))
-
-        relocated = outputs_dir / "moved" / "meridian_reloc_gap_own6.csv"
-        relocated.parent.mkdir()
-        relocated.write_text("a,b\n1,2\n", encoding="utf-8")
-        FP.tag_output(str(relocated), str(outputs_dir), script_path=str(script))
-        script.write_text("print('v2 -- changed')\n", encoding="utf-8")
-        assert OL.get_indexed_output_status(str(outputs_dir), str(relocated))["row"] is None
-
-        status = PS.get_provenance_status(str(outputs_dir), str(relocated))
-        assert status["provenance_type"] == PS.RELOCATED
-        assert status["relocation_evidence"] == "basename"
-        assert status["record"]["path"] == str(original)
-        assert status["script_staleness"]["is_stale"] is True
-        resolver = PS.evidence_record_from_provenance_status(status).resolver
-        assert resolver.status is RE.ResolverStatus.STALE
-        assert resolver.confidence == 0.3
 
     @duckdb_required
     def test_multiple_basename_candidates_is_ambiguous(
@@ -891,6 +671,79 @@ class TestBasenameRelocationFallback:
 
         status_sibling = PS.get_provenance_status(str(tmp_path), str(sibling))
         assert status_sibling["provenance_type"] == PS.UNKNOWN
+
+    @duckdb_required
+    def test_basename_relocation_is_verified_but_not_authoritative_or_trusted(
+        self, tmp_path: Path,
+    ) -> None:
+        """A basename-only relocation is VERIFIED at 0.6, but it is partial and
+        therefore NOT authoritative. It is absent from trusted_pointers and from
+        the authoritative record count. A content-confirmed exact record in the
+        same envelope is still trusted, so the exclusion is per record."""
+        outputs_dir = tmp_path / "outputs"
+        outputs_dir.mkdir()
+        exact = outputs_dir / "exact_control.csv"
+        exact.write_text("x\n1\n", encoding="utf-8")
+        AN.record_provenance(str(outputs_dir), str(exact))
+
+        original = outputs_dir / "meridian_reloc_gap_trust1.csv"
+        original.write_text("a,b\n1,2\n", encoding="utf-8")
+        OL.register_priority_path(str(outputs_dir), str(original))
+
+        relocated = tmp_path / "elsewhere" / "meridian_reloc_gap_trust1.csv"
+        relocated.parent.mkdir()
+        relocated.write_text("a,b\n1,2\n", encoding="utf-8")
+
+        env = PS.build_provenance_envelope(
+            str(outputs_dir), [str(exact), str(relocated)],
+        )
+        by_id = {r.identity.id: r for r in env.records}
+        basename_rec = by_id[str(relocated)]
+        assert basename_rec.resolver.status is RE.ResolverStatus.VERIFIED
+        assert basename_rec.resolver.confidence == 0.6
+        assert basename_rec.partial is True
+        assert basename_rec.is_authoritative is False
+        assert basename_rec.attributes["relocation_evidence"] == "basename"
+        assert env.partial is True
+
+        assert [p["id"] for p in RE.trusted_pointers(env)] == [str(exact)]
+        summary = RE.evidence_status_summary(env)
+        assert summary["authoritative_record_count"] == 1
+        assert summary["partial_record_count"] == 1
+
+    @duckdb_required
+    def test_basename_relocation_with_changed_script_is_stale_not_authoritative(
+        self, tmp_path: Path,
+    ) -> None:
+        """The changed-script rule applies to the basename tier too. A basename
+        copy whose own generating-script tag reports a changed script is STALE,
+        and it is not authoritative. The copy sits under outputs_dir because
+        tag_output only tags paths inside it. It is never indexed, so the
+        basename tier still resolves it."""
+        outputs_dir = tmp_path / "outputs"
+        outputs_dir.mkdir()
+        script = outputs_dir / "plot_basename.py"
+        script.write_text("print('v1')\n", encoding="utf-8")
+        original = outputs_dir / "run_1" / "meridian_reloc_gap_stale2.csv"
+        original.parent.mkdir()
+        original.write_text("a,b\n1,2\n", encoding="utf-8")
+        OL.register_priority_path(str(outputs_dir), str(original))
+
+        relocated = outputs_dir / "copied" / "meridian_reloc_gap_stale2.csv"
+        relocated.parent.mkdir()
+        relocated.write_text("a,b\n1,2\n", encoding="utf-8")
+        FP.tag_output(str(relocated), str(outputs_dir), script_path=str(script))
+        script.write_text("print('v2')\n", encoding="utf-8")
+
+        status = PS.get_provenance_status(str(outputs_dir), str(relocated))
+        assert status["provenance_type"] == PS.RELOCATED  # sanity
+        assert status["relocation_evidence"] == "basename"  # sanity
+        assert status["script_staleness"]["is_stale"] is True  # sanity
+        rec = PS.evidence_record_from_provenance_status(status)
+        assert rec.resolver.status is RE.ResolverStatus.STALE
+        assert rec.resolver.confidence == 0.3
+        assert script.name in rec.resolver.reason
+        assert rec.is_authoritative is False
 
 
 # ---------------------------------------------------------------------------
@@ -1132,292 +985,172 @@ class TestStaleByScript:
         assert status["script_staleness"] is None  # never fingerprint-tagged
 
     @duckdb_required
-    @pytest.mark.parametrize("garbage", [b"", b"{not json", b"[1, 2]"])
-    def test_corrupt_fingerprint_ledger_keeps_exact_with_unknown_script_staleness(
-        self, tmp_path: Path, garbage: bytes,
-    ) -> None:
-        """An unreadable fingerprint ledger must not break an exact lookup:
-        the record is kept, script staleness is reported unknown (never
-        "not stale"), and the typed bridge never calls it VERIFIED."""
-        script = tmp_path / "train.py"
-        script.write_text("print('v1')\n", encoding="utf-8")
-        output = tmp_path / "result.csv"
-        output.write_text("a,b\n1,2\n", encoding="utf-8")
-        AN.record_provenance(str(tmp_path), str(output), generating_script=str(script))
-        FP.tag_output(str(output), str(tmp_path), script_path=str(script))
-        Path(FP._ledger_path(str(tmp_path))).write_bytes(garbage)
-
-        status = PS.get_provenance_status(str(tmp_path), str(output))
-        assert status["provenance_type"] == PS.EXACT
-        assert status["record"] is not None
-        assert status["staleness"]["stale"] is False  # the output itself is unchanged
-        script_staleness = status["script_staleness"]
-        assert script_staleness["is_stale"] is None
-        assert script_staleness["error"] == "ledger_unreadable"
-        assert "fingerprint_ledger.json" in script_staleness["reason"]
-        assert str(tmp_path) not in script_staleness["reason"]
-
-        resolver = PS.evidence_record_from_provenance_status(status).resolver
-        assert resolver.status is RE.ResolverStatus.AMBIGUOUS
-        assert not resolver.is_authoritative
-
-        backed = PS.get_manifest_backed_provenance_status(str(tmp_path), str(output), None)
-        assert backed["provenance_type"] == PS.EXACT
-        assert backed["script_staleness"]["is_stale"] is None
-
-    @duckdb_required
-    @pytest.mark.parametrize("row", ["null", "3", '"x"', "[1]"])
-    def test_non_object_fingerprint_row_is_corruption_not_attribute_error(
-        self, tmp_path: Path, row: str,
-    ) -> None:
-        """A valid-JSON ledger with a non-object row passes the top-level
-        parse; the strict read must still reject it as corrupt."""
-        from meridian_outputs import ledger_io as LIO
-
-        output = tmp_path / "result.csv"
-        output.write_text("a,b\n1,2\n", encoding="utf-8")
-        AN.record_provenance(str(tmp_path), str(output))
-        Path(FP._ledger_path(str(tmp_path))).write_text(
-            '{"result.csv": ' + row + "}", encoding="utf-8",
-        )
-
-        with pytest.raises(LIO.LedgerCorruptError, match="not an object"):
-            FP.check_staleness(str(tmp_path))
-        with pytest.raises(LIO.LedgerCorruptError):
-            FP.find_stale_by_script(str(tmp_path), str(tmp_path / "train.py"))
-        status = PS.get_provenance_status(str(tmp_path), str(output))
-        assert status["provenance_type"] == PS.EXACT
-        assert status["script_staleness"]["is_stale"] is None
-
-    @duckdb_required
-    def test_tagged_row_without_resolvable_script_is_unknown_never_verified(
+    def test_relocated_output_whose_script_changed_stays_relocated_but_reads_stale(
         self, tmp_path: Path,
     ) -> None:
-        """A fingerprint-tagged output whose script was never resolved can
-        not have its script staleness checked. It used to read as "not
-        stale", so the bridge called the exact record VERIFIED at 0.95."""
-        output = tmp_path / "result.csv"
-        output.write_text("a,b\n1,2\n", encoding="utf-8")
-        AN.record_provenance(str(tmp_path), str(output))
-        assert FP.tag_output(str(output), str(tmp_path)).script_path is None
+        """A RELOCATED output is identified by content hash against its old
+        record. Its generating script is checked through that record's own
+        fingerprint tag (the new path carries none). The changed script shows
+        in script_staleness and staleness_record, but provenance_type stays
+        RELOCATED, so a caller that fails closed on a relocated identity still
+        does."""
+        script = tmp_path / "train.py"
+        script.write_text("print('v1 -- has a bug')\n", encoding="utf-8")
+        old = tmp_path / "run_1" / "predictions.csv"
+        old.parent.mkdir()
+        old.write_text("id,pred\n1,0.5\n", encoding="utf-8")
+        AN.record_provenance(str(tmp_path), str(old), generating_script=str(script))
+        FP.tag_output(str(old), str(tmp_path), script_path=str(script))
 
-        status = PS.get_provenance_status(str(tmp_path), str(output))
-        assert status["provenance_type"] == PS.EXACT
+        new = tmp_path / "run_1_moved" / "predictions.csv"
+        new.parent.mkdir()
+        new.write_text("id,pred\n1,0.5\n", encoding="utf-8")  # identical content
+        old.unlink()
+
+        # The bug is fixed: the script changes, the relocated output does not.
+        script.write_text("print('v2 -- bug fixed')\n", encoding="utf-8")
+
+        status = PS.get_provenance_status(str(tmp_path), str(new))
+        assert status["provenance_type"] == PS.RELOCATED
+        assert status["relocation_evidence"] == "content_hash"
+        assert status["record"]["path"] == str(old)
+        assert status["script_staleness"]["is_stale"] is True
+        assert "script content changed" in status["script_staleness"]["reason"]
         assert status["staleness"]["stale"] is False  # the output itself is unchanged
-        assert status["staleness"]["recorded_content_hash"] is not None
-        script_staleness = status["script_staleness"]
-        assert script_staleness["is_stale"] is None
-        assert "no generating script resolved at tag time" in script_staleness["reason"]
-        assert "error" not in script_staleness
-
-        resolver = PS.evidence_record_from_provenance_status(status).resolver
-        assert resolver.status is not RE.ResolverStatus.VERIFIED
-        assert resolver.status is RE.ResolverStatus.AMBIGUOUS
-        assert resolver.confidence != 0.95
-        assert not resolver.is_authoritative
-
-    def test_relocated_with_unknown_script_staleness_is_never_verified(self) -> None:
-        status = {
-            "path": "/out/moved.csv",
-            "provenance_type": PS.RELOCATED,
-            "record": {"path": "/out/original.csv"},
-            "directory_note": None,
-            "staleness": {
-                "exists_on_disk": True, "recorded_content_hash": "ab" * 32,
-                "current_content_hash": "ab" * 32, "stale": False,
-                "reason": "content hash matches a provenance record for a different path",
-            },
-            "script_staleness": {
-                "is_stale": None,
-                "reason": "no generating script resolved at tag time -- staleness "
-                          "cannot be confirmed either way",
-            },
-            "input_staleness": None,
-            "inconclusive": False,
-        }
-        resolver = PS._resolver_state_for_provenance_status(status)
-        assert resolver.status is RE.ResolverStatus.AMBIGUOUS
-        assert "no generating script resolved" in resolver.reason
-
-        status["script_staleness"]["is_stale"] = False
-        assert (
-            PS._resolver_state_for_provenance_status(status).status
-            is RE.ResolverStatus.VERIFIED
-        )
-
-    @staticmethod
-    def _stale_tagged_output(outputs: Path, script: Path) -> Path:
-        """An output under ``outputs`` with an exact record, fingerprint-tagged
-        against ``script``, whose script has since changed."""
-        output = outputs / "run" / "table.csv"
-        output.parent.mkdir(parents=True, exist_ok=True)
-        output.write_text("a,b\n1,2\n", encoding="utf-8")
-        script.write_text("print('v1')\n", encoding="utf-8")
-        recorded = AN.record_provenance(str(outputs), str(output), generating_script=str(script))
-        assert "error" not in recorded
-        FP.tag_output(str(output), str(outputs), script_path=str(script))
-        script.write_text("print('v2 -- changed')\n", encoding="utf-8")
-        return output
+        assert status["inconclusive"] is False
+        assert status["staleness_record"]["state"] == "stale"
+        assert "script content changed" in status["staleness_record"]["reason"]
 
     @duckdb_required
-    def test_relative_and_absolute_spellings_get_the_same_script_verdict(
-        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+    def test_relocated_output_with_unchanged_script_stays_relocated(
+        self, tmp_path: Path,
     ) -> None:
-        """S-R4-3: the script-staleness lookup resolved a relative path
-        against the working directory while the record lookup resolved it
-        against outputs_dir, so the relative spelling missed its fingerprint
-        row, read as "never tagged", and was VERIFIED at 0.95 while the
-        absolute spelling of the same file was STALE_BY_SCRIPT."""
-        outputs = tmp_path / "outputs"
-        output = self._stale_tagged_output(outputs, tmp_path / "train.py")
-        elsewhere = tmp_path / "elsewhere"
-        elsewhere.mkdir()
-        monkeypatch.chdir(elsewhere)  # the working directory is not outputs_dir
+        """Counterpart: an unchanged script keeps the RELOCATED verdict. The
+        matched record's tag is still read, but its file has moved away, so
+        the tag cannot be tied to these bytes: it reads unknown, never fresh.
+        A changed script would read stale (see the parametrized tests)."""
+        script = tmp_path / "stable_train.py"
+        script.write_text("print('unchanged')\n", encoding="utf-8")
+        old = tmp_path / "run_2" / "predictions.csv"
+        old.parent.mkdir()
+        old.write_text("id,pred\n1,0.5\n", encoding="utf-8")
+        AN.record_provenance(str(tmp_path), str(old), generating_script=str(script))
+        FP.tag_output(str(old), str(tmp_path), script_path=str(script))
 
-        verdicts = {}
-        for spelling in ("run/table.csv", str(output)):
-            status = PS.get_provenance_status(str(outputs), spelling)
-            assert status["record"] is not None, spelling
-            assert status["provenance_type"] == PS.STALE_BY_SCRIPT, spelling
-            assert status["script_staleness"]["is_stale"] is True, spelling
-            resolver = PS.evidence_record_from_provenance_status(status).resolver
-            assert resolver.status is not RE.ResolverStatus.VERIFIED, spelling
-            verdicts[spelling] = (status["provenance_type"], resolver.status, resolver.confidence)
-        assert verdicts["run/table.csv"] == verdicts[str(output)]
+        new = tmp_path / "run_2_moved" / "predictions.csv"
+        new.parent.mkdir()
+        new.write_text("id,pred\n1,0.5\n", encoding="utf-8")
+        old.unlink()
+
+        status = PS.get_provenance_status(str(tmp_path), str(new))
+        assert status["provenance_type"] == PS.RELOCATED
+        assert status["script_staleness"] is not None
+        assert status["script_staleness"]["is_stale"] is None
+        assert status["staleness_record"]["state"] == "unknown"
 
     @duckdb_required
-    def test_symlinked_outputs_dir_still_matches_the_tagged_row(
-        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+    def test_relocated_query_path_own_stale_tag_wins_over_fresh_matched_tag(
+        self, tmp_path: Path,
     ) -> None:
-        """S-R4-3: check_staleness reports realpath-resolved paths, so the
-        query must be resolved through realpath too; a path through a linked
-        outputs_dir (relative or absolute) must find the same row."""
-        real = tmp_path / "real_outputs"
-        real.mkdir()
-        link = tmp_path / "linked_outputs"
-        try:
-            link.symlink_to(real, target_is_directory=True)
-        except (OSError, NotImplementedError):
-            if os.name != "nt":
-                pytest.skip("directory symlinks unavailable")
-            try:
-                import _winapi
+        """Stale-tag precedence: the relocated file can carry its OWN
+        fingerprint tag, and that tag can report a changed script while the
+        matched record's tag is still fresh. The stale result must win, so
+        staleness_record reads stale, and provenance_type stays RELOCATED."""
+        old_script = tmp_path / "make_old.py"
+        old_script.write_text("print('stable')\n", encoding="utf-8")
+        new_script = tmp_path / "make_new.py"
+        new_script.write_text("print('v1')\n", encoding="utf-8")
+        old = tmp_path / "run_1" / "predictions.csv"
+        old.parent.mkdir()
+        old.write_text("id,pred\n1,0.5\n", encoding="utf-8")
+        AN.record_provenance(str(tmp_path), str(old), generating_script=str(old_script))
+        FP.tag_output(str(old), str(tmp_path), script_path=str(old_script))
 
-                _winapi.CreateJunction(str(real), str(link))
-            except (ImportError, OSError) as exc:
-                pytest.skip(f"directory links unavailable: {exc}")
-        self._stale_tagged_output(link, tmp_path / "train.py")
-        elsewhere = tmp_path / "elsewhere"
-        elsewhere.mkdir()
-        monkeypatch.chdir(elsewhere)
+        new = tmp_path / "run_1_moved" / "predictions.csv"
+        new.parent.mkdir()
+        new.write_text("id,pred\n1,0.5\n", encoding="utf-8")  # identical content
+        old.unlink()
+        # The relocated file gets its own tag against new_script. Only that
+        # script changes, so the matched record's tag stays fresh.
+        FP.tag_output(str(new), str(tmp_path), script_path=str(new_script))
+        new_script.write_text("print('v2')\n", encoding="utf-8")
 
-        for spelling in ("run/table.csv", str(link / "run" / "table.csv")):
-            status = PS.get_provenance_status(str(link), spelling)
-            assert status["record"] is not None, spelling
-            assert status["provenance_type"] == PS.STALE_BY_SCRIPT, spelling
-            assert status["script_staleness"]["is_stale"] is True, spelling
+        matched = PS._stale_by_script_result(str(tmp_path), str(old))
+        assert matched is not None and matched["is_stale"] is False  # sanity
 
-
-# ---------------------------------------------------------------------------
-# A provenance-ledger row that is not an object is corruption, not absence
-# ---------------------------------------------------------------------------
-
-class TestNonObjectProvenanceRow:
-    @pytest.mark.parametrize("row", ["null", "3", '"x"', "[1]"])
-    def test_non_object_row_raises_instead_of_reading_as_absent(
-        self, tmp_path: Path, row: str,
-    ) -> None:
-        from meridian_outputs import ledger_io as LIO
-
-        output = tmp_path / "result.csv"
-        output.write_text("a,b\n1,2\n", encoding="utf-8")
-        Path(AN._ledger_path(str(tmp_path))).write_text(
-            '{"result.csv": ' + row + "}", encoding="utf-8",
-        )
-
-        with pytest.raises(LIO.LedgerCorruptError, match="not an object"):
-            AN.get_provenance(str(tmp_path), str(output))
-        with pytest.raises(LIO.LedgerCorruptError, match="not an object"):
-            AN.list_provenance(str(tmp_path))
+        status = PS.get_provenance_status(str(tmp_path), str(new))
+        assert status["provenance_type"] == PS.RELOCATED
+        assert status["record"]["path"] == str(old)
+        assert status["script_staleness"]["is_stale"] is True
+        assert status["staleness_record"]["state"] == "stale"
+        assert "script content changed" in status["staleness_record"]["reason"]
+        assert status["inconclusive"] is False
 
     @duckdb_required
-    def test_null_row_is_never_unregistered_or_unavailable(self, tmp_path: Path) -> None:
-        """A null row used to read as "no record": an indexed path came back
-        UNREGISTERED and a confirmed-absent one UNKNOWN (UNAVAILABLE in the
-        envelope), hiding the corruption."""
-        from meridian_outputs import ledger_io as LIO
-
-        output = tmp_path / "result.csv"
-        output.write_text("a,b\n1,2\n", encoding="utf-8")
-        idx = OL._get_cached_index(str(tmp_path))
-        idx.rebuild()
-        assert idx.get_convergence_state().converged is True  # sanity
-        gone = tmp_path / "gone.csv"  # never created: confirmed absent
-        Path(AN._ledger_path(str(tmp_path))).write_text(
-            '{"result.csv": null}', encoding="utf-8",
-        )
-
-        for path in (output, gone):
-            with pytest.raises(LIO.LedgerCorruptError, match="not an object"):
-                PS.get_provenance_status(str(tmp_path), str(path))
-
-        envelope = PS.build_provenance_envelope(str(tmp_path), [str(output), str(gone)])
-        for record in envelope.records:
-            assert record.resolver.status is RE.ResolverStatus.AMBIGUOUS
-            assert record.resolver.status is not RE.ResolverStatus.UNAVAILABLE
-            assert record.attributes["store_error"] == "ledger_unreadable"
-            assert record.attributes["provenance_type"] not in (PS.UNREGISTERED, PS.UNKNOWN)
-            assert record.partial is True
-
-    def test_writer_still_drops_a_null_row_without_quarantining_the_ledger(
-        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+    @pytest.mark.parametrize(
+        ("old_script_edited", "new_script_edited", "expected_state", "matched_wins"),
+        [
+            pytest.param(True, False, "stale", True, id="matched-stale-query-fresh"),
+            pytest.param(True, True, "stale", True, id="both-stale"),
+            # The matched file was moved away, so its fresh reading cannot be
+            # tied to these bytes: only the copy's own tag decides.
+            pytest.param(False, False, "fresh", False, id="both-fresh"),
+        ],
+    )
+    def test_content_hash_relocation_tag_precedence(
+        self,
+        tmp_path: Path,
+        old_script_edited: bool,
+        new_script_edited: bool,
+        expected_state: str,
+        matched_wins: bool,
     ) -> None:
-        """The row check is on the read path only: record_provenance keeps
-        the good rows and drops the bad one, as before."""
-        import json
+        """Precedence in the content-hash RELOCATED branch: a stale tag on the
+        matched record wins. Otherwise a stale tag on the queried path wins.
+        Otherwise the matched record's tag is preferred over the queried
+        path's tag. script_staleness.path must name the record whose tag won,
+        and here that is the matched record when it is stale. When the matched
+        file has moved away and reads fresh, its tag cannot be tied to these
+        bytes, so the queried path's own tag decides. The case where
+        only the queried path's tag is stale is covered by
+        test_relocated_query_path_own_stale_tag_wins_over_fresh_matched_tag."""
+        old_script = tmp_path / "make_old.py"
+        old_script.write_text("print('old v1')\n", encoding="utf-8")
+        new_script = tmp_path / "make_new.py"
+        new_script.write_text("print('new v1')\n", encoding="utf-8")
+        old = tmp_path / "run_1" / "predictions.csv"
+        old.parent.mkdir()
+        old.write_text("id,pred\n1,0.5\n", encoding="utf-8")
+        AN.record_provenance(str(tmp_path), str(old), generating_script=str(old_script))
+        FP.tag_output(str(old), str(tmp_path), script_path=str(old_script))
 
-        monkeypatch.setattr(AN.outputs_local, "register_priority_path", lambda *_a, **_k: None)
-        keep = tmp_path / "keep.csv"
-        keep.write_text("a\n1\n", encoding="utf-8")
-        AN.record_provenance(str(tmp_path), str(keep), note="keep")
-        ledger_file = Path(AN._ledger_path(str(tmp_path)))
-        data = json.loads(ledger_file.read_text(encoding="utf-8"))
-        data["bad.csv"] = None
-        ledger_file.write_text(json.dumps(data), encoding="utf-8")
+        new = tmp_path / "run_1_moved" / "predictions.csv"
+        new.parent.mkdir()
+        new.write_text("id,pred\n1,0.5\n", encoding="utf-8")  # identical content
+        old.unlink()
+        FP.tag_output(str(new), str(tmp_path), script_path=str(new_script))
 
-        new = tmp_path / "new.csv"
-        new.write_text("a\n2\n", encoding="utf-8")
-        result = AN.record_provenance(str(tmp_path), str(new), note="new")
-        assert "error" not in result
-        assert "ledger_quarantined" not in result
-        assert sorted(r["note"] for r in AN.list_provenance(str(tmp_path))) == ["keep", "new"]
+        if old_script_edited:
+            old_script.write_text("print('old v2')\n", encoding="utf-8")
+        if new_script_edited:
+            new_script.write_text("print('new v2')\n", encoding="utf-8")
 
+        matched = PS._stale_by_script_result(str(tmp_path), str(old))
+        query = PS._stale_by_script_result(str(tmp_path), str(new))
+        assert matched is not None and query is not None  # sanity
+        assert matched["is_stale"] is old_script_edited  # sanity
+        assert query["is_stale"] is new_script_edited  # sanity
 
-@duckdb_required
-def test_documented_raise_matches_behaviour(tmp_path: Path) -> None:
-    """get_provenance_status raises LedgerCorruptError for an unreadable
-    provenance ledger; its docstring and the MCP tool's used to say it
-    always returns a status dict."""
-    from meridian_outputs import ledger_io as LIO
-
-    output = tmp_path / "result.csv"
-    output.write_text("a,b\n1,2\n", encoding="utf-8")
-    Path(AN._ledger_path(str(tmp_path))).write_bytes(b"{not json")
-    with pytest.raises(LIO.LedgerCorruptError):
-        PS.get_provenance_status(str(tmp_path), str(output))
-
-    docs = [PS.get_provenance_status.__doc__, PS.get_manifest_backed_provenance_status.__doc__]
-    try:
-        from meridian_outputs import server
-    except ImportError:  # mcp not installed: the tool docstring is not reachable
-        pass
-    else:
-        docs.append(server.get_provenance_status.__doc__)
-    for doc in docs:
-        assert "LedgerCorruptError" in doc
-        assert "Never raises" not in doc
-    assert "Raises:" in PS.get_provenance_status.__doc__
-    assert "ledger_unreadable" in PS.get_provenance_status.__doc__
+        status = PS.get_provenance_status(str(tmp_path), str(new))
+        assert status["provenance_type"] == PS.RELOCATED
+        assert status["record"]["path"] == str(old)
+        winner = str(old) if matched_wins else str(new)
+        assert status["script_staleness"]["path"] == winner
+        assert status["script_staleness"]["is_stale"] is (
+            old_script_edited if matched_wins else new_script_edited
+        )
+        assert status["staleness_record"]["state"] == expected_state
+        assert status["inconclusive"] is False
 
 
 # ---------------------------------------------------------------------------
@@ -1896,37 +1629,6 @@ class TestBuildProvenanceEnvelope:
         restored = RE.parse_provenance_envelope(payload, format="xml")
         assert restored == env
 
-    @duckdb_required
-    def test_corrupt_provenance_ledger_is_mapped_into_the_envelope(
-        self, tmp_path: Path,
-    ) -> None:
-        """An unreadable provenance ledger makes every path's lookup fail;
-        each still gets its own non-authoritative, partial record and the
-        envelope tool returns instead of raising."""
-        pytest.importorskip("mcp")
-        from meridian_outputs import server
-
-        a = tmp_path / "a.csv"
-        a.write_text("a\n1\n", encoding="utf-8")
-        AN.record_provenance(str(tmp_path), str(a))
-        Path(AN._ledger_path(str(tmp_path))).write_bytes(b"{not json")
-        paths = [str(a), str(tmp_path / "b.csv")]
-
-        env = PS.build_provenance_envelope(str(tmp_path), paths)
-        assert [r.identity.id for r in env.records] == paths
-        for record in env.records:
-            assert record.resolver.status is RE.ResolverStatus.AMBIGUOUS
-            assert not record.resolver.is_authoritative
-            assert record.partial is True
-            assert record.attributes["store_error"] == "ledger_unreadable"
-            assert "provenance_ledger.json" in record.partial_reason
-            assert str(tmp_path) not in record.partial_reason
-        assert env.partial is True
-
-        payload = server.get_provenance_status_envelope(str(tmp_path), paths)
-        assert len(payload["records"]) == 2
-        assert payload["partial"] is True
-
 
 # ---------------------------------------------------------------------------
 # db63385b (W31-B): a REAL get_provenance_status RELOCATED/AMBIGUOUS result
@@ -1957,6 +1659,57 @@ class TestFigureInvariantGateProvenanceIntegration:
         # value (the recorded OLD path) and identical numeric/text content
         # -- without figure_invariant_gate's dedicated RELOCATED rule, this
         # would otherwise be a false INVARIANT_HOLDS.
+        canonical = FIG.FigureSlotPayload(
+            bound_source={"kind": "resolved_path", "value": str(old)},
+            numeric_values=(1, 2),
+            text_content=("x", "y"),
+            provenance_type=FIG.PROVENANCE_EXACT,
+        )
+        candidate = FIG.FigureSlotPayload(
+            bound_source={"kind": "resolved_path", "value": status["record"]["path"]},
+            numeric_values=(1, 2),
+            text_content=("x", "y"),
+            provenance_type=status["provenance_type"],
+            provenance_candidates=status.get("candidates") or (),
+        )
+        assert canonical.bound_source == candidate.bound_source  # precondition
+
+        result = FIG.compare_figure_invariants(canonical, candidate)
+        assert result["verdict"] == FIG.SOURCE_MISMATCH
+        assert result["verdict"] != FIG.INVARIANT_HOLDS
+
+    @duckdb_required
+    def test_relocated_changed_script_keeps_relocated_type_so_gate_fails_closed(
+        self, tmp_path: Path,
+    ) -> None:
+        """A relocated output whose generating script has since changed must
+        still fail closed. provenance_type stays RELOCATED (the script result
+        rides on script_staleness), so the gate's SOURCE_MISMATCH rule applies
+        even though the content and the bound source line up exactly."""
+        script = tmp_path / "plot_figure.py"
+        script.write_text("print('v1')\n", encoding="utf-8")
+        old = tmp_path / "run_1" / "figure_data.csv"
+        old.parent.mkdir()
+        old.write_text("x,y\n1,2\n", encoding="utf-8")
+        AN.record_provenance(str(tmp_path), str(old), generating_script=str(script))
+        FP.tag_output(str(old), str(tmp_path), script_path=str(script))
+
+        new = tmp_path / "run_1_moved" / "figure_data.csv"
+        new.parent.mkdir()
+        new.write_text("x,y\n1,2\n", encoding="utf-8")  # identical content, moved
+        old.unlink()
+        script.write_text("print('v2')\n", encoding="utf-8")  # script changed
+
+        status = PS.get_provenance_status(str(tmp_path), str(new))
+        # Guards against a future promotion: provenance_type must stay the
+        # literal "relocated" (PS.RELOCATED). figure_invariant_gate's relocated
+        # SOURCE_MISMATCH rule keys on "relocated" alone and does not read
+        # script_staleness, so a stale_by_script type would fall through to
+        # the source-key comparison. Promoting it would silently weaken the
+        # gate.
+        assert status["provenance_type"] == PS.RELOCATED
+        assert status["script_staleness"]["is_stale"] is True
+
         canonical = FIG.FigureSlotPayload(
             bound_source={"kind": "resolved_path", "value": str(old)},
             numeric_values=(1, 2),

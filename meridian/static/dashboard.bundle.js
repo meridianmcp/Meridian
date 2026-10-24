@@ -268,6 +268,17 @@
     }
     return carried;
   }
+  var TAB_BODY_DRAFTS = [
+    { selector: "input[id], textarea[id]", key: (el3) => el3.id }
+  ];
+  function paintTabBody(body, html) {
+    return paintKeepingDrafts(body, html, TAB_BODY_DRAFTS);
+  }
+  function setTabBodyMessage(body, html) {
+    if (hasUnsentDrafts(body, TAB_BODY_DRAFTS)) return false;
+    body.innerHTML = html;
+    return true;
+  }
   try {
     Object.assign(window, {
       getPanelState: getPanelState2,
@@ -1681,6 +1692,34 @@
   ];
   function _paintSprintBoard(root, html) {
     paintKeepingDrafts(root, html, _SPRINT_BOARD_DRAFTS);
+    _markChangedMeanwhile(root, html);
+  }
+  function _markChangedMeanwhile(root, html) {
+    const fresh = document.createElement("template");
+    fresh.innerHTML = html;
+    const freshIcon = /* @__PURE__ */ new Map();
+    fresh.content.querySelectorAll(".sprint-item-row[data-item]").forEach((row) => {
+      const icon = row.querySelector(".sprint-item-icon");
+      if (icon && !freshIcon.has(row.dataset.item)) freshIcon.set(row.dataset.item, icon.textContent || "");
+    });
+    root.querySelectorAll(".sprint-item-row[data-item]").forEach((row) => {
+      const icon = row.querySelector(".sprint-item-icon");
+      const now = freshIcon.get(row.dataset.item);
+      const hint = row.querySelector(".sprint-changed-meanwhile");
+      const stale = !!icon && now !== void 0 && icon.textContent !== now;
+      if (stale && !hint) {
+        (row.querySelector(".sprint-item-main") || row).insertAdjacentHTML(
+          "beforeend",
+          '<span class="sprint-changed-meanwhile" hidden>changed meanwhile</span>'
+        );
+      } else if (!stale && hint) {
+        hint.remove();
+      }
+      if (icon) {
+        if (stale) icon.setAttribute("title", "changed meanwhile");
+        else icon.removeAttribute("title");
+      }
+    });
   }
   function renderSprintProgress2(projectId, items) {
     const root = document.getElementById(`live-sprint-progress-${projectId}`);
@@ -3279,7 +3318,7 @@
       body._settingsObs = null;
     }
     delete body.dataset.tabbed;
-    body.innerHTML = '<div style="color:var(--muted);font-size:11px">loading\u2026</div>';
+    setTabBodyMessage(body, '<div style="color:var(--muted);font-size:11px">loading\u2026</div>');
     const _activeRole = await getActiveWorkspaceRole();
     const _guest = _activeRole === "viewer" || _activeRole === "member";
     const _canInvite = _activeRole === "owner" || _activeRole === "admin";
@@ -6133,7 +6172,7 @@ project_id = "${displayPid}"`;
       html += `<div style="margin-top:20px;padding-top:12px;border-top:1px solid var(--border);display:flex;gap:12px;font-size:9px;color:var(--muted)"><a href="/terms" target="_blank" rel="noopener" style="color:var(--muted);text-decoration:none" onmouseover="this.style.color='var(--text)'" onmouseout="this.style.color='var(--muted)'">Terms of Service</a><a href="/privacy" target="_blank" rel="noopener" style="color:var(--muted);text-decoration:none" onmouseover="this.style.color='var(--text)'" onmouseout="this.style.color='var(--muted)'">Privacy Policy</a><span style="margin-left:auto">\xA9 2026 Meridian</span></div>`;
       if (body._loadTok !== _myTok) return;
       try {
-        body.innerHTML = html;
+        paintTabBody(body, html);
       } catch (renderErr) {
         console.error("Settings render failed:", renderErr);
         body.innerHTML = `<div style="color:var(--error);font-size:11px">Failed to render settings: ${escapeHtml(String(renderErr))}</div>`;
@@ -6836,7 +6875,7 @@ project_id = "${displayPid}"`;
         };
       }
     } catch (e3) {
-      body.innerHTML = `<div style="color:var(--error);font-size:11px">Failed to load settings: ${escapeHtml(String(e3))}</div>`;
+      setTabBodyMessage(body, `<div style="color:var(--error);font-size:11px">Failed to load settings: ${escapeHtml(String(e3))}</div>`);
     }
   }
   try {
@@ -18117,22 +18156,22 @@ get_context_block(project_id="${PROJECT_QUOTE}", mode="full")`;
       refreshBtn._experimentsWired = true;
       refreshBtn.onclick = () => loadExperimentsTab(projectId);
     }
-    body.innerHTML = `<div class="empty" style="color:var(--muted)">loading experiments\u2026</div>`;
+    setTabBodyMessage(body, `<div class="empty" style="color:var(--muted)">loading experiments\u2026</div>`);
     let data;
     try {
       data = await projectApi(projectId, `/projects/${projectId}/experiments`);
     } catch (e3) {
-      body.innerHTML = `<div style="color:#f87171;padding:10px">Failed to load experiments: ${escapeHtml(e3 && e3.message || String(e3))}</div>`;
+      setTabBodyMessage(body, `<div style="color:#f87171;padding:10px">Failed to load experiments: ${escapeHtml(e3 && e3.message || String(e3))}</div>`);
       return;
     }
     const experiments = data.experiments || [];
     if (experiments.length === 0) {
-      body.innerHTML = `<div style="color:var(--muted);padding:14px;text-align:center;border:1px dashed var(--border);border-radius:4px">
+      setTabBodyMessage(body, `<div style="color:var(--muted);padding:14px;text-align:center;border:1px dashed var(--border);border-radius:4px">
       No experiments tracked yet. Start one with <code>start_experiment_run</code> in your research session.
-    </div>`;
+    </div>`);
       return;
     }
-    body.innerHTML = experiments.map((exp) => {
+    paintTabBody(body, experiments.map((exp) => {
       const statusLabel = escapeHtml(exp.status || "active");
       const hypothesis = exp.hypothesis ? `<div style="padding:0 12px 8px;color:var(--muted);font-size:11px">${escapeHtml(exp.hypothesis)}</div>` : "";
       return `
@@ -18148,7 +18187,7 @@ get_context_block(project_id="${PROJECT_QUOTE}", mode="full")`;
         <div class="experiment-runs" id="experiment-runs-${escapeHtml(exp.id)}" style="display:none;border-top:1px solid var(--border);padding:8px 12px"></div>
       </div>
     `;
-    }).join("");
+    }).join(""));
     body.querySelectorAll("[data-exp-toggle]").forEach((headerEl) => {
       headerEl.onclick = async () => {
         const expId = headerEl.getAttribute("data-exp-toggle");
@@ -18254,17 +18293,17 @@ get_context_block(project_id="${PROJECT_QUOTE}", mode="full")`;
     const refreshBtn = document.getElementById(`team-refresh-${projectId}`);
     if (!body) return;
     const render = async () => {
-      body.innerHTML = `<div class="empty" style="color:var(--muted)">loading team summary\u2026</div>`;
+      setTabBodyMessage(body, `<div class="empty" style="color:var(--muted)">loading team summary\u2026</div>`);
       const days = parseInt(daySel && daySel.value || "14", 10);
       try {
         const data = await projectApi(projectId, `/team/summary?project_id=${encodeURIComponent(projectId)}&days=${days}`);
         const humans = data.humans || [];
         if (humans.length === 0) {
-          body.innerHTML = `<div style="color:var(--muted);padding:10px;text-align:center;border:1px dashed var(--border);border-radius:4px">
+          setTabBodyMessage(body, `<div style="color:var(--muted);padding:10px;text-align:center;border:1px dashed var(--border);border-radius:4px">
 
           (no human-attributed activity in the last ${data.period_days}d \u2014 set <code>MERIDIAN_HUMAN_ID</code> or pass <code>human_id</code> to register_session)
 
-        </div>`;
+        </div>`);
           return;
         }
         const dotColor = { active: "#4ade80", recent: "#fbbf24", idle: "#6b7280" };
@@ -18368,7 +18407,7 @@ get_context_block(project_id="${PROJECT_QUOTE}", mode="full")`;
           }
         } catch (_2) {
         }
-        body.innerHTML = `
+        paintTabBody(body, `
 
         <section>
 
@@ -18386,10 +18425,10 @@ get_context_block(project_id="${PROJECT_QUOTE}", mode="full")`;
 
         </section>
 
-        ${decisionsHtml}`;
+        ${decisionsHtml}`);
         _wireTabSearch(`team-search-${projectId}`, `team-body-${projectId}`, ".team-card");
       } catch (e3) {
-        body.innerHTML = renderProjectLoadError2(projectId, "Team summary unavailable", `/team/summary?project_id=${encodeURIComponent(projectId)}&days=${days}`, e3);
+        setTabBodyMessage(body, renderProjectLoadError2(projectId, "Team summary unavailable", `/team/summary?project_id=${encodeURIComponent(projectId)}&days=${days}`, e3));
         wireProjectLoadRetry2(body, projectId);
       }
     };
@@ -19254,8 +19293,10 @@ get_context_block(project_id="${PROJECT_QUOTE}", mode="full")`;
     const countEl = document.getElementById("hitl-count");
     const list = document.getElementById("hitl-list");
     if (!bar || !countEl || !list) return;
+    const _hitlTok = list._hitlRefreshTok = (list._hitlRefreshTok || 0) + 1;
     try {
       const items = await api("/hitl?status=pending&limit=50");
+      if (list._hitlRefreshTok !== _hitlTok) return;
       const n2 = items.length;
       countEl.textContent = String(n2);
       const perProject = /* @__PURE__ */ new Map();
@@ -19331,6 +19372,7 @@ get_context_block(project_id="${PROJECT_QUOTE}", mode="full")`;
       });
       try {
         const answered = await api("/hitl?status=answered&limit=10");
+        if (list._hitlRefreshTok !== _hitlTok) return;
         const autoHtml = _renderAutoAnsweredHitls(answered);
         if (autoHtml) list.insertAdjacentHTML("beforeend", autoHtml);
       } catch (e3) {
@@ -20510,7 +20552,7 @@ get_context_block(project_id="${PROJECT_QUOTE}", mode="full")`;
       scheduleLiveRefresh(projectId);
       return;
     }
-    if (event.type === "hitl_filed") {
+    if (event.type === "hitl_filed" || event.type === "hitl_answered" || event.type === "hitl_dismissed") {
       refreshHitl();
       refreshProjectCountBadges(projectId);
       const _hitlPanel = state.panels[projectId];

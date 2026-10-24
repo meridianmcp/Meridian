@@ -5986,7 +5986,6 @@ _PG_MIGRATIONS_LATE = (
     _migrate_pg_note_source,
     _migrate_pg_session_sprint_version,
     _migrate_pg_project_execution_mode,
-    _migrate_pg_project_use_mode,
     _migrate_pg_project_status_priority,
     _migrate_pg_decision_code_anchor,
     _migrate_pg_session_graph_snapshots,
@@ -6097,4 +6096,5 @@ _PG_MIGRATIONS_LATE = (
     _migrate_pg_sprint_item_coarse_lock_files,
     _migrate_pg_backfill_finding_note_kind,
     _migrate_pg_project_state_milestones,
+    _migrate_pg_project_use_mode,
 )

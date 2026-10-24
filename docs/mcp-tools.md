@@ -1,6 +1,6 @@
 # MCP Tool Reference
 
-Meridian exposes **245 tools** over MCP.
+Meridian exposes **251 tools** over MCP.
 
 They fall into two usage patterns:
 
@@ -778,10 +778,41 @@ read_note(project_id="abc-123", slug="deploy-note")
 
 ---
 
+## Compute
+
+### `runpod_check_key`
+[SUPPORT] RunPod key check. Resolves a RunPod API key on this machine and confirms it works with two read-only calls to the RunPod API: one billing call and one pod listing. Returns ok, credential_source (the source kind only: env, keyring or runpodctl), pod_count (pods on the first page, up to 1000), billing_available and error. The key itself is never returned, logged or echoed. Omit credential_ref to try env:RUNPOD_API_KEY, then keyring:meridian-desktop/runpod-api-key, then runpodctl:default. Pass credential_ref to use one reference only; store a reference, never the key. Local only: refused on hosted Meridian.
+
+| Parameter | Type | Required | Description |
+|-----------|------|----------|-------------|
+| `credential_ref` | string | optional | Optional credential reference: env:NAME, keyring:SERVICE/ACCOUNT or runpodctl:default. Give a reference, never the key itself; a raw key is rejected without being echoed. |
+
+**Example:**
+```
+runpod_check_key(credential_ref="env:RUNPOD_API_KEY")
+```
+
+---
+
+
+### `runpod_list_pods`
+[SUPPORT] RunPod pod list. Resolves a RunPod API key on this machine (the same sources as runpod_check_key) and lists one page (up to 1000) of the account's pods as summaries. Each summary has these keys, all always present, with null for a value RunPod does not supply: id (Pod.id); name (Pod.name); status (Pod.status: PROVISIONING, STARTING, RUNNING, EXITED, ERROR or TERMINATED); gpu (Pod.gpu as {id, count}, or null for a CPU pod); costPerHour (Pod.cost, the current cost in USD per hour, 0 when EXITED or TERMINATED); uptimeSeconds (Pod.runtime.uptime, seconds since the container started, null unless the pod is RUNNING). Cluster member pods are not listed: RunPod's includeClusterPods parameter defaults to false and this client never sends it. has_more_pods is true when more pods exist. Raw pod payloads are never returned, so pod environment variables are not exposed. Reads only: it does not create, stop or terminate a pod. Local only: refused on hosted Meridian.
+
+| Parameter | Type | Required | Description |
+|-----------|------|----------|-------------|
+| `credential_ref` | string | optional | Optional credential reference: env:NAME, keyring:SERVICE/ACCOUNT or runpodctl:default. Give a reference, never the key itself; a raw key is rejected without being echoed. |
+
+**Example:**
+```
+runpod_list_pods(credential_ref="keyring:meridian-desktop/runpod-api-key")
+```
+
+---
+
 ## Projects
 
-### `create_project`
-[MAINTENANCE] Create a new Meridian project. Persistent-state disclosure: on hosted Meridian, supplied text and project/session metadata -- including task log entries, pinned decisions, sprint items, notes, handoff/goal state, and HITL queue items -- are sent to and stored in Meridian's service, in an isolated per-tenant Postgres database (Neon); self-hosted deployments keep the same categories in the configured local SQLite/Postgres database. This data is visible in the dashboard and API, and may resurface in later project context or handoffs. Notes and pinned decisions can be deleted individually; task log entries and sprint items can be deleted via the dashboard/API (not exposed as an agent-facing tool); HITL queue items and handoff state have no per-record delete. Full removal of any of this data is available via project or account deletion, using the documented controls. Do not include secrets.
+### `meridian_project_create`
+[MAINTENANCE] Create a new Meridian project. Use `meridian_project_create` as the canonical Meridian tool name. Persistent-state disclosure: on hosted Meridian, supplied text and project/session metadata -- including task log entries, pinned decisions, sprint items, notes, handoff/goal state, and HITL queue items -- are sent to and stored in Meridian's service, in an isolated per-tenant Postgres database (Neon); self-hosted deployments keep the same categories in the configured local SQLite/Postgres database. This data is visible in the dashboard and API, and may resurface in later project context or handoffs. Notes and pinned decisions can be deleted individually; task log entries and sprint items can be deleted via the dashboard/API (not exposed as an agent-facing tool); HITL queue items and handoff state have no per-record delete. Full removal of any of this data is available via project or account deletion, using the documented controls. Do not include secrets.
 
 | Parameter | Type | Required | Description |
 |-----------|------|----------|-------------|
@@ -791,7 +822,18 @@ read_note(project_id="abc-123", slug="deploy-note")
 
 **Example:**
 ```
-create_project(name="my-app")
+meridian_project_create(name="my-app")
+```
+
+---
+
+
+### `meridian_project_list`
+[MAINTENANCE] Read-only: List all projects — find, browse, or look up your projects and their IDs. Call this first when you have a project name but need its project_id, or to discover which projects exist. Returns [{id, name, sprint, created_at}] newest first. Use `meridian_project_list` as the canonical Meridian tool name.
+
+**Example:**
+```
+meridian_project_list()
 ```
 
 ---
@@ -814,6 +856,24 @@ merge_project(source_project_id="dup-uuid", target_project_id="keep-uuid")
 ---
 
 ## Legacy
+
+### `create_project`
+[MAINTENANCE] DEPRECATED: use `meridian_project_create`. This legacy alias remains supported during the migration window. Create a new Meridian project. Persistent-state disclosure: on hosted Meridian, supplied text and project/session metadata -- including task log entries, pinned decisions, sprint items, notes, handoff/goal state, and HITL queue items -- are sent to and stored in Meridian's service, in an isolated per-tenant Postgres database (Neon); self-hosted deployments keep the same categories in the configured local SQLite/Postgres database. This data is visible in the dashboard and API, and may resurface in later project context or handoffs. Notes and pinned decisions can be deleted individually; task log entries and sprint items can be deleted via the dashboard/API (not exposed as an agent-facing tool); HITL queue items and handoff state have no per-record delete. Full removal of any of this data is available via project or account deletion, using the documented controls. Do not include secrets.
+
+| Parameter | Type | Required | Description |
+|-----------|------|----------|-------------|
+| `name` | string | required |  |
+| `execution_mode` | string | optional | Executor posture for sessions on this project. 'autonomous' (default) claims and runs sprint items immediately without asking; 'interactive' asks for direction first. Editable later in dashboard Settings. |
+| `parent_project_id` | string | optional | Optional parent project id — makes this a subproject that inherits the parent's north_star when it has none of its own. Subprojects are one level deep: the parent must exist and must not itself be a subproject. |
+
+---
+
+
+### `list_projects`
+[MAINTENANCE] DEPRECATED: use `meridian_project_list`. This legacy alias remains supported during the migration window. Read-only: List all projects — find, browse, or look up your projects and their IDs. Call this first when you have a project name but need its project_id, or to discover which projects exist. Returns [{id, name, sprint, created_at}] newest first.
+
+---
+
 
 ### `register_session`
 !!! note "Deprecated"

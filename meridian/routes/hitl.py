@@ -156,12 +156,22 @@ async def patch_hitl_endpoint(
             answered_by=body.get("answered_by"), approved=True,
             tenant=tenant,
         )
+        # 962d4480 -- other open dashboards repaint their HITL panels on this event; without
+        # it they kept the card (and any typed answer) until the next 10 s poll.
+        if result is not None and result.get("project_id"):
+            db_module._publish_project_event(
+                result["project_id"], "hitl_answered", {"hitl_id": request_id},
+            )
     elif action == "dismiss":
         result = await db_module.dismiss_hitl_request(db, request_id)
         if result is not None:
             from meridian.server import _on_hitl_answered  # noqa: PLC0415
 
             await _on_hitl_answered(db, result, approved=False)
+            if result.get("project_id"):
+                db_module._publish_project_event(
+                    result["project_id"], "hitl_dismissed", {"hitl_id": request_id},
+                )
     else:
         raise HTTPException(status_code=400, detail="action must be 'answer' or 'dismiss'")
     if result is None:

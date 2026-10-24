@@ -276,11 +276,6 @@ def _in_scope(path: str) -> bool:
 # that is acceptable. Reasons are specific on purpose: a route can only stay here while
 # the reason is still true.
 SILENT_ROUTES: dict[tuple[str, str], str] = {
-    ("PATCH", "/hitl/{request_id}"): (
-        "dismiss / answer a HITL request; the dashboard re-polls GET /hitl every 10 s "
-        "(initHitlPanel) and the acting tab calls refreshHitl() itself, so another tab "
-        "catches up within 10 s"
-    ),
     ("PATCH", "/projects/{project_id}/settings"): (
         "per-project settings form (max pinned decisions, executor config); no list view "
         "renders it, the Settings tab reloads it when opened"
@@ -471,6 +466,8 @@ def test_the_scan_sees_the_routes_this_change_fixed():
         ("DELETE", "/projects/{project_id}/notes/{note_id}"),
         ("PATCH", "/projects/{project_id}/decisions-pinned/{decision_id}"),
         ("PATCH", "/sessions/{session_id}"),
+        # 962d4480: answer / dismiss were silent (on SILENT_ROUTES) until they published
+        ("PATCH", "/hitl/{request_id}"),
         # the project list: out of scope of this scan until the verifier found a create /
         # delete that told no other dashboard
         ("POST", "/projects"),
@@ -524,6 +521,9 @@ SILENT_WRITERS: dict[tuple[str, str, str], str] = {
     ),
     ("projects", "meridian/db/__init__.py", "set_project_execution_mode"): _SETTINGS_FORM,
     ("projects", "meridian/db/__init__.py", "update_project_settings"): _SETTINGS_FORM,
+    # use_mode is rendered only in the settings form (dashboard-settings.ts), so no
+    # WebSocket-fed list needs a repaint. Allowlisted the same way as its siblings above.
+    ("projects", "meridian/db/__init__.py", "set_project_use_mode"): _SETTINGS_FORM,
     ("projects", "meridian/db/__init__.py", "set_agent_instructions"): _SETTINGS_FORM,
     ("projects", "meridian/db/__init__.py", "set_project_repo_identity"): (
         "stores a one-way repo fingerprint used for MCP scope checks; never rendered"

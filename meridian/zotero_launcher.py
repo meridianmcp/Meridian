@@ -20,6 +20,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import logging
 import os
 import subprocess
 import sys
@@ -29,6 +30,11 @@ from pathlib import Path
 
 # Import only the constant. zotero_client pulls in stdlib modules only.
 from meridian.zotero_client import _DEFAULT_BASE_URL as _ZOTERO_LOCAL_API
+# The probe's redirect rule lives with the connect flow, so the two cannot drift apart.
+from meridian import zotero_connect
+from meridian import zotero_plugin_install as _zotero_plugin
+
+_log = logging.getLogger(__name__)
 
 _EXE_ENV = "MERIDIAN_ZOTERO_EXE"
 
@@ -41,9 +47,13 @@ _PROGRAM_FILES_CANDIDATES = (
 # Any HTTP 200 from this one-item request means the local API is up.
 _PROBE_URL = f"{_ZOTERO_LOCAL_API}/users/0/items?limit=1"
 
-def _build_probe_opener():
-    # An explicit empty ProxyHandler keeps localhost off any configured HTTP proxy.
-    return urllib.request.build_opener(urllib.request.ProxyHandler({}))
+def _build_probe_opener(*handlers):
+    # An explicit empty ProxyHandler keeps localhost off any configured HTTP proxy. The redirect
+    # handler never follows a redirect off loopback, to the authorize endpoint, or through an
+    # ambiguous authority.
+    return urllib.request.build_opener(
+        urllib.request.ProxyHandler({}), zotero_connect._NoAuthorizeRedirect(), *handlers,
+    )
 
 
 _PROBE_OPENER = _build_probe_opener()
@@ -87,10 +97,12 @@ def _candidate_exe_paths(env):
 
 
 def is_zotero_process_running(runner=None):
-    """True when tasklist lists a zotero.exe process. Never raises.
+    """True when tasklist lists a zotero.exe process, False when it does not, None when the check failed.
 
     ``runner`` is a zero-argument callable returning tasklist stdout as text, so
     tests can avoid a real process listing. Off Windows this always returns False.
+    Never raises. A failed listing is None, never False, so status does not claim
+    that Zotero is closed when nothing was checked.
     """
     if not _is_windows():
         return False
@@ -98,7 +110,7 @@ def is_zotero_process_running(runner=None):
         output = (runner or _run_tasklist)()
         return _tasklist_lists_zotero(str(output or ""))
     except Exception:
-        return False
+        return None
 
 
 def _run_tasklist():
@@ -106,10 +118,14 @@ def _run_tasklist():
         ["tasklist", "/FI", "IMAGENAME eq zotero.exe", "/NH"],
         capture_output=True,
         text=True,
+        errors="replace",  # a byte outside the console code page must not raise
         timeout=10,
         check=False,
         creationflags=_CREATE_NO_WINDOW,
     )
+    if completed.returncode != 0:
+        # A failed listing says nothing about Zotero, so it must not read as "not running".
+        raise RuntimeError(f"tasklist exited with code {completed.returncode}")
     return completed.stdout or ""
 
 
@@ -149,7 +165,52 @@ def _http_status(response):
     return status
 
 
-def start_zotero(timeout_s=60.0, poll_s=2.0, launcher=None, sleep=None, clock=None):
+def _autoinstall_zotero_plugin():
+    """Before Meridian launches Zotero, install the bridge plugin when enabled.
+
+    Windows only. It also needs a recorded first-run decision (see
+    effective_autoinstall), so an undecided or unreadable settings file installs
+    nothing. Best effort: every failure becomes one log line and the launch goes
+    on. Nothing is installed while Zotero runs, because install_into_profile checks.
+    Returns the install result, or None when nothing was attempted.
+    """
+    try:
+        if not _is_windows():
+            return None
+        settings = _zotero_plugin.load_settings(_zotero_plugin.settings_path())
+        if not _zotero_plugin.effective_autoinstall(settings, os.environ):
+            return None
+        profile = _zotero_plugin.find_default_profile_dir(_zotero_plugin.zotero_data_dir())
+        if profile is None:
+            _log.info("zotero plugin autoinstall: no default Zotero profile found; skipped")
+            return None
+        stored = _zotero_plugin.signed_install_state()
+        if stored.tampered:
+            # The stored file no longer matches its record. Launching Zotero goes on; signing again is a CLI step.
+            _log.info("zotero plugin autoinstall: the stored signed file failed its integrity check; skipped")
+            return None
+        if not stored.signed:
+            # Not signed, or no signed file can be used for it (submitted without one, or an unreadable record).
+            # Launching Zotero goes on; signing is a separate CLI step.
+            _log.info("zotero plugin autoinstall: not signed, or no usable signed file; skipped")
+            return None
+        result = _zotero_plugin.install_into_profile(profile, stored.path, expected_sha256=stored.sha256)
+        _log.info("zotero plugin autoinstall: %s", result["status"])
+        return result
+    except Exception as exc:  # noqa: BLE001 -- the plugin must never block Zotero's launch
+        _log.warning("zotero plugin autoinstall skipped: %s", exc)
+        return None
+
+
+def _run_before_launch(hook):
+    """Run the pre-launch hook. A hook failure is logged and never stops the launch."""
+    try:
+        (hook if hook is not None else _autoinstall_zotero_plugin)()
+    except Exception as exc:  # noqa: BLE001 -- defence in depth for injected hooks
+        _log.warning("zotero before-launch hook skipped: %s", exc)
+
+
+def start_zotero(timeout_s=60.0, poll_s=2.0, launcher=None, sleep=None, clock=None, before_launch=None):
     """Start Zotero if needed and wait for its local API to answer.
 
     Returns ``{"action", "exe", "api_ready"}``. Actions:
@@ -159,6 +220,8 @@ def start_zotero(timeout_s=60.0, poll_s=2.0, launcher=None, sleep=None, clock=No
     * ``not_installed``: no executable was found, so nothing was launched.
     * ``timeout``: Zotero was launched but the API did not answer in time.
 
+    Just before launching, ``before_launch`` runs (default: the Zotero bridge
+    plugin auto-install). It never blocks or fails the launch.
     Nothing is killed. A failed launch raises OSError to the caller.
     """
     if zotero_api_alive():
@@ -166,6 +229,7 @@ def start_zotero(timeout_s=60.0, poll_s=2.0, launcher=None, sleep=None, clock=No
     exe = find_zotero_executable()
     if exe is None:
         return _start_result("not_installed", None, False)
+    _run_before_launch(before_launch)
     launch = launcher if launcher is not None else _launch_detached
     wait = sleep if sleep is not None else time.sleep
     now = clock if clock is not None else time.monotonic
@@ -200,7 +264,10 @@ def _launch_detached(exe):
 
 
 def status():
-    """Snapshot of install, process and API state. Never raises."""
+    """Snapshot of install, process and API state. Never raises.
+
+    ``process_running`` is None when the process check itself failed.
+    """
     exe = find_zotero_executable()
     return {
         "installed": exe is not None,

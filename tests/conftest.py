@@ -44,6 +44,25 @@ if TYPE_CHECKING:
 
 
 # ---------------------------------------------------------------------------
+# Import psutil once, before any test can patch the platform
+# (test_local_runner gate failures, 2026-10-18 diagnostic run)
+# ---------------------------------------------------------------------------
+#
+# Many tests monkeypatch ``<module>.sys.platform`` to "linux" to reach POSIX
+# branches. That is the global ``sys.platform``, so a psutil import that
+# happens inside one of them takes psutil's Linux path, which needs the POSIX-only
+# ``resource`` module and fails. A failed import leaves psutil unimportable for
+# the rest of the worker process, so every later create_time lookup returns None,
+# and the runner treats its own child as unverifiable (refusing to start, or
+# reporting UNKNOWN). A successful import is cached, so a later platform patch
+# cannot affect it.
+try:
+    import psutil  # noqa: F401
+except ImportError:  # psutil is optional on some code paths
+    pass
+
+
+# ---------------------------------------------------------------------------
 # Windows-only: disable stdlib platform's WMI-backed queries for this process
 # (test-runner reliability investigation, 2026-09-27)
 # ---------------------------------------------------------------------------
@@ -266,6 +285,11 @@ async def _reset_pg_schema(url: str) -> None:
 _pg_schema_ready: set[str] = set()
 
 
+# Savepoint control statements a caller issues through the adapter (see
+# _SavepointCursor.execute): these must reach the connection unwrapped.
+_SAVEPOINT_CONTROL_PREFIXES = ("SAVEPOINT ", "RELEASE ", "ROLLBACK TO ")
+
+
 class _SavepointCursor:
     """Cursor wrapper: each execute() runs inside its own SAVEPOINT, serialized
     by a per-connection lock (8a52dd26).
@@ -302,8 +326,17 @@ class _SavepointCursor:
         self._cursor = cursor
 
     async def execute(self, *args, **kwargs):
-        async with self._lock, self._conn.transaction():
-            return await self._cursor.execute(*args, **kwargs)
+        sql = args[0] if args else ""
+        async with self._lock:
+            if isinstance(sql, str) and sql.lstrip().upper().startswith(_SAVEPOINT_CONTROL_PREFIXES):
+                # A caller's own SAVEPOINT must outlive this statement. Wrapping
+                # it makes psycopg's savepoint its parent, and that wrapper's
+                # RELEASE also destroys the caller's savepoint, so the caller's
+                # later RELEASE fails with InvalidSavepointSpecification. A pinned
+                # production connection runs these verbs with no such wrapper.
+                return await self._cursor.execute(*args, **kwargs)
+            async with self._conn.transaction():
+                return await self._cursor.execute(*args, **kwargs)
 
     def __getattr__(self, name):
         return getattr(self._cursor, name)
@@ -643,6 +676,25 @@ def _isolate_tunnel_log(monkeypatch, tmp_path_factory):
     """
     log_dir = tmp_path_factory.mktemp("tunnel_log")
     monkeypatch.setenv("MERIDIAN_TUNNEL_LOG", str(log_dir / "tunnel.log"))
+
+
+@pytest.fixture(autouse=True)
+def _isolate_zotero_plugin(monkeypatch, tmp_path_factory):
+    """Keep the Zotero bridge plugin auto-install away from real machine state.
+
+    The launcher's pre-launch install hook and the tray's first-run prompt read
+    the per-user Meridian state dir and the Zotero data root. For EVERY test,
+    point the state dir at a temp folder, point the Zotero data root at a folder
+    with no profiles.ini (so no real Zotero profile can be found), and force
+    auto-install off. The close override is pinned unset, so the saved close
+    choice governs unless a test sets the variable itself. A test that wants the
+    install path opts in with monkeypatch.setenv / monkeypatch.delenv on its own.
+    """
+    state_dir = tmp_path_factory.mktemp("meridian_state")
+    monkeypatch.setenv("MERIDIAN_LOCAL_RUNNER_STATE_DIR", str(state_dir))
+    monkeypatch.setenv("MERIDIAN_ZOTERO_DATA_DIR", str(state_dir / "no-zotero-profile"))
+    monkeypatch.setenv("MERIDIAN_ZOTERO_PLUGIN_AUTOINSTALL", "0")
+    monkeypatch.delenv("MERIDIAN_ZOTERO_CLOSE_ON_INSTALL", raising=False)
 
 
 @pytest_asyncio.fixture

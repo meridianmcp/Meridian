@@ -614,6 +614,12 @@ def get_provenance_status(outputs_dir: str, path: str) -> dict[str, Any]:
       outputs_dir:  Absolute path to the outputs directory.
       path:         The output file to look up.
 
+    Raises:
+      ledger_io.LedgerCorruptError: the provenance ledger cannot be read (a
+      corrupt file, or a row that is not an object). The fingerprint ledger never
+      raises here: it is reported as ``script_staleness`` with ``is_stale`` ``None``
+      and ``error="ledger_unreadable"``.
+
     Returns:
       {error: ...} if outputs_dir/path are missing. Otherwise always
       {path, provenance_type, record, directory_note, staleness} where

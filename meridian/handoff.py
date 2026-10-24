@@ -3997,7 +3997,7 @@ def _build_quick_start_goal(
             f"{_xml_escape(_exc_ids)}"
             "</excluded_unprospected>"
             "\n<!-- These items were excluded from the auto-run claimable batch "
-            "because they have no prospecting evidence (no code_pointers, no "
+            "because they have no prospecting evidence (no durable sprint item pointers, no "
             "confirmed prospect_status). To include one anyway, a human/planning "
             "session must call update_sprint_item(item_id=..., prospect_bypass=true). "
             "Executors must NOT set prospect_bypass themselves. -->"

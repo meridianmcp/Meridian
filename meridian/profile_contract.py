@@ -369,6 +369,14 @@ FIELD_REGISTRY: dict[str, ProfileFieldSpec] = {
         restart_class="explicit_refresh_required", component="general",
         legacy_source="project_settings",
     ),
+    # 4bfc9293: the rights gate reads the stored project row on every check, so a change
+    # takes effect at once and is hot_reload (execution_mode is read at session start).
+    "use_mode": _spec(
+        name="use_mode", type="str", allowed_layers=_ALL_LAYERS,
+        merge_strategy="scalar_override", default="standard_publication",
+        restart_class="hot_reload", component="general",
+        legacy_source="project_settings",
+    ),
     # --- executor_config.* sub-fields (the 7th ProjectSettings field) ------
     "executor_config.repo_path": _spec(
         name="executor_config.repo_path", type="str", allowed_layers=["project", "session"],

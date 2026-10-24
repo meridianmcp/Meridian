@@ -252,6 +252,41 @@ const _SPRINT_BOARD_DRAFTS: DraftUnit[] = [
 
 function _paintSprintBoard(root: HTMLElement, html: string) {
   paintKeepingDrafts(root, html, _SPRINT_BOARD_DRAFTS);
+  _markChangedMeanwhile(root, html);
+}
+
+// 962d4480 -- a row whose inline editor is open is carried across a repaint with the status icon
+// it already showed. When the board now shows a different status for that item, say so on the
+// row, so the stale icon is not taken for the current state. Closing the editor repaints the
+// row from the fresh data, which clears the hint.
+function _markChangedMeanwhile(root: HTMLElement, html: string) {
+  const fresh = document.createElement('template') as HTMLTemplateElement;
+  fresh.innerHTML = html;
+  const freshIcon = new Map<string, string>();
+  fresh.content.querySelectorAll<HTMLElement>('.sprint-item-row[data-item]').forEach((row) => {
+    const icon = row.querySelector('.sprint-item-icon');
+    if (icon && !freshIcon.has(row.dataset.item!)) freshIcon.set(row.dataset.item!, icon.textContent || '');
+  });
+  root.querySelectorAll<HTMLElement>('.sprint-item-row[data-item]').forEach((row) => {
+    const icon = row.querySelector('.sprint-item-icon');
+    const now = freshIcon.get(row.dataset.item!);
+    const hint = row.querySelector('.sprint-changed-meanwhile');
+    const stale = !!icon && now !== undefined && icon.textContent !== now;
+    // The hint is a hidden marker: no inline style, so it cannot touch the row layout. The status icon carries the
+    // visible tooltip instead.
+    if (stale && !hint) {
+      (row.querySelector('.sprint-item-main') || row).insertAdjacentHTML(
+        'beforeend',
+        '<span class="sprint-changed-meanwhile" hidden>changed meanwhile</span>',
+      );
+    } else if (!stale && hint) {
+      hint.remove();
+    }
+    if (icon) {
+      if (stale) icon.setAttribute('title', 'changed meanwhile');
+      else icon.removeAttribute('title');
+    }
+  });
 }
 
 export function renderSprintProgress(projectId: string, items: any) {

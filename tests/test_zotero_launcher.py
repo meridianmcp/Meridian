@@ -7,18 +7,23 @@ APPDATA at a temp directory.
 """
 from __future__ import annotations
 
+import email.message
+import io
 import json
 import os
 import runpy
 import subprocess
 import sys
 import urllib.error
+import urllib.parse
 import urllib.request
+import urllib.response
 from pathlib import Path
 
 import pytest
 
 from meridian import zotero_launcher as zl
+from meridian import zotero_plugin_install as zpi
 
 # Captured at import time, before the autouse fixture swaps in fakes.
 _REAL_IS_WINDOWS = zl._is_windows
@@ -159,11 +164,60 @@ def test_running_check_parses_tasklist_output(windows, output, expected):
     assert zl.is_zotero_process_running(lambda: output) is expected
 
 
-def test_running_check_swallows_runner_exception(windows):
+def test_running_check_reports_unknown_when_the_runner_fails(windows):
+    # A failed listing says nothing about Zotero, so the status must not read it as "not running".
     def boom():
         raise OSError("tasklist unavailable")
 
-    assert zl.is_zotero_process_running(boom) is False
+    assert zl.is_zotero_process_running(boom) is None
+
+
+def test_running_check_swallows_runner_exception(windows):
+    # Kept from dev. The failure must not raise and must not be reported as running. Under the
+    # plugin contract the value is None (unknown), which is falsy, so the launch path is unchanged.
+    def boom():
+        raise OSError("tasklist unavailable")
+
+    assert not zl.is_zotero_process_running(boom)
+
+
+def test_default_runner_nonzero_exit_is_unknown_not_not_running(windows, monkeypatch):
+    monkeypatch.setattr(
+        zl.subprocess, "run", lambda argv, **kw: subprocess.CompletedProcess(argv, 1, stdout=""),
+    )
+    assert zl.is_zotero_process_running() is None
+
+
+# 0x81, 0x8D, 0x8F, 0x90 and 0x9D have no cp1252 meaning, so a strict decode fails on them.
+_CP1252_UNDECODABLE = b"\x81\x8d\x8f\x90\x9d"
+
+
+def _text_mode_run(raw):
+    """A fake subprocess.run that decodes the captured bytes the way text mode does (cp1252 here)."""
+    seen = {}
+
+    def _fake_run(argv, **kwargs):
+        seen.update(kwargs)
+        stdout = raw.decode("cp1252", errors=kwargs.get("errors") or "strict")
+        return subprocess.CompletedProcess(argv, 0, stdout=stdout)
+
+    return _fake_run, seen
+
+
+def test_undecodable_tasklist_bytes_read_as_not_running_without_raising(windows, monkeypatch):
+    fake_run, seen = _text_mode_run(b"Setup" + _CP1252_UNDECODABLE + b".exe  2468 Console\r\n")
+    monkeypatch.setattr(zl.subprocess, "run", fake_run)
+
+    assert zl.is_zotero_process_running() is False
+    assert seen["errors"] == "replace"
+
+
+def test_undecodable_tasklist_bytes_still_find_a_running_zotero(windows, monkeypatch):
+    raw = b"Setup" + _CP1252_UNDECODABLE + b".exe 2468 Console\r\nzotero.exe  1234 Console  1  100,000 K\r\n"
+    fake_run, _ = _text_mode_run(raw)
+    monkeypatch.setattr(zl.subprocess, "run", fake_run)
+
+    assert zl.is_zotero_process_running() is True
 
 
 def test_running_check_treats_none_output_as_not_running(windows):
@@ -471,6 +525,18 @@ def test_status_reports_not_installed(monkeypatch):
     }
 
 
+def test_status_reports_an_unknown_process_state_when_the_listing_fails(windows, monkeypatch):
+    # A failed listing is unknown (None), never "not running", so the status does not claim Zotero is closed.
+    _fixed_find(monkeypatch, None)
+
+    def _listing_fails():
+        raise OSError("tasklist unavailable")
+
+    monkeypatch.setattr(zl, "_run_tasklist", _listing_fails)
+    monkeypatch.setattr(zl, "zotero_api_alive", lambda *a, **k: False)
+    assert zl.status()["process_running"] is None
+
+
 # autostart plan, install and remove
 
 
@@ -726,3 +792,341 @@ def test_module_entrypoint_exits_with_main_result(monkeypatch, capsys):
         runpy.run_module("meridian.zotero_launcher", run_name="__main__")
     assert exc.value.code == 0
     assert "content" in json.loads(capsys.readouterr().out)
+
+
+# ---------------------------------------------------------------------------
+# start_zotero -- Zotero bridge plugin install before launch
+# ---------------------------------------------------------------------------
+
+_XPI_NAME = "meridian-zotero@usemeridian.us.xpi"
+
+
+@pytest.fixture(autouse=True)
+def _signed_plugin_stand_in(monkeypatch, tmp_path):
+    """The launch hook installs only a signed artifact. This stands one in, with its own hash, so the install paths run as before."""
+    import hashlib
+
+    from meridian import zotero_plugin_sign as sign
+
+    signed = tmp_path / "stand-in-signed.xpi"
+    payload = zpi.build_xpi_bytes()
+    signed.write_bytes(payload)
+    stored = sign.StoredSigned(status="signed", path=signed, sha256=hashlib.sha256(payload).hexdigest())
+    monkeypatch.setattr(zpi, "signed_install_state", lambda source_dir=None: stored)
+
+
+def _zotero_profile(tmp_path, monkeypatch, *, running=False):
+    """A fake Zotero data root with one default profile, reachable only through env.
+
+    The profile carries prefs.js, the marker install_into_profile requires.
+    """
+    data_root = tmp_path / "ZoteroRoot"
+    profile = data_root / "Profiles" / "abc.default"
+    profile.mkdir(parents=True)
+    (profile / "prefs.js").write_text('user_pref("keep", true);\n', encoding="utf-8")
+    (data_root / "profiles.ini").write_text(
+        "[Profile0]\nName=default\nIsRelative=1\nPath=Profiles/abc.default\nDefault=1\n",
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("MERIDIAN_ZOTERO_DATA_DIR", str(data_root))
+    monkeypatch.setattr(zpi, "zotero_process_state", lambda runner=None: running)
+    return profile
+
+
+def _decide(autoinstall: bool) -> None:
+    """Record the first-run answer in the (isolated) settings file."""
+    zpi.save_settings(zpi.settings_path(), {"autoinstall": autoinstall, "decided": True})
+
+
+def _start_recording_xpi_state(monkeypatch, tmp_path, *, api_answers=(False, True)):
+    """Run start_zotero and record whether the plugin file exists at the moment of launch."""
+    exe = tmp_path / "zotero.exe"
+    _scripted_alive(monkeypatch, list(api_answers))
+    _fixed_find(monkeypatch, exe)
+    seen_at_launch = []
+
+    def _launcher(path):
+        seen_at_launch.append(path)
+
+    result = zl.start_zotero(
+        timeout_s=10,
+        poll_s=1,
+        launcher=_launcher,
+        sleep=lambda seconds: None,
+        clock=lambda: 0.0,
+    )
+    return result, exe, seen_at_launch
+
+
+def test_start_installs_the_plugin_before_launching_when_enabled(windows, monkeypatch, tmp_path):
+    profile = _zotero_profile(tmp_path, monkeypatch)
+    monkeypatch.setenv("MERIDIAN_ZOTERO_PLUGIN_AUTOINSTALL", "1")
+    _decide(True)
+    target = profile / "extensions" / _XPI_NAME
+    installed_at_launch = []
+    exe = tmp_path / "zotero.exe"
+    _scripted_alive(monkeypatch, [False, True])
+    _fixed_find(monkeypatch, exe)
+
+    result = zl.start_zotero(
+        timeout_s=10,
+        poll_s=1,
+        launcher=lambda path: installed_at_launch.append(target.is_file()),
+        sleep=lambda seconds: None,
+        clock=lambda: 0.0,
+    )
+
+    assert result == {"action": "started", "exe": str(exe), "api_ready": True}
+    assert installed_at_launch == [True]
+
+
+def test_start_installs_from_the_saved_choice_when_there_is_no_env_override(windows, monkeypatch, tmp_path):
+    profile = _zotero_profile(tmp_path, monkeypatch)
+    monkeypatch.delenv("MERIDIAN_ZOTERO_PLUGIN_AUTOINSTALL", raising=False)
+    _decide(True)
+    result, _exe, launched = _start_recording_xpi_state(monkeypatch, tmp_path)
+    assert result["action"] == "started"
+    assert launched == [_exe]
+    assert (profile / "extensions" / _XPI_NAME).is_file()
+
+
+def test_undecided_launch_installs_nothing_even_when_the_env_var_says_on(windows, monkeypatch, tmp_path):
+    profile = _zotero_profile(tmp_path, monkeypatch)
+    monkeypatch.setenv("MERIDIAN_ZOTERO_PLUGIN_AUTOINSTALL", "1")
+    result, exe, launched = _start_recording_xpi_state(monkeypatch, tmp_path)
+    assert result["action"] == "started"
+    assert launched == [exe]
+    assert not (profile / "extensions" / _XPI_NAME).exists()
+
+
+def test_env_off_overrides_a_saved_on_choice(windows, monkeypatch, tmp_path):
+    profile = _zotero_profile(tmp_path, monkeypatch)
+    monkeypatch.setenv("MERIDIAN_ZOTERO_PLUGIN_AUTOINSTALL", "0")
+    _decide(True)
+    result, _exe, launched = _start_recording_xpi_state(monkeypatch, tmp_path)
+    assert result["action"] == "started"
+    assert len(launched) == 1
+    assert not (profile / "extensions" / _XPI_NAME).exists()
+
+
+def test_env_on_overrides_a_saved_opt_out_once_decided(windows, monkeypatch, tmp_path):
+    profile = _zotero_profile(tmp_path, monkeypatch)
+    monkeypatch.setenv("MERIDIAN_ZOTERO_PLUGIN_AUTOINSTALL", "1")
+    _decide(False)
+    result, exe, launched = _start_recording_xpi_state(monkeypatch, tmp_path)
+    assert result["action"] == "started"
+    assert launched == [exe]
+    assert (profile / "extensions" / _XPI_NAME).is_file()
+
+
+def test_corrupt_settings_file_installs_nothing_and_the_launch_goes_on(windows, monkeypatch, tmp_path):
+    profile = _zotero_profile(tmp_path, monkeypatch)
+    monkeypatch.delenv("MERIDIAN_ZOTERO_PLUGIN_AUTOINSTALL", raising=False)
+    settings = zpi.settings_path()
+    settings.parent.mkdir(parents=True, exist_ok=True)
+    settings.write_text('{"autoinstall": false, "decided": tru', encoding="utf-8")
+    result, exe, launched = _start_recording_xpi_state(monkeypatch, tmp_path)
+    assert result["action"] == "started"
+    assert launched == [exe]
+    assert not (profile / "extensions" / _XPI_NAME).exists()
+
+
+def test_hook_does_nothing_off_windows_even_when_decided_and_enabled(monkeypatch, tmp_path):
+    profile = _zotero_profile(tmp_path, monkeypatch)
+    monkeypatch.setenv("MERIDIAN_ZOTERO_PLUGIN_AUTOINSTALL", "1")
+    _decide(True)
+    attempted = []
+
+    def _record_build(*args, **kwargs):
+        attempted.append(args)
+        raise AssertionError("the bridge must not be built off Windows")
+
+    monkeypatch.setattr(zpi, "build_xpi", _record_build)
+    result, exe, launched = _start_recording_xpi_state(monkeypatch, tmp_path)
+    assert result["action"] == "started"
+    assert launched == [exe]
+    assert attempted == []
+    assert not (profile / "extensions" / _XPI_NAME).exists()
+
+
+def test_start_skips_the_plugin_when_autoinstall_is_disabled_by_env(windows, monkeypatch, tmp_path):
+    profile = _zotero_profile(tmp_path, monkeypatch)
+    monkeypatch.setenv("MERIDIAN_ZOTERO_PLUGIN_AUTOINSTALL", "0")
+    _decide(True)
+    result, _exe, launched = _start_recording_xpi_state(monkeypatch, tmp_path)
+    assert result["action"] == "started"
+    assert len(launched) == 1
+    assert not (profile / "extensions" / _XPI_NAME).exists()
+
+
+def test_start_respects_the_saved_opt_out_when_there_is_no_env_override(windows, monkeypatch, tmp_path):
+    profile = _zotero_profile(tmp_path, monkeypatch)
+    monkeypatch.delenv("MERIDIAN_ZOTERO_PLUGIN_AUTOINSTALL", raising=False)
+    zpi.save_settings(zpi.settings_path(), {"autoinstall": False, "decided": True})
+    result, _exe, launched = _start_recording_xpi_state(monkeypatch, tmp_path)
+    assert result["action"] == "started"
+    assert len(launched) == 1
+    assert not (profile / "extensions" / _XPI_NAME).exists()
+
+
+def test_plugin_install_exception_never_blocks_the_launch(windows, monkeypatch, tmp_path, caplog):
+    _zotero_profile(tmp_path, monkeypatch)
+    monkeypatch.setenv("MERIDIAN_ZOTERO_PLUGIN_AUTOINSTALL", "1")
+    _decide(True)
+
+    def _explode(*args, **kwargs):
+        raise RuntimeError("disk on fire")
+
+    monkeypatch.setattr(zpi, "install_into_profile", _explode)
+    with caplog.at_level("WARNING"):
+        result, exe, launched = _start_recording_xpi_state(monkeypatch, tmp_path)
+    assert result["action"] == "started"
+    assert launched == [exe]
+    assert "disk on fire" in caplog.text
+
+
+def test_plugin_build_exception_never_blocks_the_launch(windows, monkeypatch, tmp_path):
+    _zotero_profile(tmp_path, monkeypatch)
+    monkeypatch.setenv("MERIDIAN_ZOTERO_PLUGIN_AUTOINSTALL", "1")
+    _decide(True)
+
+    def _missing_source(*args, **kwargs):
+        raise FileNotFoundError("extensions/zotero-bridge is not bundled")
+
+    monkeypatch.setattr(zpi, "build_xpi", _missing_source)
+    result, exe, launched = _start_recording_xpi_state(monkeypatch, tmp_path)
+    assert result["action"] == "started"
+    assert launched == [exe]
+
+
+def test_plugin_is_never_installed_while_zotero_is_running(windows, monkeypatch, tmp_path):
+    profile = _zotero_profile(tmp_path, monkeypatch, running=True)
+    monkeypatch.setenv("MERIDIAN_ZOTERO_PLUGIN_AUTOINSTALL", "1")
+    _decide(True)
+    result, exe, launched = _start_recording_xpi_state(monkeypatch, tmp_path)
+    assert result["action"] == "started"
+    assert launched == [exe]
+    assert not (profile / "extensions" / _XPI_NAME).exists()
+
+
+# ---------------------------------------------------------------------------
+def test_start_does_not_install_an_unsigned_plugin_and_says_so(windows, monkeypatch, tmp_path, caplog):
+    profile = _zotero_profile(tmp_path, monkeypatch)
+    monkeypatch.setenv("MERIDIAN_ZOTERO_PLUGIN_AUTOINSTALL", "1")
+    _decide(True)
+    from meridian import zotero_plugin_sign as sign
+
+    monkeypatch.setattr(zpi, "signed_install_state", lambda source_dir=None: sign.StoredSigned(status="missing"))
+    with caplog.at_level("INFO"):
+        result, exe, launched = _start_recording_xpi_state(monkeypatch, tmp_path)
+    assert result["action"] == "started"
+    assert launched == [exe]
+    assert not (profile / "extensions" / _XPI_NAME).exists()
+    assert "not signed" in caplog.text
+
+
+def test_start_does_not_install_a_tampered_signed_file_and_says_so(windows, monkeypatch, tmp_path, caplog):
+    profile = _zotero_profile(tmp_path, monkeypatch)
+    monkeypatch.setenv("MERIDIAN_ZOTERO_PLUGIN_AUTOINSTALL", "1")
+    _decide(True)
+    from meridian import zotero_plugin_sign as sign
+
+    monkeypatch.setattr(zpi, "signed_install_state", lambda source_dir=None: sign.StoredSigned(status="tampered"))
+    with caplog.at_level("INFO"):
+        result, exe, launched = _start_recording_xpi_state(monkeypatch, tmp_path)
+    assert result["action"] == "started"
+    assert launched == [exe]
+    assert not (profile / "extensions" / _XPI_NAME).exists()
+    assert "integrity" in caplog.text
+
+
+# ---------------------------------------------------------------------------
+# The probe's redirects: never off loopback, never to the authorize endpoint, never through an ambiguous authority.
+# A fake local API sits at the bottom of the real probe opener. No socket is opened.
+# ---------------------------------------------------------------------------
+
+_AUTHORIZE_URL = "http://127.0.0.1:23119/api/local/authorize"
+_SPOOF_URL = "http://evil.example\\@127.0.0.1:23119/x"
+_PROBE_PATH = "/api/users/0/items"
+
+
+class _FakeZotero(urllib.request.BaseHandler):
+    """A fake local API installed under the probe opener. It records every request by its full URL.
+
+    ``redirects`` maps a request path to a Location: that path gets a 302 to it. Any other request
+    gets a 200 with an empty JSON list. The handler runs ahead of urllib's HTTP handler, so no socket
+    is opened, and the real redirect handler runs on top of it.
+    """
+
+    handler_order = 100
+
+    def __init__(self, redirects=None):
+        self.redirects = dict(redirects or {})
+        self.seen = []
+
+    def http_open(self, req):
+        self.seen.append(req.full_url)
+        location = self.redirects.get(urllib.parse.urlsplit(req.full_url).path)
+        headers = email.message.Message()
+        if location is None:
+            code, body = 200, b"[]"
+            headers["Content-Type"] = "application/json"
+        else:
+            code, body = 302, b""
+            headers["Location"] = location
+        response = urllib.response.addinfourl(io.BytesIO(body), headers, req.full_url, code)
+        response.msg = "OK" if location is None else "Found"
+        return response
+
+
+def _probe_through(monkeypatch, zotero):
+    """Point the real default probe path, zotero_api_alive() with no opener argument, at the fake Zotero."""
+    monkeypatch.setattr(zl, "_PROBE_OPENER", zl._build_probe_opener(zotero))
+
+
+@pytest.mark.parametrize(
+    "target",
+    [
+        _AUTHORIZE_URL,
+        _AUTHORIZE_URL + "/",
+        "http://127.0.0.1:23119/api/local;x/authorize",
+        "http://127.0.0.1:23119/api/local%2Fauthorize",
+        "http://localhost:23119/api/local/AUTHORIZE?appName=Meridian",
+    ],
+)
+def test_probe_does_not_follow_a_redirect_to_the_authorize_endpoint(monkeypatch, target):
+    zotero = _FakeZotero({_PROBE_PATH: target})
+    _probe_through(monkeypatch, zotero)
+    assert zl.zotero_api_alive() is False
+    assert [urllib.parse.urlsplit(url).path for url in zotero.seen] == [_PROBE_PATH]
+
+
+def test_probe_does_not_follow_a_backslash_authority_redirect(monkeypatch):
+    zotero = _FakeZotero({_PROBE_PATH: _SPOOF_URL})
+    _probe_through(monkeypatch, zotero)
+    assert zl.zotero_api_alive() is False
+    assert len(zotero.seen) == 1
+    assert all("evil.example" not in url for url in zotero.seen)
+
+
+@pytest.mark.parametrize(
+    "target",
+    [
+        "http://203.0.113.10:23119/api/users/0/items?limit=1",
+        "http://evil.example/api/users/0/items?limit=1",
+        "http://localhost.evil.example:23119/api/users/0/items?limit=1",
+    ],
+)
+def test_probe_does_not_follow_a_redirect_off_loopback(monkeypatch, target):
+    zotero = _FakeZotero({_PROBE_PATH: target})
+    _probe_through(monkeypatch, zotero)
+    assert zl.zotero_api_alive() is False
+    assert [urllib.parse.urlsplit(url).path for url in zotero.seen] == [_PROBE_PATH]
+    assert all(urllib.parse.urlsplit(url).hostname == "127.0.0.1" for url in zotero.seen)
+
+
+def test_probe_still_follows_an_ordinary_loopback_redirect(monkeypatch):
+    zotero = _FakeZotero({_PROBE_PATH: "http://127.0.0.1:23119/api/elsewhere"})
+    _probe_through(monkeypatch, zotero)
+    assert zl.zotero_api_alive() is True
+    assert len(zotero.seen) == 2

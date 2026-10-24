@@ -3,7 +3,37 @@
 from __future__ import annotations
 
 import re
+from copy import deepcopy
 from typing import Any
+
+
+# Public MCP names that are unambiguous in multi-server clients. Keep the
+# legacy names as deprecated aliases during the migration window; the call
+# transports normalize canonical names back to the existing internal routes.
+NATIVE_CANONICAL_TOOL_NAMES: dict[str, str] = {
+    "create_project": "meridian_project_create",
+    "list_projects": "meridian_project_list",
+}
+GITHUB_CANONICAL_TOOL_NAMES: dict[str, str] = {
+    "search_code": "meridian_github_search_code",
+    "get_commit": "meridian_github_get_commit",
+    "search_commits": "meridian_github_search_commits",
+    "list_branches": "meridian_github_list_branches",
+    "list_issues": "meridian_github_list_issues",
+    "create_issue": "meridian_github_create_issue",
+}
+PUBLIC_TOOL_NAME_TO_INTERNAL: dict[str, str] = {
+    canonical: legacy
+    for names in (NATIVE_CANONICAL_TOOL_NAMES, GITHUB_CANONICAL_TOOL_NAMES)
+    for legacy, canonical in names.items()
+}
+
+
+def normalize_public_tool_name(name: str) -> str:
+    """Normalize the accepted server prefix and public alias to an internal name."""
+    if name.startswith("meridian."):
+        name = name.removeprefix("meridian.")
+    return PUBLIC_TOOL_NAME_TO_INTERNAL.get(name, name)
 
 
 _TOOL_EXAMPLES: dict[str, str] = {
@@ -12,6 +42,7 @@ _TOOL_EXAMPLES: dict[str, str] = {
     "rename_project": 'rename_project(project_name="old-name", new_name="new-name")',
     "set_project_execution_mode": 'set_project_execution_mode(project_name="my-project", execution_mode="autonomous")',
     "set_project_use_mode": 'set_project_use_mode(project_name="my-project", use_mode="standard_publication")',
+    "check_image_rights": 'check_image_rights(project_name="my-project", license="CC BY-NC 4.0")',
     "merge_project": 'merge_project(source_project_id="dup-uuid", target_project_id="keep-uuid")',
     "start_session": 'start_session(project_name="my-project", session_name="feature-x", human_id="alice", role="executor")',
     "register_session": 'register_session(project_id="abc-123", session_name="feature-x", human_id="alice")',
@@ -44,6 +75,8 @@ _TOOL_EXAMPLES: dict[str, str] = {
     "start_remote_task": 'start_remote_task(project_id="abc-123", session_id="session-uuid", host="gpu-pod-1", command="python train.py")',
     "get_remote_task_status": 'get_remote_task_status(project_id="abc-123", job_id="job-uuid")',
     "list_remote_tasks": 'list_remote_tasks(project_id="abc-123")',
+    "runpod_check_key": 'runpod_check_key(credential_ref="env:RUNPOD_API_KEY")',
+    "runpod_list_pods": 'runpod_list_pods(credential_ref="keyring:meridian-desktop/runpod-api-key")',
     "register_session_recovery": 'register_session_recovery(project_id="abc-123", session_id="session-uuid", transport="remote_control", client_type="claude-code", local_identity={"local_session_id": "conv-1", "environment_id": "env-9"})',
     "list_resumable_sessions": 'list_resumable_sessions(project_id="abc-123")',
     "get_session_recovery": 'get_session_recovery(project_id="abc-123", session_id="session-uuid")',
@@ -361,6 +394,22 @@ _MCP_TOOLS_LIST: list[dict[str, Any]] = [
          "use_mode": {"type": "string", "enum": ["standard_publication", "commercialized"], "description": "The new use mode."},
          "reason": {"type": "string", "description": "Optional reason recorded in the audit row."}},
          "required": ["use_mode"]}},
+    {"name": "check_image_rights", "description":
+        "Read-only preview of the image-storage rights policy for ONE source image in a "
+        "project. Pass the source's license (a canonical id such as 'cc-by-nc', a license "
+        "string, or a creativecommons.org URL), and whether the stored figure is a derivative "
+        "of the source (derived) or a redrawn or cropped copy (redrawn). Returns the tier "
+        "(STORE_IMAGE, STORE_UNMODIFIED or LINK_ONLY), the flags (for example requires_credit "
+        "and needs_review), the project's use mode, and override_required: true when image "
+        "bytes would be refused without a human-approved override. A missing or unknown "
+        "license is LINK_ONLY. This tool grants nothing: it writes no row, no audit entry and "
+        "no approval request. Returns {error} for an unknown project.",
+     "inputSchema": {"type": "object", "properties": {
+         "project_id": {"type": "string"},
+         "project_name": {"type": "string", "description": "Project name — an alternative to project_id; resolved to the id internally. project_id wins if both are given."},
+         "license": {"type": "string", "description": "The source's license: a canonical id, a license string, or a creativecommons.org URL. Omit or leave blank when unknown; that is treated as LINK_ONLY."},
+         "derived": {"type": "boolean", "description": "True when the stored figure is a derivative of the source image."},
+         "redrawn": {"type": "boolean", "description": "True when the derivative is a redrawn or cropped copy of the source image."}}}},
     {"name": "merge_project", "description":
         "d6bd60e0 — merge a phantom-duplicate project INTO another. Re-parents EVERY "
         "child row of the source project (sprint items, tasks, decisions, insights, "
@@ -1080,11 +1129,14 @@ _MCP_TOOLS_LIST: list[dict[str, Any]] = [
         "32d3d5de — Launch a long-running job on a remote host (e.g. a rented GPU "
         "pod) over a short-lived SSH connection used ONLY to start it, never held "
         "open: the command runs fully detached (nohup+setsid), so it survives the "
-        "launching connection dropping for any reason. Returns quickly (a few "
-        "hundred ms) with a job_id regardless of how long the underlying job "
-        "takes — poll get_remote_task_status separately to check on it. Do not "
-        "include credentials in command; use env vars already set on the remote "
-        "host instead.",
+        "launching connection dropping for any reason. A launch that starts returns "
+        "within seconds with a job_id, regardless of how long the underlying job "
+        "takes — poll get_remote_task_status separately to check on it. A launch "
+        "that cannot confirm within about 15 seconds is recorded as status "
+        "launch_unconfirmed and may still be running on the host: confirm "
+        "it with get_remote_task_status before relaunching, because relaunching "
+        "can start a second, possibly paid, job. Do not include credentials in "
+        "command; use env vars already set on the remote host instead.",
      "inputSchema": {"type": "object", "properties": {
          "project_id": {"type": "string"},
          "project_name": {"type": "string", "description": "Project name — an alternative to project_id; resolved to the id internally. project_id wins if both are given."},
@@ -1100,8 +1152,13 @@ _MCP_TOOLS_LIST: list[dict[str, Any]] = [
         "code), still running (PID alive), terminated-unexpectedly (PID gone, no "
         "exit code — often OOM-kill or a host reset), connection-lost-but-"
         "possibly-still-running (the SSH connection itself could not be "
-        "established, explicitly distinct from a failure), or unknown. Includes "
-        "a bounded log tail and elapsed time.",
+        "established, explicitly distinct from a failure), or unknown. A "
+        "successful status check (one that connects to the host) re-checks the row, "
+        "including a launch_unconfirmed one, and replaces its status with the one "
+        "observed there, except that an observed unknown never replaces an already-terminal "
+        "status. A check that connects but finds no pid file (NOPID) returns unknown and cannot "
+        "tell 'never started' from 'started, pid not yet written', so do not relaunch on unknown "
+        "alone. Includes a bounded log tail and elapsed time.",
      "inputSchema": {"type": "object", "properties": {
          "project_id": {"type": "string"},
          "project_name": {"type": "string", "description": "Project name — an alternative to project_id; resolved to the id internally. project_id wins if both are given."},
@@ -2471,20 +2528,24 @@ _MCP_TOOLS_LIST: list[dict[str, Any]] = [
         "Inline capture for web/paper research during planning: save a finding "
         "from a URL as an addressable note with the source link, optionally linked "
         "to a decision. A research-shaped wrapper over save_finding — arXiv URLs "
-        "are tagged source_type=arxiv automatically, everything else as web. Turns "
+        "and arXiv-issued DOIs are tagged source_type=arxiv automatically; "
+        "everything else as web. Turns "
         "web-search results into durable Meridian artifacts instead of evaporating. "
         "In-project dedupe: if this project already has a finding for the same "
         "paper/page (case-folded DOI, arXiv id without version, PMID, or "
         "normalised URL) nothing is created and the result carries "
         "existing_note_id (a soft result, not an error); pass force_new=true to "
-        "save a separate copy.",
+        "save a separate copy. Identify the paper by url, or by doi / pmid when "
+        "no url is available (a doi is stored as its https doi.org form).",
      "inputSchema": {"type": "object", "properties": {
          "project_id": {"type": "string"}, "project_name": {"type": "string", "description": "Project name — an alternative to project_id; resolved to the id internally. project_id wins if both are given."},
-         "url": {"type": "string", "description": "Source URL of the web page or paper."},
+         "url": {"type": "string", "description": "Source URL of the web page or paper. A doi.org or dx.doi.org url (http, https or no scheme) is read as a DOI: it is refused if the DOI is not in the allowed form (for example one with a query string, fragment, percent escape, dot path segment or non-ASCII character), and it is stored as https://doi.org/<doi>. Takes precedence over doi and pmid when several are given."},
+         "doi": {"type": "string", "description": "DOI of the paper (e.g. 10.1145/3292500.3330701, or doi:/doi.org form). Used as the source, stored as https://doi.org/<doi>, when no url is given."},
+         "pmid": {"type": "string", "description": "PubMed id of the paper. Used as the source, stored as its PubMed URL, when neither url nor doi is given."},
          "summary": {"type": "string", "description": "Your summary of the finding (markdown)."},
          "related_decision_id": {"type": "string", "description": "Optional pinned-decision id to link the finding to."},
          "force_new": {"type": "boolean", "description": "Default false. true skips the in-project duplicate check and always creates a new finding note."}},
-         "required": ["url", "summary"]}},
+         "required": ["summary"]}},
     {"name": "get_notes", "description":
         "Read-only: List project notes (newest first), LIGHTWEIGHT by default — "
         "each item is id/slug/title/tags/kind/priority/timestamps with NO body, "
@@ -4774,7 +4835,58 @@ _MCP_TOOLS_LIST: list[dict[str, Any]] = [
          "blocking": {"type": "boolean", "description": "true = real exit-code-blocking semantics. false = advisory/non-blocking."},
          "enabled": {"type": "boolean", "description": "Enable/disable this hook. Disabling immediately removes any already-written artifact files for it (best-effort)."}},
          "required": ["hook_id"]}},
+    {"name": "runpod_check_key", "description":
+        "RunPod key check. Resolves a RunPod API key on this machine and confirms it works with two "
+        "read-only calls to the RunPod API: one billing call and one pod listing. Returns ok, "
+        "credential_source (the source kind only: env, keyring or runpodctl), pod_count (pods on the "
+        "first page, up to 1000), billing_available and error. The key itself is never returned, logged "
+        "or echoed. Omit credential_ref to try env:RUNPOD_API_KEY, then keyring:meridian-desktop/"
+        "runpod-api-key, then runpodctl:default. Pass credential_ref to use one reference only; store a "
+        "reference, never the key. Local only: refused on hosted Meridian.",
+     "inputSchema": {"type": "object", "properties": {
+         "credential_ref": {"type": "string", "description": "Optional credential reference: env:NAME, keyring:SERVICE/ACCOUNT or runpodctl:default. Give a reference, never the key itself; a raw key is rejected without being echoed."}},
+         "required": []}},
+    {"name": "runpod_list_pods", "description":
+        "RunPod pod list. Resolves a RunPod API key on this machine (the same sources as runpod_check_key) "
+        "and lists one page (up to 1000) of the account's pods as summaries. Each summary has these keys, "
+        "all always present, with null for a value RunPod does not supply: id (Pod.id); name (Pod.name); "
+        "status (Pod.status: PROVISIONING, STARTING, RUNNING, EXITED, ERROR or TERMINATED); gpu (Pod.gpu as "
+        "{id, count}, or null for a CPU pod); costPerHour (Pod.cost, the current cost in USD per hour, 0 "
+        "when EXITED or TERMINATED); uptimeSeconds (Pod.runtime.uptime, seconds since the container started, "
+        "null unless the pod is RUNNING). Cluster member pods are not listed: RunPod's includeClusterPods "
+        "parameter defaults to false and this client never sends it. has_more_pods is true when more pods "
+        "exist. Raw pod payloads are never returned, so pod environment variables are not exposed. Reads "
+        "only: it does not create, stop or terminate a pod. Local only: refused on hosted Meridian.",
+     "inputSchema": {"type": "object", "properties": {
+         "credential_ref": {"type": "string", "description": "Optional credential reference: env:NAME, keyring:SERVICE/ACCOUNT or runpodctl:default. Give a reference, never the key itself; a raw key is rejected without being echoed."}},
+         "required": []}},
 ]
+
+# Publish the distinctive canonical names first so clients that rank the
+# registry see them before the deprecated, collision-prone aliases. The
+# dispatcher still uses the original internal names via
+# normalize_public_tool_name().
+for _legacy_name, _canonical_name in NATIVE_CANONICAL_TOOL_NAMES.items():
+    _legacy_tool = next(
+        tool for tool in _MCP_TOOLS_LIST if tool["name"] == _legacy_name
+    )
+    _canonical_tool = deepcopy(_legacy_tool)
+    _canonical_tool["name"] = _canonical_name
+    _legacy_description = _legacy_tool["description"]
+    _canonical_tool["description"] = (
+        _legacy_description.rstrip()
+        + f" Use `{_canonical_name}` as the canonical Meridian tool name."
+    )
+    _legacy_tool["description"] = (
+        f"DEPRECATED: use `{_canonical_name}`. This legacy alias remains "
+        f"supported during the migration window. {_legacy_description}"
+    )
+    _MCP_TOOLS_LIST.insert(_MCP_TOOLS_LIST.index(_legacy_tool), _canonical_tool)
+    _example = _TOOL_EXAMPLES.pop(_legacy_name, None)
+    if _example:
+        _TOOL_EXAMPLES[_canonical_name] = _example.replace(
+            _legacy_name, _canonical_name, 1
+        )
 
 _READ_ONLY_TOOLS = {
     "list_projects", "get_project_by_name", "get_goal", "get_notes", "read_note",
@@ -4828,6 +4940,11 @@ _READ_ONLY_TOOLS = {
     # 7c96d41b — paper_contract read-only queries.
     "get_paper_contract", "list_paper_contract_revisions",
     "get_current_paper_contract_content",
+    # Image-storage rights preview: pure decision, reads the stored use mode, grants nothing.
+    "check_image_rights",
+    # RunPod key check and pod list: local only, read-only calls to RunPod with a local key.
+    # Read level: absent from MCP_MEMBER_POLICY_OPERATIONS, which has no read operation.
+    "runpod_check_key", "runpod_list_pods",
 }
 
 # Member-policy intent for MCP dispatch.  Values describe the operation shape,
@@ -4901,6 +5018,8 @@ _OPEN_WORLD_TOOLS = {
     # R2-G — the only step of this tool that isn't a local DB read/write is
     # the actual OTLP HTTP POST to an operator-configured external endpoint.
     "export_ai_log_otel",
+    # RunPod key check and pod list: each makes read-only calls to the RunPod API.
+    "runpod_check_key", "runpod_list_pods",
 }
 
 # ---------------------------------------------------------------------------
@@ -4963,6 +5082,8 @@ _TOOL_CATEGORY: dict[str, str] = {
     "start_remote_task":        "session",
     "get_remote_task_status":   "session",
     "list_remote_tasks":        "session",
+    "runpod_check_key":         "session",
+    "runpod_list_pods":         "session",
     "register_session_recovery": "session",
     "list_resumable_sessions":   "session",
     "get_session_recovery":      "session",
@@ -5036,6 +5157,7 @@ _TOOL_CATEGORY: dict[str, str] = {
     "rename_project":      "project",
     "set_project_execution_mode": "project",
     "set_project_use_mode": "project",
+    "check_image_rights": "project",
     "merge_project":       "project",
     "list_projects":       "project",
     "get_project_by_name": "project",
@@ -5289,6 +5411,8 @@ _TOOL_ROLE_RELEVANCE: dict[str, str] = {
     "start_remote_task":          "executor",
     "get_remote_task_status":     "both",
     "list_remote_tasks":          "both",
+    "runpod_check_key":           "both",
+    "runpod_list_pods":           "both",
     "register_session_recovery":  "both",
     "list_resumable_sessions":    "both",
     "get_session_recovery":       "both",
@@ -5396,6 +5520,7 @@ _TOOL_ROLE_RELEVANCE: dict[str, str] = {
     "rename_project":            "both",
     "set_project_execution_mode": "both",
     "set_project_use_mode": "both",
+    "check_image_rights": "both",
     "merge_project":             "both",
     "list_projects":             "both",
     "get_project_by_name":       "both",
@@ -5548,6 +5673,8 @@ _TOOL_WORKFLOW_TIER: dict[str, str] = {
     "start_remote_task":           "common-support",
     "get_remote_task_status":      "common-support",
     "list_remote_tasks":           "common-support",
+    "runpod_check_key":            "common-support",
+    "runpod_list_pods":            "common-support",
     "start_research_run":          "common-support",
     "complete_research_run":       "common-support",
     "get_research_run":            "common-support",
@@ -5689,6 +5816,7 @@ _TOOL_WORKFLOW_TIER: dict[str, str] = {
     "rename_project":             "maintenance-only",
     "set_project_execution_mode": "maintenance-only",
     "set_project_use_mode": "maintenance-only",
+    "check_image_rights": "common-support",
     "merge_project":              "maintenance-only",
     "set_parent_project":         "maintenance-only",
     "list_projects":              "maintenance-only",
@@ -5885,6 +6013,29 @@ _TITLE_OVERRIDES: dict[str, str] = {
     "search_server_logs": "Search Server Logs",
     "get_server_log_checkpoint": "Get Server Log Checkpoint",
 }
+
+for _legacy_name, _canonical_name in NATIVE_CANONICAL_TOOL_NAMES.items():
+    if _legacy_name in _READ_ONLY_TOOLS:
+        _READ_ONLY_TOOLS.add(_canonical_name)
+    if _legacy_name in _DESTRUCTIVE_TOOLS:
+        _DESTRUCTIVE_TOOLS.add(_canonical_name)
+    if _legacy_name in _TOOL_CATEGORY:
+        _TOOL_CATEGORY[_canonical_name] = _TOOL_CATEGORY[_legacy_name]
+    if _legacy_name in _TOOL_ROLE_RELEVANCE:
+        _TOOL_ROLE_RELEVANCE[_canonical_name] = _TOOL_ROLE_RELEVANCE[
+            _legacy_name
+        ]
+    if _legacy_name in _TOOL_WORKFLOW_TIER:
+        _TOOL_WORKFLOW_TIER[_canonical_name] = _TOOL_WORKFLOW_TIER[
+            _legacy_name
+        ]
+
+_TITLE_OVERRIDES.update({
+    "meridian_project_create": "Meridian Project Create",
+    "meridian_project_list": "Meridian Project List",
+    "create_project": "DEPRECATED: use meridian_project_create",
+    "list_projects": "DEPRECATED: use meridian_project_list",
+})
 
 for _tool in _MCP_TOOLS_LIST:
     _is_read_only = _tool["name"] in _READ_ONLY_TOOLS

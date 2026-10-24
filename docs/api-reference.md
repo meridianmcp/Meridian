@@ -791,6 +791,14 @@ No auth required.
 | `POST` | `/code/mcp/{tenant_id}/{rest:path}` | Same as code_mcp_proxy but for sub-paths |
 
 
+### `/compute`
+
+| Method | Path | Description |
+|--------|------|-------------|
+| `GET` | `/compute/runpod/check` | Check that the default RunPod credential works (one billing call, one pod-listing call) |
+| `GET` | `/compute/runpod/pods` | List one page (up to 1000) of the account's RunPod pods as summaries |
+
+
 ### `/config`
 
 | Method | Path | Description |
@@ -1362,6 +1370,7 @@ No auth required.
 
 | Method | Path | Description |
 |--------|------|-------------|
+| `POST` | `/zotero/connect` | Run one Zotero approval attempt for a self-hosted loopback caller who explicitly confirmed it |
 | `GET` | `/zotero/mcp/{tenant_id}` | Proxy requests to the tenant's zotero-mcp server over the zotero tunnel |
 | `OPTIONS` | `/zotero/mcp/{tenant_id}` | Proxy requests to the tenant's zotero-mcp server over the zotero tunnel |
 | `POST` | `/zotero/mcp/{tenant_id}` | Proxy requests to the tenant's zotero-mcp server over the zotero tunnel |
