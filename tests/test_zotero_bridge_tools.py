@@ -440,3 +440,23 @@ def test_batch_schema_bounds_the_operation_count_to_the_client_limit():
     assert operations["minItems"] == 1
     assert operations["maxItems"] == 200
     assert operations["items"]["required"] == ["method", "path"]
+
+
+@pytest.mark.asyncio
+async def test_zotero_batch_refuses_an_unlisted_route_through_the_real_client_before_any_send(monkeypatch):
+    sent: list[tuple[str, str]] = []
+
+    def transport(method, path, headers, body):
+        sent.append((method, path))
+        return 200, {}
+
+    real = ZoteroBridgeClient(transport=transport, reader=lambda path: (200, []), sleep=lambda seconds: None)
+    monkeypatch.setattr(transport_mod, "get_client", lambda: real)
+
+    payload = await handlers.handle_zotero_batch(
+        {"operations": [{"method": "POST", "path": "/v1/grants", "body": {"app_name": "x"}}]}
+    )
+
+    assert payload["ok"] is False
+    assert payload["error"]["code"] == "not_batchable"
+    assert sent == []

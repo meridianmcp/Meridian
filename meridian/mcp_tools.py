@@ -4934,17 +4934,19 @@ _MCP_TOOLS_LIST: list[dict[str, Any]] = [
          "required": ["parent_key", "html", "dedup_marker"]}},
     {"name": "zotero_batch", "description":
         "Runs 1 to 200 Zotero bridge write operations in one bridge transaction. Each operation is an object with `method`, "
-        "`path` and an optional object `body`, such as {\"method\": \"PATCH\", \"path\": \"/v1/items/<key>\", \"body\": {...}}. "
-        "All operations apply or none do. Attachments, tag renames and BibTeX imports are refused inside a batch: attach "
-        "a PDF with zotero_attach_pdf, and this tool cannot run the other two. Writes to the Zotero library on this "
-        "machine only, through the Zotero Bridge plugin. A "
-        "grant prompt may appear in the Zotero desktop app the first time, and a person must approve it; the call waits "
-        "for that answer. Local only: refused on hosted Meridian.",
+        "`path` and an optional object `body`. Only these routes can be batched: POST /v1/items; PATCH /v1/items/<key>; "
+        "POST /v1/items/<key>/trash and /restore; POST /v1/items/<key>/notes; PATCH /v1/notes/<key>; POST and DELETE "
+        "/v1/items/<key>/relations; POST /v1/collections; PATCH /v1/collections/<key>; POST /v1/collections/<key>/trash "
+        "and /restore; POST and DELETE /v1/collections/<key>/items. Every other route or method is refused before anything "
+        "is sent, including grant routes, the status route, attachments, tag renames and BibTeX imports (attach a PDF with "
+        "zotero_attach_pdf). All operations apply or none do. Writes to the Zotero library on this machine only, through "
+        "the Zotero Bridge plugin. A grant prompt may appear in the Zotero desktop app the first time, and a person must "
+        "approve it; the call waits for that answer. Local only: refused on hosted Meridian.",
      "inputSchema": {"type": "object", "properties": {
          "operations": {"type": "array", "minItems": 1, "maxItems": 200, "description": "The operations to run, in order.",
              "items": {"type": "object", "properties": {
                  "method": {"type": "string", "description": "HTTP method of the bridge route, for example PATCH or POST."},
-                 "path": {"type": "string", "description": "Bridge route, for example /v1/items/<key>."},
+                 "path": {"type": "string", "description": "A route from the list in this tool's description, for example /v1/items/<key>."},
                  "body": {"type": "object", "description": "Optional JSON body for the route."}},
                  "required": ["method", "path"]}}},
          "required": ["operations"]}},

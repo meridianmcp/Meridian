@@ -128,12 +128,54 @@ def _http_url(value: Any) -> str:
     raise _invalid("url", "must be an absolute http or https URL")
 
 
-def _refused_in_batch(path: str) -> bool:
-    """True for the routes the bridge refuses inside a batch: attachments, tag rename and BibTeX import."""
+_BATCH_KEY = r"[A-Za-z0-9]{8}"
+# The only routes a batch may carry, as (method, path pattern). extensions/zotero-bridge/README.md lists the same set
+# under "Batches": item create, update, trash and restore; note create and update; relation add and remove; collection
+# create, update, trash and restore; and adding or removing items in a collection. Every other route is refused.
+_BATCHABLE_ROUTES: tuple[tuple[str, re.Pattern[str]], ...] = tuple(
+    (method, re.compile(pattern))
+    for method, pattern in (
+        ("POST", r"/v1/items"),
+        ("PATCH", rf"/v1/items/{_BATCH_KEY}"),
+        ("POST", rf"/v1/items/{_BATCH_KEY}/trash"),
+        ("POST", rf"/v1/items/{_BATCH_KEY}/restore"),
+        ("POST", rf"/v1/items/{_BATCH_KEY}/notes"),
+        ("PATCH", rf"/v1/notes/{_BATCH_KEY}"),
+        ("POST", rf"/v1/items/{_BATCH_KEY}/relations"),
+        ("DELETE", rf"/v1/items/{_BATCH_KEY}/relations"),
+        ("POST", r"/v1/collections"),
+        ("PATCH", rf"/v1/collections/{_BATCH_KEY}"),
+        ("POST", rf"/v1/collections/{_BATCH_KEY}/trash"),
+        ("POST", rf"/v1/collections/{_BATCH_KEY}/restore"),
+        ("POST", rf"/v1/collections/{_BATCH_KEY}/items"),
+        ("DELETE", rf"/v1/collections/{_BATCH_KEY}/items"),
+    )
+)
+_BATCH_REFUSED_ROUTE = (
+    "targets an attachment, a tag rename or a BibTeX import. The bridge refuses those inside a batch, "
+    "so send them on their own."
+)
+
+
+def _batch_refusal(method: str, path: str) -> str | None:
+    """Why a batch may not carry this route, or None when it may. The reason names a category and never the path."""
     segments = [part for part in path.split("?", 1)[0].split("/") if part]
     if len(segments) == 4 and segments[:2] == ["v1", "items"] and segments[3] == "attachments":
-        return True
-    return segments in (["v1", "tags", "rename"], ["v1", "import", "bibtex"])
+        return _BATCH_REFUSED_ROUTE
+    if segments in (["v1", "tags", "rename"], ["v1", "import", "bibtex"]):
+        return _BATCH_REFUSED_ROUTE
+    if segments[:2] == ["v1", "grants"]:
+        return "targets a grant route. A grant is asked for and ended outside a batch."
+    if segments == ["v1", "status"]:
+        return "targets the status route. A batch carries writes only."
+    if segments == ["v1", "batch"]:
+        return "targets the batch route. A batch cannot hold another batch."
+    if any(allowed == method and pattern.fullmatch(path) for allowed, pattern in _BATCHABLE_ROUTES):
+        return None
+    return (
+        "is not a route a batch may carry. A batch carries item, note, relation, collection and "
+        "collection-membership writes only."
+    )
 
 
 def _batch_entry(operation: Any, index: int) -> dict[str, Any]:
@@ -147,12 +189,9 @@ def _batch_entry(operation: Any, index: int) -> dict[str, Any]:
         raise _invalid(name, "needs a method and a path")
     if body is not None and not isinstance(body, dict):
         raise _invalid(name, "body must be an object")
-    if _refused_in_batch(path):
-        raise ZoteroBridgeError(
-            "not_batchable",
-            f"{name} targets an attachment, a tag rename or a BibTeX import. The bridge refuses those inside a "
-            "batch, so send them on their own.",
-        )
+    reason = _batch_refusal(method, path)
+    if reason is not None:
+        raise ZoteroBridgeError("not_batchable", f"{name} {reason}")
     entry: dict[str, Any] = {"method": method, "path": path}
     if body is not None:
         entry["body"] = body
@@ -334,9 +373,12 @@ class ZoteroBridgeClient:
     # ----- batches -----------------------------------------------------------------------------
 
     def batch(self, operations: list[dict[str, Any]] | tuple[dict[str, Any], ...]) -> list[Any]:
-        """Runs 1 to 200 operations in one bridge transaction. Refuses attachments, tag rename and BibTeX import first.
+        """Runs 1 to 200 operations in one bridge transaction.
 
-        A rollback raises BatchRolledBackError with the failed operation's index. Nothing is applied in part.
+        Only the routes in _BATCHABLE_ROUTES are sent. Every operation is checked first, and any other route, method or
+        category is refused before anything is sent: grant routes, the status route, a nested batch, attachments, tag
+        rename, BibTeX import, and any unlisted method or path. A rollback raises BatchRolledBackError with the failed
+        operation's index. Nothing is applied in part.
         """
         if not isinstance(operations, (list, tuple)):
             raise _invalid("operations", "must be a list")
