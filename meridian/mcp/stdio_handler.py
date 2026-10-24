@@ -2087,6 +2087,15 @@ def build_mcp_server():
             # in the shared elif tuple below (mirrors reconcile_stale_claims).
             _shared_tool("release_sprint_item_claim"),
             _shared_tool("transfer_sprint_item_claim"),
+            # Local-only Zotero bridge writes. _shared_tool() pulls the schema HTTP MCP advertises from _MCP_TOOLS_LIST,
+            # and call_tool routes them through _dispatch_mcp_tool, so the transports cannot drift apart.
+            _shared_tool("zotero_create_collection"),
+            _shared_tool("zotero_move_collection"),
+            _shared_tool("zotero_move_item"),
+            _shared_tool("zotero_create_webpage"),
+            _shared_tool("zotero_attach_pdf"),
+            _shared_tool("zotero_add_child_note"),
+            _shared_tool("zotero_batch"),
             # 325276f8 — was a hand-duplicated inputSchema that had drifted from
             # the canonical one in meridian/mcp_tools.py: it was missing "compact"
             # and "mode" entirely, and its "role" enum only allowed "executor"
@@ -2700,6 +2709,14 @@ def build_mcp_server():
                 "release_sprint_item_claim", "transfer_sprint_item_claim",
             ):
                 # v2.4/v0.9 — share dispatch with HTTP MCP so both surfaces stay in sync.
+                result = await _dispatch_mcp_tool(
+                    name, arguments, db, state["data_dir"]
+                )
+            elif name in (
+                "zotero_create_collection", "zotero_move_collection", "zotero_move_item",
+                "zotero_create_webpage", "zotero_attach_pdf", "zotero_add_child_note", "zotero_batch",
+            ):
+                # Local-only Zotero bridge writes: share dispatch with HTTP MCP (the _handle_zotero_bridge_tools group).
                 result = await _dispatch_mcp_tool(
                     name, arguments, db, state["data_dir"]
                 )
