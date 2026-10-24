@@ -7500,6 +7500,25 @@ async def _handle_runpod_tools(
     return _MISS
 
 
+async def _handle_zotero_bridge_tools(
+    name: str,
+    args: dict[str, Any],
+    db: Any,
+    data_dir: str,
+    tenant: dict[str, Any] | None,
+    _mcp_tenant_id: Any,
+) -> Any:
+    """Dispatch group: the seven local-only Zotero bridge write tools (meridian/mcp/handlers/zotero_bridge_tools.py).
+    They write to the caller's own Zotero library through the bridge and take no project, so the database, tenant and
+    data dir are unused. Hosted Meridian refuses them inside the handlers."""
+    from .handlers.zotero_bridge_tools import ZOTERO_BRIDGE_HANDLERS  # noqa: PLC0415
+
+    handler = ZOTERO_BRIDGE_HANDLERS.get(name)
+    if handler is None:
+        return _MISS
+    return await handler(args)
+
+
 # a2a027cf — bounded dispatch-level budget for complete_sprint_item,
 # comfortably under the ~60s client-side timeouts observed in the field
 # (HTTP, stdio, and connector/mcp-remote transports all funnel through this
@@ -7901,6 +7920,7 @@ async def _dispatch_mcp_tool(
         _handle_docx_derivative_tools,
         _handle_paper_contract_tools,
         _handle_runpod_tools,
+        _handle_zotero_bridge_tools,
     )
     # a2a027cf — complete_sprint_item timeout-safety at the dispatch layer.
     # Repeated live reports: an MCP client (HTTP/stdio/connector — this

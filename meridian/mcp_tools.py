@@ -77,6 +77,13 @@ _TOOL_EXAMPLES: dict[str, str] = {
     "list_remote_tasks": 'list_remote_tasks(project_id="abc-123")',
     "runpod_check_key": 'runpod_check_key(credential_ref="env:RUNPOD_API_KEY")',
     "runpod_list_pods": 'runpod_list_pods(credential_ref="keyring:meridian-desktop/runpod-api-key")',
+    "zotero_create_collection": 'zotero_create_collection(name="Reading list", parent_key="ABCD1234")',
+    "zotero_move_collection": 'zotero_move_collection(key="ABCD1234", parent_key=null)',
+    "zotero_move_item": 'zotero_move_item(item_key="WXYZ5678", add_collections=["ABCD1234"], remove_collections=["EFGH5678"])',
+    "zotero_create_webpage": 'zotero_create_webpage(title="Pricing page", url="https://example.com/pricing", collection_keys=["ABCD1234"])',
+    "zotero_attach_pdf": 'zotero_attach_pdf(item_key="WXYZ5678", path="C:/papers/smith2025.pdf", title="Full text")',
+    "zotero_add_child_note": 'zotero_add_child_note(parent_key="WXYZ5678", html="<p>Summary</p>", dedup_marker="meridian-summary-v1")',
+    "zotero_batch": 'zotero_batch(operations=[{"method": "PATCH", "path": "/v1/items/WXYZ5678", "body": {"add_collections": ["ABCD1234"]}}])',
     "register_session_recovery": 'register_session_recovery(project_id="abc-123", session_id="session-uuid", transport="remote_control", client_type="claude-code", local_identity={"local_session_id": "conv-1", "environment_id": "env-9"})',
     "list_resumable_sessions": 'list_resumable_sessions(project_id="abc-123")',
     "get_session_recovery": 'get_session_recovery(project_id="abc-123", session_id="session-uuid")',
@@ -4860,6 +4867,89 @@ _MCP_TOOLS_LIST: list[dict[str, Any]] = [
      "inputSchema": {"type": "object", "properties": {
          "credential_ref": {"type": "string", "description": "Optional credential reference: env:NAME, keyring:SERVICE/ACCOUNT or runpodctl:default. Give a reference, never the key itself; a raw key is rejected without being echoed."}},
          "required": []}},
+    # Zotero bridge write tools: local only. They write to the caller's own Zotero library through the Zotero Bridge
+    # plugin on 127.0.0.1 (meridian/zotero_bridge_transport.py). Hosted Meridian refuses them in the handlers.
+    {"name": "zotero_create_collection", "description":
+        "Creates a collection named `name` in the local Zotero library, under `parent_key` when it is given and at the "
+        "top level when it is not. Returns the new collection key. Writes to the Zotero library on this machine only, "
+        "through the Zotero Bridge plugin. A grant prompt may appear in the Zotero desktop app the first time, and a "
+        "person must approve it; the call waits for that answer. Local only: refused on hosted Meridian.",
+     "inputSchema": {"type": "object", "properties": {
+         "name": {"type": "string", "description": "Name of the new collection. Must not be blank."},
+         "parent_key": {"type": "string", "description": "Optional. The 8-character key of the collection to create this one under. Omit it to create the collection at the top level."}},
+         "required": ["name"]}},
+    {"name": "zotero_move_collection", "description":
+        "Moves the collection `key` under `parent_key`. Omit `parent_key` or pass null to move it to the top level. "
+        "Writes to the Zotero library on this machine only, through the Zotero Bridge plugin. A grant prompt may appear "
+        "in the Zotero desktop app the first time, and a person must approve it; the call waits for that answer. Local "
+        "only: refused on hosted Meridian.",
+     "inputSchema": {"type": "object", "properties": {
+         "key": {"type": "string", "description": "The 8-character key of the collection to move."},
+         "parent_key": {"type": ["string", "null"], "description": "Optional. The 8-character key of the new parent collection. Omit it or pass null to move the collection to the top level."}},
+         "required": ["key"]}},
+    {"name": "zotero_move_item", "description":
+        "Adds a Zotero item to the collections in `add_collections` and removes it from the collections in "
+        "`remove_collections`. Give at least one collection in either list. A collection cannot be in both lists. "
+        "Writes to the Zotero library on this machine only, through the Zotero Bridge plugin. A grant prompt may appear "
+        "in the Zotero desktop app the first time, and a person must approve it; the call waits for that answer. Local "
+        "only: refused on hosted Meridian.",
+     "inputSchema": {"type": "object", "properties": {
+         "item_key": {"type": "string", "description": "The 8-character key of the item to move."},
+         "add_collections": {"type": "array", "items": {"type": "string"}, "description": "Optional. Keys of the collections to add the item to."},
+         "remove_collections": {"type": "array", "items": {"type": "string"}, "description": "Optional. Keys of the collections to remove the item from."}},
+         "required": ["item_key"]}},
+    {"name": "zotero_create_webpage", "description":
+        "Creates a webpage item in the local Zotero library with the given title and absolute http or https URL. With "
+        "`collection_keys`, the item is added to those collections. Returns the new item key. Writes to the Zotero "
+        "library on this machine only, through the Zotero Bridge plugin. A grant prompt may appear in the Zotero desktop "
+        "app the first time, and a person must approve it; the call waits for that answer. Local only: refused on "
+        "hosted Meridian.",
+     "inputSchema": {"type": "object", "properties": {
+         "title": {"type": "string", "description": "Title of the webpage item. Must not be blank."},
+         "url": {"type": "string", "description": "Absolute http or https URL of the page. It must not contain spaces."},
+         "collection_keys": {"type": "array", "items": {"type": "string"}, "description": "Optional. Keys of the collections to add the item to."}},
+         "required": ["title", "url"]}},
+    {"name": "zotero_attach_pdf", "description":
+        "Attaches the PDF at `path` to the Zotero item `item_key` as a child attachment. `path` must be an absolute path "
+        "to a file that starts with %PDF-. Files of 24 MiB or less are imported into Zotero. Larger files are linked by "
+        "path, and the bridge decides whether it may link them. Returns status already_attached, with nothing written, "
+        "when the item already has a PDF attachment. Writes to the Zotero library on this machine only, through the "
+        "Zotero Bridge plugin. A grant prompt may appear in the Zotero desktop app the first time, and a person must "
+        "approve it; the call waits for that answer. Local only: refused on hosted Meridian.",
+     "inputSchema": {"type": "object", "properties": {
+         "item_key": {"type": "string", "description": "The 8-character key of the parent item."},
+         "path": {"type": "string", "description": "Absolute path to the PDF file on this machine."},
+         "title": {"type": "string", "description": "Optional title for the attachment."}},
+         "required": ["item_key", "path"]}},
+    {"name": "zotero_add_child_note", "description":
+        "Adds a child note holding `html` to the Zotero item `parent_key`. The note carries `dedup_marker`, which must be "
+        "8 to 128 letters, digits, dots, underscores or hyphens. If a child note of that item already carries the marker, "
+        "nothing is written and the result is status already_present. Writes to the Zotero library on this machine only, "
+        "through the Zotero Bridge plugin. A grant prompt may appear in the Zotero desktop app the first time, and a "
+        "person must approve it; the call waits for that answer. Local only: refused on hosted Meridian.",
+     "inputSchema": {"type": "object", "properties": {
+         "parent_key": {"type": "string", "description": "The 8-character key of the parent item."},
+         "html": {"type": "string", "description": "HTML content of the note."},
+         "dedup_marker": {"type": "string", "description": "Marker stored in the note, used to detect an existing copy. 8 to 128 letters, digits, dots, underscores or hyphens."}},
+         "required": ["parent_key", "html", "dedup_marker"]}},
+    {"name": "zotero_batch", "description":
+        "Runs 1 to 200 Zotero bridge write operations in one bridge transaction. Each operation is an object with `method`, "
+        "`path` and an optional object `body`. Only these routes can be batched: POST /v1/items; PATCH /v1/items/<key>; "
+        "POST /v1/items/<key>/trash and /restore; POST /v1/items/<key>/notes; PATCH /v1/notes/<key>; POST and DELETE "
+        "/v1/items/<key>/relations; POST /v1/collections; PATCH /v1/collections/<key>; POST /v1/collections/<key>/trash "
+        "and /restore; POST and DELETE /v1/collections/<key>/items. Every other route or method is refused before anything "
+        "is sent, including grant routes, the status route, attachments, tag renames and BibTeX imports (attach a PDF with "
+        "zotero_attach_pdf). All operations apply or none do. Writes to the Zotero library on this machine only, through "
+        "the Zotero Bridge plugin. A grant prompt may appear in the Zotero desktop app the first time, and a person must "
+        "approve it; the call waits for that answer. Local only: refused on hosted Meridian.",
+     "inputSchema": {"type": "object", "properties": {
+         "operations": {"type": "array", "minItems": 1, "maxItems": 200, "description": "The operations to run, in order.",
+             "items": {"type": "object", "properties": {
+                 "method": {"type": "string", "description": "HTTP method of the bridge route, for example PATCH or POST."},
+                 "path": {"type": "string", "description": "A route from the list in this tool's description, for example /v1/items/<key>."},
+                 "body": {"type": "object", "description": "Optional JSON body for the route."}},
+                 "required": ["method", "path"]}}},
+         "required": ["operations"]}},
 ]
 
 # Publish the distinctive canonical names first so clients that rank the
@@ -5084,6 +5174,14 @@ _TOOL_CATEGORY: dict[str, str] = {
     "list_remote_tasks":        "session",
     "runpod_check_key":         "session",
     "runpod_list_pods":         "session",
+    # Zotero bridge write tools (local only), grouped with the research tools that read Zotero.
+    "zotero_create_collection": "research",
+    "zotero_move_collection":   "research",
+    "zotero_move_item":         "research",
+    "zotero_create_webpage":    "research",
+    "zotero_attach_pdf":        "research",
+    "zotero_add_child_note":    "research",
+    "zotero_batch":             "research",
     "register_session_recovery": "session",
     "list_resumable_sessions":   "session",
     "get_session_recovery":      "session",
@@ -5413,6 +5511,13 @@ _TOOL_ROLE_RELEVANCE: dict[str, str] = {
     "list_remote_tasks":          "both",
     "runpod_check_key":           "both",
     "runpod_list_pods":           "both",
+    "zotero_create_collection":   "both",
+    "zotero_move_collection":     "both",
+    "zotero_move_item":           "both",
+    "zotero_create_webpage":      "both",
+    "zotero_attach_pdf":          "both",
+    "zotero_add_child_note":      "both",
+    "zotero_batch":               "both",
     "register_session_recovery":  "both",
     "list_resumable_sessions":    "both",
     "get_session_recovery":       "both",
@@ -5675,6 +5780,13 @@ _TOOL_WORKFLOW_TIER: dict[str, str] = {
     "list_remote_tasks":           "common-support",
     "runpod_check_key":            "common-support",
     "runpod_list_pods":            "common-support",
+    "zotero_create_collection":    "maintenance-only",
+    "zotero_move_collection":      "maintenance-only",
+    "zotero_move_item":            "maintenance-only",
+    "zotero_create_webpage":       "maintenance-only",
+    "zotero_attach_pdf":           "maintenance-only",
+    "zotero_add_child_note":       "maintenance-only",
+    "zotero_batch":                "maintenance-only",
     "start_research_run":          "common-support",
     "complete_research_run":       "common-support",
     "get_research_run":            "common-support",

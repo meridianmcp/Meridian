@@ -508,6 +508,90 @@ def test_batch_size_limit_and_success_results():
     assert len(client.batch([one] * zbc.BATCH_LIMIT)) == zbc.BATCH_LIMIT
 
 
+# The routes a batch may carry, as the bridge README lists them under "Batches".
+ALLOWED_BATCH_ROUTES = [
+    ("POST", "/v1/items", {"item_type": "webpage", "fields": {"title": "T"}}),
+    ("PATCH", "/v1/items/ITEM0001", {"fields": {"title": "T"}}),
+    ("POST", "/v1/items/ITEM0001/trash", None),
+    ("POST", "/v1/items/ITEM0001/restore", None),
+    ("POST", "/v1/items/ITEM0001/notes", {"html": "<p>x</p>"}),
+    ("PATCH", "/v1/notes/NOTE0001", {"html": "<p>x</p>"}),
+    ("POST", "/v1/items/ITEM0001/relations", {"related_key": "ITEM0002"}),
+    ("DELETE", "/v1/items/ITEM0001/relations", {"related_key": "ITEM0002"}),
+    ("POST", "/v1/collections", {"name": "A"}),
+    ("PATCH", "/v1/collections/COLL0001", {"name": "B"}),
+    ("POST", "/v1/collections/COLL0001/trash", None),
+    ("POST", "/v1/collections/COLL0001/restore", None),
+    ("POST", "/v1/collections/COLL0001/items", {"item_keys": ["ITEM0001"]}),
+    ("DELETE", "/v1/collections/COLL0001/items", {"item_keys": ["ITEM0001"]}),
+]
+
+ATTACHMENT_TAG_BIBTEX = "attachment, a tag rename or a BibTeX import"
+# Each refused operation, with the reason fragment the client must give. Grant routes, the status route and a nested
+# batch each have their own reason; anything else is refused as not on the list.
+REFUSED_BATCH_ROUTES = [
+    ("POST", "/v1/grants", {"app_name": "Meridian"}, "grant route"),
+    ("GET", f"/v1/grants/{GRANT_ID}", None, "grant route"),
+    ("DELETE", f"/v1/grants/{GRANT_ID}", None, "grant route"),
+    ("GET", "/v1/status", None, "status route"),
+    ("POST", "/v1/batch", {"operations": []}, "batch route"),
+    ("POST", "/v1/items/PARENT01/attachments", {"mode": "linked_file"}, ATTACHMENT_TAG_BIBTEX),
+    ("POST", "/v1/tags/rename", {"from": "a", "to": "b"}, ATTACHMENT_TAG_BIBTEX),
+    ("POST", "/v1/import/bibtex", {"bibtex": "@article{x}"}, ATTACHMENT_TAG_BIBTEX),
+    ("GET", "/v1/items/ITEM0001", None, "is not a route a batch may carry"),
+    ("PUT", "/v1/items/ITEM0001", {"fields": {}}, "is not a route a batch may carry"),
+    ("DELETE", "/v1/items/ITEM0001", None, "is not a route a batch may carry"),
+    ("DELETE", "/v1/items/ITEM0001/notes", None, "is not a route a batch may carry"),
+    ("PATCH", "/v1/items/ITEM0001/trash", {}, "is not a route a batch may carry"),
+    ("DELETE", "/v1/collections/COLL0001", None, "is not a route a batch may carry"),
+    ("POST", "/v1/notes/NOTE0001", {"html": "<p>x</p>"}, "is not a route a batch may carry"),
+    ("GET", "/v1/collections/COLL0001/items", None, "is not a route a batch may carry"),
+    ("PATCH", "/v1/items", {"fields": {}}, "is not a route a batch may carry"),
+    ("POST", "/v1/items/ITEM0001/unknown", {}, "is not a route a batch may carry"),
+    ("POST", "/v1/items/SHORT/trash", None, "is not a route a batch may carry"),
+    ("PATCH", "/v1/items/ITEM0001?x=1", {"fields": {}}, "is not a route a batch may carry"),
+    ("POST", "/v1/collections/COLL0001/items/extra", {"item_keys": []}, "is not a route a batch may carry"),
+]
+
+
+@pytest.mark.parametrize(("method", "path", "body"), ALLOWED_BATCH_ROUTES)
+def test_batch_sends_each_route_on_the_list(method: str, path: str, body: Any):
+    bridge = FakeBridge()
+    client, _ = make_client(bridge)
+    operation: dict[str, Any] = {"method": method, "path": path}
+    if body is not None:
+        operation["body"] = body
+
+    assert client.batch([operation]) == [{"key": "BATCH001"}]
+
+    sent = writes_of(bridge)
+    assert [(call["method"], call["path"]) for call in sent] == [("POST", "/v1/batch")]
+    assert sent[0]["body"] == {"operations": [operation]}
+
+
+@pytest.mark.parametrize(("method", "path", "body", "reason"), REFUSED_BATCH_ROUTES)
+def test_batch_refuses_a_route_off_the_list_before_anything_is_sent(
+    method: str, path: str, body: Any, reason: str
+):
+    bridge = FakeBridge()
+    client, _ = make_client(bridge)
+    valid = {"method": "POST", "path": "/v1/collections", "body": {"name": "fine"}}
+    operation: dict[str, Any] = {"method": method, "path": path}
+    if body is not None:
+        operation["body"] = body
+
+    with pytest.raises(ZoteroBridgeError) as info:
+        client.batch([valid, operation])
+
+    assert info.value.code == "not_batchable"
+    assert info.value.message.startswith("operations[1] ")
+    assert reason in info.value.message
+    assert bridge.calls == []
+    # The reason names the category and never echoes the route or a grant key.
+    assert path not in info.value.message
+    assert GRANT_ID not in info.value.message
+
+
 # ---------------------------------------------------------------------------------------------
 # Secret hygiene
 # ---------------------------------------------------------------------------------------------
