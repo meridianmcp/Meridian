@@ -4110,16 +4110,21 @@ async def get_notification_prefs(request: Request) -> dict[str, Any]:
     return {"prefs": prefs}
 
 
-_WORKSPACE_MEMBER_LIMITS: dict[str, int] = {"standard": 25, "pro": 50}
+# Team-size cap on POST /workspace/invite, by entitlement plan. It counts the
+# invited workspace_members rows (pending and accepted), never the owner. It only
+# blocks new invites: a workspace over its cap keeps every member it has. Pro's
+# 1000 is a safeguard ceiling, not an unlimited allowance.
+_WORKSPACE_MEMBER_LIMITS: dict[str, int] = {"free": 1, "standard": 20, "pro": 1000}
 
 
 def _workspace_member_limit(tenant: dict[str, Any]) -> int:
     """Team-size cap for the entitlement in force on ``tenant`` (a playtester has
-    Pro's; a plan the table does not know gets the Standard-sized default)."""
+    Pro's; a plan the table does not know gets Standard's cap, not Free's)."""
     from .plans import tenant_entitlement_plan  # noqa: PLC0415
 
     return _WORKSPACE_MEMBER_LIMITS.get(
-        tenant_entitlement_plan(tenant, default="standard"), 25
+        tenant_entitlement_plan(tenant, default="standard"),
+        _WORKSPACE_MEMBER_LIMITS["standard"],
     )
 
 
