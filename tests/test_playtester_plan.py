@@ -543,28 +543,117 @@ def test_tunnel_plugins_card_gate_reports_the_entitlement_plan(monkeypatch, tmp_
             assert body["plan"] == expect, (plan, extra)
 
 
+def _silence_invite_email(monkeypatch):
+    """The invite route emails through Resend when RESEND_API_KEY is set; no test
+    in this file may reach it."""
+    from meridian import hosted as hosted_module
+
+    async def _no_send(*_a, **_k):
+        return None
+
+    monkeypatch.setattr(hosted_module, "send_invite_email", _no_send)
+
+
 def test_workspace_member_limit_follows_the_entitlement(monkeypatch, tmp_path):
-    """The real limits table, with a member count between Standard's cap (25)
-    and Pro's (50): the only place a playtester that fell through to the
-    default (25) would be told it is full while Pro is not."""
+    """The real limits table, with a member count between Standard's cap (20)
+    and Pro's (1000): the only place a playtester that fell through to the
+    default (20) would be told it is full while Pro is not."""
+    _silence_invite_email(monkeypatch)
     client = _hosted_client(monkeypatch, tmp_path)
     with client:
         async def _thirty_members(_db, _tenant_id):
             return 30
 
         monkeypatch.setattr(db_module, "count_workspace_members", _thirty_members)
-        for i, (plan, extra, status) in enumerate((
-            ("standard", {}, 402),
-            ("pro", {}, 201),
-            ("playtester", {}, 201),
+        for i, (plan, extra, status, limit) in enumerate((
+            ("standard", {}, 402, 20),
+            ("pro", {}, 201, None),
+            ("playtester", {}, 201, None),
             # past its end date a playtester has the Free entitlement
-            ("playtester", {"inactivity_expires_at": PAST}, 402),
+            ("playtester", {"inactivity_expires_at": PAST}, 402, 1),
         )):
             _seed(client, f"ws-{i}@example.com", plan, **extra)
             r = client.post("/workspace/invite", json={"email": f"invitee-{i}@example.com"})
             assert r.status_code == status, (plan, extra, r.text)
-            if status == 402:
-                assert "(25)" in r.json()["detail"]
+            if limit is not None:
+                assert f"({limit})" in r.json()["detail"]
+
+
+def test_workspace_member_limits_are_the_team_size_policy():
+    import meridian.server as srv
+
+    assert srv._WORKSPACE_MEMBER_LIMITS == {"free": 1, "standard": 20, "pro": 1000}
+
+
+def test_unknown_plan_gets_the_standard_cap_not_free():
+    # tenants.plan has no CHECK constraint, so a stored value the table does not
+    # name is possible: it gets Standard's cap (20), never Free's (1).
+    for plan in ("bogus", "", None):
+        assert _probe_member_limit(plan) == 20, plan
+
+
+@pytest.mark.parametrize(
+    ("plan", "limit"),
+    (("free", 1), ("standard", 20), ("pro", 1000), ("playtester", 1000)),
+)
+def test_team_size_cap_admits_up_to_the_limit_and_no_further(monkeypatch, tmp_path, plan, limit):
+    """Counting the invited members already on the workspace: the invite that
+    brings the count to ``limit`` goes through, the one after it is refused."""
+    _silence_invite_email(monkeypatch)
+    client = _hosted_client(monkeypatch, tmp_path)
+    with client:
+        count = {"n": limit - 1}
+
+        async def _members(_db, _tenant_id):
+            return count["n"]
+
+        monkeypatch.setattr(db_module, "count_workspace_members", _members)
+        _seed(client, f"cap-{plan}@example.com", plan)
+        last = client.post("/workspace/invite", json={"email": "last@example.com"})
+        assert last.status_code == 201, last.text
+        count["n"] = limit
+        extra = client.post("/workspace/invite", json={"email": "extra@example.com"})
+        assert extra.status_code == 402, extra.text
+        assert f"({limit})" in extra.json()["detail"]
+
+
+def test_free_tenant_can_invite_one_member_and_no_second(monkeypatch, tmp_path):
+    """No stub on the counter: the real rows decide. The owner is not a
+    workspace_members row, so the first invite is the one member a Free
+    workspace gets."""
+    _silence_invite_email(monkeypatch)
+    client = _hosted_client(monkeypatch, tmp_path)
+    with client:
+        _seed(client, "free-cap@example.com", "free")
+        first = client.post("/workspace/invite", json={"email": "one@example.com"})
+        assert first.status_code == 201, first.text
+        second = client.post("/workspace/invite", json={"email": "two@example.com"})
+        assert second.status_code == 402, second.text
+        assert "(1)" in second.json()["detail"]
+
+
+def test_over_limit_workspace_keeps_its_members_and_only_new_invites_are_refused(monkeypatch, tmp_path):
+    """Lowering the cap never removes anyone: a Free workspace already holding
+    two invited members keeps both, and only a further invite is refused."""
+    _silence_invite_email(monkeypatch)
+    client = _hosted_client(monkeypatch, tmp_path)
+    with client:
+        tenant = _seed(client, "over-cap@example.com", "free")
+
+        async def _two_existing():
+            for n in (1, 2):
+                await db_module.create_workspace_invite(
+                    client.app.state.db, tenant["id"], f"old{n}@example.com", "member",
+                    f"hash-{n}", github_access="read", project_id=None,
+                )
+
+        asyncio.run(_two_existing())
+        before = client.get("/workspace/members").json()
+        assert len(before) == 2, before
+        r = client.post("/workspace/invite", json={"email": "new@example.com"})
+        assert r.status_code == 402, r.text
+        assert "(1)" in r.json()["detail"]
+        assert client.get("/workspace/members").json() == before
 
 
 # ---------------------------------------------------------------------------
