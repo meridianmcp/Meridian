@@ -1,6 +1,6 @@
 # MCP Tool Reference
 
-Meridian exposes **251 tools** over MCP.
+Meridian exposes **258 tools** over MCP.
 
 They fall into two usage patterns:
 
@@ -805,6 +805,122 @@ runpod_check_key(credential_ref="env:RUNPOD_API_KEY")
 **Example:**
 ```
 runpod_list_pods(credential_ref="keyring:meridian-desktop/runpod-api-key")
+```
+
+---
+
+## Zotero bridge (local only)
+
+### `zotero_create_collection`
+[MAINTENANCE] Creates a collection named `name` in the local Zotero library, under `parent_key` when it is given and at the top level when it is not. Returns the new collection key. Writes to the Zotero library on this machine only, through the Zotero Bridge plugin. A grant prompt may appear in the Zotero desktop app the first time, and a person must approve it; the call waits for that answer. Local only: refused on hosted Meridian. Persistent-state disclosure: on hosted Meridian, supplied text and project/session metadata -- including task log entries, pinned decisions, sprint items, notes, handoff/goal state, and HITL queue items -- are sent to and stored in Meridian's service, in an isolated per-tenant Postgres database (Neon); self-hosted deployments keep the same categories in the configured local SQLite/Postgres database. This data is visible in the dashboard and API, and may resurface in later project context or handoffs. Notes and pinned decisions can be deleted individually; task log entries and sprint items can be deleted via the dashboard/API (not exposed as an agent-facing tool); HITL queue items and handoff state have no per-record delete. Full removal of any of this data is available via project or account deletion, using the documented controls. Do not include secrets.
+
+| Parameter | Type | Required | Description |
+|-----------|------|----------|-------------|
+| `name` | string | required | Name of the new collection. Must not be blank. |
+| `parent_key` | string | optional | Optional. The 8-character key of the collection to create this one under. Omit it to create the collection at the top level. |
+
+**Example:**
+```
+zotero_create_collection(name="Reading list", parent_key="ABCD1234")
+```
+
+---
+
+
+### `zotero_move_collection`
+[MAINTENANCE] Moves the collection `key` under `parent_key`. Omit `parent_key` or pass null to move it to the top level. Writes to the Zotero library on this machine only, through the Zotero Bridge plugin. A grant prompt may appear in the Zotero desktop app the first time, and a person must approve it; the call waits for that answer. Local only: refused on hosted Meridian. Persistent-state disclosure: on hosted Meridian, supplied text and project/session metadata -- including task log entries, pinned decisions, sprint items, notes, handoff/goal state, and HITL queue items -- are sent to and stored in Meridian's service, in an isolated per-tenant Postgres database (Neon); self-hosted deployments keep the same categories in the configured local SQLite/Postgres database. This data is visible in the dashboard and API, and may resurface in later project context or handoffs. Notes and pinned decisions can be deleted individually; task log entries and sprint items can be deleted via the dashboard/API (not exposed as an agent-facing tool); HITL queue items and handoff state have no per-record delete. Full removal of any of this data is available via project or account deletion, using the documented controls. Do not include secrets.
+
+| Parameter | Type | Required | Description |
+|-----------|------|----------|-------------|
+| `key` | string | required | The 8-character key of the collection to move. |
+| `parent_key` | ['string', 'null'] | optional | Optional. The 8-character key of the new parent collection. Omit it or pass null to move the collection to the top level. |
+
+**Example:**
+```
+zotero_move_collection(key="ABCD1234", parent_key=null)
+```
+
+---
+
+
+### `zotero_move_item`
+[MAINTENANCE] Adds a Zotero item to the collections in `add_collections` and removes it from the collections in `remove_collections`. Give at least one collection in either list. A collection cannot be in both lists. Writes to the Zotero library on this machine only, through the Zotero Bridge plugin. A grant prompt may appear in the Zotero desktop app the first time, and a person must approve it; the call waits for that answer. Local only: refused on hosted Meridian. Persistent-state disclosure: on hosted Meridian, supplied text and project/session metadata -- including task log entries, pinned decisions, sprint items, notes, handoff/goal state, and HITL queue items -- are sent to and stored in Meridian's service, in an isolated per-tenant Postgres database (Neon); self-hosted deployments keep the same categories in the configured local SQLite/Postgres database. This data is visible in the dashboard and API, and may resurface in later project context or handoffs. Notes and pinned decisions can be deleted individually; task log entries and sprint items can be deleted via the dashboard/API (not exposed as an agent-facing tool); HITL queue items and handoff state have no per-record delete. Full removal of any of this data is available via project or account deletion, using the documented controls. Do not include secrets.
+
+| Parameter | Type | Required | Description |
+|-----------|------|----------|-------------|
+| `item_key` | string | required | The 8-character key of the item to move. |
+| `add_collections` | array | optional | Optional. Keys of the collections to add the item to. |
+| `remove_collections` | array | optional | Optional. Keys of the collections to remove the item from. |
+
+**Example:**
+```
+zotero_move_item(item_key="WXYZ5678", add_collections=["ABCD1234"], remove_collections=["EFGH5678"])
+```
+
+---
+
+
+### `zotero_create_webpage`
+[MAINTENANCE] Creates a webpage item in the local Zotero library with the given title and absolute http or https URL. With `collection_keys`, the item is added to those collections. Returns the new item key. Writes to the Zotero library on this machine only, through the Zotero Bridge plugin. A grant prompt may appear in the Zotero desktop app the first time, and a person must approve it; the call waits for that answer. Local only: refused on hosted Meridian. Persistent-state disclosure: on hosted Meridian, supplied text and project/session metadata -- including task log entries, pinned decisions, sprint items, notes, handoff/goal state, and HITL queue items -- are sent to and stored in Meridian's service, in an isolated per-tenant Postgres database (Neon); self-hosted deployments keep the same categories in the configured local SQLite/Postgres database. This data is visible in the dashboard and API, and may resurface in later project context or handoffs. Notes and pinned decisions can be deleted individually; task log entries and sprint items can be deleted via the dashboard/API (not exposed as an agent-facing tool); HITL queue items and handoff state have no per-record delete. Full removal of any of this data is available via project or account deletion, using the documented controls. Do not include secrets.
+
+| Parameter | Type | Required | Description |
+|-----------|------|----------|-------------|
+| `title` | string | required | Title of the webpage item. Must not be blank. |
+| `url` | string | required | Absolute http or https URL of the page. It must not contain spaces. |
+| `collection_keys` | array | optional | Optional. Keys of the collections to add the item to. |
+
+**Example:**
+```
+zotero_create_webpage(title="Pricing page", url="https://example.com/pricing", collection_keys=["ABCD1234"])
+```
+
+---
+
+
+### `zotero_attach_pdf`
+[MAINTENANCE] Attaches the PDF at `path` to the Zotero item `item_key` as a child attachment. `path` must be an absolute path to a file that starts with %PDF-. Files of 24 MiB or less are imported into Zotero. Larger files are linked by path, and the bridge decides whether it may link them. Returns status already_attached, with nothing written, when the item already has a PDF attachment. Writes to the Zotero library on this machine only, through the Zotero Bridge plugin. A grant prompt may appear in the Zotero desktop app the first time, and a person must approve it; the call waits for that answer. Local only: refused on hosted Meridian. Persistent-state disclosure: on hosted Meridian, supplied text and project/session metadata -- including task log entries, pinned decisions, sprint items, notes, handoff/goal state, and HITL queue items -- are sent to and stored in Meridian's service, in an isolated per-tenant Postgres database (Neon); self-hosted deployments keep the same categories in the configured local SQLite/Postgres database. This data is visible in the dashboard and API, and may resurface in later project context or handoffs. Notes and pinned decisions can be deleted individually; task log entries and sprint items can be deleted via the dashboard/API (not exposed as an agent-facing tool); HITL queue items and handoff state have no per-record delete. Full removal of any of this data is available via project or account deletion, using the documented controls. Do not include secrets.
+
+| Parameter | Type | Required | Description |
+|-----------|------|----------|-------------|
+| `item_key` | string | required | The 8-character key of the parent item. |
+| `path` | string | required | Absolute path to the PDF file on this machine. |
+| `title` | string | optional | Optional title for the attachment. |
+
+**Example:**
+```
+zotero_attach_pdf(item_key="WXYZ5678", path="C:/papers/smith2025.pdf", title="Full text")
+```
+
+---
+
+
+### `zotero_add_child_note`
+[MAINTENANCE] Adds a child note holding `html` to the Zotero item `parent_key`. The note carries `dedup_marker`, which must be 8 to 128 letters, digits, dots, underscores or hyphens. If a child note of that item already carries the marker, nothing is written and the result is status already_present. Writes to the Zotero library on this machine only, through the Zotero Bridge plugin. A grant prompt may appear in the Zotero desktop app the first time, and a person must approve it; the call waits for that answer. Local only: refused on hosted Meridian. Persistent-state disclosure: on hosted Meridian, supplied text and project/session metadata -- including task log entries, pinned decisions, sprint items, notes, handoff/goal state, and HITL queue items -- are sent to and stored in Meridian's service, in an isolated per-tenant Postgres database (Neon); self-hosted deployments keep the same categories in the configured local SQLite/Postgres database. This data is visible in the dashboard and API, and may resurface in later project context or handoffs. Notes and pinned decisions can be deleted individually; task log entries and sprint items can be deleted via the dashboard/API (not exposed as an agent-facing tool); HITL queue items and handoff state have no per-record delete. Full removal of any of this data is available via project or account deletion, using the documented controls. Do not include secrets.
+
+| Parameter | Type | Required | Description |
+|-----------|------|----------|-------------|
+| `parent_key` | string | required | The 8-character key of the parent item. |
+| `html` | string | required | HTML content of the note. |
+| `dedup_marker` | string | required | Marker stored in the note, used to detect an existing copy. 8 to 128 letters, digits, dots, underscores or hyphens. |
+
+**Example:**
+```
+zotero_add_child_note(parent_key="WXYZ5678", html="<p>Summary</p>", dedup_marker="meridian-summary-v1")
+```
+
+---
+
+
+### `zotero_batch`
+[MAINTENANCE] Runs 1 to 200 Zotero bridge write operations in one bridge transaction. Each operation is an object with `method`, `path` and an optional object `body`, such as {"method": "PATCH", "path": "/v1/items/<key>", "body": {...}}. All operations apply or none do. Attachments, tag renames and BibTeX imports are refused inside a batch: attach a PDF with zotero_attach_pdf, and this tool cannot run the other two. Writes to the Zotero library on this machine only, through the Zotero Bridge plugin. A grant prompt may appear in the Zotero desktop app the first time, and a person must approve it; the call waits for that answer. Local only: refused on hosted Meridian. Persistent-state disclosure: on hosted Meridian, supplied text and project/session metadata -- including task log entries, pinned decisions, sprint items, notes, handoff/goal state, and HITL queue items -- are sent to and stored in Meridian's service, in an isolated per-tenant Postgres database (Neon); self-hosted deployments keep the same categories in the configured local SQLite/Postgres database. This data is visible in the dashboard and API, and may resurface in later project context or handoffs. Notes and pinned decisions can be deleted individually; task log entries and sprint items can be deleted via the dashboard/API (not exposed as an agent-facing tool); HITL queue items and handoff state have no per-record delete. Full removal of any of this data is available via project or account deletion, using the documented controls. Do not include secrets.
+
+| Parameter | Type | Required | Description |
+|-----------|------|----------|-------------|
+| `operations` | array | required | The operations to run, in order. |
+
+**Example:**
+```
+zotero_batch(operations=[{"method": "PATCH", "path": "/v1/items/WXYZ5678", "body": {"add_collections": ["ABCD1234"]}}])
 ```
 
 ---
