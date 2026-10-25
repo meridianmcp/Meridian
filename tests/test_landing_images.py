@@ -40,3 +40,12 @@ def test_landing_solution_showcase_uses_committed_screenshot(client):
     # The e89daf1 hotfix once wedged a literal "\\r\\n" into the <img> tag.
     assert "dashboard-queue.png\"\\r\\n" not in r.text
     assert "dashboard-hero-screenshot.png" not in r.text
+
+
+def test_landing_waitlist_mailto_subject_is_encoded_by_script(client):
+    """The waitlist CTA keeps its subject as plain text in data-subject; the
+    inline script percent-encodes it when it builds the mailto href."""
+    r = client.get("/")
+    assert r.status_code == 200
+    assert 'data-subject="Pro waitlist"' in r.text
+    assert "encodeURIComponent(subj)" in r.text

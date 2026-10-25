@@ -2,6 +2,7 @@
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import {
   escapeHtml,
+  escapeQuotedLiteral,
   formatRelativeTime,
   sessionAgeMs,
   isLiveSession,
@@ -24,6 +25,33 @@ describe("escapeHtml", () => {
   it("coerces non-strings", () => {
     expect(escapeHtml(42)).toBe("42");
     expect(escapeHtml(null)).toBe("null");
+  });
+});
+
+describe("escapeQuotedLiteral (CodeQL js/incomplete-sanitization)", () => {
+  it("leaves plain names and forward-slash paths byte-identical", () => {
+    expect(escapeQuotedLiteral("resume-session_1")).toBe("resume-session_1");
+    expect(escapeQuotedLiteral("/home/me/Meridian")).toBe("/home/me/Meridian");
+  });
+  it("escapes double quotes", () => {
+    expect(escapeQuotedLiteral('say "hi"')).toBe('say \\"hi\\"');
+  });
+  it("doubles backslashes so a Windows path stays one literal", () => {
+    expect(escapeQuotedLiteral("C:\\Users\\me\\Meridian")).toBe("C:\\\\Users\\\\me\\\\Meridian");
+  });
+  it("escapes a backslash before a quote so the literal cannot end early (breakout)", () => {
+    // Input: x\", human_id="admin  -- the quote must stay inside the literal.
+    const hostile = 'x\\", human_id="admin';
+    expect(escapeQuotedLiteral(hostile)).toBe('x\\\\\\", human_id=\\"admin');
+  });
+  it("escapes CR and LF so the literal stays on one line", () => {
+    expect(escapeQuotedLiteral("a\r\nb")).toBe("a\\r\\nb");
+  });
+  it("does not HTML-encode: copied text keeps & and apostrophes", () => {
+    expect(escapeQuotedLiteral("A&B's")).toBe("A&B's");
+  });
+  it("coerces non-strings", () => {
+    expect(escapeQuotedLiteral(42)).toBe("42");
   });
 });
 

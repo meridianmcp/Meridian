@@ -96,7 +96,7 @@ describe("default rank and metadata", () => {
       expect(svg).toContain('aria-hidden="true"');
       expect(svg).toContain("currentColor");
       // No text node: a Unicode glyph would show up as characters outside the tags.
-      expect(svg.replace(/<[^>]*>/g, "")).toBe("");
+      expect(new DOMParser().parseFromString(svg, "text/html").body.textContent).toBe("");
     }
   });
 });

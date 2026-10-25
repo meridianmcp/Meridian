@@ -73,6 +73,19 @@ export function escapeHtml(s: unknown): string {
   return String(s).replace(/[&<>"']/g, (c) => map[c] ?? c);
 }
 
+// Escapes a value for a double-quoted literal in copied text: a start_session(...)
+// argument or a TOML basic string. The output is copied or set as textContent, never
+// parsed as HTML, so HTML entities would corrupt it. Backslash is escaped first, so a
+// backslash before a quote cannot end the literal early. The output is valid in both
+// Python and TOML basic strings.
+export function escapeQuotedLiteral(s: unknown): string {
+  return String(s)
+    .replace(/\\/g, '\\\\')
+    .replace(/"/g, '\\"')
+    .replace(/\r/g, '\\r')
+    .replace(/\n/g, '\\n');
+}
+
 export function formatRelativeTime(ts: string | null | undefined): string {
   if (!ts) return '';
   const iso = ts.includes('T') ? ts : ts.replace(' ', 'T') + 'Z';

@@ -2,7 +2,7 @@
 // 423f5929 — modules migrated .js → .ts; imports are extensionless so esbuild
 // (resolveExtensions) and tsc (bundler resolution) both resolve the .ts files.
 import "./dashboard-core";
-import "./dashboard-utils";
+import { escapeQuotedLiteral } from "./dashboard-utils";
 import "./dashboard-demo";
 import "./dashboard-timeline";
 import "./dashboard-mcp";
@@ -6857,7 +6857,7 @@ function showCopyPreview(title: any, content: any) {
 
 function wireClaudeLaunchPanel(projectId: any) {
 
-  const PROJECT_QUOTE = projectId.replace(/"/g, '\\"');
+  const PROJECT_QUOTE = escapeQuotedLiteral(projectId);
   const sequentialKey = `meridian.sequentialMode.${projectId}`;
 
   function normalizeTouchesFile(path: any) {
@@ -7043,7 +7043,7 @@ function wireClaudeLaunchPanel(projectId: any) {
 
     if (!sessionName) { toast('pick a session first', true); return; }
 
-    const cmd = `start_session(project_id="${PROJECT_QUOTE}", session_name="${sessionName.replace(/"/g, '\\"')}", human_id="adam")\nget_context_block(project_id="${PROJECT_QUOTE}", mode="full")`;
+    const cmd = `start_session(project_id="${PROJECT_QUOTE}", session_name="${escapeQuotedLiteral(sessionName)}", human_id="adam")\nget_context_block(project_id="${PROJECT_QUOTE}", mode="full")`;
 
     showCopyPreview('Resume MCP Flow', cmd);
 
@@ -9882,9 +9882,9 @@ async function loadRecentSessions(projectId: any, sessions = null) {
         const summaryPreview = summaryText ? escapeHtml(summaryText.slice(0, 90)) : '';
         const hasSummary = !!summaryText;
 
-        const humanClause = s.human_id ? `, human_id="${String(s.human_id).replace(/"/g, '\\"')}"` : '';
+        const humanClause = s.human_id ? `, human_id="${escapeQuotedLiteral(s.human_id)}"` : '';
 
-        const cmd = `start_session(project_id="${projectId}", session_name="${String(s.name || 'resume-session').replace(/"/g, '\\"')}"${humanClause})`;
+        const cmd = `start_session(project_id="${projectId}", session_name="${escapeQuotedLiteral(s.name || 'resume-session')}"${humanClause})`;
 
         const safeCmd = escapeHtml(cmd);
 

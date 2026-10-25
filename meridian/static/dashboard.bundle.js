@@ -143,6 +143,9 @@
     const map = { "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" };
     return String(s3).replace(/[&<>"']/g, (c3) => map[c3] ?? c3);
   }
+  function escapeQuotedLiteral(s3) {
+    return String(s3).replace(/\\/g, "\\\\").replace(/"/g, '\\"').replace(/\r/g, "\\r").replace(/\n/g, "\\n");
+  }
   function formatRelativeTime2(ts) {
     if (!ts) return "";
     const iso = ts.includes("T") ? ts : ts.replace(" ", "T") + "Z";
@@ -4096,7 +4099,7 @@ stop = ${JSON.stringify(stop)}`;
 type = "stdio"
 command = "pixi"
 args = ["run", "python", "-m", "meridian", "--mcp"]
-cwd = "${cwd.replace(/"/g, '\\"')}"`;
+cwd = "${escapeQuotedLiteral(cwd)}"`;
         const httpText = `[mcp_servers.meridian]
 type = "http"
 url = "${mcpHttpUrl}"`;
@@ -4299,7 +4302,7 @@ project_id = "${displayPid}"`;
           if (pathInput) {
             pathInput.addEventListener("input", function() {
               const newCwd = pathInput.value.trim() || "/path/to/your/meridian";
-              const newStdio = '[mcp_servers.meridian]\ntype = "stdio"\ncommand = "pixi"\nargs = ["run", "python", "-m", "meridian", "--mcp"]\ncwd = "' + newCwd.replace(/"/g, '\\"') + '"';
+              const newStdio = '[mcp_servers.meridian]\ntype = "stdio"\ncommand = "pixi"\nargs = ["run", "python", "-m", "meridian", "--mcp"]\ncwd = "' + escapeQuotedLiteral(newCwd) + '"';
               if (stdioEl) stdioEl.textContent = newStdio;
               _codexCopySetup(`codex-copy-stdio-${projectId}`, newStdio);
             });
@@ -16456,7 +16459,7 @@ Current: ${current2 || "(none)"}`,
     };
   }
   function wireClaudeLaunchPanel(projectId) {
-    const PROJECT_QUOTE = projectId.replace(/"/g, '\\"');
+    const PROJECT_QUOTE = escapeQuotedLiteral(projectId);
     const sequentialKey = `meridian.sequentialMode.${projectId}`;
     function normalizeTouchesFile(path) {
       return String(path || "").trim().replace(/\\/g, "/").replace(/^\.\//, "");
@@ -16596,7 +16599,7 @@ Project ID: ${projectId}`;
         toast("pick a session first", true);
         return;
       }
-      const cmd = `start_session(project_id="${PROJECT_QUOTE}", session_name="${sessionName.replace(/"/g, '\\"')}", human_id="adam")
+      const cmd = `start_session(project_id="${PROJECT_QUOTE}", session_name="${escapeQuotedLiteral(sessionName)}", human_id="adam")
 get_context_block(project_id="${PROJECT_QUOTE}", mode="full")`;
       showCopyPreview("Resume MCP Flow", cmd);
     };
@@ -18542,8 +18545,8 @@ get_context_block(project_id="${PROJECT_QUOTE}", mode="full")`;
         const summaryText = typeof _rawSummary === "string" ? _rawSummary : _rawSummary && _rawSummary.summary ? _rawSummary.summary : "";
         const summaryPreview = summaryText ? escapeHtml(summaryText.slice(0, 90)) : "";
         const hasSummary = !!summaryText;
-        const humanClause = s3.human_id ? `, human_id="${String(s3.human_id).replace(/"/g, '\\"')}"` : "";
-        const cmd = `start_session(project_id="${projectId}", session_name="${String(s3.name || "resume-session").replace(/"/g, '\\"')}"${humanClause})`;
+        const humanClause = s3.human_id ? `, human_id="${escapeQuotedLiteral(s3.human_id)}"` : "";
+        const cmd = `start_session(project_id="${projectId}", session_name="${escapeQuotedLiteral(s3.name || "resume-session")}"${humanClause})`;
         const safeCmd = escapeHtml(cmd);
         return `<div class="recent-session-row" data-session-id="${escapeHtml(s3.id)}" style="border:1px solid var(--border);border-radius:3px;padding:5px 8px;margin-bottom:4px;background:var(--surface-1);cursor:pointer">
 

@@ -77,8 +77,13 @@ function parse(html: string): HTMLInputElement {
   return input as HTMLInputElement;
 }
 
-// Strip inline tags so length/word checks measure the visible copy.
-const visible = (html: string) => html.replace(/<[^>]+>/g, "");
+// Visible copy only, so length/word checks measure what a reader sees. Read the parsed
+// text nodes rather than stripping tags with a regex (CodeQL js/incomplete-multi-character-sanitization).
+const visible = (html: string) => {
+  const el = document.createElement("div");
+  el.innerHTML = html;
+  return el.textContent ?? "";
+};
 
 describe("ws-handoff-template textarea", () => {
   it("exists in the settings source", () => {
@@ -636,5 +641,73 @@ describe("ff9d2963 — hook snippets never interpolate the live bearer token", (
     // as real environment variables by the child process at startup, not a
     // literal command-line/argv substring re-exposed on every hook firing.
     expect(source).toContain("env:{BEARER_TOKEN:tok.token}");
+  });
+});
+
+describe("stdio cwd escaping (CodeQL js/incomplete-sanitization)", () => {
+  const flush = async () => {
+    for (let i = 0; i < 8; i++) await new Promise((resolve) => setTimeout(resolve, 0));
+  };
+  const shimKeys = [
+    "api", "loadProjectSettings", "saveProjectSettings", "getActiveWorkspaceRole", "isDemoMode",
+    "hideDemoAdminControls", "osExecutorHintBanner", "githubIconSvg", "toast", "suggestedFsRoots",
+    "loadExecutorRulesSection", "loadTunnelPluginsSection", "DEFAULT_MAX_PINNED_DECISIONS",
+    "DEFAULT_CONTEXT_THRESHOLD", "DEFAULT_MAX_TURNS",
+  ];
+
+  beforeEach(() => {
+    const g = globalThis as any;
+    const w = window as any;
+    const apiStub = vi.fn(async () => ({}));
+    const shims: Record<string, unknown> = {
+      api: apiStub,
+      loadProjectSettings: async () => ({ project_id: PID, executor_config: {}, max_pinned_decisions: 50 }),
+      saveProjectSettings: async () => ({}),
+      getActiveWorkspaceRole: async () => "owner",
+      isDemoMode: () => false,
+      hideDemoAdminControls: () => {},
+      osExecutorHintBanner: () => "",
+      githubIconSvg: () => "",
+      toast: () => {},
+      suggestedFsRoots: () => [],
+      loadExecutorRulesSection: null,
+      loadTunnelPluginsSection: null,
+      DEFAULT_MAX_PINNED_DECISIONS: 100,
+      DEFAULT_CONTEXT_THRESHOLD: 60,
+      DEFAULT_MAX_TURNS: 120,
+    };
+    for (const [key, value] of Object.entries(shims)) {
+      g[key] = value;
+      w[key] = value;
+    }
+    g.isHostedMode = () => false;
+    w.isHostedMode = g.isHostedMode;
+    g.state = { tenantEmail: "", tenantPlan: "standard", projects: [{ id: PID, name: "My Project" }], serverConfig: {} };
+    w.state = g.state;
+    _settingsTabDataCache.clear();
+    document.body.innerHTML = `<div id="settings-body-${PID}"></div>`;
+  });
+
+  afterEach(() => {
+    _settingsTabDataCache.clear();
+    document.body.innerHTML = "";
+    const g = globalThis as any;
+    [...shimKeys, "state", "isHostedMode"].forEach((key) => {
+      delete g[key];
+      delete (window as any)[key];
+    });
+  });
+
+  it("types a Windows path into the path box and renders a TOML-valid cwd", async () => {
+    await loadSettingsTab(PID, { force: true });
+    await flush();
+    const input = document.getElementById(`meridian-path-${PID}`) as HTMLInputElement | null;
+    expect(input).not.toBeNull();
+    input!.value = "C:\\Users\\me\\Meridian";
+    input!.dispatchEvent(new Event("input"));
+    const stdio = document.getElementById(`codex-stdio-${PID}`);
+    // TOML basic strings need each backslash doubled; the parsed value is C:\Users\me\Meridian.
+    expect(stdio?.textContent).toContain('cwd = "C:\\\\Users\\\\me\\\\Meridian"');
+    expect(stdio?.textContent).not.toContain('cwd = "C:\\Users');
   });
 });
