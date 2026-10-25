@@ -4235,12 +4235,19 @@ async def workspace_invite_resend(request: Request, member_id: str) -> dict[str,
     return {"id": member_id, "email": member["email"], "resent": True}
 
 
+# Invite tokens are minted with secrets.token_urlsafe(32) (the invite and resend
+# handlers), so every real token matches this shape. Anything else can never match
+# an invite, so it is refused before the token is echoed into the login ``next=``
+# Location or the pending_invite_token cookie.
+_INVITE_TOKEN_RE = re.compile(r"[A-Za-z0-9_-]{1,256}")
+
+
 @app.get("/workspace/accept")
 async def workspace_accept(request: Request, token: str = "") -> HTMLResponse:
     """Accept a workspace invite. Marks joined_at and redirects to dashboard."""
     if not _hosted_mode():
         raise HTTPException(status_code=404)
-    if not token:
+    if not _INVITE_TOKEN_RE.fullmatch(token):
         return HTMLResponse("<h2>Invalid invite link.</h2><p><a href='/auth/login'>Sign in</a></p>", status_code=400)
     import hashlib
     from fastapi.responses import RedirectResponse as _Redir
