@@ -69,7 +69,7 @@ const PERMANENT_DELETE = [
 // Every http or https run (up to whitespace, a quote, or an angle bracket) must be exactly one of the
 // allowed XML namespaces. A prefix match is not enough: a longer host, path, query, or port that
 // starts with a namespace (xhtml.evil.example, xhtml:evil, xhtml?x) is a URL and is reported.
-const URL_RUN = /https?:\/\/[^\s"'<>]+/g;
+const URL_RUN = /https?:\/\/[^\s"'<>]*/g;
 const XML_NAMESPACE_OK = new Set([
   'http://www.w3.org/1999/xhtml',
   'https://www.w3.org/1999/xhtml',
@@ -84,6 +84,8 @@ function disallowedUrls(text) {
 test('runtime code has no network client, watcher, observer, localhost name, or URL literal', () => {
   // A namespace with more host or path after it is still a URL, so each of these must be reported.
   for (const hostile of [
+    'http://',
+    'https://',
     'https://www.w3.org/1999/xhtml.evil.example/x.js',
     'https://www.w3.org/1999/xhtml:evil',
     'https://www.w3.org/1999/xhtml?x=1',
