@@ -1,6 +1,7 @@
 """Project notes (per-project wiki) routes — extracted from server.py."""
 from __future__ import annotations
 
+import logging
 import os
 from typing import Any
 
@@ -10,6 +11,7 @@ from fastapi.responses import Response
 from .._deps import _db, _data_dir, validate_input_size, _MANUAL_NOTE_LINT
 from .. import db as db_module
 
+_log = logging.getLogger(__name__)
 router = APIRouter()
 
 
@@ -77,8 +79,9 @@ async def document_structure_endpoint(
         return docs_intel.document_outline(fp)
     except FileNotFoundError:
         return {"error": f"file not found on server: {fp}"}
-    except Exception as exc:  # noqa: BLE001 — surface parse errors inline
-        return {"error": f"could not parse document: {exc}"}
+    except Exception:  # noqa: BLE001 — surface parse errors inline
+        _log.warning("could not parse document %r", fp, exc_info=True)
+        return {"error": "could not parse document"}
 
 
 def _resolve_document_review_builder():
@@ -162,8 +165,9 @@ async def list_journal_style_presets_endpoint(request: Request) -> dict[str, Any
         }
     try:
         return lister(user_presets_path=_journal_style_presets_path(request))
-    except Exception as exc:  # noqa: BLE001 — surface inline, never a 500
-        return {"error": f"could not list journal style presets: {exc}"}
+    except Exception:  # noqa: BLE001 — surface inline, never a 500
+        _log.warning("could not list journal style presets", exc_info=True)
+        return {"error": "could not list journal style presets"}
 
 
 @router.get("/projects/{project_id}/document-review")
@@ -246,15 +250,17 @@ async def document_review_endpoint(
                 journal_name, user_presets_path=_journal_style_presets_path(request)
             )
         except ValueError as exc:
-            return {"error": str(exc)}
+            _log.info("journal style preset %r rejected: %s", journal_name, exc)
+            return {"error": f"invalid journal style preset: {journal_name}"}
     try:
         result = builder(
             fp, expected_source_fingerprint=fingerprint, style_policy=style_policy
         )
     except FileNotFoundError:
         return {"error": f"file not found on server: {fp}"}
-    except Exception as exc:  # noqa: BLE001 — surface parse errors inline, never a 500
-        return {"error": f"could not build document review: {exc}"}
+    except Exception:  # noqa: BLE001 — surface parse errors inline, never a 500
+        _log.warning("could not build document review %r", fp, exc_info=True)
+        return {"error": "could not build document review"}
     if not isinstance(result, dict):
         return {"error": "document review builder returned an unexpected result"}
     return result

@@ -14,6 +14,7 @@ import { constants } from "node:fs";
 import { promises as fs } from "node:fs";
 import { homedir } from "node:os";
 import { basename, delimiter, dirname, extname, isAbsolute, join, relative, resolve, sep } from "node:path";
+import { ExpectedError } from "./expected-error.js";
 
 export type LatexEngine = "pdflatex" | "xelatex" | "lualatex";
 export type CompileStatus = "passed" | "failed" | "incomplete" | "unavailable";
@@ -1703,7 +1704,7 @@ export async function getWorkflowStatusPayload(
   overleafProjectId: string,
   stateDir = join(homedir(), ".meridian-latex"),
 ) {
-  if (!/^[a-zA-Z0-9_-]{1,128}$/.test(overleafProjectId)) throw new Error("invalid Overleaf project identifier");
+  if (!/^[a-zA-Z0-9_-]{1,128}$/.test(overleafProjectId)) throw new ExpectedError("invalid Overleaf project identifier");
   return {
     ok: true as const,
     localCompile: {

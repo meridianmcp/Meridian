@@ -44,7 +44,9 @@ def _run(coro: Any) -> Any:
 
 
 async def _make_db() -> Any:
-    tmp = tempfile.mktemp(suffix=".db")
+    # mkstemp creates the file atomically (no race), unlike the deprecated mktemp.
+    fd, tmp = tempfile.mkstemp(suffix=".db")
+    os.close(fd)
     return await db_module.init_db(tmp)
 
 

@@ -530,11 +530,28 @@ def _backup_once(path: Path) -> None:
             pass
 
 
-def _write_text_atomic(path: Path, text: str) -> None:
+def _write_text_atomic(path: Path, text: str, *, private: bool = False) -> None:
     """Write via a sibling temp file + rename, so a crash never leaves the user's
-    config half-written. ``newline=""`` keeps the line endings ``text`` carries."""
+    config half-written. ``newline=""`` keeps the line endings ``text`` carries.
+
+    ``private=True`` is for a config that embeds the Meridian token. The temp file
+    is then created with ``O_EXCL`` and mode 0600 before any byte of ``text`` is
+    written, so on POSIX the token is never world-readable, even briefly. It spawns
+    no subprocess: on Windows the temp file inherits the folder's ACL, and the
+    caller restricts the final file afterwards with ``_restrict_to_owner``. Without
+    ``private`` the write is the same as before (default file mode, no restriction).
+    """
     tmp = path.with_name(path.name + ".meridian-tmp")
-    with open(tmp, "w", encoding="utf-8", newline="") as fh:
+    if private:
+        try:
+            tmp.unlink()  # drop a stale temp file left by an interrupted run
+        except FileNotFoundError:
+            pass
+        fd = os.open(str(tmp), os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+        fh = os.fdopen(fd, "w", encoding="utf-8", newline="")
+    else:
+        fh = open(tmp, "w", encoding="utf-8", newline="")
+    with fh:
         fh.write(text)
     os.replace(tmp, path)
 
@@ -555,7 +572,7 @@ def _configure_codex(config_path: Path, meridian_url: str, token: str, start_cmd
         config_path.parent.mkdir(parents=True, exist_ok=True)
         if existing:
             _backup_once(config_path)
-        _write_text_atomic(config_path, new_text)
+        _write_text_atomic(config_path, new_text, private=bool(token))
     except OSError as exc:
         return False, notes + [f"WARNING: could not write {config_path} ({exc})."]
     if token and not _restrict_to_owner(config_path):
@@ -606,7 +623,7 @@ def _configure_cursor(meridian_url: str, token: str):
     try:
         path.parent.mkdir(parents=True, exist_ok=True)
         _backup_once(path)
-        _write_text_atomic(path, json.dumps(data, indent=2) + "\n")
+        _write_text_atomic(path, json.dumps(data, indent=2) + "\n", private=bool(token))
     except OSError as exc:
         return False, f"WARNING: could not write {path} ({exc})."
     if token and not _restrict_to_owner(path):

@@ -12534,7 +12534,10 @@ def test_hooks_stop_handoff_exception_is_swallowed(client, monkeypatch):
     body = r.json()
     assert body["ok"] is True
     assert body["handoff"] is None
-    assert "handoff blew up" in body.get("error", "")
+    # Fixed message (CodeQL stack-trace exposure): the exception text is logged
+    # server-side, never returned to the hook caller.
+    assert body.get("error") == "delta handoff failed; see server log"
+    assert "handoff blew up" not in str(body)
 
 
 def test_hooks_session_start_injects_full_uuid_not_truncated(client):
