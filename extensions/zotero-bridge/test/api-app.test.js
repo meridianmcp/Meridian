@@ -31,6 +31,10 @@ function fakeGrants() {
       calls.push(['revoke', id]);
       return { grant_id: id, status: 'revoked' };
     },
+    revokeStanding: () => {
+      calls.push(['revokeStanding']);
+      return { standing: 'none' };
+    },
     checkKey: (key) => key === WRITE_KEY,
   };
 }
@@ -43,7 +47,7 @@ function build(overrides) {
   const tracker = { inBatch: false, touched: [], created: [] };
   const deps = {
     zotero,
-    version: '0.1.4',
+    version: '0.1.5',
     host: HOST,
     token: TOKEN,
     validate: v,
@@ -113,7 +117,7 @@ test('GET /v1/status answers with the versions, for an admitted caller', async (
   const { app } = build();
   const out = await call(app, 'GET', '/v1/status');
   assert.equal(out.status, 200);
-  assert.deepEqual(out.body, { plugin_version: '0.1.4', api_version: 1, zotero_version: '10.0.6', library_id: 1 });
+  assert.deepEqual(out.body, { plugin_version: '0.1.5', api_version: 1, zotero_version: '10.0.6', library_id: 1 });
 });
 
 test('no token is a 401 that says how to send one', async () => {
@@ -397,4 +401,21 @@ test('createApp refuses to start without the grant store', () => {
     () => createApp({ zotero, validate: v, http, auth, host: HOST, token: TOKEN, items: {}, collections: {}, tracker }),
     /needs deps\.grants/
   );
+});
+
+test('DELETE /v1/standing clears the standing approval with the token alone, and answers 200', async () => {
+  const grants = fakeGrants();
+  const { app } = build({ grants });
+  const out = await call(app, 'DELETE', '/v1/standing', { noGrant: true });
+  assert.equal(out.status, 200);
+  assert.deepEqual(out.body, { standing: 'none' });
+  assert.deepEqual(grants.calls, [['revokeStanding']]);
+});
+
+test('the standing route still needs the token, and other methods on it are refused', async () => {
+  const { app } = build();
+  assert.equal((await call(app, 'DELETE', '/v1/standing', { noAuth: true, noGrant: true })).status, 401);
+  const wrong = await call(app, 'GET', '/v1/standing');
+  assert.equal(wrong.status, 405);
+  assert.deepEqual(wrong.body.error.details.allow, ['DELETE']);
 });

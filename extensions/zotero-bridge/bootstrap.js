@@ -16,6 +16,7 @@ var MERIDIAN_ADDON_ID = 'meridian-zotero@usemeridian.us';
 var MERIDIAN_PREF_PREFIX = 'extensions.zotero.meridianZoteroBridge.';
 var MERIDIAN_API_PORT_PREF = MERIDIAN_PREF_PREFIX + 'apiPort';
 var MERIDIAN_API_TOKEN_PATH_PREF = MERIDIAN_PREF_PREFIX + 'apiTokenPath';
+var MERIDIAN_STANDING_PREF = MERIDIAN_PREF_PREFIX + 'standingGrantUntil';
 var MERIDIAN_BIBTEX_TRANSLATOR_ID = '9cb70025-a888-4a29-a210-93ec52da40d4';
 var MERIDIAN_MENU_COLLECTION = 'meridian-zotero-bridge-collection-menu';
 var MERIDIAN_MENU_ITEM = 'meridian-zotero-bridge-item-menu';
@@ -531,6 +532,8 @@ async function meridianStartApi() {
     randomHex: meridianRandomHex,
     ask: meridianAskWriteGrant,
     constantTimeEquals: meridianLib['api/auth'].constantTimeEquals,
+    // Read here, at startup, so a standing approval saved in an earlier run is in force from the first request.
+    standing: meridianStandingStore(),
   });
   var app = meridianLib['api/app'].createApp({
     zotero: Zotero,
@@ -598,18 +601,41 @@ function meridianAskWriteGrant(appName) {
       text:
         'An app asks to write to your Zotero library:\n\n"' + appName + '"\n\n' +
         'The app name is what the app says it is. Allow only if you started this request yourself. ' +
-        'A session grant ends when Zotero restarts, or after 8 hours.',
-      // Deny is the second button, because Escape comes back as that button's index. Only the two allow buttons
+        'A session grant ends when Zotero restarts, or after 8 hours.\n\n' +
+        'Allow for 30 days: for the next 30 days, any app that asks gets write access at once, with no prompt. ' +
+        'You can end this at any time with DELETE /v1/standing on the write API.',
+      // Deny is the second button, because Escape comes back as that button's index. Only the three allow buttons
       // grant anything, and every other answer, Escape included, refuses.
       button0: 'Allow for 1 hour',
       button1: 'Deny',
       button2: 'Allow until Zotero restarts',
+      button3: 'Allow for 30 days',
       defaultButton: 1,
     });
     if (index === 0) return 'hour';
     if (index === 2) return 'session';
+    if (index === 3) return 'standing';
     return 'deny';
   });
+}
+
+// The saved standing approval: its expiry in ms since the epoch, as a string preference. A string, because a 30-day
+// expiry is larger than an integer preference holds. An empty value means none is saved. The store only reads and
+// writes this one preference, and the grant logic decides what the value means.
+function meridianStandingStore() {
+  return {
+    read: function () {
+      var raw = Services.prefs.getStringPref(MERIDIAN_STANDING_PREF, '');
+      return raw === '' ? null : Number(raw);
+    },
+    write: function (until) {
+      if (until === null) {
+        Services.prefs.clearUserPref(MERIDIAN_STANDING_PREF);
+        return;
+      }
+      Services.prefs.setStringPref(MERIDIAN_STANDING_PREF, String(until));
+    },
+  };
 }
 
 // Random hex from a secure source. Zotero's own keys come from Math.random, which is not enough for a credential,

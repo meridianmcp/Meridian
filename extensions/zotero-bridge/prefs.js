@@ -17,3 +17,7 @@ pref("extensions.zotero.meridianZoteroBridge.linkFolders", "");
 //               profile's user.js. Empty means the API stays off.
 pref("extensions.zotero.meridianZoteroBridge.apiPort", 23125);
 pref("extensions.zotero.meridianZoteroBridge.apiTokenPath", "");
+
+// standingGrantUntil: the expiry, in ms since the epoch, of a 30-day standing approval, saved by the desktop's
+//                     "Allow for 30 days" answer. Empty (the default) means none. Revoke clears it: DELETE /v1/standing.
+pref("extensions.zotero.meridianZoteroBridge.standingGrantUntil", "");

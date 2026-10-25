@@ -10,9 +10,9 @@ Menu actions and a local write API for Zotero:
   notes, attachments, relations, collections and tags, and it imports BibTeX. Reads stay on Zotero's own local API.
   See "Local write API" below.
 
-Plugin ID: `meridian-zotero@usemeridian.us`. Version `0.1.4` (source; not yet signed or released).
-Earlier builds: `0.1.3` (released; it had the write API, but accepted any readable file as a linked attachment, which
-0.1.4 closes), `0.1.2` (Mozilla-signed, menus only, no write API), `0.1.1` (on Mozilla, uploaded by the owner, with
+Plugin ID: `meridian-zotero@usemeridian.us`. Version `0.1.5` (source; not yet signed or released).
+Earlier builds: `0.1.4` (source; not signed or released), `0.1.3` (released; it had the write API, but accepted any
+readable file as a linked attachment, which 0.1.4 closes), `0.1.2` (Mozilla-signed, menus only, no write API), `0.1.1` (on Mozilla, uploaded by the owner, with
 the old placeholder `update_url`, so it does not auto-update from GitHub), `0.1.0` (Mozilla-approved, no
 `strict_max_version`).
 
@@ -31,6 +31,9 @@ the old placeholder `update_url`, so it does not auto-update from GitHub), `0.1.
   again at once. The key came back once. A
   write with the key succeeded, one without it was refused, and a revoked key was refused. The live run found one
   defect, which is fixed: Escape came back as the second button and granted a session, so Deny is now that button.
+- **Standing approval (30 days) and `DELETE /v1/standing`: not yet verified in Zotero.** The node tests cover the
+  logic. The desktop's fourth button, and the revoke, still need a live check in a throwaway profile. The button also
+  depends on `Zotero.Prompt.confirm` showing four buttons, which the node tests cannot check.
 - **Linking, verified live on the real Windows resolver.** On 2026-10-17, in a throwaway Zotero 10.0.6 profile with
   the local API on, the link policy gave the expected result for 13 of 13 cases: a plain allowed file, a trailing dot
   on a folder and an 8.3 alias of the allowed folder (all stored at the real path), an allowed folder written with
@@ -45,7 +48,7 @@ the old placeholder `update_url`, so it does not auto-update from GitHub), `0.1.
 - **Not verified in Zotero:** the two menu commands, the preferences pane, and the file pickers. These run only
   through the Zotero window, which the checks above did not drive. The BibTeX import they share with the API was
   verified through the API.
-- **Not yet done:** a Mozilla-signed `0.1.4` build, and its release to the update channel. Until that happens,
+- **Not yet done:** a Mozilla-signed `0.1.5` build, and its release to the update channel. Until that happens,
   Meridian's install step prints the signing command.
 
 Two bugs were found and fixed while verifying. The BibTeX duplicate check called `Zotero.Items.getAll` with its first
@@ -61,7 +64,8 @@ Zotero's own restore does. That restore is API-only.
   compared in constant time. A write also needs a grant key that a person approved at the desktop (see Write grants).
 - **Local trust.** The token admits a request, but it does not grant a write. A write needs a grant that a person
   approves at the desktop. The API cannot tell that person from another process of the same user, so the desktop
-  prompt is the protection, and it shows the app name as self-reported. The processes share one connection limit of
+  prompt is the protection, and it shows the app name as self-reported. A standing approval (30 days) lets any process
+  get a write without a prompt, so it widens this (see Standing approval below). The processes share one connection limit of
   eight. A connection that sends no complete request is closed after ten seconds, so one process can hold a slot for
   up to ten seconds that way. After an answer, the socket stays open for up to five more
   seconds. This affects local availability only: a local process can keep other callers from connecting.
@@ -121,8 +125,9 @@ A write needs a grant key, and a person at the desktop has to approve the grant.
 cannot write on its own.
 
 - `POST /v1/grants` with `{"app_name": "..."}` asks for a grant. The answer is `202` and a `grant_id`. Zotero shows a
-  prompt that names the app. Its buttons are **Allow for 1 hour**, **Allow until Zotero restarts** and **Deny**. Deny is
-  the default, so Enter and Escape both refuse.
+  prompt that names the app. Its buttons are **Allow for 1 hour**, **Allow until Zotero restarts**, **Allow for 30
+  days** and **Deny**. Deny is the default, so Enter and Escape both refuse. While a standing approval is in force, the
+  answer already says `granted`, with no prompt (see below).
 - `GET /v1/grants/<grant_id>` reports `pending`, `granted`, `denied`, `expired` or `revoked`. When a grant is first seen
   as granted, the reply carries `write_key` once. A later request does not return it again.
 - Send the key as `Meridian-Write-Grant: <write_key>` on every write. A write without a live key is refused with
@@ -142,6 +147,20 @@ Reads: use Zotero's own local API (`http://127.0.0.1:23119/api/users/0/...`), wh
 "Allow other applications on this computer to communicate with Zotero" is on. The write API does not serve reads.
 Linked attachments are allowed only from the folders you choose, with the switch on or off (see Limits). While the switch
 is on, Zotero tells local programs the path of each linked attachment.
+
+### Standing approval for 30 days
+
+**Allow for 30 days** at the desktop saves a standing approval that runs for 30 days from that click. While it lasts,
+every `POST /v1/grants`, from any app, is granted at once with no prompt. The key it gives is a one-hour key, and it
+comes back on the poll as usual. The busy, cooldown and rate limits still apply.
+
+- Only that desktop answer makes a standing approval. A request body cannot make or extend one.
+- It is saved as the preference `extensions.zotero.meridianZoteroBridge.standingGrantUntil`, so it survives a restart
+  of Zotero. It ends when it runs out, or when you revoke it.
+- **To revoke it,** send `DELETE /v1/standing` with the bearer token. It answers `200`, and the next grant request
+  prompts again. Grants already made are not ended, and each runs to the end of its own hour.
+- This is a wider grant than the others. Any process that holds the token can ask, and while the approval lasts it is
+  granted without a prompt. Turn it on only on a machine where you trust every process that can read the token file.
 
 ### Endpoints
 
@@ -168,9 +187,10 @@ Collection responses have the same fields except `date_modified`, because Zotero
 | `POST /v1/tags/rename` | `from`, `to` | Renames a tag across the user library. Not allowed inside a batch. |
 | `POST /v1/import/bibtex` | `bibtex`, optional `collection_key`, optional `dry_run` | Returns the plan: what would import, the exact duplicates, and the conflicts. `dry_run: true` writes nothing. A file whose library changes during the parse is refused with 409 `library_changed`, and nothing is imported. Not allowed inside a batch. |
 | `POST /v1/batch` | `operations`: a list of `{method, path, body}` | Runs the operations in one transaction. Any failure rolls the whole batch back and reports `failed_index`. Needs a write grant key. |
-| `POST /v1/grants` | `app_name` | Asks a person at the desktop for a write grant. Answers 202 with a `grant_id`. The token is enough here. |
+| `POST /v1/grants` | `app_name` | Asks a person at the desktop for a write grant. Answers 202 with a `grant_id`, and `granted` at once while a standing approval is in force. The token is enough here. |
 | `GET /v1/grants/{id}` | none | Reports the grant's status. Returns `write_key` once, when the grant is first granted. The token is enough here. |
 | `DELETE /v1/grants/{id}` | none | Ends the grant at once. The token is enough here. |
+| `DELETE /v1/standing` | none | Clears the standing approval, so the next grant request prompts again. Answers 200. The token is enough here. |
 
 Relation objects are the ones Zotero stores. `related_key` links two items in the library. Any other predicate
 needs the `predicate:name` form (for example `dc:replaces`) and an `object` with no spaces.
@@ -352,6 +372,8 @@ the run goes on, so the summary always shows every item.
   linked files may come from, separated by vertical bars (`|`). Shown in the preferences pane. The write API cannot set it.
 - `extensions.zotero.meridianZoteroBridge.apiPort`, default `23125`. Set by the install.
 - `extensions.zotero.meridianZoteroBridge.apiTokenPath`, default empty, which keeps the API off. Set by the install.
+- `extensions.zotero.meridianZoteroBridge.standingGrantUntil`, default empty, which means no standing approval. Set only
+  by the desktop's **Allow for 30 days** answer, and cleared by `DELETE /v1/standing` or when it runs out.
 
 ## Compatibility
 
