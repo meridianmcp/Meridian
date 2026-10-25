@@ -1361,16 +1361,18 @@ function buildReceipt(input: {
 /** Compile a local source tree without contacting Overleaf. This is not a TeX sandbox. */
 export async function compileLocalLatex(options: CompileLocalLatexOptions): Promise<CompileReceipt> {
   const engine = options.engine ?? "pdflatex";
-  if (!ENGINE_NAMES.includes(engine)) throw new Error(`unsupported TeX engine: ${String(engine)}`);
+  // Caller-input validation throws ExpectedError so its message reaches the caller
+  // (see expected-error.ts). Any other error is answered with a generic message.
+  if (!ENGINE_NAMES.includes(engine)) throw new ExpectedError(`unsupported TeX engine: ${String(engine)}`);
   const timeoutMs = options.timeoutMs ?? DEFAULT_TIMEOUT_MS;
-  if (!Number.isFinite(timeoutMs) || timeoutMs < 1 || timeoutMs > 30 * 60_000) throw new Error("timeoutMs must be between 1 and 1800000");
-  if (options.overleafProjectId !== undefined && !/^[a-zA-Z0-9_-]{1,128}$/.test(options.overleafProjectId)) throw new Error("overleafProjectId must be a simple Overleaf project identifier");
+  if (!Number.isFinite(timeoutMs) || timeoutMs < 1 || timeoutMs > 30 * 60_000) throw new ExpectedError("timeoutMs must be between 1 and 1800000");
+  if (options.overleafProjectId !== undefined && !/^[a-zA-Z0-9_-]{1,128}$/.test(options.overleafProjectId)) throw new ExpectedError("overleafProjectId must be a simple Overleaf project identifier");
 
   const rootFileInput = resolve(options.rootFile);
   const projectRoot = resolve(options.projectRoot ?? dirname(rootFileInput));
   const originalRoot = await fs.realpath(projectRoot);
   const originalMain = await fs.realpath(rootFileInput);
-  if (!inside(originalRoot, originalMain)) throw new Error("root .tex file must be inside the selected project root");
+  if (!inside(originalRoot, originalMain)) throw new ExpectedError("root .tex file must be inside the selected project root");
   const relativeMain = relative(originalRoot, originalMain);
   const stateDir = options.stateDir ?? join(homedir(), ".meridian-latex");
   const identity = options.overleafProjectId ? "overleaf:" + options.overleafProjectId : "local:" + originalRoot;
