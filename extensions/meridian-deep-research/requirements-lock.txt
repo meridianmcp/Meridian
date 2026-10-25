@@ -30,6 +30,15 @@
 # resolve after upstream's dependencies drift.
 #
 # Captured: 2026-09-23, win-64, Python 3.12.13.
+#
+# Security bump 2026-10-25 (Dependabot alerts #1-#8, #38, #54, #55): the
+# pins for cryptography, certifi, oauthlib, langgraph-api,
+# langgraph-runtime-inmem and the opentelemetry-* family were raised to their
+# first patched versions by hand (plus two new opentelemetry transitive pins
+# and the grpc family moved to 1.80.0, which langgraph-api 0.10.0 requires),
+# not by a fresh freeze. The resolved graph was checked with
+# `pip install --dry-run` on Python 3.12.13 in a throwaway venv. Redo the full
+# regeneration above at the next dependency refresh.
 
 Bottleneck==1.6.0
 PyJWT==2.15.0
@@ -53,7 +62,7 @@ azure-search==1.0.0b2
 beautifulsoup4==4.13.3
 blockbuster==1.5.28
 build==1.6.1
-certifi==2026.7.22
+certifi==2026.10.19
 cffi==2.1.1
 charset-normalizer==3.5.1
 click==8.5.0
@@ -61,7 +70,7 @@ cloudpickle==3.1.2
 colorama==0.4.6
 comm==0.2.3
 croniter==6.2.4
-cryptography==46.0.7
+cryptography==50.0.0
 debugpy==1.8.22
 deprecation==2.1.0
 distro==1.9.0
@@ -87,10 +96,10 @@ googleapis-common-protos==1.75.3
 greenlet==3.5.6
 groq==0.37.1
 grpc-google-iam-v1==0.14.5
-grpcio-health-checking==1.81.1
-grpcio-status==1.84.0
-grpcio-tools==1.75.1
-grpcio==1.84.0
+grpcio-health-checking==1.80.0
+grpcio-status==1.80.0
+grpcio-tools==1.80.0
+grpcio==1.80.0
 h11==0.16.0
 h2==4.4.1
 hpack==4.2.0
@@ -129,11 +138,11 @@ langchain-protocol==0.0.19
 langchain-tavily==0.2.18
 langchain-text-splitters==1.1.2
 langchain==1.4.2
-langgraph-api==0.7.27
+langgraph-api==0.10.0
 langgraph-checkpoint==4.2.0
 langgraph-cli==0.4.32
 langgraph-prebuilt==1.1.0
-langgraph-runtime-inmem==0.24.1
+langgraph-runtime-inmem==0.30.3
 langgraph-sdk==0.4.5
 langgraph==1.2.12
 langsmith==0.14.0
@@ -151,15 +160,17 @@ multidict==6.9.1
 nest-asyncio2==1.7.3
 numexpr==2.14.2
 numpy==2.5.3
-oauthlib==3.3.1
+oauthlib==4.0.0
 open_deep_research==0.0.16
 openai==3.19.0
-opentelemetry-api==1.44.0
-opentelemetry-exporter-otlp-proto-common==1.44.0
-opentelemetry-exporter-otlp-proto-http==1.44.0
-opentelemetry-proto==1.44.0
-opentelemetry-sdk==1.44.0
-opentelemetry-semantic-conventions==0.65b0
+opentelemetry-api==1.45.1
+opentelemetry-exporter-http-transport==0.66b1
+opentelemetry-exporter-otlp-common==0.66b1
+opentelemetry-exporter-otlp-proto-common==1.45.1
+opentelemetry-exporter-otlp-proto-http==1.45.1
+opentelemetry-proto==1.45.1
+opentelemetry-sdk==1.45.1
+opentelemetry-semantic-conventions==0.66b1
 orjson==3.12.0
 ormsgpack==1.12.2
 packaging==26.3
