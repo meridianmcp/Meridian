@@ -29,6 +29,11 @@ the old placeholder `update_url`, so it does not auto-update from GitHub), `0.1.
   Those checks ran before the limit, collection, restore, linked-file, batch rollback, BibTeX key and creator-role
   changes listed below, so those changes are not live-checked yet. They also predate write grants, so writes in those
   checks would now need a grant key.
+- **Not live-checked yet.** Node tests cover two changes. First, an imported attachment whose base64 body is about
+  4.5 million characters or more (a PDF of about 3.2 MiB and up) returned 500 because the base64 check overflowed the
+  regex engine's stack. The check now uses a pattern without a repeated group. Second, a top-level key the body does not
+  read, or a creator key such as `first_name`, is refused with 422 instead of being dropped. A live check should import a
+  PDF of about 4.5 MB, and create a journal article with `title`, `date`, `DOI`, `url`, `creators` and `collection_keys`.
 - **Write grants, verified live on 2026-10-19 in a throwaway Zotero 10.0.6 profile.** A write without a grant key was
   refused with `grant_required`. The desktop prompt showed the app name and the self-reported warning. Allow for 1 hour
   gave a grant that expired about an hour later, and Allow until Zotero restarts gave one that expired about eight
@@ -156,8 +161,8 @@ Collection responses have the same fields except `date_modified`, because Zotero
 | Method and path | Body | Notes |
 | --- | --- | --- |
 | `GET /v1/status` | none | Plugin, API and Zotero versions, and the library id. |
-| `POST /v1/items` | `item_type`, optional `fields`, `creators`, `tags`, `collection_keys`, `relations` | Answers 201. Unknown fields are refused, and the reply lists them. |
-| `PATCH /v1/items/{key}` | `fields`, `creators`, `set_tags`, `add_tags`, `remove_tags`, `set_collections`, `add_collections`, `remove_collections`, `add_relations`, `remove_relations`, and the precondition fields | Only the fields you send change. `item_type` cannot change. |
+| `POST /v1/items` | `item_type`, optional `fields`, `creators`, `tags`, `collection_keys`, `relations` | Answers 201. Unknown fields are refused, and the reply lists them. A top-level key the body does not read, such as `title`, `date` or `collections`, is refused with 422 `invalid_fields`, and the reply names where it belongs (`fields` or `collection_keys`). A creator takes `creatorType` with `firstName` and `lastName`, or with `name`. Other creator keys, such as `first_name`, are refused. |
+| `PATCH /v1/items/{key}` | `fields`, `creators`, `set_tags`, `add_tags`, `remove_tags`, `set_collections`, `add_collections`, `remove_collections`, `add_relations`, `remove_relations`, and the precondition fields | Only the fields you send change. `item_type` cannot change. A top-level key the body does not read, such as `title` or `tags`, is refused with 422 `invalid_fields` and nothing changes. |
 | `POST /v1/items/{key}/trash` | precondition fields, optional | Moves the item to the trash. Works for notes and attachments too. |
 | `POST /v1/items/{key}/restore` | precondition fields, optional | Takes the item out of the trash. |
 | `POST /v1/items/{key}/notes` | `html` | Creates a child note of a regular item. Answers 201. |

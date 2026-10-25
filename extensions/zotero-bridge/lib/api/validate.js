@@ -5,7 +5,11 @@
 
 var KEY_RE = /^[A-Z0-9]{8}$/;
 var PREDICATE_RE = /^[a-z]+:[A-Za-z]+$/;
-var BASE64_RE = /^(?:[A-Za-z0-9+/]{4})*(?:[A-Za-z0-9+/]{2}==|[A-Za-z0-9+/]{3}=)?$/;
+// One character class and at most two closing '=' signs. The pattern used to repeat a group once per four characters,
+// and the regex engine kept a backtrack entry for each repeat. A base64 body of about 4.5 million characters (a PDF of
+// about 3.2 MiB) then overflowed that stack and threw a RangeError, which reached the caller as a 500. decodeBase64
+// checks the length, so a string is accepted exactly when the old pattern accepted it.
+var BASE64_RE = /^[A-Za-z0-9+/]*={0,2}$/;
 // A colon in a file name names an alternate data stream on Windows, so it is refused here too.
 var FILENAME_BAD_RE = /[\\/:\x00-\x1f\x7f]/;
 // Windows device names. A file named CON.pdf or nul.txt opens the device, so these stems are refused.
@@ -142,7 +146,8 @@ function optionalList(value, name, max) {
 
 // Decodes standard base64 with padding. Rejects anything else rather than skipping it.
 function decodeBase64(text, name, maxBytes) {
-  if (!BASE64_RE.test(text)) throw invalid(name, 'must be standard base64 with padding');
+  // Standard base64 with padding is always a multiple of four characters long. BASE64_RE does not check that.
+  if (text.length % 4 !== 0 || !BASE64_RE.test(text)) throw invalid(name, 'must be standard base64 with padding');
   var alphabet = 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/';
   var padding = text.endsWith('==') ? 2 : text.endsWith('=') ? 1 : 0;
   var byteLength = (text.length / 4) * 3 - padding;
