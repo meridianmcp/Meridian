@@ -47,6 +47,9 @@ describe("escapeQuotedLiteral (CodeQL js/incomplete-sanitization)", () => {
   it("escapes CR and LF so the literal stays on one line", () => {
     expect(escapeQuotedLiteral("a\r\nb")).toBe("a\\r\\nb");
   });
+  it("writes the other control characters as \\uXXXX (TOML rejects them raw) and keeps a tab raw", () => {
+    expect(escapeQuotedLiteral("a\u0000b\u001bc\u007fd\te")).toBe("a\\u0000b\\u001bc\\u007fd\te");
+  });
   it("does not HTML-encode: copied text keeps & and apostrophes", () => {
     expect(escapeQuotedLiteral("A&B's")).toBe("A&B's");
   });

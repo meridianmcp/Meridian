@@ -9884,7 +9884,7 @@ async function loadRecentSessions(projectId: any, sessions = null) {
 
         const humanClause = s.human_id ? `, human_id="${escapeQuotedLiteral(s.human_id)}"` : '';
 
-        const cmd = `start_session(project_id="${projectId}", session_name="${escapeQuotedLiteral(s.name || 'resume-session')}"${humanClause})`;
+        const cmd = `start_session(project_id="${escapeQuotedLiteral(projectId)}", session_name="${escapeQuotedLiteral(s.name || 'resume-session')}"${humanClause})`;
 
         const safeCmd = escapeHtml(cmd);
 

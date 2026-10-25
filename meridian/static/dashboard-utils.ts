@@ -76,14 +76,17 @@ export function escapeHtml(s: unknown): string {
 // Escapes a value for a double-quoted literal in copied text: a start_session(...)
 // argument or a TOML basic string. The output is copied or set as textContent, never
 // parsed as HTML, so HTML entities would corrupt it. Backslash is escaped first, so a
-// backslash before a quote cannot end the literal early. The output is valid in both
-// Python and TOML basic strings.
+// backslash before a quote cannot end the literal early. CR and LF become \r and \n.
+// TOML forbids the other control characters (U+0000 to U+001F, and U+007F) raw in a
+// basic string, so they become \uXXXX. A tab stays raw, because TOML allows it. The
+// output is valid in both Python and TOML basic strings.
 export function escapeQuotedLiteral(s: unknown): string {
   return String(s)
     .replace(/\\/g, '\\\\')
     .replace(/"/g, '\\"')
     .replace(/\r/g, '\\r')
-    .replace(/\n/g, '\\n');
+    .replace(/\n/g, '\\n')
+    .replace(/[\u0000-\u0008\u000b\u000c\u000e-\u001f\u007f]/g, (c) => `\\u${c.charCodeAt(0).toString(16).padStart(4, '0')}`);
 }
 
 export function formatRelativeTime(ts: string | null | undefined): string {

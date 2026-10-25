@@ -66,9 +66,13 @@ const PERMANENT_DELETE = [
   [/\bDELETE FROM\b/i, 'SQL DELETE'],
 ];
 
-const XML_NAMESPACE_OK = /https?:\/\/(?:www\.w3\.org\/1999\/xhtml|www\.mozilla\.org\/keymaster\/gatekeeper\/there\.is\.only\.xul)/g;
+// The allow-list must end at the namespace. The lookahead stops a longer host or path that
+// merely starts with one (xhtml.evil.example, xhtml/x) from being stripped as if it were the namespace.
+const XML_NAMESPACE_OK = /https?:\/\/(?:www\.w3\.org\/1999\/xhtml|www\.mozilla\.org\/keymaster\/gatekeeper\/there\.is\.only\.xul)(?![\w./-])/g;
 
 test('runtime code has no network client, watcher, observer, localhost name, or URL literal', () => {
+  // A namespace prefix followed by more host or path is still a URL, so it must survive the strip.
+  assert.match('https://www.w3.org/1999/xhtml.evil.example/x.js'.replace(XML_NAMESPACE_OK, ''), /https?:\/\//);
   for (const file of runtimeFiles()) {
     const text = fs.readFileSync(file, 'utf8');
     const relative = path.relative(PLUGIN_ROOT, file);

@@ -144,7 +144,7 @@
     return String(s3).replace(/[&<>"']/g, (c3) => map[c3] ?? c3);
   }
   function escapeQuotedLiteral(s3) {
-    return String(s3).replace(/\\/g, "\\\\").replace(/"/g, '\\"').replace(/\r/g, "\\r").replace(/\n/g, "\\n");
+    return String(s3).replace(/\\/g, "\\\\").replace(/"/g, '\\"').replace(/\r/g, "\\r").replace(/\n/g, "\\n").replace(/[\u0000-\u0008\u000b\u000c\u000e-\u001f\u007f]/g, (c3) => `\\u${c3.charCodeAt(0).toString(16).padStart(4, "0")}`);
   }
   function formatRelativeTime2(ts) {
     if (!ts) return "";
@@ -18546,7 +18546,7 @@ get_context_block(project_id="${PROJECT_QUOTE}", mode="full")`;
         const summaryPreview = summaryText ? escapeHtml(summaryText.slice(0, 90)) : "";
         const hasSummary = !!summaryText;
         const humanClause = s3.human_id ? `, human_id="${escapeQuotedLiteral(s3.human_id)}"` : "";
-        const cmd = `start_session(project_id="${projectId}", session_name="${escapeQuotedLiteral(s3.name || "resume-session")}"${humanClause})`;
+        const cmd = `start_session(project_id="${escapeQuotedLiteral(projectId)}", session_name="${escapeQuotedLiteral(s3.name || "resume-session")}"${humanClause})`;
         const safeCmd = escapeHtml(cmd);
         return `<div class="recent-session-row" data-session-id="${escapeHtml(s3.id)}" style="border:1px solid var(--border);border-radius:3px;padding:5px 8px;margin-bottom:4px;background:var(--surface-1);cursor:pointer">
 
