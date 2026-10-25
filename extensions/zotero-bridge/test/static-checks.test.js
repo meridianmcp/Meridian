@@ -66,13 +66,36 @@ const PERMANENT_DELETE = [
   [/\bDELETE FROM\b/i, 'SQL DELETE'],
 ];
 
-// The allow-list must end at the namespace. The lookahead stops a longer host or path that
-// merely starts with one (xhtml.evil.example, xhtml/x) from being stripped as if it were the namespace.
-const XML_NAMESPACE_OK = /https?:\/\/(?:www\.w3\.org\/1999\/xhtml|www\.mozilla\.org\/keymaster\/gatekeeper\/there\.is\.only\.xul)(?![\w./-])/g;
+// Every http or https run (up to whitespace, a quote, or an angle bracket) must be exactly one of the
+// allowed XML namespaces. A prefix match is not enough: a longer host, path, query, or port that
+// starts with a namespace (xhtml.evil.example, xhtml:evil, xhtml?x) is a URL and is reported.
+const URL_RUN = /https?:\/\/[^\s"'<>]+/g;
+const XML_NAMESPACE_OK = new Set([
+  'http://www.w3.org/1999/xhtml',
+  'https://www.w3.org/1999/xhtml',
+  'http://www.mozilla.org/keymaster/gatekeeper/there.is.only.xul',
+  'https://www.mozilla.org/keymaster/gatekeeper/there.is.only.xul',
+]);
+
+function disallowedUrls(text) {
+  return (text.match(URL_RUN) || []).filter((run) => !XML_NAMESPACE_OK.has(run));
+}
 
 test('runtime code has no network client, watcher, observer, localhost name, or URL literal', () => {
-  // A namespace prefix followed by more host or path is still a URL, so it must survive the strip.
-  assert.match('https://www.w3.org/1999/xhtml.evil.example/x.js'.replace(XML_NAMESPACE_OK, ''), /https?:\/\//);
+  // A namespace with more host or path after it is still a URL, so each of these must be reported.
+  for (const hostile of [
+    'https://www.w3.org/1999/xhtml.evil.example/x.js',
+    'https://www.w3.org/1999/xhtml:evil',
+    'https://www.w3.org/1999/xhtml?x=1',
+    'https://www.mozilla.org/keymaster/gatekeeper/there.is.only.xul/x',
+  ]) {
+    assert.deepEqual(disallowedUrls(hostile), [hostile], `${hostile} must not pass as a namespace`);
+  }
+  // The real namespaces pass, in either scheme.
+  assert.deepEqual(
+    disallowedUrls('xmlns="http://www.w3.org/1999/xhtml" xmlns:x="https://www.w3.org/1999/xhtml"'),
+    [],
+  );
   for (const file of runtimeFiles()) {
     const text = fs.readFileSync(file, 'utf8');
     const relative = path.relative(PLUGIN_ROOT, file);
@@ -82,8 +105,8 @@ test('runtime code has no network client, watcher, observer, localhost name, or 
     if (file.endsWith('.js')) {
       assert.equal(/https?:\/\//.test(text), false, `${relative} contains a URL literal`);
     } else {
-      const withoutNamespaces = text.replace(XML_NAMESPACE_OK, '');
-      assert.equal(/https?:\/\//.test(withoutNamespaces), false, `${relative} contains a URL outside an XML namespace`);
+      const bad = disallowedUrls(text);
+      assert.equal(bad.length, 0, `${relative} contains a URL outside an XML namespace: ${bad.join(', ')}`);
     }
   }
 });
