@@ -7894,7 +7894,8 @@ async def hooks_stop(body: dict[str, Any], request: Request) -> dict[str, Any]:
             }
         except Exception as exc:  # noqa: BLE001
             import logging as _hook_logging
-            _hook_logging.getLogger("meridian.hooks").info(
+            # WARNING, not INFO: server_logs only persists WARNING and above (f0a48685).
+            _hook_logging.getLogger("meridian.hooks").warning(
                 "hooks/stop delta handoff failed for project=%s session=%s: %r",
                 project_id, session_id, exc,
             )

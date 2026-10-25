@@ -1,10 +1,12 @@
 """Regression tests for the CodeQL clear-text logging/storage and stack-trace fixes.
 
-* Config writes spawn no subprocess. A token-bearing config's temp file is owner-only
-  from creation on POSIX, and a temp file that cannot be created leaves the target alone.
+* Plain config writes spawn no subprocess. A token-bearing config's temp file is created
+  empty and owner-only, locked before the token is written (icacls on Windows), and a
+  temp file that cannot be created or locked leaves the target alone.
 * Tunnel client stderr lines mask bearer-token-shaped text.
 * Error text returned to HTTP callers is a fixed string, and the exception is logged
-  instead: admin git status, notes, pkg-guard, tunnel fs-root helpers, 429 detail.
+  instead: admin git status, notes, pkg-guard, tunnel fs-root helpers, 429 detail,
+  and hooks/stop (logged at WARNING so server_logs keeps it).
 * The pkg-guard registry lookups fail open with a fixed message.
 * local_ingest writes the bearer-token header file with O_EXCL and mode 0600.
 * _deps logs a redacted tenant id when a tenant's DB URL cannot be decrypted.
@@ -12,7 +14,9 @@
 from __future__ import annotations
 
 import asyncio
+import errno
 import importlib.util
+import logging
 import os
 import stat
 import sys
@@ -94,19 +98,54 @@ def test_plain_write_does_not_use_the_private_temp_file_path(tmp_path, monkeypat
     assert target.read_text(encoding="utf-8") == "{}\n"
 
 
-@pytest.mark.parametrize("private", [False, True])
-def test_config_writes_never_spawn_a_subprocess(tmp_path, monkeypatch, private):
+def test_plain_config_writes_never_spawn_a_subprocess(tmp_path, monkeypatch):
     connect = _load_connect()
 
     def _never(*_a, **_k):
-        raise AssertionError("config writes must not spawn icacls or any other subprocess")
+        raise AssertionError("plain config writes must not spawn icacls or any other subprocess")
 
     monkeypatch.setattr(connect.subprocess, "run", _never)
     target = tmp_path / "settings.json"
 
-    connect._write_text_atomic(target, "{}\n", private=private)
+    connect._write_text_atomic(target, "{}\n", private=False)
 
     assert target.read_text(encoding="utf-8") == "{}\n"
+
+
+def test_token_config_write_locks_the_temp_file_before_the_token_lands(tmp_path, monkeypatch):
+    """Codex/Cursor token configs: the temp file that becomes the final file is
+    empty and locked to the current user at the moment the lock is applied, so
+    the token is never written into a file that is still open to other principals."""
+    connect = _load_connect()
+    target = tmp_path / "config.toml"
+    target.write_text("old = 1\n", encoding="utf-8")
+    seen: list[tuple[str, str]] = []
+
+    def _lock(path):
+        path = Path(path)
+        seen.append((path.name, path.read_text(encoding="utf-8")))
+        return True
+
+    monkeypatch.setattr(connect, "_restrict_to_owner", _lock)
+
+    connect._write_text_atomic(target, 'token = "sk_meridian_faketoken"\n', private=True)
+
+    assert seen == [("config.toml.meridian-tmp", "")]
+    assert target.read_text(encoding="utf-8") == 'token = "sk_meridian_faketoken"\n'
+    assert not (tmp_path / "config.toml.meridian-tmp").exists()
+
+
+def test_token_config_write_fails_closed_when_the_lock_cannot_be_applied(tmp_path, monkeypatch):
+    connect = _load_connect()
+    target = tmp_path / "config.toml"
+    target.write_text("old = 1\n", encoding="utf-8")
+    monkeypatch.setattr(connect, "_restrict_to_owner", lambda _path: False)
+
+    with pytest.raises(OSError, match="token was not written"):
+        connect._write_text_atomic(target, 'token = "sk_meridian_faketoken"\n', private=True)
+
+    assert target.read_text(encoding="utf-8") == "old = 1\n"
+    assert not (tmp_path / "config.toml.meridian-tmp").exists()
 
 
 @pytest.mark.parametrize("private", [False, True])
@@ -123,16 +162,38 @@ def test_write_replaces_a_stale_temp_file(tmp_path, private):
 
 
 @pytest.mark.parametrize("private", [False, True])
-def test_write_fails_closed_and_leaves_target_untouched(tmp_path, private):
+def test_write_fails_closed_and_leaves_target_untouched(tmp_path, monkeypatch, private):
     connect = _load_connect()
     target = tmp_path / "settings.json"
     target.write_text("original\n", encoding="utf-8")
-    # A directory where the temp file should go, so the temp file cannot be created.
-    (tmp_path / "settings.json.meridian-tmp").mkdir()
+    temp = tmp_path / "settings.json.meridian-tmp"
+    seen: dict = {}
 
-    with pytest.raises(OSError):
+    if private:
+        # The private path unlinks a stale temp file before its O_EXCL create, so a
+        # directory at the temp path would fail at unlink, not at the create. Make
+        # the create itself fail, the way another process winning the race would.
+        real_open = os.open
+
+        def _create_loses_race(path, flags, mode=0o777, *args, **kwargs):
+            if str(path) == str(temp):
+                seen["flags"] = flags
+                raise FileExistsError(errno.EEXIST, "temp file created by another process", str(path))
+            return real_open(path, flags, mode, *args, **kwargs)
+
+        monkeypatch.setattr(connect.os, "open", _create_loses_race)
+    else:
+        # A directory where the temp file should go: the plain open-for-write fails at its create.
+        temp.mkdir()
+
+    with pytest.raises(OSError) as excinfo:
         connect._write_text_atomic(target, "new token config\n", private=private)
 
+    assert excinfo.value.filename == str(temp)
+    if private:
+        assert seen["flags"] & os.O_EXCL and seen["flags"] & os.O_CREAT, (
+            "the failure must come from the O_EXCL create of the temp file"
+        )
     assert target.read_text(encoding="utf-8") == "original\n"
 
 
@@ -256,6 +317,36 @@ def test_pkg_guard_internal_error_text_is_fixed(client, monkeypatch):
     assert body["action"] == "allow"
     assert body["message"] == "pkg-guard internal error (failing open); see server log"
     assert "secret" not in str(body)
+
+
+def test_hooks_stop_handoff_failure_is_logged_at_warning(client, monkeypatch, caplog):
+    """hooks/stop: the detail goes to the server log at WARNING. server_logs
+    persists only WARNING and above, so an INFO line would never be stored."""
+
+    async def _boom(*_a, **_kw):
+        raise RuntimeError("handoff internals at /srv/secret-store")
+
+    monkeypatch.setattr("meridian.handoff.generate_handoff", _boom)
+    project = client.post("/projects", json={"name": "codeql-hooks-stop-warn"}).json()
+    start = client.post("/hooks/session-start", json={"project_id": project["id"]}).json()
+    context = start["hookSpecificOutput"]["additionalContext"]
+    session_id = next(
+        line.split(":", 1)[1].strip() for line in context.splitlines() if line.startswith("SESSION ID:")
+    )
+
+    with caplog.at_level(logging.INFO, logger="meridian.hooks"):
+        r = client.post("/hooks/stop", json={"project_id": project["id"], "session_id": session_id})
+
+    assert r.status_code == 200
+    assert r.json()["error"] == "delta handoff failed; see server log"
+    assert "handoff internals" not in r.text
+    records = [
+        rec for rec in caplog.records
+        if rec.name == "meridian.hooks" and "delta handoff failed" in rec.getMessage()
+    ]
+    assert records, "the failure must be logged on meridian.hooks"
+    assert all(rec.levelno == logging.WARNING for rec in records)
+    assert "handoff internals" in caplog.text
 
 
 @pytest.mark.parametrize(

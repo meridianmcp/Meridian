@@ -205,14 +205,22 @@ def test_configure_codex_end_to_end_backs_up_once_and_restricts_the_token_file(m
     cfg = tmp_path / ".codex" / "config.toml"
     cfg.parent.mkdir()
     cfg.write_text(USER_CONFIG, encoding="utf-8")
-    restricted: list[Path] = []
-    monkeypatch.setattr(mod, "_restrict_to_owner", lambda p: restricted.append(Path(p)) or True)
+    locked: list[tuple[str, str]] = []
+
+    def _lock(p):
+        p = Path(p)
+        locked.append((p.name, p.read_text(encoding="utf-8")))
+        return True
+
+    monkeypatch.setattr(mod, "_restrict_to_owner", _lock)
 
     ok, notes = mod._configure_codex(cfg, _URL, _FAKE, _START, _STOP)
     assert ok
     backup = cfg.with_name("config.toml.meridian-bak")
     assert backup.read_text(encoding="utf-8") == USER_CONFIG, "pristine original kept"
-    assert restricted == [cfg], "the file that now holds the token must be locked down"
+    # The temp file that becomes the token config is locked while still empty,
+    # before the token is written (9784f8ef ordering; os.replace keeps the lock).
+    assert locked == [("config.toml.meridian-tmp", "")], "lock must precede the token write"
     parsed = tomllib.loads(cfg.read_text(encoding="utf-8"))
     assert parsed["hooks"]["my_hook"] == "echo mine"
     assert not list(cfg.parent.glob("*.meridian-tmp")), "no temp file left behind"
@@ -316,7 +324,9 @@ def test_cursor_token_file_is_locked_down(mod, tmp_path, monkeypatch):
     restricted: list[Path] = []
     monkeypatch.setattr(mod, "_restrict_to_owner", lambda p: restricted.append(Path(p)) or True)
     mod._configure_cursor(_URL, _FAKE)
-    assert restricted == [home / ".cursor" / "mcp.json"]
+    assert restricted == [home / ".cursor" / "mcp.json.meridian-tmp"], (
+        "the temp file that becomes mcp.json is locked before the token is written"
+    )
     restricted.clear()
     mod._configure_cursor(_URL, "")  # no token -> nothing sensitive to protect
     assert restricted == []

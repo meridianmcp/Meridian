@@ -145,6 +145,26 @@ def _journal_style_presets_path(request: Request) -> str:
     return os.path.join(_data_dir(request), "journal_style_presets.json")
 
 
+def _known_journal_style_preset_names(lister, request: Request) -> list[str]:
+    """Names of every journal style preset the lister reports (built-in and
+    user-saved), for the invalid-preset error text. Best effort: a missing or
+    failing lister yields an empty list instead of a second error."""
+    if lister is None:
+        return []
+    try:
+        catalog = lister(user_presets_path=_journal_style_presets_path(request))
+    except Exception:  # noqa: BLE001 — the name list is a hint; never fail the review over it
+        _log.warning("could not list journal style presets for an error message", exc_info=True)
+        return []
+    presets = catalog.get("presets") if isinstance(catalog, dict) else None
+    if not isinstance(presets, list):
+        return []
+    return [
+        p["name"] for p in presets
+        if isinstance(p, dict) and isinstance(p.get("name"), str)
+    ]
+
+
 @router.get("/journal-style-presets")
 async def list_journal_style_presets_endpoint(request: Request) -> dict[str, Any]:
     """9c1a3fd2 -- catalog for the journal-preset picker on the document
@@ -251,7 +271,13 @@ async def document_review_endpoint(
             )
         except ValueError as exc:
             _log.info("journal style preset %r rejected: %s", journal_name, exc)
-            return {"error": f"invalid journal style preset: {journal_name}"}
+            known = _known_journal_style_preset_names(_lister, request)
+            return {
+                "error": (
+                    f"invalid journal style preset: {journal_name}; "
+                    f"known presets: {known}"
+                ),
+            }
     try:
         result = builder(
             fp, expected_source_fingerprint=fingerprint, style_policy=style_policy
