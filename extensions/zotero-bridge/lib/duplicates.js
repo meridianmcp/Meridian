@@ -4,7 +4,10 @@
 //
 // Rules, applied in this order for one entry against the existing items:
 //   1. A normalised DOI equal to an existing item's normalised DOI -> exact.
-//   2. Otherwise, if the normalised title is empty -> new (no title matching).
+//   2. Otherwise, if the normalised title is empty -> no title matching. An
+//      entry with no DOI is exact when an existing item has the same BibTeX
+//      key, else new. Without the key rule every re-import added another copy
+//      of an untitled entry.
 //   3. A title match is exact only when neither side has a DOI.
 //      Any such title match returns exact, even if another title match
 //      conflicts.
@@ -15,9 +18,15 @@
 
 const { normalizeTitle, normalizeDoi } = require('./normalize.js');
 
+// The BibTeX key as a trimmed string, or '' when there is none. Keys are case-sensitive, so they are compared as written.
+function bibKeyOf(value) {
+  return value && typeof value.key === 'string' ? value.key.trim() : '';
+}
+
 function classify(entry, existing) {
   const entryDoi = normalizeDoi(entry && entry.doi);
   const entryTitle = normalizeTitle(entry && entry.title);
+  const entryKey = bibKeyOf(entry);
   const items = Array.isArray(existing) ? existing : [];
 
   if (entryDoi) {
@@ -26,7 +35,14 @@ function classify(entry, existing) {
     }
   }
 
-  if (!entryTitle) return 'new';
+  if (!entryTitle) {
+    if (!entryDoi && entryKey) {
+      for (const item of items) {
+        if (item && bibKeyOf(item) === entryKey) return 'exact';
+      }
+    }
+    return 'new';
+  }
 
   let sawConflict = false;
   for (const item of items) {
@@ -54,7 +70,7 @@ function planImport(entries, existing) {
       plan.conflicts.push(entry);
     } else {
       plan.toImport.push(entry);
-      known.push({ title: entry.title, doi: entry.doi });
+      known.push({ title: entry.title, doi: entry.doi, key: bibKeyOf(entry) });
     }
   }
   return plan;
