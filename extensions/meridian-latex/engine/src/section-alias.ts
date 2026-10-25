@@ -16,6 +16,7 @@
 // correct, via tests against raw strings.
 
 import { matchBraceIndex } from "./range-locate.js";
+import { createNewcommandScanner } from "./latex-scan.js";
 
 /** Every sectioning macro name outline.js's own `SECTION_MACROS` constant
  * recognizes (see outline.js, near its top) -- kept in sync by hand since
@@ -29,15 +30,6 @@ const SECTION_MACRO_NAMES = [
   "paragraph",
   "subparagraph",
 ];
-
-/** A `\newcommand`/`\renewcommand` definition head, up to the opening brace of
- * its body: captures the defined macro name in group 1. Handles the star
- * form, an optional `[nargs]` count and an optional `[default]` first-arg
- * value -- direct translation of the Python port's `_NEWCOMMAND_HEAD_RE`;
- * this particular pattern uses no Python-only regex constructs, so the
- * structure carries over unchanged. Must stay `g` (global) so repeated
- * `.exec()` calls advance through the whole source. */
-const NEWCOMMAND_HEAD_RE = /\\(?:re)?newcommand\*?\s*\{\s*\\([A-Za-z@]+)\s*\}\s*(?:\[\d+\])?\s*(?:\[[^\]]*\])?\s*\{/g;
 
 /** Matches any of `SECTION_MACRO_NAMES` as a macro use, e.g. `\section`.
  * Translation of the Python port's `_SECTION_MACRO_ALT` + `_SECTION_IN_BODY_RE`
@@ -90,13 +82,13 @@ function braceMatch(text: string, openIdx: number): { body: string; end: number 
 export function expandSectionAliases(source: string): string {
   try {
     const aliases = new Map<string, string>();
-    NEWCOMMAND_HEAD_RE.lastIndex = 0;
-    let headMatch: RegExpExecArray | null;
-    while ((headMatch = NEWCOMMAND_HEAD_RE.exec(source)) !== null) {
+    const headScanner = createNewcommandScanner(source);
+    let headMatch = headScanner.next(0);
+    while (headMatch !== null) {
       const name = headMatch[1];
-      // The trailing "{" the head pattern ends on is the last character of
-      // the match -- headMatch.index + headMatch[0].length - 1, mirroring
-      // the Python port's own `m.end() - 1`.
+      // The trailing "{" the head ends on is the last character of the
+      // match -- headMatch.index + headMatch[0].length - 1, mirroring the
+      // Python port's own `m.end() - 1`.
       const openIdx = headMatch.index + headMatch[0].length - 1;
       const { body } = braceMatch(source, openIdx);
       const bodyMatch = SECTION_IN_BODY_RE.exec(body);
@@ -104,6 +96,7 @@ export function expandSectionAliases(source: string): string {
         // bodyMatch[0] is like "\section"; strip the leading backslash.
         aliases.set(name, bodyMatch[0].slice(1));
       }
+      headMatch = headScanner.next(openIdx + 1);
     }
     if (aliases.size === 0) return source;
 
@@ -115,16 +108,12 @@ export function expandSectionAliases(source: string): string {
       //    \newcommand{\name}... in the source), searching from the position
       //    left off after the previous definition's body -- mirroring the
       //    Python port's own `defpat.search(result, i)` loop.
-      const defRe = new RegExp(
-        `\\\\(?:re)?newcommand\\*?\\s*\\{\\s*\\\\${escapeRegExp(name)}\\s*\\}` +
-          `\\s*(?:\\[\\d+\\])?\\s*(?:\\[[^\\]]*\\])?\\s*\\{`,
-        "g",
-      );
+      const defScanner = createNewcommandScanner(result);
+      const nameSource = escapeRegExp(name);
       const pieces: string[] = [];
       let i = 0;
       while (true) {
-        defRe.lastIndex = i;
-        const defMatch = defRe.exec(result);
+        const defMatch = defScanner.next(i, nameSource);
         if (!defMatch) {
           pieces.push(result.slice(i));
           break;

@@ -18,6 +18,7 @@ the field is always populated.
 from __future__ import annotations
 
 import asyncio
+import bisect
 import dataclasses as _dataclasses
 import enum as _enum
 import functools
@@ -1781,10 +1782,30 @@ async def _mint_and_embed_goal_token(
         return quick_start_goal
 
 
-_GOAL_TOKEN_BANNER_RE = re.compile(
-    r"\n<goal_token>[^<]*</goal_token>\n<!-- SECURITY:.*?-->",
-    re.DOTALL,
+# The banner is located in two linear steps rather than one pattern ending in a
+# lazy ``.*?-->``: that single pattern rescanned to the end of the input once for
+# every banner head that lacked a closer (CodeQL py/polynomial-redos). The head
+# is an unambiguous literal plus ``[^<]*`` match; its closer is a plain ``find``.
+_GOAL_TOKEN_BANNER_HEAD_RE = re.compile(
+    r"\n<goal_token>[^<]*</goal_token>\n<!-- SECURITY:"
 )
+
+
+def _find_goal_token_banner(text: str) -> "tuple[int, int] | None":
+    """Return ``(start, end)`` of the first embedded goal-token banner in
+    ``text`` (``end`` exclusive), or ``None`` when there is none.
+
+    Same match as ``\\n<goal_token>[^<]*</goal_token>\\n<!-- SECURITY:.*?-->``
+    with DOTALL. If the first head has no closing ``-->`` after it, no later
+    head can have one either, so checking only the first head is exact.
+    """
+    head = _GOAL_TOKEN_BANNER_HEAD_RE.search(text)
+    if head is None:
+        return None
+    closer = text.find("-->", head.end())
+    if closer == -1:
+        return None
+    return head.start(), closer + len("-->")
 
 
 def strip_goal_token_banner(text: str) -> str:
@@ -1800,7 +1821,11 @@ def strip_goal_token_banner(text: str) -> str:
     A no-op (returns ``text`` unchanged) when no token/banner is present, so
     it is always safe to call even on content that was never token-embedded.
     """
-    return _GOAL_TOKEN_BANNER_RE.sub("", text, count=1)
+    span = _find_goal_token_banner(text)
+    if span is None:
+        return text
+    start, end = span
+    return text[:start] + text[end:]
 
 
 def _evict_expired_tokens() -> None:
@@ -2046,27 +2071,56 @@ _DEFAULT_COMPACT_CONTRACT_MAX_ITEMS = 15
 # (every attribute value in this file is written via ``_xml_escape``, which
 # already escapes ``<``/``>``/``&``, so an attribute value can never itself
 # contain an unescaped ``<`` or ``>`` to confuse this scan).
-_STRUCTURAL_TAG_RE = re.compile(
-    r"<([a-zA-Z][a-zA-Z0-9_]*)(?:\s[^<>]*)?>.*?</\1>", re.DOTALL,
-)
+_STRUCTURAL_OPEN_RE = re.compile(r"<([a-zA-Z][a-zA-Z0-9_]*)(?:\s[^<>]*)?>")
+_STRUCTURAL_CLOSE_RE = re.compile(r"</([a-zA-Z][a-zA-Z0-9_]*)>")
 
 
 def _structural_tag_spans(content: str) -> "list[tuple[int, int]]":
     """Return ``(start_byte, end_byte)`` UTF-8 byte offsets for every
     top-level ``<tag>...</tag>`` span in ``content``.
 
-    Matches are whatever ``re.finditer`` returns for the (non-overlapping)
-    pattern above — good enough for the flat, sibling-tag shape every handoff
-    mode actually renders (no mode nests one of these tags inside another).
-    Offsets are in UTF-8 BYTES (not characters) so they compare directly
-    against the byte-oriented cut point ``format_handoff_mcp_content`` already
-    computes.
+    Same spans as a non-overlapping scan for ``<name ...>`` followed by the
+    first ``</name>``: each opening tag pairs with the first closing tag of its
+    name at or after the opener's end, and a found span consumes everything up
+    to its closer, so openers inside it are skipped. Closers are indexed by name
+    and paired with ``bisect``, so the scan is linear in the input size; a
+    lazy ``.*?</name>`` instead rescanned to the end for every unclosed opener
+    (CodeQL py/polynomial-redos). Good enough for the flat, sibling-tag shape
+    every handoff mode actually renders (no mode nests one of these tags inside
+    another). Offsets are in UTF-8 BYTES (not characters) so they compare
+    directly against the byte-oriented cut point
+    ``format_handoff_mcp_content`` already computes.
     """
+    closes: "dict[str, list[int]]" = {}
+    for close in _STRUCTURAL_CLOSE_RE.finditer(content):
+        closes.setdefault(close.group(1), []).append(close.start())
+
     spans: "list[tuple[int, int]]" = []
-    for m in _STRUCTURAL_TAG_RE.finditer(content):
-        start_b = len(content[: m.start()].encode("utf-8"))
-        end_b = len(content[: m.end()].encode("utf-8"))
-        spans.append((start_b, end_b))
+    # Every offset requested below is non-decreasing, so accumulating the
+    # encoded length keeps the byte conversion linear overall.
+    char_pos = 0
+    byte_pos = 0
+
+    def _byte_offset(index: int) -> int:
+        nonlocal char_pos, byte_pos
+        byte_pos += len(content[char_pos:index].encode("utf-8"))
+        char_pos = index
+        return byte_pos
+
+    resume_at = 0
+    for opener in _STRUCTURAL_OPEN_RE.finditer(content):
+        if opener.start() < resume_at:
+            continue
+        name = opener.group(1)
+        starts = closes.get(name)
+        if not starts:
+            continue
+        idx = bisect.bisect_left(starts, opener.end())
+        if idx == len(starts):
+            continue
+        end = starts[idx] + len(name) + 3  # "</" + name + ">"
+        spans.append((_byte_offset(opener.start()), _byte_offset(end)))
+        resume_at = end
     return spans
 
 
@@ -2140,7 +2194,7 @@ def format_handoff_mcp_content(
     never blind: this function locates any embedded
     ``<goal_token>...</goal_token>`` plus SECURITY banner
     (``_mint_and_embed_goal_token``'s own marker, matched via
-    ``_GOAL_TOKEN_BANNER_RE``) and NEVER cuts through or before the end of
+    ``_find_goal_token_banner``) and NEVER cuts through or before the end of
     that banner, even if honoring that means exceeding ``max_bytes`` — the
     provenance token and its verification instructions are the one thing a
     truncated handoff must never silently lose or corrupt (the
@@ -2218,14 +2272,14 @@ def format_handoff_mcp_content(
     # bounded marker behavior below.
     _is_executable_goal = (
         content.lstrip().startswith(("/goal", "/loop /goal"))
-        and _GOAL_TOKEN_BANNER_RE.search(content) is not None
+        and _find_goal_token_banner(content) is not None
     )
     if _is_executable_goal:
         return content
     _protected_end = 0
-    _banner_match = _GOAL_TOKEN_BANNER_RE.search(content)
-    if _banner_match:
-        _protected_end = len(content[: _banner_match.end()].encode("utf-8"))
+    _banner_span = _find_goal_token_banner(content)
+    if _banner_span is not None:
+        _protected_end = len(content[: _banner_span[1]].encode("utf-8"))
     _total_bytes = len(_raw)
     # 4f3bd70c — every top-level structural tag span, so the cut point below
     # can be snapped to never land inside one (see _snap_to_safe_boundary).
@@ -11529,7 +11583,11 @@ def compute_required_tools_hash(items: "list[dict[str, Any]]") -> str:
 _PROJECT_START_CONFIG_TAG_RE = re.compile(
     r"<project_start_config\b([^>]*)/?>", re.IGNORECASE
 )
-_PROJECT_START_CONFIG_ATTR_RE = re.compile(r'(\w+)="([^"]*)"')
+# The lookbehind restricts matches to the start of a word run. Without it,
+# findall retried every suffix of a long run (CodeQL py/polynomial-redos).
+# Results are unchanged: a suffix of a run that fails to match fails for the
+# same closing quote, so only run starts can ever produce a match.
+_PROJECT_START_CONFIG_ATTR_RE = re.compile(r'(?<!\w)(\w+)="([^"]*)"')
 
 
 def _parse_project_start_config(body: "str | None") -> "dict[str, str] | None":

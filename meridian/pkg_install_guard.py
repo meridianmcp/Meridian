@@ -405,7 +405,23 @@ _UVX_INSTALL_RE = re.compile(
 # Flags to skip when extracting package names from the install command.
 _FLAG_RE = re.compile(r"^-")
 # Version specifiers / extras that attach to a package name (strip these before lookup).
-_VERSION_STRIP_RE = re.compile(r"[=<>!~\[;,@#].*$")
+_VERSION_TAIL_CHARS = frozenset("=<>!~[;,@#")
+
+
+def _strip_version_tail(s: str) -> str:
+    """Equivalent to ``re.sub(r"[=<>!~\\[;,@#].*$", "", s)``, linear in ``len(s)``.
+
+    The removed text runs from the first version character on the last line
+    to the end, leaving a single trailing newline in place (``$`` matches before
+    it and ``.`` never crosses a newline). A ``.*$`` pattern rescanned the rest
+    of the line for every candidate character (CodeQL py/polynomial-redos).
+    """
+    end = len(s) - 1 if s.endswith("\n") else len(s)
+    seg_start = s.rfind("\n", 0, end) + 1
+    for i in range(seg_start, end):
+        if s[i] in _VERSION_TAIL_CHARS:
+            return s[:i] + s[end:]
+    return s
 
 
 def _strip_version(pkg: str) -> str:
@@ -418,8 +434,8 @@ def _strip_version(pkg: str) -> str:
     # ``@scope/name`` while unscoped tokens retain their existing behavior.
     if pkg.startswith("@") and "/" in pkg:
         scope, name = pkg.split("/", 1)
-        return f"{scope}/{_VERSION_STRIP_RE.sub('', name).strip()}".strip()
-    return _VERSION_STRIP_RE.sub("", pkg).strip()
+        return f"{scope}/{_strip_version_tail(name).strip()}".strip()
+    return _strip_version_tail(pkg).strip()
 
 
 def extract_packages_from_command(command: str) -> list[tuple[str, str]]:
