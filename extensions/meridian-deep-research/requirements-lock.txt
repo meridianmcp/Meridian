@@ -31,7 +31,7 @@
 #
 # Captured: 2026-09-23, win-64, Python 3.12.13.
 #
-# Security bump 2026-10-25 (Dependabot alerts #1-#8, #38, #54, #55): the
+# Security bump 2026-10-25 (Dependabot pip alerts #1-#8, #38, #54): the
 # pins for cryptography, certifi, oauthlib, langgraph-api,
 # langgraph-runtime-inmem and the opentelemetry-* family were raised to their
 # first patched versions by hand (plus two new opentelemetry transitive pins
