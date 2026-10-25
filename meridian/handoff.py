@@ -1132,6 +1132,43 @@ async def update_handoff_correction_status(
     return await get_handoff_correction(db, correction_id)
 
 
+def resolve_contained_output_dir(requested: Any, root: Any) -> str:
+    """Resolve ``requested`` and require it to sit inside ``root``.
+
+    Confines a path joined onto a handoff output dir (a promotion target) to
+    that dir. ``Path.resolve`` collapses ``..`` segments, follows symlinks and
+    anchors drive-relative Windows paths, so a traversal, an absolute path
+    outside ``root``, or a symlink that points out of ``root`` all fail the
+    ``is_relative_to`` test. ``root`` itself is allowed. Returns the resolved
+    path as a string and raises ``ValueError`` on escape or on a non-path value.
+    """
+    try:
+        root_path = Path(root).resolve()
+        candidate = Path(requested).resolve()
+    except (TypeError, ValueError, OSError, RuntimeError) as exc:
+        raise ValueError("path must be a valid filesystem path") from exc
+    if not candidate.is_relative_to(root_path):
+        raise ValueError("path must resolve inside the allowed root")
+    return str(candidate)
+
+
+def resolve_output_dir_override(requested: Any, default: str) -> str:
+    """Return the output dir a regenerate call writes to.
+
+    Same rule as before the CodeQL work: a truthy ``requested`` wins, otherwise
+    ``default`` (the server data directory). Only values that cannot name a
+    directory are refused: non-strings and strings with an embedded NUL. The
+    refusal runs before any correction row, ai_log event or handoff file is
+    written. Every other string is returned unchanged, including paths outside
+    ``default``. Confining the override to a root is an open decision, so this
+    helper does not confine it.
+    """
+    value = requested or default
+    if not isinstance(value, str) or "\x00" in value:
+        raise ValueError("output_dir must be a string path without NUL bytes")
+    return value
+
+
 async def regenerate_handoff_correction(
     db: Any,
     project_id: str,
@@ -10204,6 +10241,9 @@ async def build_promotion_readiness_for_handoff(
     against it. Returns ``{"checked": [...], "unresolved_count": int}`` where
     each ``checked`` entry is
     ``{"item_id", "target_docx_path", **check_promotion_preconditions(...)}``.
+    A target that resolves outside ``output_dir`` is never hashed. It is
+    recorded with ``ok`` False and ``reason`` ``target_outside_output_dir``,
+    and counted in ``unresolved_count``.
 
     Bounded to ``max_checked_items`` (mirrors ``docx_integrity_gate``'s own
     ``_MAX_CHECKED_ARTIFACTS`` discipline) so a large board never turns this
@@ -10232,6 +10272,22 @@ async def build_promotion_readiness_for_handoff(
             if not target_uri:
                 continue
             target_path = os.path.join(output_dir, target_uri)
+            # CodeQL py/path-injection: target_uri is a sprint-item declaration, and
+            # os.path.join discards output_dir when target_uri is absolute. A target
+            # that resolves outside the handoff output dir is never hashed; it is
+            # recorded as unresolved so the readiness report shows it. The joined
+            # path is kept unchanged for valid targets.
+            try:
+                resolve_contained_output_dir(target_path, output_dir)
+            except ValueError:
+                checked.append({
+                    "item_id": item["id"],
+                    "target_docx_path": target_path,
+                    "ok": False,
+                    "reason": "target_outside_output_dir",
+                })
+                unresolved += 1
+                continue
             outcome = artifact_declaration_module.check_promotion_preconditions(item, target_path)
         except Exception:  # noqa: BLE001 — one item's check failure skips just that item
             continue
