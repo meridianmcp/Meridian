@@ -2,20 +2,19 @@
 
 Covers the caller-controlled path flows on fix/codeql-path-injection:
 
-- ``handoff.resolve_contained_output_dir`` (containment for promotion targets)
 - the regenerate ``output_dir`` override, over MCP and HTTP: refused before any
   write when it cannot name a directory. Containment of the override is an
   open decision, so a path outside the data directory is still accepted as
   before.
-- promotion targets joined onto a handoff output dir, recorded as unresolved
-  (never hashed) when they escape
+- promotion targets joined onto a handoff output dir. Containment of promotion
+  targets is an open decision, so a target that escapes the output dir is still
+  checked as before.
 - the codebase-map temp file, which no longer embeds the URL ``project_id``
 """
 from __future__ import annotations
 
 import importlib
 import os
-import sys
 import tempfile
 from pathlib import Path
 
@@ -31,133 +30,6 @@ import meridian.server  # noqa: F401,E402
 
 routes_handoff = importlib.import_module("meridian.routes.handoff")
 mcp_handler = importlib.import_module("meridian.mcp.handler")
-
-
-# ---------------------------------------------------------------------------
-# resolve_contained_output_dir: the shared containment check
-# ---------------------------------------------------------------------------
-
-
-def test_contained_dir_accepts_root_and_nested_children(tmp_path):
-    root = tmp_path / "data"
-    nested = root / "handoffs" / "nested"
-    nested.mkdir(parents=True)
-    assert handoff_module.resolve_contained_output_dir(str(root), str(root)) == str(root.resolve())
-    assert handoff_module.resolve_contained_output_dir(str(nested), str(root)) == str(nested.resolve())
-
-
-def test_contained_dir_accepts_not_yet_created_child(tmp_path):
-    root = tmp_path / "data"
-    root.mkdir()
-    target = root / "fresh" / "dir"
-    assert handoff_module.resolve_contained_output_dir(str(target), str(root)) == str(target.resolve())
-
-
-@pytest.mark.parametrize(
-    "segments",
-    [
-        ("..", "escape"),
-        ("..", "..", "escape"),
-        ("nested", "..", "..", "escape"),
-    ],
-)
-def test_contained_dir_rejects_parent_traversal(tmp_path, segments):
-    root = tmp_path / "data"
-    root.mkdir()
-    with pytest.raises(ValueError):
-        handoff_module.resolve_contained_output_dir(str(root.joinpath(*segments)), str(root))
-
-
-def test_contained_dir_rejects_sibling_with_shared_string_prefix(tmp_path):
-    # "data-evil" starts with the string "data" but is not inside it.
-    root = tmp_path / "data"
-    root.mkdir()
-    sibling = tmp_path / "data-evil"
-    sibling.mkdir()
-    with pytest.raises(ValueError):
-        handoff_module.resolve_contained_output_dir(str(sibling), str(root))
-
-
-def test_contained_dir_rejects_absolute_path_outside_root(tmp_path):
-    root = tmp_path / "data"
-    root.mkdir()
-    outside = tmp_path / "elsewhere"
-    with pytest.raises(ValueError):
-        handoff_module.resolve_contained_output_dir(str(outside), str(root))
-
-
-def test_contained_dir_rejects_filesystem_anchor(tmp_path):
-    root = tmp_path / "data"
-    root.mkdir()
-    with pytest.raises(ValueError):
-        handoff_module.resolve_contained_output_dir(root.anchor, str(root))
-
-
-@pytest.mark.skipif(sys.platform != "win32", reason="drive-relative paths are Windows-only")
-def test_contained_dir_rejects_drive_relative_path_escaping_root(tmp_path, monkeypatch):
-    root = tmp_path / "data"
-    root.mkdir()
-    # "C:escape" is relative to the current directory on drive C; with the cwd
-    # set to tmp_path it resolves to tmp_path\escape, which is outside root.
-    monkeypatch.chdir(tmp_path)
-    with pytest.raises(ValueError):
-        handoff_module.resolve_contained_output_dir(root.drive + "escape", str(root))
-
-
-@pytest.mark.skipif(sys.platform != "win32", reason="drive-relative paths are Windows-only")
-def test_contained_dir_accepts_drive_relative_path_inside_root(tmp_path, monkeypatch):
-    root = tmp_path / "data"
-    root.mkdir()
-    monkeypatch.chdir(root)
-    resolved = handoff_module.resolve_contained_output_dir(root.drive + "inside", str(root))
-    assert resolved == str((root / "inside").resolve())
-
-
-def _make_dir_link(link: Path, target: Path) -> None:
-    """Create a directory symlink; on Windows fall back to a junction, which needs no privilege."""
-    import subprocess
-
-    try:
-        link.symlink_to(target, target_is_directory=True)
-        return
-    except (OSError, NotImplementedError):
-        pass
-    if sys.platform == "win32":
-        proc = subprocess.run(
-            ["cmd", "/c", "mklink", "/J", str(link), str(target)],
-            capture_output=True, text=True,
-        )
-        if proc.returncode == 0:
-            return
-    pytest.skip("directory links are unavailable on this platform")
-
-
-def test_contained_dir_rejects_symlink_escaping_root(tmp_path):
-    root = tmp_path / "data"
-    root.mkdir()
-    outside = tmp_path / "outside"
-    outside.mkdir()
-    link = root / "link"
-    _make_dir_link(link, outside)
-    with pytest.raises(ValueError):
-        handoff_module.resolve_contained_output_dir(str(link), str(root))
-    with pytest.raises(ValueError):
-        handoff_module.resolve_contained_output_dir(str(link / "child"), str(root))
-
-
-def test_contained_dir_accepts_symlink_that_stays_inside_root(tmp_path):
-    root = tmp_path / "data"
-    real = root / "real"
-    real.mkdir(parents=True)
-    alias = root / "alias"
-    _make_dir_link(alias, real)
-    assert handoff_module.resolve_contained_output_dir(str(alias), str(root)) == str(real.resolve())
-
-
-@pytest.mark.parametrize("bad", [None, 123, ["x"], {"a": 1}, "bad\x00name"])
-def test_contained_dir_rejects_non_path_values(tmp_path, bad):
-    with pytest.raises(ValueError):
-        handoff_module.resolve_contained_output_dir(bad, str(tmp_path))
 
 
 # ---------------------------------------------------------------------------
@@ -213,7 +85,9 @@ def _spy_preconditions(monkeypatch):
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("escaping", ["../escape.docx", "ABSOLUTE"])
-async def test_promotion_readiness_records_target_escaping_output_dir_as_unresolved(tmp_path, monkeypatch, escaping):
+async def test_promotion_readiness_checks_target_escaping_output_dir_pending_decision(tmp_path, monkeypatch, escaping):
+    # Pins the pre-existing behaviour. Containment of promotion targets is an
+    # open decision, so an escaping target is still checked and reported as before.
     out_dir = tmp_path / "out"
     out_dir.mkdir()
     outside = tmp_path / "escape.docx"
@@ -226,15 +100,10 @@ async def test_promotion_readiness_records_target_escaping_output_dir_as_unresol
         None, "proj", [{"id": "item-1"}], output_dir=str(out_dir),
     )
 
-    assert seen == [], "a target outside output_dir must never be hashed or checked"
+    assert seen == [os.path.join(str(out_dir), uri)]
     assert result == {
-        "checked": [{
-            "item_id": "item-1",
-            "target_docx_path": os.path.join(str(out_dir), uri),
-            "ok": False,
-            "reason": "target_outside_output_dir",
-        }],
-        "unresolved_count": 1,
+        "checked": [{"item_id": "item-1", "ok": True, "reason": "stub"}],
+        "unresolved_count": 0,
     }
 
 
