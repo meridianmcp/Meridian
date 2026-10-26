@@ -57,7 +57,8 @@ UNVERIFIED on a real machine:
   Zotero exit within the 20-second wait. A Zotero that is busy or shows a dialog
   will not close, and the install then reports ``close_failed``.
 
-CLI: ``python -m meridian zotero install-plugin [--profile DIR] [--dry-run] [--keep-zotero-open]``.
+CLI: ``python -m meridian zotero install-plugin [--profile DIR] [--dry-run] [--keep-zotero-open]
+[--local-writes on|off]``.
 """
 
 from __future__ import annotations
@@ -76,6 +77,8 @@ import time
 import zipfile
 from pathlib import Path
 from typing import Any, Callable, Mapping
+
+from meridian import zotero_local_writes
 
 XPI_FILENAME = "meridian-zotero@usemeridian.us.xpi"
 SETTINGS_FILENAME = "zotero_plugin.json"
@@ -1504,6 +1507,79 @@ def _print_install_status(result: Mapping[str, Any], xpi: Path, profile: Path) -
     return 1
 
 
+def _local_writes_after_install(profile: "Path | str", enabled: bool) -> dict[str, Any]:
+    """Set the bridge's open local writes pref in the profile's user.js for an install that asked for it. Never raises.
+
+    The result is ``changed`` or ``unchanged`` with the state before, or ``failed`` with the error.
+    """
+    try:
+        change = zotero_local_writes.set_local_writes(profile, enabled)
+    except (OSError, ValueError) as exc:
+        return {"status": "failed", "error": str(exc)}
+    return {"status": "changed" if change["changed"] else "unchanged", "before": change["state"]}
+
+
+def _with_local_writes(
+    install: "Callable[[], Mapping[str, Any]]", profile: "Path | str", enabled: "bool | None",
+) -> "Callable[[], Mapping[str, Any]]":
+    """The install step, then the local-writes pref when the install succeeded and the caller asked for it.
+
+    The pref is written while Zotero is closed, before any Zotero start in this run, so that start reads it. With
+    ``enabled=None`` the install step is returned as it was, and nothing changes.
+    """
+    if enabled is None:
+        return install
+
+    def _install_then_local_writes() -> dict[str, Any]:
+        result = dict(install())
+        if result.get("status") in ("installed", "unchanged"):
+            result["local_writes"] = _local_writes_after_install(profile, enabled)
+        return result
+
+    return _install_then_local_writes
+
+
+def _print_local_writes(result: Mapping[str, Any], enabled: "bool | None", code: int) -> int:
+    """The local-writes line for an install run that asked for it. Returns ``code``, or 1 when it was not written."""
+    if enabled is None:
+        return code
+    local = result.get("local_writes")
+    if not isinstance(local, Mapping):
+        print("Local writes were not changed, because the plugin was not installed.")
+        return code
+    if local.get("status") == "failed":
+        print(f"Local writes were not set: {local.get('error') or 'unknown error'}")
+        return 1
+    word = "on" if enabled else "off"
+    if local.get("status") == "changed":
+        before = zotero_local_writes.state_text(str(local.get("before")))
+        print(
+            f"Local writes are {word} in user.js. Before, the setting was {before}. "
+            "Zotero reads this setting when it starts."
+        )
+    else:
+        print(f"Local writes are already {word} in user.js. Nothing was changed.")
+    return code
+
+
+def _local_writes_plan_text(profile: "Path | None", enabled: bool) -> str:
+    """The dry run's line for the local-writes setting. It says what a real run would do and writes nothing."""
+    word = "on" if enabled else "off"
+    if profile is None:
+        return f"Local writes: no profile was found, so {word} would not be set."
+    try:
+        plan = zotero_local_writes.plan_local_writes(profile, enabled)
+    except (OSError, ValueError) as exc:
+        return f"Local writes: would not be set. {exc}"
+    if plan["changed"]:
+        before = zotero_local_writes.state_text(str(plan["state"]))
+        return (
+            f"Local writes: would set {word} in user.js after a successful install. "
+            f"The setting is {before} now."
+        )
+    return f"Local writes: already {word} in user.js, so nothing would change."
+
+
 def cli_main(argv: "list[str] | None" = None) -> int:
     """``python -m meridian zotero install-plugin``. Returns 0 on success, 1 otherwise.
 
@@ -1525,11 +1601,22 @@ def cli_main(argv: "list[str] | None" = None) -> int:
         action="store_true",
         help="Do not close Zotero for this install, even when the saved setting says to. Nothing is written while Zotero runs.",
     )
+    parser.add_argument(
+        "--local-writes",
+        choices=("on", "off"),
+        default=None,
+        help="After a successful install, set the Zotero bridge's open local writes setting in the profile's user.js "
+        "to on or off. Without this flag the setting is left alone.",
+    )
     args = parser.parse_args(argv)
     profile = Path(args.profile) if args.profile is not None else find_default_profile_dir(zotero_data_dir())
     close_zotero = False if args.keep_zotero_open else None
+    local_enabled = None if args.local_writes is None else args.local_writes == "on"
     if args.dry_run:
-        return _dry_run(profile, close_zotero=close_zotero)
+        code = _dry_run(profile, close_zotero=close_zotero)
+        if local_enabled is not None:
+            print(_local_writes_plan_text(profile, local_enabled))
+        return code
     try:
         xpi = build_xpi(default_xpi_path())
     except OSError as exc:
@@ -1561,17 +1648,24 @@ def cli_main(argv: "list[str] | None" = None) -> int:
     # A plugin that is already identical needs no close, whether or not Zotero runs. Its profile repairs still run.
     current = _already_current(profile, stored.sha256)
     if current is not None:
+        # The local-writes setting is written before the repairs and the enable step, so any Zotero start here reads it.
+        local = _local_writes_after_install(profile, local_enabled) if local_enabled is not None else None
         if is_default:
             outcome = _unchanged_outcome(profile, current, None, None, None, None)
         else:
             outcome = _repair_profile(profile, current)
             if outcome.get("status") == "unchanged":
                 outcome = _not_default(outcome)
-        return _print_install_status_and_enable(outcome, xpi, profile)
+        if local is not None:
+            outcome = {**outcome, "local_writes": local}
+        code = _print_install_status_and_enable(outcome, xpi, profile)
+        return _print_local_writes(outcome, local_enabled, code)
     result = install_with_close(
         load_settings(settings_path()),
         close_zotero=close_zotero,
-        install=lambda: _install_files(profile, stored.path, None, stored.sha256),
+        install=_with_local_writes(
+            lambda: _install_files(profile, stored.path, None, stored.sha256), profile, local_enabled,
+        ),
         after_install=(lambda: _register_default(profile, None, None, None, None)) if is_default else None,
     )
     if not is_default and result.get("status") in ("installed", "unchanged"):
@@ -1579,8 +1673,9 @@ def cli_main(argv: "list[str] | None" = None) -> int:
     if result.get("closed_zotero") and result.get("status") in UNCONFIRMED_CLOSED_STATUSES:
         # Meridian closed Zotero, so the text must not tell the user to close it as if it had not.
         print(_closed_unconfirmed_cli_text(result.get("restart")))
-        return 1
+        return _print_local_writes(result, local_enabled, 1)
     code = _print_install_status_and_enable(result, xpi, profile)
+    code = _print_local_writes(result, local_enabled, code)
     if result.get("closed_zotero"):
         print(_restart_sentence(result.get("restart")))
     return code

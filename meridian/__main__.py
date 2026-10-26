@@ -221,9 +221,13 @@ def _dispatch_subcommand(raw_argv: list[str]) -> int | None:
       local-only provider output capture and verification.
     * ``zotero sync`` -- run one bounded workstation sync of hosted citation
       markers through authenticated MCP calls; no background loop is started.
-    * ``zotero install-plugin [--profile DIR] [--dry-run] [--keep-zotero-open]`` -- install the
+    * ``zotero install-plugin [--profile DIR] [--dry-run] [--keep-zotero-open] [--local-writes on|off]`` -- install the
       Zotero bridge plugin into Zotero's profile. A running Zotero is closed first when the
-      saved setting allows it; ``--keep-zotero-open`` refuses instead.
+      saved setting allows it; ``--keep-zotero-open`` refuses instead. ``--local-writes`` also sets the
+      bridge's open local writes setting after the install.
+    * ``zotero local-writes status|on|off [--profile DIR] [--restart] [--dry-run]`` -- show or set the
+      bridge's open local writes setting in the profile's user.js. ``--restart`` is the only way this
+      command closes Zotero, and it closes gracefully (never a force kill).
     * ``zotero sign-plugin [--timeout-minutes N] [--dry-run] [--fetch]`` -- sign the Zotero bridge plugin
       with Mozilla as an unlisted add-on (needs WEB_EXT_API_KEY and WEB_EXT_API_SECRET). ``--fetch``
       downloads the file Mozilla already approved instead, and never uploads. Never closes Zotero,
@@ -262,6 +266,10 @@ def _dispatch_subcommand(raw_argv: list[str]) -> int | None:
             from .zotero_plugin_sign import cli_main as _sign_cli
 
             return _sign_cli(raw_argv[2:])
+        if len(raw_argv) > 1 and raw_argv[1] == "local-writes":
+            from .zotero_local_writes import cli_main as _local_writes_cli
+
+            return _local_writes_cli(raw_argv[2:])
         from .zotero_sync import cli_main as _zotero_cli
 
         return _zotero_cli(raw_argv[1:])

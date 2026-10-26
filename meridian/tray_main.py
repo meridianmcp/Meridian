@@ -85,6 +85,7 @@ from .local_runner import (
     RunnerAlreadyRunningError,
     default_state_dir,
 )
+from . import zotero_local_writes
 from . import zotero_plugin_install as zotero_plugin
 from .zotero_setup import ZoteroSetupError, run_zotero_setup_dialog
 
@@ -1278,6 +1279,209 @@ def _toggle_zotero_plugin_close_from_menu(
         )
 
 
+# ---------------------------------------------------------------------------
+# Zotero local writes (the open local writes setting in the default profile's user.js).
+# The label, the checkmark and the dialog text are pure, so they are tested without a GUI.
+# _ask_two_choice and _show_* touch Tk. The menu action only sequences them.
+# ---------------------------------------------------------------------------
+
+ZOTERO_LOCAL_WRITES_TITLE = "Zotero local writes"
+ZOTERO_LOCAL_WRITES_TURN_ON_BUTTON = "Turn on"
+ZOTERO_LOCAL_WRITES_CANCEL_BUTTON = "Cancel"
+ZOTERO_LOCAL_WRITES_RESTART_BUTTON = "Restart"
+ZOTERO_LOCAL_WRITES_LATER_BUTTON = "Later"
+_ZOTERO_LOCAL_WRITES_STATE_WORDS = {
+    "on": "on (writes need no prompt)",
+    "off": "off (the bridge asks at the desktop)",
+    "unset": "off (the bridge asks at the desktop)",
+    "unknown": "unknown (user.js could not be read)",
+}
+
+
+def zotero_local_writes_label(state: "str | None") -> str:
+    """The menu label with the current state. ``None`` means no Zotero profile was found. Pure."""
+    if state is None:
+        return f"{ZOTERO_LOCAL_WRITES_TITLE}: no Zotero profile found"
+    words = _ZOTERO_LOCAL_WRITES_STATE_WORDS.get(state, _ZOTERO_LOCAL_WRITES_STATE_WORDS["unknown"])
+    return f"{ZOTERO_LOCAL_WRITES_TITLE}: {words}"
+
+
+def zotero_local_writes_checked(state: "str | None") -> bool:
+    """The check mark shows the saved state: checked only while the setting is on. Pure."""
+    return state == zotero_local_writes.STATE_ON
+
+
+def zotero_local_writes_turn_on_text() -> str:
+    """The consent question, in plain words. The user must choose Turn on to continue. Pure."""
+    return (
+        "Any program on this computer that can read the Zotero bridge token can write to your Zotero library "
+        "with no prompt while this is on. Turn it on?"
+    )
+
+
+def zotero_local_writes_restart_text() -> str:
+    """The question asked after the setting changes, so Zotero reads it. Pure."""
+    return "Restart Zotero now to apply it?"
+
+
+def zotero_local_writes_no_profile_text() -> str:
+    """Shown when no default Zotero profile is found, so there is nothing to change. Pure."""
+    return "No Zotero profile was found. Open Zotero once so it creates a profile, then try again."
+
+
+def _zotero_local_writes_state() -> "str | None":
+    """The saved setting in the default profile, or None when there is no profile. Reads only. Never raises."""
+    target = zotero_local_writes.default_profile_dir()
+    if target is None:
+        return None
+    try:
+        return zotero_local_writes.read_state(target)
+    except Exception:  # noqa: BLE001 -- a menu label must never take the tray down
+        return zotero_local_writes.STATE_UNKNOWN
+
+
+def _ask_two_choice(
+    title: str, message: str, primary: str, secondary: str, *, parent: Any | None = None,
+) -> "bool | None":
+    """A message with two buttons. True = the primary button. False = the secondary button or a closed window.
+
+    None means no GUI is available.
+    """
+    try:
+        import tkinter as tk
+    except ImportError:
+        return None
+    owns_root = parent is None
+    try:
+        root = parent if parent is not None else tk.Tk()
+    except tk.TclError:
+        return None
+    if owns_root:
+        root.withdraw()
+    answer = {"value": False}
+    try:
+        dialog = tk.Toplevel(root)
+        dialog.title(title)
+        dialog.resizable(False, False)
+
+        def _choose(value: bool) -> None:
+            answer["value"] = value
+            dialog.destroy()
+
+        tk.Label(dialog, text=message, wraplength=420, justify="left", padx=16, pady=16).pack()
+        buttons = tk.Frame(dialog)
+        buttons.pack(fill="x", padx=16, pady=(0, 16))
+        tk.Button(buttons, text=primary, width=14, command=lambda: _choose(True)).pack(side="right")
+        tk.Button(buttons, text=secondary, width=12, command=lambda: _choose(False)).pack(side="right", padx=(0, 8))
+        # Escape and the window's close button choose the secondary button. Enter does not choose the primary one.
+        dialog.bind("<Escape>", lambda _event: _choose(False))
+        dialog.protocol("WM_DELETE_WINDOW", lambda: _choose(False))
+        try:
+            dialog.wait_visibility()
+            dialog.grab_set()
+        except tk.TclError:
+            pass  # some window managers refuse a grab; the dialog still works without one
+        root.wait_window(dialog)
+    finally:
+        if owns_root:
+            root.destroy()
+    return bool(answer["value"])
+
+
+def _write_zotero_local_writes(enabled: bool, dispatch: Any, *, parent: Any | None, target: Path) -> None:
+    """Write the setting, then queue the restart question when it changed, or queue the error. Never raises."""
+    try:
+        change = zotero_local_writes.set_local_writes(target, enabled)
+    except (OSError, ValueError) as exc:
+        dispatch(
+            lambda error=exc: _show_error_dialog(
+                ZOTERO_LOCAL_WRITES_TITLE, f"The setting could not be saved: {error}", parent=parent,
+            )
+        )
+        return
+    if change["changed"]:
+        dispatch(lambda: _offer_zotero_local_writes_restart(dispatch, parent=parent))
+
+
+def _confirm_turn_on_zotero_local_writes(dispatch: Any, *, parent: Any | None, target: Path) -> None:
+    """UI-thread step: the consent question. Only an explicit Turn on writes the setting. Never raises."""
+    try:
+        answer = _ask_two_choice(
+            ZOTERO_LOCAL_WRITES_TITLE,
+            zotero_local_writes_turn_on_text(),
+            ZOTERO_LOCAL_WRITES_TURN_ON_BUTTON,
+            ZOTERO_LOCAL_WRITES_CANCEL_BUTTON,
+            parent=parent,
+        )
+    except Exception:  # noqa: BLE001 -- a broken dialog must never take the tray down; nothing is changed
+        _logger.warning("tray_main: the Zotero local writes question could not be shown", exc_info=True)
+        return
+    if answer is True:
+        _write_zotero_local_writes(True, dispatch, parent=parent, target=target)
+
+
+def _offer_zotero_local_writes_restart(dispatch: Any, *, parent: Any | None) -> None:
+    """UI-thread step: ask whether to restart Zotero now. Restart runs on its own thread, then reports via dispatch."""
+    try:
+        answer = _ask_two_choice(
+            ZOTERO_LOCAL_WRITES_TITLE,
+            zotero_local_writes_restart_text(),
+            ZOTERO_LOCAL_WRITES_RESTART_BUTTON,
+            ZOTERO_LOCAL_WRITES_LATER_BUTTON,
+            parent=parent,
+        )
+    except Exception:  # noqa: BLE001 -- the setting is saved; a broken dialog only skips the offer
+        _logger.warning("tray_main: the Zotero restart question could not be shown", exc_info=True)
+        return
+    if answer is True:
+        threading.Thread(
+            target=_restart_zotero_and_report, args=(dispatch,), kwargs={"parent": parent}, daemon=True,
+        ).start()
+
+
+def _restart_zotero_and_report(dispatch: Any, *, parent: Any | None = None) -> str:
+    """Worker-thread body: close and start Zotero with the restart helper, then show the result. Never raises."""
+    try:
+        text = zotero_local_writes.restart_zotero()
+    except Exception as exc:  # noqa: BLE001 -- the helper reports its own failures; this is a last guard
+        text = f"Zotero was not restarted: {exc}"
+    try:
+        dispatch(lambda text=text: _show_info_dialog(ZOTERO_LOCAL_WRITES_TITLE, text, parent=parent))
+    except Exception:  # noqa: BLE001 -- a broken dispatcher must never take the tray down
+        _logger.warning("tray_main: could not queue the Zotero restart result", exc_info=True)
+    return text
+
+
+def _toggle_zotero_local_writes_from_menu(
+    dispatch: Any, *, parent: Any | None = None, profile: "Path | None" = None,
+) -> None:
+    """Menu action body. Turning the setting off needs no question. Turning it on asks first. Never raises.
+
+    ``dispatch`` queues a callback for the UI thread. ``profile`` defaults to the default Zotero profile.
+    """
+    try:
+        target = profile if profile is not None else zotero_local_writes.default_profile_dir()
+        if target is None:
+            dispatch(
+                lambda: _show_info_dialog(
+                    ZOTERO_LOCAL_WRITES_TITLE, zotero_local_writes_no_profile_text(), parent=parent,
+                )
+            )
+            return
+        if zotero_local_writes.read_state(target) == zotero_local_writes.STATE_ON:
+            _write_zotero_local_writes(False, dispatch, parent=parent, target=target)
+            return
+        dispatch(lambda: _confirm_turn_on_zotero_local_writes(dispatch, parent=parent, target=target))
+    except OSError as exc:
+        dispatch(
+            lambda error=exc: _show_error_dialog(
+                ZOTERO_LOCAL_WRITES_TITLE, f"Zotero's user.js could not be read: {error}", parent=parent,
+            )
+        )
+    except Exception:  # noqa: BLE001 -- a menu action must never take the tray down
+        _logger.warning("tray_main: the Zotero local writes menu action failed", exc_info=True)
+
+
 def _ask_zotero_plugin_first_run(parent: Any | None = None) -> "bool | None":
     """Show the first-run prompt. True = Install, False = Not now (or the window was closed),
     None = no GUI is available, so the caller leaves the choice undecided."""
@@ -2053,6 +2257,15 @@ def _run_tray() -> int:
     def _zotero_plugin_close_text(item: Any) -> str:
         return zotero_plugin_close_label(os.environ)
 
+    def _toggle_zotero_local_writes(icon: "pystray.Icon", item: Any) -> None:
+        _toggle_zotero_local_writes_from_menu(_dispatch_ui, parent=ui_root)
+
+    def _zotero_local_writes_text(item: Any) -> str:
+        return zotero_local_writes_label(_zotero_local_writes_state())
+
+    def _zotero_local_writes_checked(item: Any) -> bool:
+        return zotero_local_writes_checked(_zotero_local_writes_state())
+
     local_tools = pystray.Menu(
         pystray.MenuItem("Set up a local project…", _configure_local_project),
         pystray.MenuItem("Check a local project…", _check_local_project),
@@ -2078,6 +2291,7 @@ def _run_tray() -> int:
             _toggle_zotero_plugin_autoinstall,
             checked=_zotero_plugin_autoinstall_checked,
         ),
+        pystray.MenuItem(_zotero_local_writes_text, _toggle_zotero_local_writes, checked=_zotero_local_writes_checked),
     ]
     if zotero_plugin.autoinstall_supported():
         zotero_plugin_menu_items.append(

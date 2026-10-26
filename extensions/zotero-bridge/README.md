@@ -171,6 +171,12 @@ Open local writes turns off the prompt for this Zotero. While it is on, every `P
 no dialog, and the key comes back on the poll as usual. Each key is a one-hour key, as with a standing approval. The
 busy, cooldown and rate limits still apply.
 
+Meridian can set this for you: `python -m meridian zotero local-writes on --restart` writes the setting into the default
+profile's `user.js`, then closes Zotero gracefully (never a force kill) and starts it again, so the change takes effect.
+`off` turns it back off the same way. Without `--restart` the command says that Zotero must restart first. The tray's
+Zotero local writes item asks you to confirm before it turns the setting on. The shipped default stays off: the plugin
+ships with this preference set to `false`, and installing it changes nothing unless you pass `--local-writes`.
+
 - **It is off by default.** To turn it on, set `extensions.zotero.meridianZoteroBridge.localWritesOpen` to `true` in
   Zotero's Config Editor (about:config), then restart Zotero. The bridge reads it at startup, so a change takes effect
   only after a restart.
