@@ -17,6 +17,7 @@ var MERIDIAN_PREF_PREFIX = 'extensions.zotero.meridianZoteroBridge.';
 var MERIDIAN_API_PORT_PREF = MERIDIAN_PREF_PREFIX + 'apiPort';
 var MERIDIAN_API_TOKEN_PATH_PREF = MERIDIAN_PREF_PREFIX + 'apiTokenPath';
 var MERIDIAN_STANDING_PREF = MERIDIAN_PREF_PREFIX + 'standingGrantUntil';
+var MERIDIAN_LOCAL_WRITES_OPEN_PREF = MERIDIAN_PREF_PREFIX + 'localWritesOpen';
 var MERIDIAN_BIBTEX_TRANSLATOR_ID = '9cb70025-a888-4a29-a210-93ec52da40d4';
 var MERIDIAN_MENU_COLLECTION = 'meridian-zotero-bridge-collection-menu';
 var MERIDIAN_MENU_ITEM = 'meridian-zotero-bridge-item-menu';
@@ -525,6 +526,8 @@ async function meridianStartApi() {
   var validate = meridianLib['api/validate'];
   // One tracker serves both write factories and the app, so a rolled-back batch sees every object it touched.
   var tracker = { inBatch: false, touched: [], created: [] };
+  // Open local writes: the owner sets the pref in about:config. Read here, at startup, so a change takes effect after a restart.
+  var openLocalWrites = Services.prefs.getBoolPref(MERIDIAN_LOCAL_WRITES_OPEN_PREF, false);
   // Write grants: a person approves each app at the desktop. The token alone never writes. See lib/api/grants.js.
   var grants = meridianLib['api/grants'].createGrants({
     validate: validate,
@@ -534,6 +537,7 @@ async function meridianStartApi() {
     constantTimeEquals: meridianLib['api/auth'].constantTimeEquals,
     // Read here, at startup, so a standing approval saved in an earlier run is in force from the first request.
     standing: meridianStandingStore(),
+    openLocalWrites: openLocalWrites,
   });
   var app = meridianLib['api/app'].createApp({
     zotero: Zotero,

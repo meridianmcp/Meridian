@@ -34,6 +34,8 @@ the old placeholder `update_url`, so it does not auto-update from GitHub), `0.1.
 - **Standing approval (30 days) and `DELETE /v1/standing`: not yet verified in Zotero.** The node tests cover the
   logic. The desktop's fourth button, and the revoke, still need a live check in a throwaway profile. The button also
   depends on `Zotero.Prompt.confirm` showing four buttons, which the node tests cannot check.
+- **Open local writes: not yet verified in Zotero.** The node tests cover the logic, including the token and the write
+  gate. The pref read at startup, and the restart that turns it off, still need a live check in a throwaway profile.
 - **Linking, verified live on the real Windows resolver.** On 2026-10-17, in a throwaway Zotero 10.0.6 profile with
   the local API on, the link policy gave the expected result for 13 of 13 cases: a plain allowed file, a trailing dot
   on a folder and an 8.3 alias of the allowed folder (all stored at the real path), an allowed folder written with
@@ -65,7 +67,8 @@ Zotero's own restore does. That restore is API-only.
 - **Local trust.** The token admits a request, but it does not grant a write. A write needs a grant that a person
   approves at the desktop. The API cannot tell that person from another process of the same user, so the desktop
   prompt is the protection, and it shows the app name as self-reported. A standing approval (30 days) lets any process
-  get a write without a prompt, so it widens this (see Standing approval below). The processes share one connection limit of
+  get a write without a prompt, so it widens this (see Standing approval below). Open local writes does the same for as
+  long as the owner has it on (see Open local writes below). The processes share one connection limit of
   eight. A connection that sends no complete request is closed after ten seconds, so one process can hold a slot for
   up to ten seconds that way. After an answer, the socket stays open for up to five more
   seconds. This affects local availability only: a local process can keep other callers from connecting.
@@ -126,8 +129,8 @@ cannot write on its own.
 
 - `POST /v1/grants` with `{"app_name": "..."}` asks for a grant. The answer is `202` and a `grant_id`. Zotero shows a
   prompt that names the app. Its buttons are **Allow for 1 hour**, **Allow until Zotero restarts**, **Allow for 30
-  days** and **Deny**. Deny is the default, so Enter and Escape both refuse. While a standing approval is in force, the
-  answer already says `granted`, with no prompt (see below).
+  days** and **Deny**. Deny is the default, so Enter and Escape both refuse. While a standing approval is in force, or
+  open local writes is on, the answer already says `granted`, with no prompt (see below).
 - `GET /v1/grants/<grant_id>` reports `pending`, `granted`, `denied`, `expired` or `revoked`. When a grant is first seen
   as granted, the reply carries `write_key` once. A later request does not return it again.
 - Send the key as `Meridian-Write-Grant: <write_key>` on every write. A write without a live key is refused with
@@ -162,6 +165,26 @@ comes back on the poll as usual. The busy, cooldown and rate limits still apply.
 - This is a wider grant than the others. Any process that holds the token can ask, and while the approval lasts it is
   granted without a prompt. Turn it on only on a machine where you trust every process that can read the token file.
 
+### Open local writes (off by default)
+
+Open local writes turns off the prompt for this Zotero. While it is on, every `POST /v1/grants` is granted at once, with
+no dialog, and the key comes back on the poll as usual. Each key is a one-hour key, as with a standing approval. The
+busy, cooldown and rate limits still apply.
+
+- **It is off by default.** To turn it on, set `extensions.zotero.meridianZoteroBridge.localWritesOpen` to `true` in
+  Zotero's Config Editor (about:config), then restart Zotero. The bridge reads it at startup, so a change takes effect
+  only after a restart.
+- **The token is still required.** A request without the bearer token is refused with `401`, as before. A write still
+  needs a grant key in the `Meridian-Write-Grant` header. Only the prompt is skipped.
+- **A request body cannot turn it on.** Only the preference does.
+- **It does not expire and saves nothing.** It makes no standing approval, so it needs no saved expiry, and nothing is
+  left behind when it is turned off.
+- **To turn it off,** set `extensions.zotero.meridianZoteroBridge.localWritesOpen` to `false` and restart Zotero. A
+  restart also ends every grant, since grants are kept only in memory. `DELETE /v1/standing` does not turn it off: it
+  clears only a standing approval.
+- This is wider than the prompted grants. While it is on, any process that holds the token can write without a prompt.
+  Turn it on only on a machine where you trust every process that can read the token file.
+
 ### Endpoints
 
 Keys are Zotero's 8-character keys. Every item response has `key`, `version`, `date_modified`, and `library_id`.
@@ -187,10 +210,10 @@ Collection responses have the same fields except `date_modified`, because Zotero
 | `POST /v1/tags/rename` | `from`, `to` | Renames a tag across the user library. Not allowed inside a batch. |
 | `POST /v1/import/bibtex` | `bibtex`, optional `collection_key`, optional `dry_run` | Returns the plan: what would import, the exact duplicates, and the conflicts. `dry_run: true` writes nothing. A file whose library changes during the parse is refused with 409 `library_changed`, and nothing is imported. Not allowed inside a batch. |
 | `POST /v1/batch` | `operations`: a list of `{method, path, body}` | Runs the operations in one transaction. Any failure rolls the whole batch back and reports `failed_index`. Needs a write grant key. |
-| `POST /v1/grants` | `app_name` | Asks a person at the desktop for a write grant. Answers 202 with a `grant_id`, and `granted` at once while a standing approval is in force. The token is enough here. |
+| `POST /v1/grants` | `app_name` | Asks a person at the desktop for a write grant. Answers 202 with a `grant_id`, and `granted` at once while a standing approval is in force or open local writes is on. The token is enough here. |
 | `GET /v1/grants/{id}` | none | Reports the grant's status. Returns `write_key` once, when the grant is first granted. The token is enough here. |
 | `DELETE /v1/grants/{id}` | none | Ends the grant at once. The token is enough here. |
-| `DELETE /v1/standing` | none | Clears the standing approval, so the next grant request prompts again. Answers 200. The token is enough here. |
+| `DELETE /v1/standing` | none | Clears the standing approval, so the next grant request prompts again, unless open local writes is on. It does not turn open local writes off. Answers 200. The token is enough here. |
 
 Relation objects are the ones Zotero stores. `related_key` links two items in the library. Any other predicate
 needs the `predicate:name` form (for example `dc:replaces`) and an `object` with no spaces.
@@ -374,6 +397,8 @@ the run goes on, so the summary always shows every item.
 - `extensions.zotero.meridianZoteroBridge.apiTokenPath`, default empty, which keeps the API off. Set by the install.
 - `extensions.zotero.meridianZoteroBridge.standingGrantUntil`, default empty, which means no standing approval. Set only
   by the desktop's **Allow for 30 days** answer, and cleared by `DELETE /v1/standing` or when it runs out.
+- `extensions.zotero.meridianZoteroBridge.localWritesOpen`, default `false`. Set `true` in about:config to grant every write
+  request at once, with no prompt. See Open local writes. It is read at startup, so a restart is needed after a change.
 
 ## Compatibility
 

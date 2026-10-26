@@ -46,6 +46,7 @@ function setup(answer, options = {}) {
     },
     constantTimeEquals: auth.constantTimeEquals,
     standing,
+    openLocalWrites: options.openLocalWrites,
   });
   return { store, clock, asked, standing };
 }
@@ -334,4 +335,95 @@ test('the one-hour and until-restart choices are unchanged, and neither saves a 
   assert.equal(new Date(session.store.status(sessionId).expires_at).getTime(), 1_000_000 + SESSION_MAX_MS);
   assert.deepEqual(hour.standing.writes, []);
   assert.deepEqual(session.standing.writes, []);
+});
+
+test('open local writes: a request is granted at once with no dialog, and its key writes', async () => {
+  const { store, asked, standing } = setup('deny', { openLocalWrites: true });
+  const out = store.request({ app_name: 'Claude Code' });
+  assert.equal(out.status, 'granted', 'the answer comes back at once, with no wait');
+  assert.deepEqual(asked, [], 'no dialog was shown');
+  const granted = store.status(out.grant_id);
+  assert.equal(granted.status, 'granted');
+  assert.equal(granted.write_key.length, 64);
+  assert.equal(store.checkKey(granted.write_key), true, 'the key works for a write');
+  assert.equal(new Date(granted.expires_at).getTime(), 1_000_000 + HOUR_MS, 'the key is a one-hour key');
+  assert.deepEqual(standing.writes, [], 'nothing was saved, so no expiry is needed');
+});
+
+test('open local writes does not expire: once its keys run out, the next request is still granted at once', () => {
+  const { store, clock, asked } = setup('deny', { openLocalWrites: true });
+  const first = store.request({ app_name: 'Claude Code' });
+  const { write_key } = store.status(first.grant_id);
+  clock.t += HOUR_MS;
+  assert.equal(store.checkKey(write_key), false, 'the key itself still runs out after an hour');
+  assert.equal(store.request({ app_name: 'Claude Code' }).status, 'granted', 'open mode is still on, so the next request is granted');
+  assert.deepEqual(asked, []);
+});
+
+test('open local writes still applies the request limit', () => {
+  const { store, asked } = setup('deny', { openLocalWrites: true });
+  for (let i = 0; i < REQUEST_LIMIT; i += 1) {
+    assert.equal(store.request({ app_name: 'App ' + i }).status, 'granted');
+  }
+  assert.throws(() => store.request({ app_name: 'One more' }), apiErrorMatch(429, 'grant_rate_limited'));
+  assert.deepEqual(asked, []);
+});
+
+test('open local writes is off unless the owner turns it on: absent, false, or a value that is not true does not grant', async () => {
+  for (const value of [undefined, false, 'true', 1]) {
+    const { store, asked } = setup('deny', { openLocalWrites: value });
+    const id = await askAndAnswer(store, 'Claude Code');
+    assert.equal(store.status(id).status, 'denied', `openLocalWrites ${String(value)} must not grant`);
+    assert.equal(asked.length, 1, 'the request prompted');
+  }
+});
+
+test('a request body cannot turn open local writes on', async () => {
+  const { store, asked, standing } = setup('deny');
+  const extra = { open_local_writes: true, openLocalWrites: true, local_writes_open: true, choice: 'open', standing: true };
+  const first = store.request({ app_name: 'Claude Code', ...extra });
+  assert.equal(first.status, 'pending', 'the request waits for the dialog, as before');
+  await flush();
+  assert.equal(store.status(first.grant_id).status, 'denied', 'the dialog answered deny');
+  const second = store.request({ app_name: 'Another app', ...extra });
+  assert.equal(second.status, 'pending', 'the same body still gets no grant at once');
+  await flush();
+  assert.equal(asked.length, 2, 'both requests prompted');
+  assert.deepEqual(standing.writes, [], 'nothing was saved');
+});
+
+test('DELETE /v1/standing does not turn open local writes off', () => {
+  const { store, asked, standing } = setup('deny', { openLocalWrites: true });
+  assert.equal(store.request({ app_name: 'Claude Code' }).status, 'granted');
+  assert.deepEqual(store.revokeStanding(), { standing: 'none' });
+  assert.equal(store.request({ app_name: 'Another app' }).status, 'granted', 'still granted at once after the standing revoke');
+  assert.deepEqual(asked, []);
+  assert.deepEqual(standing.writes, [null], 'the revoke wrote only the clear; open mode saved nothing');
+});
+
+test('open local writes saves no standing approval, so turning it off prompts again', async () => {
+  const standing = fakeStanding();
+  const open = setup('deny', { openLocalWrites: true, standing });
+  assert.equal(open.store.request({ app_name: 'Claude Code' }).status, 'granted');
+  assert.equal(open.store.request({ app_name: 'Another app' }).status, 'granted');
+  assert.deepEqual(standing.writes, [], 'nothing was saved while it was on');
+  // Turning it off sets the owner's preference back to false and restarts Zotero. The next start reads a store with nothing saved.
+  const closed = setup('deny', { standing });
+  const id = await askAndAnswer(closed.store, 'Claude Code');
+  assert.equal(closed.asked.length, 1, 'with open mode off, the request prompts');
+  assert.equal(closed.store.status(id).status, 'denied');
+});
+
+test('open local writes does not skip the factory checks: missing deps still refuse to start', () => {
+  const base = {
+    validate: v,
+    now: () => 0,
+    randomHex: () => '',
+    ask: async () => 'deny',
+    constantTimeEquals: auth.constantTimeEquals,
+    standing: fakeStanding(),
+    openLocalWrites: true,
+  };
+  assert.throws(() => createGrants({ ...base, now: undefined }), /needs deps\.now/);
+  assert.throws(() => createGrants({ ...base, standing: undefined }), /needs deps\.standing/);
 });

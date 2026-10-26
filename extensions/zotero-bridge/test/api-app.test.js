@@ -8,6 +8,7 @@ const v = require('../lib/api/validate.js');
 const { createApp } = require('../lib/api/app.js');
 const { createItemWrites } = require('../lib/api/items.js');
 const { createCollectionWrites } = require('../lib/api/collections.js');
+const { createGrants } = require('../lib/api/grants.js');
 const { createFakeZotero, createFakeIO } = require('./support/fake-zotero.js');
 
 const HOST = '127.0.0.1:23125';
@@ -418,4 +419,86 @@ test('the standing route still needs the token, and other methods on it are refu
   const wrong = await call(app, 'GET', '/v1/standing');
   assert.equal(wrong.status, 405);
   assert.deepEqual(wrong.body.error.details.allow, ['DELETE']);
+});
+
+// The real grant store, with open local writes as given. Any dialog it shows is recorded in `asked`.
+function realGrants(openLocalWrites) {
+  const clock = { t: 1_000_000 };
+  let counter = 0;
+  const asked = [];
+  const standing = {
+    value: null,
+    writes: [],
+    read: () => standing.value,
+    write: (value) => {
+      standing.writes.push(value);
+      standing.value = value;
+    },
+  };
+  const grants = createGrants({
+    validate: v,
+    now: () => clock.t,
+    randomHex: (bytes) => {
+      counter += 1;
+      return counter.toString(16).padStart(bytes * 2, '0');
+    },
+    ask: async (appName) => {
+      asked.push(appName);
+      return 'deny';
+    },
+    constantTimeEquals: auth.constantTimeEquals,
+    standing,
+    openLocalWrites,
+  });
+  return { grants, asked, standing };
+}
+
+test('open local writes: a grant is granted at once, its key writes, and the token is still required', async () => {
+  const { grants, asked } = realGrants(true);
+  const { app } = build({ grants });
+  const refused = await call(app, 'POST', '/v1/grants', { json: { app_name: 'Claude Code' }, noAuth: true, noGrant: true });
+  assert.equal(refused.status, 401, 'a grant request without the token is refused');
+  const asking = await call(app, 'POST', '/v1/grants', { json: { app_name: 'Claude Code' }, noGrant: true });
+  assert.equal(asking.status, 202);
+  assert.equal(asking.body.status, 'granted', 'granted at once');
+  const polled = await call(app, 'GET', '/v1/grants/' + asking.body.grant_id, { noGrant: true });
+  assert.equal(polled.body.status, 'granted');
+  const key = polled.body.write_key;
+  const wrote = await call(app, 'POST', '/v1/items', {
+    json: { item_type: 'book', fields: { title: 'Open mode' } },
+    headers: { 'meridian-write-grant': key },
+  });
+  assert.equal(wrote.status, 201, 'the key writes');
+  const noKey = await call(app, 'POST', '/v1/items', { json: { item_type: 'book', fields: { title: 'No key' } }, noGrant: true });
+  assert.equal(noKey.status, 403, 'a write without a grant key is still refused');
+  assert.equal(noKey.body.error.code, 'grant_required');
+  const noToken = await call(app, 'POST', '/v1/items', {
+    json: { item_type: 'book', fields: { title: 'No token' } },
+    noAuth: true,
+    headers: { 'meridian-write-grant': key },
+  });
+  assert.equal(noToken.status, 401, 'a write without the token is refused even with the key');
+  assert.deepEqual(asked, [], 'no dialog was shown');
+});
+
+test('open local writes stays on after DELETE /v1/standing', async () => {
+  const { grants, asked } = realGrants(true);
+  const { app } = build({ grants });
+  const cleared = await call(app, 'DELETE', '/v1/standing', { noGrant: true });
+  assert.equal(cleared.status, 200);
+  const asking = await call(app, 'POST', '/v1/grants', { json: { app_name: 'Claude Code' }, noGrant: true });
+  assert.equal(asking.body.status, 'granted', 'the next request is still granted at once');
+  assert.deepEqual(asked, []);
+});
+
+test('a grant request body cannot turn open local writes on, at the HTTP layer either', async () => {
+  const { grants, asked } = realGrants(false);
+  const { app } = build({ grants });
+  const out = await call(app, 'POST', '/v1/grants', {
+    json: { app_name: 'Claude Code', open_local_writes: true, openLocalWrites: true, standing: true },
+    noGrant: true,
+  });
+  assert.equal(out.body.status, 'pending', 'the request waits for the dialog');
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.deepEqual(asked, ['Claude Code'], 'the dialog was shown');
 });

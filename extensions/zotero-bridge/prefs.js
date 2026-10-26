@@ -21,3 +21,9 @@ pref("extensions.zotero.meridianZoteroBridge.apiTokenPath", "");
 // standingGrantUntil: the expiry, in ms since the epoch, of a 30-day standing approval, saved by the desktop's
 //                     "Allow for 30 days" answer. Empty (the default) means none. Revoke clears it: DELETE /v1/standing.
 pref("extensions.zotero.meridianZoteroBridge.standingGrantUntil", "");
+
+// localWritesOpen: true turns off the write prompt, so every write grant request is granted at once, with a one-hour key.
+//                  The token is still required, and the write gate does not change. Off (the default). It is set by the
+//                  owner in Zotero's about:config, and it is read at startup, so a change takes effect after a restart.
+//                  A request body cannot set it. See the README section on open local writes.
+pref("extensions.zotero.meridianZoteroBridge.localWritesOpen", false);

@@ -6,9 +6,13 @@
 // the default answer is Deny; a grant is never remembered across a restart, except a standing approval (below); and
 // the key goes back once, to the request that asked for it.
 //
-// A standing approval is the one exception. The desktop's "Allow for 30 days" answer saves it, and while it is in
+// A standing approval is one exception. The desktop's "Allow for 30 days" answer saves it, and while it is in
 // force a request is granted at once, with no dialog. Only that answer makes one. A request body cannot make or extend
 // one, and a revoke clears it.
+//
+// Open local writes is the other. The owner turns it on in about:config, never in a request. While it is on, a request
+// is granted at once, with no dialog, and each key is a one-hour key as before. It has no expiry and saves nothing, so
+// turning it off leaves nothing behind. The token is still required, and the write gate does not change.
 //
 // This module is pure logic. The clock, the random source, the prompt and the saved standing approval are injected, so
 // the node tests run the whole state machine without a timer, a dialog or a preference.
@@ -32,6 +36,8 @@ function createGrants(deps) {
   var randomHex = deps.randomHex;
   var ask = deps.ask;
   var constantTimeEquals = deps.constantTimeEquals;
+  // Only a literal true turns open local writes on, so a damaged or non-boolean value leaves it off. Read once, here.
+  var openLocalWrites = deps.openLocalWrites === true;
 
   if (typeof now !== 'function') throw new Error('createGrants needs deps.now');
   if (typeof randomHex !== 'function') throw new Error('createGrants needs deps.randomHex');
@@ -90,6 +96,23 @@ function createGrants(deps) {
     var until = now() + STANDING_MS;
     if (!saveStanding(until)) return;
     standingUntil = until;
+  }
+
+  // True while open local writes is on. Nothing is saved for it and it has no expiry, so there is nothing to clear.
+  function openInForce() {
+    return openLocalWrites;
+  }
+
+  // Grants a request at once, with no dialog. The key is made before the record is stored, so a failure here leaves no
+  // pending record behind. Nothing waits for an answer, so the one-request-at-a-time rule does not apply.
+  function grantAtOnce(record, choice) {
+    record.key = randomHex(KEY_HEX_LENGTH / 2);
+    record.status = 'granted';
+    record.expiresAt = now() + HOUR_MS;
+    record.choice = choice;
+    records.set(record.id, record);
+    prune();
+    return { grant_id: record.id, status: 'granted' };
   }
 
   // A grant that has run out is marked expired and loses its key. Nothing else depends on the clock.
@@ -166,17 +189,10 @@ function createGrants(deps) {
       choice: null,
       delivered: false,
     };
-    if (standingInForce()) {
-      // The key is made before the record is stored, so a failure here leaves no pending record behind. Nothing waits
-      // for an answer, so the one-request-at-a-time rule does not apply.
-      record.key = randomHex(KEY_HEX_LENGTH / 2);
-      record.status = 'granted';
-      record.expiresAt = now() + HOUR_MS;
-      record.choice = 'standing';
-      records.set(record.id, record);
-      prune();
-      return { grant_id: record.id, status: 'granted' };
-    }
+    // Open local writes and a standing approval both grant at once. Open mode is checked first. It never expires and
+    // saves nothing, so it does not read the stored expiry at all.
+    if (openInForce()) return grantAtOnce(record, 'open');
+    if (standingInForce()) return grantAtOnce(record, 'standing');
     records.set(record.id, record);
     pendingId = record.id;
     prune();
@@ -248,6 +264,7 @@ function createGrants(deps) {
 
   // Clears the standing approval, so the next request prompts again. Grants already made are not touched. The saved
   // expiry is cleared first: if the store refuses, the error reaches the caller and the approval stays in force.
+  // Open local writes is not touched here. Only the owner's preference turns it off.
   function revokeStanding() {
     deps.standing.write(null);
     standingUntil = null;
