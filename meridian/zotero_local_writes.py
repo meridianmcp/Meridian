@@ -5,6 +5,8 @@ true, every write grant is given with no prompt at the desktop. The shipped plug
 and nothing here changes it. This module sets that one preference in a profile's ``user.js``, keeps every other
 line of the file byte for byte, and can restart Zotero so the change takes effect.
 
+Out of scope: the check reads the literal pref name only, so a file that builds the name at runtime is not recognized.
+
 Standard library only at import time. Zotero's profile lookup and the close and start helpers are imported inside
 the functions that use them, so the installer can import this module without a cycle.
 
@@ -76,18 +78,59 @@ def _split_lines(text: str) -> "list[str]":
     return re.findall(r"[^\n]*\n|[^\n]+", text)
 
 
+def _block_comment_at_line_starts(lines: "list[str]") -> "list[bool]":
+    """For each line, whether a ``/* ... */`` block comment is open where the line starts.
+
+    A comment marker inside a double or single quoted string opens nothing, a ``//`` comment runs to the end of its
+    line, and a block comment may span lines. A string is read within one line, since a pref line never spans lines.
+    """
+    open_block = False
+    starts: "list[bool]" = []
+    for line in lines:
+        starts.append(open_block)
+        quote = ""
+        index = 0
+        while index < len(line):
+            if open_block:
+                if line.startswith("*/", index):
+                    open_block = False
+                    index += 2
+                else:
+                    index += 1
+            elif quote:
+                if line[index] == "\\":
+                    index += 2
+                else:
+                    if line[index] == quote:
+                        quote = ""
+                    index += 1
+            elif line.startswith("//", index):
+                break
+            elif line.startswith("/*", index):
+                open_block = True
+                index += 2
+            else:
+                if line[index] in "\"'":
+                    quote = line[index]
+                index += 1
+    return starts
+
+
 def _statements(lines: "Iterable[str]") -> "list[tuple[int, bool]]":
     """The pref's statements in file order, as (line index, value). Raises ValueError for a bad line.
 
-    Every line that names the pref must be exactly one complete statement. A split call, two statements on one line or
-    any other syntax raises ValueError, so nothing is read from such a file and nothing is written to it.
+    Every line that names the pref must be exactly one complete statement, and must not sit inside a ``/* ... */``
+    block comment, where Zotero ignores it. A split call, two statements on one line, a statement inside a block comment
+    or any other syntax raises ValueError, so nothing is read from such a file and nothing is written to it.
     """
+    line_list = list(lines)
+    in_block_comment = _block_comment_at_line_starts(line_list)
     found: "list[tuple[int, bool]]" = []
-    for index, line in enumerate(lines):
+    for index, line in enumerate(line_list):
         if PREF not in line:
             continue
         match = _STATEMENT.fullmatch(line.rstrip("\n"))
-        if match is None:
+        if match is None or in_block_comment[index]:
             raise ValueError(_REFUSED_TEXT)
         found.append((index, match.group(1) == "true"))
     return found

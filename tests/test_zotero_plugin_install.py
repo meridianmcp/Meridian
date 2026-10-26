@@ -1897,9 +1897,36 @@ def test_cli_says_when_it_closed_zotero_but_could_not_restart_it(monkeypatch, ca
     monkeypatch.setattr(zotero_launcher, "start_zotero", _no_start)
     rc = zpi.cli_main(["--profile", str(profile)])
     out = capsys.readouterr().out
-    assert rc == 0
+    assert rc == 1
     assert "Installed the Zotero bridge plugin" in out
     assert "Meridian closed Zotero, but could not restart it. Start Zotero yourself." in out
+
+
+@pytest.mark.parametrize(
+    ("launch", "expected_rc"),
+    [
+        ({"action": "started", "exe": "Z", "api_ready": True}, 0),
+        ({"action": "already_running"}, 0),
+        ({"action": "not_installed"}, 1),
+        ({"action": "timeout"}, 1),
+    ],
+)
+def test_cli_exit_code_follows_whether_meridian_restarted_the_zotero_it_closed(
+    monkeypatch, capsys, profile, launch, expected_rc,
+):
+    from meridian import zotero_launcher
+
+    monkeypatch.setattr(zpi, "zotero_process_state", _states(True, False))
+    monkeypatch.setattr(zpi, "close_zotero_gracefully", lambda **kwargs: "closed")
+    monkeypatch.setattr(zotero_launcher, "start_zotero", lambda **kwargs: launch)
+    rc = zpi.cli_main(["--profile", str(profile)])
+    out = capsys.readouterr().out
+    assert rc == expected_rc
+    assert "Installed the Zotero bridge plugin" in out
+    if expected_rc == 0:
+        assert "Meridian closed Zotero and restarted it." in out
+    else:
+        assert "Meridian closed Zotero, but could not restart it. Start Zotero yourself." in out
 
 
 # docs ---------------------------------------------------------------------------

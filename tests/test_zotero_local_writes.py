@@ -41,7 +41,9 @@ def _isolated(monkeypatch, tmp_path):
     monkeypatch.setenv(ENV_STATE_DIR, str(tmp_path / "meridian-state"))
 
     def _blocked_process(*args, **kwargs):
-        raise RuntimeError("real process calls are blocked in tests")
+        # pytest.fail, not a raise: zotero_process_state swallows ordinary exceptions and reports "unknown", so a test
+        # that reached the process check would pass silently.
+        pytest.fail("a real process call was reached from this test; process calls are blocked in tests")
 
     def _blocked_socket(*args, **kwargs):
         pytest.fail("the bridge port must not be contacted from this test")
@@ -158,6 +160,35 @@ def test_read_state_reads_a_latin1_byte_without_failing(tmp_path):
     assert zlw.read_state(folder) == "on"
 
 
+BLOCK_COMMENT_TEXTS = [
+    f"/*\n{PREF_TRUE}\n*/\n",
+    f"/* {PREF_FALSE} */\n",
+    f"// header\n/* a note\n{PREF_TRUE}\nend */\n",
+]
+
+
+@pytest.mark.parametrize("user_js", BLOCK_COMMENT_TEXTS)
+def test_read_state_refuses_a_statement_inside_a_block_comment(tmp_path, user_js):
+    folder = _profile(tmp_path, user_js=user_js)
+    with pytest.raises(ValueError, match="cannot read safely"):
+        zlw.read_state(folder)
+
+
+@pytest.mark.parametrize(
+    "user_js",
+    [
+        f"/*\nnote\n*/\n{PREF_TRUE}\n",
+        f"// see /* here\n{PREF_TRUE}\n",
+        f'user_pref("other.pref", "/*");\n{PREF_TRUE}\n',
+        f'user_pref("glob", "*/*");\n{PREF_TRUE}\n',
+        f'user_pref("quoted", "say \\"/*\\"");\n{PREF_TRUE}\n',
+    ],
+)
+def test_read_state_reads_a_statement_that_is_live_code_after_comment_like_text(tmp_path, user_js):
+    folder = _profile(tmp_path, user_js=user_js)
+    assert zlw.read_state(folder) == "on"
+
+
 def test_state_text_names_each_state_and_treats_others_as_unknown():
     assert zlw.state_text("on") == "on"
     assert zlw.state_text("off") == "off"
@@ -267,6 +298,18 @@ def test_set_refuses_two_statements_on_one_line_and_leaves_the_file_unchanged(tm
     before = _snapshot(folder)
     with pytest.raises(ValueError, match="cannot read safely"):
         zlw.set_local_writes(folder, enabled)
+    assert _snapshot(folder) == before
+
+
+@pytest.mark.parametrize("user_js", BLOCK_COMMENT_TEXTS)
+@pytest.mark.parametrize("enabled", [True, False])
+def test_set_refuses_a_statement_inside_a_block_comment_and_leaves_the_file_unchanged(tmp_path, user_js, enabled):
+    folder = _profile(tmp_path, user_js=user_js)
+    before = _snapshot(folder)
+    with pytest.raises(ValueError, match="cannot read safely"):
+        zlw.set_local_writes(folder, enabled)
+    with pytest.raises(ValueError, match="cannot read safely"):
+        zlw.plan_local_writes(folder, enabled)
     assert _snapshot(folder) == before
 
 
@@ -578,6 +621,41 @@ def test_cli_restart_exits_0_when_zotero_was_not_running_and_starts_it(tmp_path,
     assert "Zotero was not running, so it was started. The setting applies." in capsys.readouterr().out
 
 
+def test_cli_restart_exits_1_and_says_why_when_the_launch_finds_no_zotero_program(tmp_path, capsys, monkeypatch):
+    folder = _profile(tmp_path)
+    monkeypatch.setattr(zlw, "_close_zotero", lambda: "closed")
+    monkeypatch.setattr(zlw, "_start_zotero", lambda: {"action": "not_installed"})
+    assert zlw.cli_main(["on", "--profile", str(folder), "--restart"]) == 1
+    out = capsys.readouterr().out
+    assert "Zotero closed, but no Zotero program was found, so it was not started. Start Zotero yourself." in out
+    assert "so the setting applies" not in out
+    assert zlw.read_state(folder) == "on"
+
+
+def test_cli_restart_exits_1_and_says_why_when_the_launch_raises_after_a_clean_close(tmp_path, capsys, monkeypatch):
+    folder = _profile(tmp_path)
+
+    def _launch_raises():
+        raise OSError("launcher exploded")
+
+    monkeypatch.setattr(zlw, "_close_zotero", lambda: "closed")
+    monkeypatch.setattr(zlw, "_start_zotero", _launch_raises)
+    assert zlw.cli_main(["on", "--profile", str(folder), "--restart"]) == 1
+    out = capsys.readouterr().out
+    assert "Zotero could not be started (launcher exploded). Start Zotero yourself." in out
+    assert "so the setting applies" not in out
+    assert zlw.read_state(folder) == "on"
+
+
+def test_cli_restart_refuses_a_statement_inside_a_block_comment_and_restarts_nothing(tmp_path, capsys, restart_calls):
+    folder = _profile(tmp_path, user_js=f"/*\n{PREF_TRUE}\n*/\n")
+    before = _snapshot(folder)
+    assert zlw.cli_main(["on", "--profile", str(folder), "--restart"]) == 1
+    assert "cannot read safely" in capsys.readouterr().out
+    assert _snapshot(folder) == before
+    assert restart_calls == []
+
+
 def test_cli_restart_refuses_a_split_setting_line_and_restarts_nothing(tmp_path, capsys, restart_calls):
     folder = _profile(tmp_path, user_js=f'user_pref("{PREF}",\n true);\n')
     before = _snapshot(folder)
@@ -814,6 +892,20 @@ def test_install_on_the_default_profile_whose_repair_fails_sets_no_pref_and_enab
     assert rc == 1
     assert "Local writes were not set: the profile repair failed" in capsys.readouterr().out
     assert zlw.read_state(signed_install) == "unset"
+
+
+def test_install_whose_repair_fails_after_the_copy_says_the_file_was_copied_and_local_writes_were_not_changed(
+    signed_install, capsys, monkeypatch,
+):
+    monkeypatch.setattr(zpi, "_repair_profile", _failing_repair)
+    rc = zpi.cli_main(["--profile", str(signed_install), "--local-writes", "on"])
+    out = capsys.readouterr().out
+    assert rc == 1
+    assert (signed_install / "extensions" / XPI_NAME).is_file()
+    assert "The plugin file was copied, but local writes were not changed, because the profile repair failed." in out
+    assert "because the plugin was not installed" not in out
+    assert zlw.read_state(signed_install) == "unset"
+    assert not (signed_install / "user.js").exists()
 
 
 def test_install_on_the_default_profile_writes_the_pref_before_the_enable_step(

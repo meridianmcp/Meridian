@@ -1421,9 +1421,14 @@ def _print_manual_steps(xpi: Path) -> None:
         print(line.format(xpi=xpi))
 
 
+def _restart_succeeded(restart: Any) -> bool:
+    """True when the Zotero that Meridian closed is running again. The restart sentence and the exit code use it."""
+    return restart in ("started", "already_running")
+
+
 def _restart_sentence(restart: Any) -> str:
     """What happened to the Zotero that Meridian closed for this run. Printed after every outcome that closed it."""
-    if restart in ("started", "already_running"):
+    if _restart_succeeded(restart):
         return "Meridian closed Zotero and restarted it."
     return "Meridian closed Zotero, but could not restart it. Start Zotero yourself."
 
@@ -1566,7 +1571,11 @@ def _print_local_writes(result: Mapping[str, Any], enabled: "bool | None", code:
         return code
     local = result.get("local_writes")
     if not isinstance(local, Mapping):
-        print("Local writes were not changed, because the plugin was not installed.")
+        if result.get("status") == "failed" and result.get("path"):
+            # The .xpi was copied, and the profile repair after the copy failed, so the pref was never reached.
+            print("The plugin file was copied, but local writes were not changed, because the profile repair failed.")
+        else:
+            print("Local writes were not changed, because the plugin was not installed.")
         return code
     if local.get("status") == "failed":
         print(f"Local writes were not set: {local.get('error') or 'unknown error'}")
@@ -1705,6 +1714,9 @@ def cli_main(argv: "list[str] | None" = None) -> int:
     code = _print_local_writes(result, local_enabled, code)
     if result.get("closed_zotero"):
         print(_restart_sentence(result.get("restart")))
+        if not _restart_succeeded(result.get("restart")):
+            # Meridian closed Zotero and could not start it again, so the run does not end as a success.
+            code = 1
     return code
 
 
