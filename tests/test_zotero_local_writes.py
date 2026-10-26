@@ -437,10 +437,10 @@ def test_restart_a_close_that_raises_is_a_close_that_failed():
     ("close_result", "action", "expected", "restarted"),
     [
         ("closed", "already_running", "Zotero closed and is running again", True),
-        ("closed", "timeout", "did not answer in time", True),
+        ("closed", "timeout", "its local API has not answered yet", True),
         ("closed", "not_installed", "no Zotero program was found", False),
         ("not_running", "already_running", "Zotero is running, so the setting applies.", True),
-        ("not_running", "timeout", "did not answer in time", True),
+        ("not_running", "timeout", "its local API has not answered yet", True),
         ("not_running", "not_installed", "no Zotero program was found", False),
         ("closed", "something_else", "could not be started", False),
     ],
@@ -645,6 +645,67 @@ def test_cli_restart_exits_1_and_says_why_when_the_launch_raises_after_a_clean_c
     assert "Zotero could not be started (launcher exploded). Start Zotero yourself." in out
     assert "so the setting applies" not in out
     assert zlw.read_state(folder) == "on"
+
+
+def test_cli_restart_exits_0_when_zotero_closed_and_its_local_api_has_not_answered_yet(tmp_path, capsys, monkeypatch):
+    folder = _profile(tmp_path)
+    monkeypatch.setattr(zlw, "_close_zotero", lambda: "closed")
+    monkeypatch.setattr(zlw, "_start_zotero", lambda: {"action": "timeout", "exe": "Z", "api_ready": False})
+    assert zlw.cli_main(["on", "--profile", str(folder), "--restart"]) == 0
+    out = capsys.readouterr().out
+    assert "Zotero closed and was started again, but its local API has not answered yet." in out
+    assert "so the setting applies" not in out
+    assert zlw.read_state(folder) == "on"
+
+
+def test_cli_restart_exits_0_when_zotero_was_not_running_and_its_local_api_has_not_answered_yet(
+    tmp_path, capsys, monkeypatch,
+):
+    folder = _profile(tmp_path)
+    monkeypatch.setattr(zlw, "_close_zotero", lambda: "not_running")
+    monkeypatch.setattr(zlw, "_start_zotero", lambda: {"action": "timeout", "exe": "Z", "api_ready": False})
+    assert zlw.cli_main(["on", "--profile", str(folder), "--restart"]) == 0
+    assert "Zotero was started, but its local API has not answered yet." in capsys.readouterr().out
+    assert zlw.read_state(folder) == "on"
+
+
+def test_cli_restart_refuses_a_pref_line_after_a_string_that_a_line_continuation_leaves_open(
+    tmp_path, capsys, restart_calls,
+):
+    folder = _profile(tmp_path, user_js='user_pref("some.other", "a\\\n");\n' + PREF_TRUE + "\n")
+    before = _snapshot(folder)
+    assert zlw.cli_main(["status", "--profile", str(folder)]) == 1
+    assert "cannot read safely" in capsys.readouterr().out
+    assert zlw.cli_main(["on", "--profile", str(folder), "--restart"]) == 1
+    assert "cannot read safely" in capsys.readouterr().out
+    assert _snapshot(folder) == before
+    assert restart_calls == []
+
+
+def test_a_line_continuation_that_does_not_name_the_setting_is_not_refused(tmp_path):
+    folder = _profile(tmp_path, user_js='user_pref("some.other", "a\\\n");\n')
+    assert zlw.read_state(folder) == "unset"
+
+
+def test_a_setting_line_before_a_line_continuation_is_still_read(tmp_path):
+    folder = _profile(tmp_path, user_js=PREF_TRUE + '\nuser_pref("some.other", "a\\\n");\n')
+    assert zlw.read_state(folder) == "on"
+
+
+def test_a_pref_name_written_with_an_escape_sequence_is_not_recognized_and_reads_as_unset(tmp_path):
+    escaped = 'user_pref("extensions.zotero.meridianZoteroBridge.local\\x57ritesOpen", true);\n'
+    folder = _profile(tmp_path, user_js=escaped)
+    assert zlw.read_state(folder) == "unset"
+    assert zlw.cli_main(["status", "--profile", str(folder)]) == 0
+    assert zlw.set_local_writes(folder, True)["changed"] is True
+    assert zlw.read_state(folder) == "on"
+    assert (folder / "user.js").read_text(encoding="utf-8").startswith(escaped)
+
+
+def test_the_module_and_the_bridge_readme_both_name_the_escape_sequence_limit():
+    readme = (REPO_ROOT / "extensions" / "zotero-bridge" / "README.md").read_text(encoding="utf-8")
+    assert "escape sequence" in zlw.__doc__
+    assert "escape sequence" in readme
 
 
 def test_cli_restart_refuses_a_statement_inside_a_block_comment_and_restarts_nothing(tmp_path, capsys, restart_calls):

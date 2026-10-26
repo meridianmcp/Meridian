@@ -1422,12 +1422,15 @@ def _print_manual_steps(xpi: Path) -> None:
 
 
 def _restart_succeeded(restart: Any) -> bool:
-    """True when the Zotero that Meridian closed is running again. The restart sentence and the exit code use it."""
-    return restart in ("started", "already_running")
+    """True when Meridian's restart started the Zotero it closed. ``timeout`` counts: the launch started Zotero, and
+    only its local API has not answered yet. The restart sentence and the exit code use it."""
+    return restart in ("started", "already_running", "timeout")
 
 
 def _restart_sentence(restart: Any) -> str:
     """What happened to the Zotero that Meridian closed for this run. Printed after every outcome that closed it."""
+    if restart == "timeout":
+        return "Meridian closed Zotero and started it again, but its local API has not answered yet."
     if _restart_succeeded(restart):
         return "Meridian closed Zotero and restarted it."
     return "Meridian closed Zotero, but could not restart it. Start Zotero yourself."
@@ -1435,7 +1438,7 @@ def _restart_sentence(restart: Any) -> str:
 
 def _closed_unconfirmed_cli_text(restart: Any) -> str:
     """What the CLI says when Meridian closed Zotero but could not confirm it was closed. Names the restart. Pure."""
-    if restart in ("started", "already_running"):
+    if _restart_succeeded(restart):
         return (
             "Meridian closed Zotero and restarted it, but could not confirm that Zotero is closed, so nothing was "
             "installed. Close Zotero, then run this command again."
@@ -1750,9 +1753,6 @@ def _print_install_status_and_enable(result: Mapping[str, Any], xpi: Path, profi
             print(message)
         if str(enable.get("status")) in ("register_timeout", "close_failed", "not_registered", "registry_unreadable", "failed", "blocked"):
             code = 1
-    if result.get("scan_pref_error"):
-        print(f"The scan setting could not be written to user.js: {result['scan_pref_error']}")
-        code = 1
     return code
 
 

@@ -176,8 +176,10 @@ profile's `user.js`, then closes Zotero gracefully (never a force kill) and star
 `off` turns it back off the same way. Without `--restart` the command says that Zotero must restart first. With
 `--restart`, a run that did not restart Zotero exits with 1. If `user.js` already has a line that names this setting in
 any other form (a statement split over two lines, two statements on one line, a statement inside a `/* ... */` block
-comment, or a comment that names it), the command changes nothing and says so. The check reads the literal pref name
-only, so a file that builds the name at runtime is not recognized. The tray's Zotero local writes item asks you to
+comment, a statement after a string that a backslash line continuation leaves open, or a comment that names it), the
+command changes nothing and says so. The check reads the literal pref name only, so a file that builds the name at
+runtime is not recognized. A pref name written with an escape sequence, such as a hex or unicode escape like
+`local\x57ritesOpen`, is not recognized and reads as unset. The tray's Zotero local writes item asks you to
 confirm before it turns the setting on. The shipped default stays off: the plugin ships with this preference set to
 `false`, and installing it changes nothing unless you pass `--local-writes`.
 

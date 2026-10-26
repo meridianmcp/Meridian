@@ -6,6 +6,8 @@ and nothing here changes it. This module sets that one preference in a profile's
 line of the file byte for byte, and can restart Zotero so the change takes effect.
 
 Out of scope: the check reads the literal pref name only, so a file that builds the name at runtime is not recognized.
+A pref name written with an escape sequence, such as a hex or unicode escape like local\\x57ritesOpen, is not recognized
+and reads as unset.
 
 Standard library only at import time. Zotero's profile lookup and the close and start helpers are imported inside
 the functions that use them, so the installer can import this module without a cycle.
@@ -78,16 +80,22 @@ def _split_lines(text: str) -> "list[str]":
     return re.findall(r"[^\n]*\n|[^\n]+", text)
 
 
-def _block_comment_at_line_starts(lines: "list[str]") -> "list[bool]":
-    """For each line, whether a ``/* ... */`` block comment is open where the line starts.
+def _scan_lines(lines: "list[str]") -> "tuple[list[bool], list[bool]]":
+    """For each line, whether a ``/* ... */`` block comment is open where the line starts, and whether a string that an
+    earlier line left open is still running where it starts.
 
     A comment marker inside a double or single quoted string opens nothing, a ``//`` comment runs to the end of its
-    line, and a block comment may span lines. A string is read within one line, since a pref line never spans lines.
+    line, and a block comment may span lines. A string is read within one line. A string still open at the end of a
+    line (a backslash line continuation) runs into the next line, which this scan cannot follow, so every later line is
+    flagged, and a pref line after it is refused.
     """
     open_block = False
+    lost = False
     starts: "list[bool]" = []
+    after_open_string: "list[bool]" = []
     for line in lines:
         starts.append(open_block)
+        after_open_string.append(lost)
         quote = ""
         index = 0
         while index < len(line):
@@ -113,24 +121,27 @@ def _block_comment_at_line_starts(lines: "list[str]") -> "list[bool]":
                 if line[index] in "\"'":
                     quote = line[index]
                 index += 1
-    return starts
+        if quote:
+            lost = True
+    return starts, after_open_string
 
 
 def _statements(lines: "Iterable[str]") -> "list[tuple[int, bool]]":
     """The pref's statements in file order, as (line index, value). Raises ValueError for a bad line.
 
     Every line that names the pref must be exactly one complete statement, and must not sit inside a ``/* ... */``
-    block comment, where Zotero ignores it. A split call, two statements on one line, a statement inside a block comment
-    or any other syntax raises ValueError, so nothing is read from such a file and nothing is written to it.
+    block comment, where Zotero ignores it, or after a string that a backslash line continuation left open, which the
+    comment scan cannot follow. A split call, two statements on one line, a statement inside a block comment or any
+    other syntax raises ValueError, so nothing is read from such a file and nothing is written to it.
     """
     line_list = list(lines)
-    in_block_comment = _block_comment_at_line_starts(line_list)
+    in_block_comment, after_open_string = _scan_lines(line_list)
     found: "list[tuple[int, bool]]" = []
     for index, line in enumerate(line_list):
         if PREF not in line:
             continue
         match = _STATEMENT.fullmatch(line.rstrip("\n"))
-        if match is None or in_block_comment[index]:
+        if match is None or in_block_comment[index] or after_open_string[index]:
             raise ValueError(_REFUSED_TEXT)
         found.append((index, match.group(1) == "true"))
     return found
@@ -274,17 +285,13 @@ _START_FAILED_TEXT = "Zotero could not be started. Start Zotero yourself."
 _START_TEXT = {
     ("closed", "started"): "Zotero closed and was started again, so the setting applies.",
     ("closed", "already_running"): "Zotero closed and is running again, so the setting applies.",
-    ("closed", "timeout"): (
-        "Zotero closed and was started again, but its local API did not answer in time. Check that Zotero is running."
-    ),
+    ("closed", "timeout"): "Zotero closed and was started again, but its local API has not answered yet.",
     ("closed", "not_installed"): (
         "Zotero closed, but no Zotero program was found, so it was not started. Start Zotero yourself."
     ),
     ("not_running", "started"): "Zotero was not running, so it was started. The setting applies.",
     ("not_running", "already_running"): "Zotero is running, so the setting applies.",
-    ("not_running", "timeout"): (
-        "Zotero was started, but its local API did not answer in time. Check that Zotero is running."
-    ),
+    ("not_running", "timeout"): "Zotero was started, but its local API has not answered yet.",
     ("not_running", "not_installed"): (
         "Zotero is not running, and no Zotero program was found, so it was not started. Start Zotero yourself."
     ),

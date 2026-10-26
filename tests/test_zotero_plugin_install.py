@@ -14,6 +14,7 @@ import json
 import os
 import re
 import shutil
+import socket
 import subprocess
 import sys
 import zipfile
@@ -57,6 +58,27 @@ def _no_real_processes(monkeypatch):
 
     monkeypatch.setattr(zpi.subprocess, "run", _blocked)
     monkeypatch.setattr(zpi.subprocess, "Popen", _blocked)
+
+
+@pytest.fixture(autouse=True)
+def _no_real_api_probe(monkeypatch):
+    """The profile repairs ask whether the local write API's port (127.0.0.1:23125) answers. A real answer depends on
+    what runs on the machine, so the probe is stubbed to False here, and every call is recorded in the list this
+    fixture returns. ``socket.create_connection`` fails the test if anything reaches it, so a path that reaches the port
+    another way fails here instead of answering from the machine.
+    """
+    calls: list[bool] = []
+
+    def _not_listening() -> bool:
+        calls.append(True)
+        return False
+
+    def _blocked_socket(*args, **kwargs):
+        pytest.fail("the bridge port must not be contacted from this test")
+
+    monkeypatch.setattr(zpi, "_api_listening", _not_listening)
+    monkeypatch.setattr(socket, "create_connection", _blocked_socket)
+    return calls
 
 
 def _write(path: Path, data) -> Path:
@@ -1539,7 +1561,7 @@ def test_a_different_installed_plugin_still_closes_zotero_for_the_install(defaul
     assert installed.read_bytes() == zpi.build_xpi_bytes()
 
 
-@pytest.mark.parametrize("restart", ["started", "already_running"])
+@pytest.mark.parametrize("restart", ["started", "already_running", "timeout"])
 @pytest.mark.parametrize(
     "process_states",
     [(True, None), (True, True)],
@@ -1855,7 +1877,7 @@ def test_cli_reports_close_failed_with_the_shared_text_and_writes_nothing(monkey
         ("started", "Meridian closed Zotero and restarted it."),
         ("already_running", "Meridian closed Zotero and restarted it."),
         ("error", "Meridian closed Zotero, but could not restart it. Start Zotero yourself."),
-        ("timeout", "Meridian closed Zotero, but could not restart it. Start Zotero yourself."),
+        ("timeout", "Meridian closed Zotero and started it again, but its local API has not answered yet."),
         (None, "Meridian closed Zotero, but could not restart it. Start Zotero yourself."),
     ],
 )
@@ -1903,16 +1925,24 @@ def test_cli_says_when_it_closed_zotero_but_could_not_restart_it(monkeypatch, ca
 
 
 @pytest.mark.parametrize(
-    ("launch", "expected_rc"),
+    ("launch", "expected_rc", "sentence"),
     [
-        ({"action": "started", "exe": "Z", "api_ready": True}, 0),
-        ({"action": "already_running"}, 0),
-        ({"action": "not_installed"}, 1),
-        ({"action": "timeout"}, 1),
+        ({"action": "started", "exe": "Z", "api_ready": True}, 0, "Meridian closed Zotero and restarted it."),
+        ({"action": "already_running"}, 0, "Meridian closed Zotero and restarted it."),
+        (
+            {"action": "timeout", "exe": "Z", "api_ready": False},
+            0,
+            "Meridian closed Zotero and started it again, but its local API has not answered yet.",
+        ),
+        (
+            {"action": "not_installed"},
+            1,
+            "Meridian closed Zotero, but could not restart it. Start Zotero yourself.",
+        ),
     ],
 )
 def test_cli_exit_code_follows_whether_meridian_restarted_the_zotero_it_closed(
-    monkeypatch, capsys, profile, launch, expected_rc,
+    monkeypatch, capsys, profile, launch, expected_rc, sentence,
 ):
     from meridian import zotero_launcher
 
@@ -1923,10 +1953,25 @@ def test_cli_exit_code_follows_whether_meridian_restarted_the_zotero_it_closed(
     out = capsys.readouterr().out
     assert rc == expected_rc
     assert "Installed the Zotero bridge plugin" in out
-    if expected_rc == 0:
-        assert "Meridian closed Zotero and restarted it." in out
-    else:
-        assert "Meridian closed Zotero, but could not restart it. Start Zotero yourself." in out
+    assert sentence in out
+
+
+def test_cli_a_launch_that_times_out_exits_0_because_zotero_was_started_before_its_api_answered(
+    monkeypatch, capsys, profile,
+):
+    from meridian import zotero_launcher
+
+    monkeypatch.setattr(zpi, "zotero_process_state", _states(True, False))
+    monkeypatch.setattr(zpi, "close_zotero_gracefully", lambda **kwargs: "closed")
+    monkeypatch.setattr(
+        zotero_launcher, "start_zotero", lambda **kwargs: {"action": "timeout", "exe": "Z", "api_ready": False},
+    )
+    rc = zpi.cli_main(["--profile", str(profile)])
+    out = capsys.readouterr().out
+    assert rc == 0
+    assert "Installed the Zotero bridge plugin" in out
+    assert "Meridian closed Zotero and started it again, but its local API has not answered yet." in out
+    assert "could not restart" not in out
 
 
 # docs ---------------------------------------------------------------------------
