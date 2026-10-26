@@ -46,6 +46,9 @@ _TRAY_SPEC_PATH = _REPO_ROOT / "meridian-tray.spec"
 _TRAY_MAIN_PATH = _REPO_ROOT / "meridian" / "tray_main.py"
 _ICO_PATH = _REPO_ROOT / "meridian" / "static" / "meridian-tray.ico"
 
+# This file must open no socket: the strict guard in tests/conftest.py fails any test that tries.
+pytestmark = pytest.mark.usefixtures("strict_no_sockets")
+
 
 # ---------------------------------------------------------------------------
 # _server_command -- frozen self-relaunch vs. unfrozen direct entry point
@@ -2776,6 +2779,18 @@ def zotero_faked(monkeypatch):
     monkeypatch.setattr(zpi, "ensure_scan_pref", lambda profile: "present")
     monkeypatch.setattr(zpi, "_ensure_api", lambda profile: "present")
     return recorded
+
+
+@pytest.fixture(autouse=True)
+def _no_bridge_port_or_mozilla(monkeypatch):
+    """No test here contacts the Zotero bridge port or Mozilla.
+
+    The install reads the bridge port on this machine, and fetches the approved file from Mozilla when none is stored.
+    Both are answered here: nothing listens, and nothing is fetched. That is the answer with Zotero closed and no
+    network, so a result does not depend on what is running on the machine or on the network.
+    """
+    monkeypatch.setattr(zpi, "_api_listening", lambda: False)
+    monkeypatch.setattr(zpi, "_fetch_approved_if_missing", lambda: None)
 
 
 @pytest.fixture(autouse=True)

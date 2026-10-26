@@ -118,12 +118,11 @@ def _argv_wants_tunnel_mode(argv: list[str]) -> bool:
 # `status: "error", message: ""`. Leaving tunnel mode on the Windows-default
 # ProactorEventLoop (via _ensure_event_loop's fallback) fixes that while
 # server/--mcp modes keep the SelectorEventLoop psycopg3 needs.
+# The loop itself is made by _use_windows_selector_loop(), called from main(). A SelectorEventLoop opens a loopback
+# socket pair when it is created, so importing this module must not create one. The policy opens nothing: it stays here.
 if sys.platform == "win32" and not _argv_wants_tunnel_mode(sys.argv[1:]):
-    import selectors
     # psycopg3 requires SelectorEventLoop — override Windows default ProactorEventLoop
     asyncio.set_event_loop_policy(asyncio.WindowsSelectorEventLoopPolicy())
-    loop = asyncio.SelectorEventLoop(selectors.SelectSelector())
-    asyncio.set_event_loop(loop)
 
 
 def _is_frozen() -> bool:
@@ -175,16 +174,27 @@ def _frozen_default_to_tunnel(
     args.tunnel = True
 
 
+def _use_windows_selector_loop(argv: list[str]) -> None:
+    """Make the Windows SelectorEventLoop the thread's loop, for every mode but --tunnel (see the comment above).
+
+    Called from main() rather than at import, because creating a SelectorEventLoop opens a loopback socket pair.
+    """
+    if sys.platform == "win32" and not _argv_wants_tunnel_mode(argv):
+        import selectors
+
+        asyncio.set_event_loop(asyncio.SelectorEventLoop(selectors.SelectSelector()))
+
+
 def _ensure_event_loop() -> "asyncio.AbstractEventLoop":
     """Return the thread's event loop, creating one if none is set or it's closed.
 
     Python 3.12 makes ``asyncio.get_event_loop()`` raise ``RuntimeError`` when no
     loop is set for the current thread (e.g. after another test closed it under
-    pytest-xdist, or on a non-Windows entrypoint where the module-scope loop
-    above never ran). The CLI dispatch drives its own loop via
-    ``run_until_complete``, so it just needs *a* usable loop regardless of
-    ambient state — this keeps that robust without changing Windows behaviour
-    (the module-scope SelectorEventLoop is returned unchanged when present).
+    pytest-xdist, or on a non-Windows entrypoint where main() never made a
+    loop). The CLI dispatch drives its own loop via ``run_until_complete``, so it
+    just needs *a* usable loop regardless of ambient state — this keeps that
+    robust without changing Windows behaviour (the SelectorEventLoop that main()
+    made is returned unchanged when present).
     """
     try:
         loop = asyncio.get_event_loop()
@@ -221,9 +231,13 @@ def _dispatch_subcommand(raw_argv: list[str]) -> int | None:
       local-only provider output capture and verification.
     * ``zotero sync`` -- run one bounded workstation sync of hosted citation
       markers through authenticated MCP calls; no background loop is started.
-    * ``zotero install-plugin [--profile DIR] [--dry-run] [--keep-zotero-open]`` -- install the
+    * ``zotero install-plugin [--profile DIR] [--dry-run] [--keep-zotero-open] [--local-writes on|off]`` -- install the
       Zotero bridge plugin into Zotero's profile. A running Zotero is closed first when the
-      saved setting allows it; ``--keep-zotero-open`` refuses instead.
+      saved setting allows it; ``--keep-zotero-open`` refuses instead. ``--local-writes`` also sets the
+      bridge's open local writes setting after the install.
+    * ``zotero local-writes status|on|off [--profile DIR] [--restart] [--dry-run]`` -- show or set the
+      bridge's open local writes setting in the profile's user.js. ``--restart`` is the only way this
+      command closes Zotero, and it closes gracefully (never a force kill).
     * ``zotero sign-plugin [--timeout-minutes N] [--dry-run] [--fetch]`` -- sign the Zotero bridge plugin
       with Mozilla as an unlisted add-on (needs WEB_EXT_API_KEY and WEB_EXT_API_SECRET). ``--fetch``
       downloads the file Mozilla already approved instead, and never uploads. Never closes Zotero,
@@ -262,6 +276,10 @@ def _dispatch_subcommand(raw_argv: list[str]) -> int | None:
             from .zotero_plugin_sign import cli_main as _sign_cli
 
             return _sign_cli(raw_argv[2:])
+        if len(raw_argv) > 1 and raw_argv[1] == "local-writes":
+            from .zotero_local_writes import cli_main as _local_writes_cli
+
+            return _local_writes_cli(raw_argv[2:])
         from .zotero_sync import cli_main as _zotero_cli
 
         return _zotero_cli(raw_argv[1:])
@@ -282,6 +300,7 @@ def main(argv: list[str] | None = None) -> int:
     # Capture the exact argv we're dispatching on (not sys.argv) so the
     # frozen host/port heuristic is correct under tests and embedding.
     raw_argv = list(argv) if argv is not None else list(sys.argv[1:])
+    _use_windows_selector_loop(raw_argv)
     sub_rc = _dispatch_subcommand(raw_argv)
     if sub_rc is not None:
         return sub_rc
@@ -401,7 +420,7 @@ def main(argv: list[str] | None = None) -> int:
 
         _, run_stdio = build_mcp_server()
         # On Windows asyncio.run() creates a new ProactorEventLoop, breaking psycopg3.
-        # Use the SelectorEventLoop we set at module scope instead.
+        # Use the SelectorEventLoop that main() set up instead.
         loop = _ensure_event_loop()
         loop.run_until_complete(run_stdio())
         return 0
@@ -423,7 +442,7 @@ def main(argv: list[str] | None = None) -> int:
             loop="none",
         )
         server = uvicorn.Server(config)
-        loop = _ensure_event_loop()  # SelectorEventLoop set above in module scope on win32
+        loop = _ensure_event_loop()  # the SelectorEventLoop that main() set up on win32
         loop.run_until_complete(server.serve())
     else:
         uvicorn.run(

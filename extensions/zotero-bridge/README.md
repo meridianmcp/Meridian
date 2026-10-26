@@ -184,6 +184,22 @@ Open local writes turns off the prompt for this Zotero. While it is on, every `P
 no dialog, and the key comes back on the poll as usual. Each key is a one-hour key, as with a standing approval. The
 busy, cooldown and rate limits still apply.
 
+Meridian can set this for you: `python -m meridian zotero local-writes on --restart` writes the setting into the default
+profile's `user.js`, then closes Zotero gracefully (never a force kill) and starts it again, so the change takes effect.
+`off` turns it back off the same way. Without `--restart` the command says that Zotero must restart first. With
+`--restart`, a run that did not restart Zotero exits with 1. If `user.js` already has a line that names this setting in
+any other form (a statement split over two lines, two statements on one line, a statement inside a `/* ... */` block
+comment, a statement inside a string or template literal (including one that a backslash line continuation leaves open),
+a pref name written with an escape sequence such as `local\x57ritesOpen`, or a comment that names it), the command
+changes nothing and says so. Meridian reads `user.js` as JavaScript and decodes its string literals. A file it cannot
+read safely is refused as a whole, and the command changes nothing. Limits: a pref name built at runtime, such as by
+joining string pieces with +, or inside a template literal's ${ } substitution, is not detected. Anything in the file
+that is not valid JavaScript is refused where the scanner cannot tell what Zotero reads, but the scanner does not parse
+the whole file. A / outside a comment or a string, which is a division or a regular expression, is refused, because the
+scanner does not parse expressions. The tray's Zotero local writes item asks you to
+confirm before it turns the setting on. The shipped default stays off: the plugin ships with this preference set to
+`false`, and installing it changes nothing unless you pass `--local-writes`.
+
 - **It is off by default.** To turn it on, set `extensions.zotero.meridianZoteroBridge.localWritesOpen` to `true` in
   Zotero's Config Editor (about:config), then restart Zotero. The bridge reads it at startup, so a change takes effect
   only after a restart.

@@ -32,6 +32,7 @@ from __future__ import annotations
 import asyncio
 from concurrent.futures import Future
 import os
+import socket
 import sys
 from pathlib import Path
 from typing import TYPE_CHECKING
@@ -695,6 +696,25 @@ def _isolate_zotero_plugin(monkeypatch, tmp_path_factory):
     monkeypatch.setenv("MERIDIAN_ZOTERO_DATA_DIR", str(state_dir / "no-zotero-profile"))
     monkeypatch.setenv("MERIDIAN_ZOTERO_PLUGIN_AUTOINSTALL", "0")
     monkeypatch.delenv("MERIDIAN_ZOTERO_CLOSE_ON_INSTALL", raising=False)
+
+
+@pytest.fixture
+def strict_no_sockets(monkeypatch):
+    """Fail the test if it opens a socket: a socket object, a socket pair (what an asyncio event loop opens for
+    itself) or a connection. Not autouse. A test file opts in with
+    ``pytestmark = pytest.mark.usefixtures("strict_no_sockets")``.
+    """
+
+    def _refuse(*args, **kwargs):
+        pytest.fail("this test opened a socket, which it must not do")
+
+    class _NoSocket(socket.socket):
+        def __init__(self, *args, **kwargs):
+            _refuse()
+
+    monkeypatch.setattr(socket, "socket", _NoSocket)
+    monkeypatch.setattr(socket, "socketpair", _refuse)
+    monkeypatch.setattr(socket, "create_connection", _refuse)
 
 
 @pytest_asyncio.fixture
