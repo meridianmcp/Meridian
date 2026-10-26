@@ -5,9 +5,13 @@ true, every write grant is given with no prompt at the desktop. The shipped plug
 and nothing here changes it. This module sets that one preference in a profile's ``user.js``, keeps every other
 line of the file byte for byte, and can restart Zotero so the change takes effect.
 
-Out of scope: the check reads the literal pref name only, so a file that builds the name at runtime is not recognized.
-A pref name written with an escape sequence, such as a hex or unicode escape like local\\x57ritesOpen, is not recognized
-and reads as unset.
+The file is read as JavaScript, far enough to find its comments, strings and template literals. String literals are
+decoded with the usual escapes, so a pref name spelled with an escape, such as local\\x57ritesOpen, is refused like any
+other form that is not one complete statement. Limits, worded the same way in extensions/zotero-bridge/README.md: a pref
+name built at runtime, such as by joining string pieces with +, or inside a template literal's ${ } substitution, is not
+detected. Anything in the file that is not valid JavaScript is refused where the scanner cannot tell what Zotero reads,
+but the scanner does not parse the whole file. A / outside a comment or a string, which is a division or a regular
+expression, is refused, because the scanner does not parse expressions.
 
 Standard library only at import time. Zotero's profile lookup and the close and start helpers are imported inside
 the functions that use them, so the installer can import this module without a cycle.
@@ -22,7 +26,7 @@ import os
 import re
 import tempfile
 from pathlib import Path
-from typing import Any, Callable, Iterable, Mapping
+from typing import Any, Callable, Mapping
 
 PREF = "extensions.zotero.meridianZoteroBridge.localWritesOpen"
 MARK = (
@@ -80,71 +84,212 @@ def _split_lines(text: str) -> "list[str]":
     return re.findall(r"[^\n]*\n|[^\n]+", text)
 
 
-def _scan_lines(lines: "list[str]") -> "tuple[list[bool], list[bool]]":
-    """For each line, whether a ``/* ... */`` block comment is open where the line starts, and whether a string that an
-    earlier line left open is still running where it starts.
+# The states the scanner tells apart at the start of a line. Only top-level code is live: Zotero ignores the rest.
+_TOP = "top"  # top-level code, where a statement is live
+_NESTED = "nested"  # code inside a template literal's ${ } substitution
+_BLOCK = "block"  # inside a /* ... */ comment
+_STRING = "string"  # inside a quoted string, which a line continuation can carry onto the next line
+_TEMPLATE = "template"  # inside the text of a template literal
+_LINE_BREAKS = "\r\u2028\u2029"  # besides LF, what ends a // comment in JavaScript
+_HEX = frozenset("0123456789abcdefABCDEF")
+_OCTAL = "01234567"
+_SIMPLE_ESCAPES = {"b": "\b", "f": "\f", "n": "\n", "r": "\r", "t": "\t", "v": "\v"}
 
-    A comment marker inside a double or single quoted string opens nothing, a ``//`` comment runs to the end of its
-    line, and a block comment may span lines. A string is read within one line. A string still open at the end of a
-    line (a backslash line continuation) runs into the next line, which this scan cannot follow, so every later line is
-    flagged, and a pref line after it is refused.
+
+def _hex_value(text: str, start: int, count: int) -> int:
+    digits = text[start:start + count]
+    if len(digits) != count or any(char not in _HEX for char in digits):
+        raise ValueError(_REFUSED_TEXT)
+    return int(digits, 16)
+
+
+def _escape(text: str, start: int, template: bool) -> "tuple[str, int, int]":
+    """Decode the escape sequence whose backslash is at ``start``, the way JavaScript does.
+
+    Returns the decoded text, the index just after the sequence, and how many LF line breaks the sequence consumed (a
+    line continuation). A sequence JavaScript rejects raises ValueError, and so does an octal escape in a template.
     """
-    open_block = False
-    lost = False
-    starts: "list[bool]" = []
-    after_open_string: "list[bool]" = []
-    for line in lines:
-        starts.append(open_block)
-        after_open_string.append(lost)
-        quote = ""
-        index = 0
-        while index < len(line):
-            if open_block:
-                if line.startswith("*/", index):
-                    open_block = False
-                    index += 2
+    end = len(text)
+    at = start + 1
+    if at >= end:
+        raise ValueError(_REFUSED_TEXT)
+    char = text[at]
+    if char == "\r":
+        return ("", at + 2, 1) if text.startswith("\n", at + 1) else ("", at + 1, 0)
+    if char == "\n":
+        return "", at + 1, 1
+    if char in "\u2028\u2029":
+        return "", at + 1, 0
+    if char in _SIMPLE_ESCAPES:
+        return _SIMPLE_ESCAPES[char], at + 1, 0
+    if char == "x":
+        return chr(_hex_value(text, at + 1, 2)), at + 3, 0
+    if char == "u":
+        if text.startswith("{", at + 1):
+            close = text.find("}", at + 2)
+            digits = text[at + 2:close] if close != -1 else ""
+            if not digits or any(digit not in _HEX for digit in digits) or int(digits, 16) > 0x10FFFF:
+                raise ValueError(_REFUSED_TEXT)
+            return chr(int(digits, 16)), close + 1, 0
+        return chr(_hex_value(text, at + 1, 4)), at + 5, 0
+    if char == "0" and not (at + 1 < end and text[at + 1] in "0123456789"):
+        return "\0", at + 1, 0
+    if char in _OCTAL:
+        if template:
+            raise ValueError(_REFUSED_TEXT)
+        width = 3 if char in "0123" else 2
+        stop = at
+        while stop < end and stop - at < width and text[stop] in _OCTAL:
+            stop += 1
+        return chr(int(text[at:stop], 8)), stop, 0
+    if char in "89":
+        if template:
+            raise ValueError(_REFUSED_TEXT)
+        return char, at + 1, 0
+    return char, at + 1, 0
+
+
+def _lex(source: str) -> "tuple[list[str], list[tuple[int, str]]]":
+    """Walk ``source`` as JavaScript, far enough to find its comments, strings and template literals.
+
+    Returns the state at the start of each line (a line ends at LF, as the physical lines do), and the decoded value of
+    each string literal and each template chunk with the line it starts on. Raises ValueError where the scanner cannot
+    tell what Zotero reads: a comment, string, template or substitution still open at the end of the file, a raw line
+    break inside a quoted string, and a / outside a comment or a string.
+    """
+    states = [_TOP]
+    literals: "list[tuple[int, str]]" = []
+    mode = "code"  # code, line (a // comment), block, quote, or template
+    quote = ""
+    depths: "list[int]" = []  # the brace depth inside each open ${ } substitution, the innermost last
+    chunk: "list[str]" = []
+    chunk_line = 0
+    line = 0
+    at = 0
+    end = len(source)
+
+    def state() -> str:
+        if mode == "block":
+            return _BLOCK
+        if mode == "quote":
+            return _STRING
+        if mode == "template":
+            return _TEMPLATE
+        return _NESTED if depths else _TOP
+
+    while at < end:
+        char = source[at]
+        if mode == "code":
+            if char == "\n":
+                line += 1
+                states.append(state())
+                at += 1
+            elif char in "\"'":
+                mode, quote, chunk, chunk_line = "quote", char, [], line
+                at += 1
+            elif char == "`":
+                mode, chunk, chunk_line = "template", [], line
+                at += 1
+            elif char == "/":
+                follow = source[at + 1:at + 2]
+                if follow == "/":
+                    mode, at = "line", at + 2
+                elif follow == "*":
+                    mode, at = "block", at + 2
                 else:
-                    index += 1
-            elif quote:
-                if line[index] == "\\":
-                    index += 2
+                    raise ValueError(_REFUSED_TEXT)
+            elif depths and char == "{":
+                depths[-1] += 1
+                at += 1
+            elif depths and char == "}":
+                if depths[-1] == 0:
+                    depths.pop()
+                    mode, chunk, chunk_line = "template", [], line
                 else:
-                    if line[index] == quote:
-                        quote = ""
-                    index += 1
-            elif line.startswith("//", index):
-                break
-            elif line.startswith("/*", index):
-                open_block = True
-                index += 2
+                    depths[-1] -= 1
+                at += 1
             else:
-                if line[index] in "\"'":
-                    quote = line[index]
-                index += 1
-        if quote:
-            lost = True
-    return starts, after_open_string
+                at += 1
+        elif mode == "line":
+            if char == "\n":
+                mode = "code"
+                line += 1
+                states.append(state())
+            elif char in _LINE_BREAKS:
+                mode = "code"
+            at += 1
+        elif mode == "block":
+            if source.startswith("*/", at):
+                mode, at = "code", at + 2
+            else:
+                if char == "\n":
+                    line += 1
+                    states.append(state())
+                at += 1
+        elif mode == "quote":
+            if char == quote:
+                literals.append((chunk_line, "".join(chunk)))
+                mode, at = "code", at + 1
+            elif char in "\r\n":
+                raise ValueError(_REFUSED_TEXT)
+            elif char == "\\":
+                value, at, breaks = _escape(source, at, template=False)
+                chunk.append(value)
+                for _ in range(breaks):
+                    line += 1
+                    states.append(state())
+            else:
+                chunk.append(char)
+                at += 1
+        else:  # a template literal's text
+            if char == "`":
+                literals.append((chunk_line, "".join(chunk)))
+                mode, at = "code", at + 1
+            elif source.startswith("${", at):
+                literals.append((chunk_line, "".join(chunk)))
+                depths.append(0)
+                mode, at = "code", at + 2
+            elif char == "\\":
+                value, at, breaks = _escape(source, at, template=True)
+                chunk.append(value)
+                for _ in range(breaks):
+                    line += 1
+                    states.append(state())
+            else:
+                if char == "\n":
+                    line += 1
+                    states.append(state())
+                chunk.append(char)
+                at += 1
+    if mode in ("block", "quote", "template") or depths:
+        raise ValueError(_REFUSED_TEXT)
+    return states, literals
 
 
-def _statements(lines: "Iterable[str]") -> "list[tuple[int, bool]]":
-    """The pref's statements in file order, as (line index, value). Raises ValueError for a bad line.
+def _read_user_js(text: str) -> "tuple[list[str], list[str], list[tuple[int, bool]]]":
+    """The physical lines of ``text``, the scanner's state at the start of each line, and the pref's statements.
 
-    Every line that names the pref must be exactly one complete statement, and must not sit inside a ``/* ... */``
-    block comment, where Zotero ignores it, or after a string that a backslash line continuation left open, which the
-    comment scan cannot follow. A split call, two statements on one line, a statement inside a block comment or any
-    other syntax raises ValueError, so nothing is read from such a file and nothing is written to it.
+    Each statement is (line index, value). Raises ValueError for a file the scanner cannot read safely, and that is the
+    whole file, so nothing is read from it and nothing is written to it. The file is scanned as UTF-8, the encoding
+    Zotero reads it in, so U+2028 and U+2029 end a line comment as they do for Zotero. A line that names the pref must
+    be exactly one complete statement, in top-level code. A pref name spelled with an escape is a string literal that
+    equals the name, and it is refused unless it is that statement.
     """
-    line_list = list(lines)
-    in_block_comment, after_open_string = _scan_lines(line_list)
-    found: "list[tuple[int, bool]]" = []
-    for index, line in enumerate(line_list):
+    lines = _split_lines(text)
+    states, literals = _lex(text.encode("latin-1").decode("utf-8", errors="surrogateescape"))
+    statements: "list[tuple[int, bool]]" = []
+    statement_lines: "set[int]" = set()
+    for index, line in enumerate(lines):
         if PREF not in line:
             continue
         match = _STATEMENT.fullmatch(line.rstrip("\n"))
-        if match is None or in_block_comment[index] or after_open_string[index]:
+        if match is None or states[index] != _TOP:
             raise ValueError(_REFUSED_TEXT)
-        found.append((index, match.group(1) == "true"))
-    return found
+        statements.append((index, match.group(1) == "true"))
+        statement_lines.add(index)
+    if any(value == PREF and line not in statement_lines for line, value in literals):
+        raise ValueError(_REFUSED_TEXT)
+    return lines, states, statements
 
 
 def _state_of_statements(statements: "list[tuple[int, bool]]") -> str:
@@ -157,15 +302,15 @@ def _state_of_statements(statements: "list[tuple[int, bool]]") -> str:
 def read_state(profile_dir: "Path | str") -> str:
     """``on``, ``off`` or ``unset`` for the profile's user.js. A missing file or folder reads as unset.
 
-    The file is read as latin-1, the same bytes in and out, so a non-ASCII line is never misread. A line that names the
-    pref in any form other than one complete statement raises ValueError, the same refusal the write path makes.
-    Other errors (for example a file that cannot be read) are raised as OSError.
+    The file is read as latin-1, the same bytes in and out, so a non-ASCII line is never misread. A file the scanner
+    cannot read safely raises ValueError, the same refusal the write path makes. Other errors (for example a file that
+    cannot be read) are raised as OSError.
     """
     try:
         text = user_js_path(profile_dir).read_bytes().decode("latin-1")
     except (FileNotFoundError, NotADirectoryError):
         return STATE_UNSET
-    return _state_of_statements(_statements(_split_lines(text)))
+    return _state_of_statements(_read_user_js(text)[2])
 
 
 def _require_profile(profile_dir: "Path | str") -> Path:
@@ -181,10 +326,10 @@ def _require_profile(profile_dir: "Path | str") -> Path:
 def _plan(profile_dir: "Path | str", enabled: bool) -> "tuple[str, bytes | None]":
     """The state before, and the new user.js bytes, or None when the file would not change.
 
-    A file with any line that names the pref in a form other than one complete statement raises ValueError before
-    anything is planned. The file would not change when the state already matches and exactly one statement sets the
-    pref. Every other line is kept byte for byte. The statements and the MARK line this module wrote before are
-    replaced, and the MARK and the pref line are appended at the end.
+    A file the scanner cannot read safely raises ValueError before anything is planned. The file would not change when
+    the state already matches and exactly one statement sets the pref. Every other line is kept byte for byte. The
+    statements and the MARK line this module wrote before are replaced, and the MARK and the pref line are appended at
+    the end. A MARK-looking line inside a string or a template literal is text, so it is kept.
     """
     folder = _require_profile(profile_dir)
     try:
@@ -192,14 +337,16 @@ def _plan(profile_dir: "Path | str", enabled: bool) -> "tuple[str, bytes | None]
     except FileNotFoundError:
         original = b""
     text = original.decode("latin-1")
-    lines = _split_lines(text)
-    statements = _statements(lines)
+    lines, states, statements = _read_user_js(text)
     before = _state_of_statements(statements)
     if before == _state_for(enabled) and len(statements) == 1:
         return before, None
     newline = "\r\n" if "\r\n" in text else "\n"
     replaced = {index for index, _value in statements}
-    kept = [line for index, line in enumerate(lines) if index not in replaced and line.strip() != MARK]
+    kept = [
+        line for index, line in enumerate(lines)
+        if index not in replaced and not (states[index] == _TOP and line.strip() == MARK)
+    ]
     if kept and not kept[-1].endswith(("\n", "\r")):
         kept[-1] += newline
     kept.append(MARK + newline)

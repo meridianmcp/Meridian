@@ -25,6 +25,9 @@ import pytest
 from meridian import zotero_bridge_api as bridge
 from meridian import zotero_plugin_install as zpi
 
+# This file must open no socket: the strict guard in tests/conftest.py fails any test that tries.
+pytestmark = pytest.mark.usefixtures("strict_no_sockets")
+
 
 @pytest.fixture(autouse=True)
 def _no_real_icacls(monkeypatch):

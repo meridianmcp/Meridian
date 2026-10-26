@@ -176,10 +176,14 @@ profile's `user.js`, then closes Zotero gracefully (never a force kill) and star
 `off` turns it back off the same way. Without `--restart` the command says that Zotero must restart first. With
 `--restart`, a run that did not restart Zotero exits with 1. If `user.js` already has a line that names this setting in
 any other form (a statement split over two lines, two statements on one line, a statement inside a `/* ... */` block
-comment, a statement after a string that a backslash line continuation leaves open, or a comment that names it), the
-command changes nothing and says so. The check reads the literal pref name only, so a file that builds the name at
-runtime is not recognized. A pref name written with an escape sequence, such as a hex or unicode escape like
-`local\x57ritesOpen`, is not recognized and reads as unset. The tray's Zotero local writes item asks you to
+comment, a statement inside a string or template literal (including one that a backslash line continuation leaves open),
+a pref name written with an escape sequence such as `local\x57ritesOpen`, or a comment that names it), the command
+changes nothing and says so. Meridian reads `user.js` as JavaScript and decodes its string literals. A file it cannot
+read safely is refused as a whole, and the command changes nothing. Limits: a pref name built at runtime, such as by
+joining string pieces with +, or inside a template literal's ${ } substitution, is not detected. Anything in the file
+that is not valid JavaScript is refused where the scanner cannot tell what Zotero reads, but the scanner does not parse
+the whole file. A / outside a comment or a string, which is a division or a regular expression, is refused, because the
+scanner does not parse expressions. The tray's Zotero local writes item asks you to
 confirm before it turns the setting on. The shipped default stays off: the plugin ships with this preference set to
 `false`, and installing it changes nothing unless you pass `--local-writes`.
 

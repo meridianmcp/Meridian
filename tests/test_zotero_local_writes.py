@@ -9,7 +9,9 @@ injected or replaced wherever a test reaches it.
 from __future__ import annotations
 
 import hashlib
+import importlib
 import socket
+import sys
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -32,6 +34,9 @@ ENV_DATA_DIR = "MERIDIAN_ZOTERO_DATA_DIR"
 ENV_STATE_DIR = "MERIDIAN_LOCAL_RUNNER_STATE_DIR"
 XPI_NAME = "meridian-zotero@usemeridian.us.xpi"
 REPO_ROOT = Path(zlw.__file__).resolve().parent.parent
+
+# This file must open no socket at all: the strict guard in tests/conftest.py fails any test that tries.
+pytestmark = pytest.mark.usefixtures("strict_no_sockets")
 
 
 @pytest.fixture(autouse=True)
@@ -669,10 +674,11 @@ def test_cli_restart_exits_0_when_zotero_was_not_running_and_its_local_api_has_n
     assert zlw.read_state(folder) == "on"
 
 
-def test_cli_restart_refuses_a_pref_line_after_a_string_that_a_line_continuation_leaves_open(
+def test_cli_restart_refuses_a_pref_line_inside_a_string_that_a_line_continuation_leaves_open(
     tmp_path, capsys, restart_calls,
 ):
-    folder = _profile(tmp_path, user_js='user_pref("some.other", "a\\\n");\n' + PREF_TRUE + "\n")
+    # The backslash carries the string onto the next line, so the setting line is text inside that string.
+    folder = _profile(tmp_path, user_js='user_pref("some.other", "a\\\n' + PREF_TRUE + '\n");\n')
     before = _snapshot(folder)
     assert zlw.cli_main(["status", "--profile", str(folder)]) == 1
     assert "cannot read safely" in capsys.readouterr().out
@@ -680,6 +686,13 @@ def test_cli_restart_refuses_a_pref_line_after_a_string_that_a_line_continuation
     assert "cannot read safely" in capsys.readouterr().out
     assert _snapshot(folder) == before
     assert restart_calls == []
+
+
+def test_a_pref_line_after_a_string_that_a_line_continuation_closes_is_read(tmp_path, capsys):
+    folder = _profile(tmp_path, user_js='user_pref("some.other", "a\\\n");\n' + PREF_TRUE + "\n")
+    assert zlw.read_state(folder) == "on"
+    assert zlw.cli_main(["status", "--profile", str(folder)]) == 0
+    assert "Local writes are on" in capsys.readouterr().out
 
 
 def test_a_line_continuation_that_does_not_name_the_setting_is_not_refused(tmp_path):
@@ -692,20 +705,203 @@ def test_a_setting_line_before_a_line_continuation_is_still_read(tmp_path):
     assert zlw.read_state(folder) == "on"
 
 
-def test_a_pref_name_written_with_an_escape_sequence_is_not_recognized_and_reads_as_unset(tmp_path):
-    escaped = 'user_pref("extensions.zotero.meridianZoteroBridge.local\\x57ritesOpen", true);\n'
-    folder = _profile(tmp_path, user_js=escaped)
+# ---------------------------------------------------------------------------
+# What the scanner reads as JavaScript: escapes, comments, strings, templates and slashes
+# ---------------------------------------------------------------------------
+
+# Raw strings, so each backslash is the one in the file.
+ESCAPED_PREF_TEXTS = [
+    r'user_pref("extensions.zotero.meridianZoteroBridge.local\x57ritesOpen", true);' + "\n",
+    r'user_pref("extensions.zotero.meridianZoteroBridge.local\u0057ritesOpen", false);' + "\n",
+    r'user_pref("extensions.zotero.meridianZoteroBridge.local\u{57}ritesOpen", true);' + "\n",
+    r'user_pref("extensions.zotero.meridianZoteroBridge.local\127ritesOpen", true);' + "\n",
+]
+
+
+@pytest.mark.parametrize("enabled", [True, False])
+@pytest.mark.parametrize("user_js", ESCAPED_PREF_TEXTS)
+def test_a_pref_name_spelled_with_an_escape_is_refused_on_read_and_write(tmp_path, user_js, enabled):
+    folder = _profile(tmp_path, user_js=user_js)
+    before = _snapshot(folder)
+    with pytest.raises(ValueError, match="cannot read safely"):
+        zlw.read_state(folder)
+    with pytest.raises(ValueError, match="cannot read safely"):
+        zlw.set_local_writes(folder, enabled)
+    assert _snapshot(folder) == before
+
+
+def test_a_literal_setting_followed_by_an_escaped_one_is_refused_and_not_read_as_on(tmp_path):
+    folder = _profile(tmp_path, user_js=PREF_TRUE + "\n" + ESCAPED_PREF_TEXTS[1])
+    before = _snapshot(folder)
+    with pytest.raises(ValueError, match="cannot read safely"):
+        zlw.read_state(folder)
+    with pytest.raises(ValueError, match="cannot read safely"):
+        zlw.plan_local_writes(folder, True)
+    with pytest.raises(ValueError, match="cannot read safely"):
+        zlw.set_local_writes(folder, False)
+    assert _snapshot(folder) == before
+
+
+def test_cli_status_and_restart_refuse_an_escaped_pref_name_and_restart_nothing(tmp_path, capsys, restart_calls):
+    folder = _profile(tmp_path, user_js=ESCAPED_PREF_TEXTS[0])
+    before = _snapshot(folder)
+    assert zlw.cli_main(["status", "--profile", str(folder)]) == 1
+    assert "cannot read safely" in capsys.readouterr().out
+    assert zlw.cli_main(["on", "--profile", str(folder), "--restart"]) == 1
+    assert "cannot read safely" in capsys.readouterr().out
+    assert _snapshot(folder) == before
+    assert restart_calls == []
+
+
+@pytest.mark.parametrize(
+    "user_js",
+    [
+        r'user_pref("some.other", "local\x57ritesOpen");' + "\n",
+        r'user_pref("some.other", "\x65\x78tensions.zotero");' + "\n",
+    ],
+)
+def test_an_unrelated_string_that_decodes_to_part_of_the_name_is_not_refused(tmp_path, user_js):
+    folder = _profile(tmp_path, user_js=user_js)
     assert zlw.read_state(folder) == "unset"
-    assert zlw.cli_main(["status", "--profile", str(folder)]) == 0
     assert zlw.set_local_writes(folder, True)["changed"] is True
     assert zlw.read_state(folder) == "on"
-    assert (folder / "user.js").read_text(encoding="utf-8").startswith(escaped)
 
 
-def test_the_module_and_the_bridge_readme_both_name_the_escape_sequence_limit():
+@pytest.mark.parametrize(
+    "user_js",
+    [
+        r'user_pref("a", "\xZZ");' + "\n",
+        r'user_pref("a", "\u12");' + "\n",
+        r'user_pref("a", "\u{110000}");' + "\n",
+        r"`\1`" + "\n",
+        'user_pref("a", "b\n' + PREF_TRUE + "\n",
+    ],
+)
+def test_a_string_or_template_javascript_would_reject_is_refused(tmp_path, user_js):
+    folder = _profile(tmp_path, user_js=user_js)
+    before = _snapshot(folder)
+    with pytest.raises(ValueError, match="cannot read safely"):
+        zlw.read_state(folder)
+    with pytest.raises(ValueError, match="cannot read safely"):
+        zlw.set_local_writes(folder, True)
+    assert _snapshot(folder) == before
+
+
+# An unclosed comment, string, template or substitution at the end of the file: everything after its start is text to
+# Zotero, so a setting line the scanner placed in code would be a lie. Refused on read and on write, in both directions.
+OPEN_AT_END_TEXTS = [
+    f"{PREF_TRUE}\n/* a comment that never closes\n",
+    f'{PREF_TRUE}\nuser_pref("a", "never closed',
+    f'{PREF_TRUE}\nuser_pref("a", "a\\\n',
+    "`open template\n",
+    "`${ 1 + 2\n",
+    f"{PREF_FALSE}\n/* open\n",
+]
+
+
+@pytest.mark.parametrize("enabled", [True, False])
+@pytest.mark.parametrize("user_js", OPEN_AT_END_TEXTS)
+def test_an_unclosed_comment_string_or_template_at_the_end_refuses_read_and_write(tmp_path, user_js, enabled):
+    folder = _profile(tmp_path, user_js=user_js)
+    before = _snapshot(folder)
+    with pytest.raises(ValueError, match="cannot read safely"):
+        zlw.read_state(folder)
+    with pytest.raises(ValueError, match="cannot read safely"):
+        zlw.plan_local_writes(folder, enabled)
+    with pytest.raises(ValueError, match="cannot read safely"):
+        zlw.set_local_writes(folder, enabled)
+    assert _snapshot(folder) == before
+
+
+def test_cli_restart_refuses_an_open_block_comment_and_restarts_nothing(tmp_path, capsys, restart_calls):
+    folder = _profile(tmp_path, user_js=PREF_TRUE + "\n/* open\n")
+    before = _snapshot(folder)
+    assert zlw.cli_main(["off", "--profile", str(folder), "--restart"]) == 1
+    assert "cannot read safely" in capsys.readouterr().out
+    assert _snapshot(folder) == before
+    assert restart_calls == []
+
+
+@pytest.mark.parametrize(
+    "user_js",
+    [
+        f"`\n{PREF_TRUE}\n`\n",
+        f"`${{\n{PREF_TRUE}\n}}`\n",
+        f"`{PREF}`\n",
+        f'user_pref("a", "x\\\n{PREF_TRUE}\n");\n',
+    ],
+)
+def test_a_setting_line_inside_a_string_or_template_is_refused(tmp_path, user_js):
+    folder = _profile(tmp_path, user_js=user_js)
+    with pytest.raises(ValueError, match="cannot read safely"):
+        zlw.read_state(folder)
+
+
+def test_a_template_literal_with_substitutions_is_read_and_its_setting_line_counts(tmp_path):
+    folder = _profile(tmp_path, user_js="`a ${1} b`\n`nested ${`c ${2}`}`\n" + PREF_TRUE + "\n")
+    assert zlw.read_state(folder) == "on"
+
+
+def test_a_mark_line_inside_a_template_literal_is_text_and_is_kept(tmp_path):
+    folder = _profile(tmp_path, user_js="`\n" + MARK + "\n`\n")
+    assert zlw.set_local_writes(folder, True)["changed"] is True
+    assert (folder / "user.js").read_bytes() == f"`\n{MARK}\n`\n{MARK}\n{PREF_TRUE}\n".encode("utf-8")
+    assert zlw.read_state(folder) == "on"
+
+
+@pytest.mark.parametrize("user_js", ['user_pref("a", 1/2);\n', 'user_pref("a", (1)/2);\n', "x = /ab/;\n", "*/\n"])
+def test_a_slash_outside_a_comment_or_a_string_is_refused_and_writes_nothing(tmp_path, user_js):
+    folder = _profile(tmp_path, user_js=user_js)
+    before = _snapshot(folder)
+    with pytest.raises(ValueError, match="cannot read safely"):
+        zlw.read_state(folder)
+    with pytest.raises(ValueError, match="cannot read safely"):
+        zlw.set_local_writes(folder, True)
+    assert _snapshot(folder) == before
+
+
+def test_slashes_inside_strings_and_comments_are_not_refused(tmp_path):
+    user_js = 'user_pref("a", "1/2 and /* not a comment */");\n// 1/2 /* a note\n' + PREF_TRUE + "\n"
+    folder = _profile(tmp_path, user_js=user_js)
+    assert zlw.read_state(folder) == "on"
+
+
+@pytest.mark.parametrize("breaker", ["\r", "\u2028", "\u2029"])
+def test_a_line_break_zotero_reads_ends_a_line_comment_before_a_block_comment_opens(tmp_path, breaker):
+    # After the break, /* is code to Zotero: it opens a block comment that hides the setting line below it.
+    folder = _profile(tmp_path, user_js="// a" + breaker + "/* b\n" + PREF_TRUE + "\n*/\n")
+    with pytest.raises(ValueError, match="cannot read safely"):
+        zlw.read_state(folder)
+
+
+# The limits, worded the same way here, in the module docstring and in the bridge README.
+LIMIT_PHRASES = (
+    "a pref name built at runtime, such as by joining string pieces with +, or inside a template literal's ${ } "
+    "substitution, is not detected.",
+    "Anything in the file that is not valid JavaScript is refused where the scanner cannot tell what Zotero reads, "
+    "but the scanner does not parse the whole file.",
+    "A / outside a comment or a string, which is a division or a regular expression, is refused, because the scanner "
+    "does not parse expressions.",
+)
+
+
+def test_the_module_and_the_bridge_readme_name_the_same_limits():
     readme = (REPO_ROOT / "extensions" / "zotero-bridge" / "README.md").read_text(encoding="utf-8")
-    assert "escape sequence" in zlw.__doc__
-    assert "escape sequence" in readme
+    doc = " ".join((zlw.__doc__ or "").split())
+    text = " ".join(readme.split())
+    for phrase in LIMIT_PHRASES:
+        assert phrase in doc
+        assert phrase in text
+
+
+def test_importing_the_entry_module_creates_no_event_loop_and_opens_no_socket(monkeypatch):
+    # Import meridian.__main__ again, here, under the strict guard. Removing the module first makes the check hold no
+    # matter which test imported it first. A SelectorEventLoop opens a loopback socket pair, so the import makes none.
+    package = importlib.import_module("meridian")
+    monkeypatch.delitem(sys.modules, "meridian.__main__", raising=False)
+    monkeypatch.delattr(package, "__main__", raising=False)
+    module = importlib.import_module("meridian.__main__")
+    assert hasattr(module, "main")
 
 
 def test_cli_restart_refuses_a_statement_inside_a_block_comment_and_restarts_nothing(tmp_path, capsys, restart_calls):
