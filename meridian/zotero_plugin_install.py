@@ -1257,12 +1257,16 @@ def _unchanged_outcome(
     close: "Callable[..., str] | None",
     launch: "Callable[[], Any] | None",
     timeout_s: "float | None",
+    *,
+    repair: "Callable[[], dict[str, Any]] | None" = None,
 ) -> dict[str, Any]:
     """The outcome when the installed file is already the signed one: the profile repairs run, then the enable step.
 
-    The .xpi is not rewritten and nothing is closed. The enable step runs only while Zotero is closed. Never raises.
+    The .xpi is not rewritten and nothing is closed. The enable step runs only while Zotero is closed. ``repair``, when
+    given, replaces the profile repairs, so a caller can run its own step between the repairs and the enable step. Never
+    raises.
     """
-    repaired = _repair_profile(profile, current)
+    repaired = repair() if repair is not None else _repair_profile(profile, current)
     result = {**repaired, "closed_zotero": False, "restart": None}
     if repaired.get("status") != "unchanged":
         return result
@@ -1519,6 +1523,23 @@ def _local_writes_after_install(profile: "Path | str", enabled: bool) -> dict[st
     return {"status": "changed" if change["changed"] else "unchanged", "before": change["state"]}
 
 
+def _repair_with_local_writes(
+    profile: "Path | str", current: Mapping[str, Any], enabled: "bool | None",
+) -> dict[str, Any]:
+    """The profile repairs for a plugin that is already current, then the local-writes pref when they succeeded.
+
+    The pref is written only after the repairs return a successful status, the same gate as ``_with_local_writes``. A
+    failed repair leaves the pref alone and says so in ``local_writes``. With ``enabled=None`` the repairs run and
+    nothing else changes. Never raises.
+    """
+    repaired = _repair_profile(profile, current)
+    if enabled is None:
+        return repaired
+    if repaired.get("status") not in ("installed", "unchanged"):
+        return {**repaired, "local_writes": {"status": "failed", "error": "the profile repair failed"}}
+    return {**repaired, "local_writes": _local_writes_after_install(profile, enabled)}
+
+
 def _with_local_writes(
     install: "Callable[[], Mapping[str, Any]]", profile: "Path | str", enabled: "bool | None",
 ) -> "Callable[[], Mapping[str, Any]]":
@@ -1559,6 +1580,11 @@ def _print_local_writes(result: Mapping[str, Any], enabled: "bool | None", code:
         )
     else:
         print(f"Local writes are already {word} in user.js. Nothing was changed.")
+        if enabled:
+            print(
+                "Zotero reads this setting only when it starts. If Zotero was already running, the setting applies "
+                "only after Zotero restarts. Nothing was restarted."
+            )
     return code
 
 
@@ -1648,16 +1674,17 @@ def cli_main(argv: "list[str] | None" = None) -> int:
     # A plugin that is already identical needs no close, whether or not Zotero runs. Its profile repairs still run.
     current = _already_current(profile, stored.sha256)
     if current is not None:
-        # The local-writes setting is written before the repairs and the enable step, so any Zotero start here reads it.
-        local = _local_writes_after_install(profile, local_enabled) if local_enabled is not None else None
+        # The local-writes setting is written after the repairs succeed and before the enable step, so a Zotero start in
+        # this run reads it. A failed repair writes nothing.
         if is_default:
-            outcome = _unchanged_outcome(profile, current, None, None, None, None)
+            outcome = _unchanged_outcome(
+                profile, current, None, None, None, None,
+                repair=lambda: _repair_with_local_writes(profile, current, local_enabled),
+            )
         else:
-            outcome = _repair_profile(profile, current)
+            outcome = _repair_with_local_writes(profile, current, local_enabled)
             if outcome.get("status") == "unchanged":
                 outcome = _not_default(outcome)
-        if local is not None:
-            outcome = {**outcome, "local_writes": local}
         code = _print_install_status_and_enable(outcome, xpi, profile)
         return _print_local_writes(outcome, local_enabled, code)
     result = install_with_close(

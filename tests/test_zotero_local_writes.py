@@ -116,19 +116,41 @@ def test_read_state_last_line_wins(tmp_path):
     assert zlw.read_state(off_then_on) == "on"
 
 
-def test_read_state_accepts_spaces_and_an_optional_semicolon(tmp_path):
-    folder = _profile(tmp_path, user_js=f'   user_pref( "{PREF}" , true )  \n')
+def test_read_state_accepts_spaces_and_tabs_inside_one_statement(tmp_path):
+    folder = _profile(tmp_path, user_js=f'   user_pref( "{PREF}" , true ) ;  \n')
     assert zlw.read_state(folder) == "on"
-    folder = _profile(tmp_path, "no-semicolon", user_js=f'user_pref("{PREF}", false)\n')
+    folder = _profile(tmp_path, "tabs", user_js=f'\tuser_pref("{PREF}",false);\n')
     assert zlw.read_state(folder) == "off"
 
 
-def test_read_state_ignores_commented_out_and_non_boolean_lines(tmp_path):
-    folder = _profile(
-        tmp_path,
-        user_js=f'// {PREF_TRUE}\nuser_pref("{PREF}", 1);\nuser_pref("{PREF}", "true");\n',
-    )
-    assert zlw.read_state(folder) == "unset"
+@pytest.mark.parametrize(
+    "line",
+    [f"// {PREF_TRUE}", f'user_pref("{PREF}", 1);', f'user_pref("{PREF}", "true");', f'user_pref("{PREF}", false)'],
+)
+def test_read_state_refuses_a_pref_line_that_is_not_one_boolean_statement(tmp_path, line):
+    folder = _profile(tmp_path, user_js=line + "\n")
+    with pytest.raises(ValueError, match="cannot read safely"):
+        zlw.read_state(folder)
+
+
+def test_read_state_on_a_valid_file_returns_on_off_or_unset(tmp_path):
+    assert zlw.read_state(_profile(tmp_path, "unset-file", user_js='user_pref("other.pref", 1);\n')) == "unset"
+    assert zlw.read_state(_profile(tmp_path, "on-file", user_js=PREF_TRUE + "\n")) == "on"
+    assert zlw.read_state(_profile(tmp_path, "off-file", user_js=PREF_FALSE + "\n")) == "off"
+
+
+SPLIT_TEXTS = [
+    f'user_pref("{PREF}",\n  true);\n',
+    f'user_pref(\n"{PREF}", true);\n',
+    f'user_pref("{PREF}", true\n);\n',
+]
+
+
+@pytest.mark.parametrize("user_js", SPLIT_TEXTS)
+def test_read_state_refuses_a_split_pref_statement(tmp_path, user_js):
+    folder = _profile(tmp_path, user_js=user_js)
+    with pytest.raises(ValueError, match="cannot read safely"):
+        zlw.read_state(folder)
 
 
 def test_read_state_reads_a_latin1_byte_without_failing(tmp_path):
@@ -228,6 +250,35 @@ def test_set_uses_lf_for_a_file_that_has_no_crlf(tmp_path):
     assert (folder / "user.js").read_bytes() == f'user_pref("a", 1);\n{MARK}\n{PREF_FALSE}\n'.encode("utf-8")
 
 
+@pytest.mark.parametrize("user_js", SPLIT_TEXTS)
+def test_set_refuses_a_split_pref_statement_and_leaves_the_file_unchanged(tmp_path, user_js):
+    folder = _profile(tmp_path, user_js=user_js)
+    before = _snapshot(folder)
+    with pytest.raises(ValueError, match="cannot read safely"):
+        zlw.set_local_writes(folder, False)
+    with pytest.raises(ValueError, match="cannot read safely"):
+        zlw.plan_local_writes(folder, False)
+    assert _snapshot(folder) == before
+
+
+@pytest.mark.parametrize("enabled", [True, False])
+def test_set_refuses_two_statements_on_one_line_and_leaves_the_file_unchanged(tmp_path, enabled):
+    folder = _profile(tmp_path, user_js=f"{PREF_TRUE} {PREF_FALSE}\n")
+    before = _snapshot(folder)
+    with pytest.raises(ValueError, match="cannot read safely"):
+        zlw.set_local_writes(folder, enabled)
+    assert _snapshot(folder) == before
+
+
+def test_a_clean_single_line_is_set_and_unset_correctly(tmp_path):
+    folder = _profile(tmp_path, user_js=f"{PREF_FALSE}\n")
+    assert zlw.set_local_writes(folder, True) == {"state": "off", "after": "on", "changed": True}
+    assert (folder / "user.js").read_bytes() == f"{MARK}\n{PREF_TRUE}\n".encode("utf-8")
+    assert zlw.set_local_writes(folder, False) == {"state": "on", "after": "off", "changed": True}
+    assert zlw.read_state(folder) == "off"
+    assert zlw.set_local_writes(folder, False) == {"state": "off", "after": "off", "changed": False}
+
+
 def test_set_refuses_a_folder_without_prefs_js_and_writes_nothing(tmp_path):
     folder = tmp_path / "no-prefs"
     folder.mkdir()
@@ -288,8 +339,9 @@ def test_restart_starts_only_after_a_close_that_stopped_zotero(close_result, sho
         started.append(True)
         return {"action": "started", "exe": "Z", "api_ready": True}
 
-    text = zlw.restart_zotero(close=lambda: close_result, start=_start)
+    restarted, text = zlw.restart_zotero(close=lambda: close_result, start=_start)
     assert bool(started) is should_start
+    assert restarted is should_start
     if not should_start:
         assert "not" in text.lower()
 
@@ -305,23 +357,27 @@ def test_restart_closed_then_started_says_the_setting_applies():
         order.append("start")
         return {"action": "started"}
 
-    text = zlw.restart_zotero(close=_close, start=_start)
+    restarted, text = zlw.restart_zotero(close=_close, start=_start)
     assert order == ["close", "start"]
+    assert restarted is True
     assert text == "Zotero closed and was started again, so the setting applies."
 
 
 def test_restart_not_running_is_started():
-    text = zlw.restart_zotero(close=lambda: "not_running", start=lambda: {"action": "started"})
+    restarted, text = zlw.restart_zotero(close=lambda: "not_running", start=lambda: {"action": "started"})
+    assert restarted is True
     assert text == "Zotero was not running, so it was started. The setting applies."
 
 
 def test_restart_close_failed_never_starts_and_says_so():
-    text = zlw.restart_zotero(close=lambda: "close_failed", start=lambda: pytest.fail("start must not run"))
+    restarted, text = zlw.restart_zotero(close=lambda: "close_failed", start=lambda: pytest.fail("start must not run"))
+    assert restarted is False
     assert text.startswith("Zotero did not close, so it was not started again.")
 
 
 def test_restart_unsupported_never_starts_and_says_so():
-    text = zlw.restart_zotero(close=lambda: "unsupported", start=lambda: pytest.fail("start must not run"))
+    restarted, text = zlw.restart_zotero(close=lambda: "unsupported", start=lambda: pytest.fail("start must not run"))
+    assert restarted is False
     assert "cannot close Zotero" in text
 
 
@@ -329,37 +385,42 @@ def test_restart_a_close_that_raises_is_a_close_that_failed():
     def _close():
         raise RuntimeError("the close broke")
 
-    text = zlw.restart_zotero(close=_close, start=lambda: pytest.fail("start must not run"))
+    restarted, text = zlw.restart_zotero(close=_close, start=lambda: pytest.fail("start must not run"))
+    assert restarted is False
     assert "did not close" in text
 
 
 @pytest.mark.parametrize(
-    ("close_result", "action", "expected"),
+    ("close_result", "action", "expected", "restarted"),
     [
-        ("closed", "already_running", "Zotero closed and is running again"),
-        ("closed", "timeout", "did not answer in time"),
-        ("closed", "not_installed", "no Zotero program was found"),
-        ("not_running", "already_running", "Zotero is running, so the setting applies."),
-        ("not_running", "timeout", "did not answer in time"),
-        ("not_running", "not_installed", "no Zotero program was found"),
-        ("closed", "something_else", "could not be started"),
+        ("closed", "already_running", "Zotero closed and is running again", True),
+        ("closed", "timeout", "did not answer in time", True),
+        ("closed", "not_installed", "no Zotero program was found", False),
+        ("not_running", "already_running", "Zotero is running, so the setting applies.", True),
+        ("not_running", "timeout", "did not answer in time", True),
+        ("not_running", "not_installed", "no Zotero program was found", False),
+        ("closed", "something_else", "could not be started", False),
     ],
 )
-def test_restart_reports_each_launch_result(close_result, action, expected):
-    text = zlw.restart_zotero(close=lambda: close_result, start=lambda: {"action": action})
+def test_restart_reports_each_launch_result(close_result, action, expected, restarted):
+    is_restarted, text = zlw.restart_zotero(close=lambda: close_result, start=lambda: {"action": action})
     assert expected in text
+    assert is_restarted is restarted
 
 
 def test_restart_a_launch_that_raises_is_reported_not_raised():
     def _start():
         raise OSError("no launcher")
 
-    text = zlw.restart_zotero(close=lambda: "closed", start=_start)
+    restarted, text = zlw.restart_zotero(close=lambda: "closed", start=_start)
+    assert restarted is False
     assert "could not be started (no launcher)" in text
 
 
 def test_restart_accepts_a_bare_action_string_from_the_launch_helper():
-    assert "so the setting applies" in zlw.restart_zotero(close=lambda: "closed", start=lambda: "started")
+    restarted, text = zlw.restart_zotero(close=lambda: "closed", start=lambda: "started")
+    assert restarted is True
+    assert "so the setting applies" in text
 
 
 def test_restart_defaults_use_the_installer_close_and_the_launcher_start(monkeypatch):
@@ -375,7 +436,8 @@ def test_restart_defaults_use_the_installer_close_and_the_launcher_start(monkeyp
 
     monkeypatch.setattr(zpi, "close_zotero_gracefully", _close)
     monkeypatch.setattr(zotero_launcher, "start_zotero", _start)
-    text = zlw.restart_zotero()
+    restarted, text = zlw.restart_zotero()
+    assert restarted is True
     assert text == "Zotero closed and was started again, so the setting applies."
     assert seen["close_kwargs"] == {}
     # The launcher's pre-launch hook is replaced with nothing, so a restart for this setting installs no plugin.
@@ -415,7 +477,7 @@ def restart_calls(monkeypatch):
 
     def _fake(**kwargs):
         calls.append(kwargs)
-        return "Zotero closed and was started again, so the setting applies."
+        return True, "Zotero closed and was started again, so the setting applies."
 
     monkeypatch.setattr(zlw, "restart_zotero", _fake)
     return calls
@@ -475,6 +537,60 @@ def test_cli_restart_still_restarts_when_the_file_did_not_change(tmp_path, capsy
     assert zlw.cli_main(["on", "--profile", str(folder), "--restart"]) == 0
     assert "already on" in capsys.readouterr().out
     assert len(restart_calls) == 1
+
+
+@pytest.mark.parametrize("close_result", ["close_failed", "unsupported"])
+def test_cli_restart_exits_1_when_zotero_did_not_close_and_never_starts_it(tmp_path, monkeypatch, close_result):
+    folder = _profile(tmp_path)
+    started = []
+
+    def _start():
+        started.append(True)
+        return {"action": "started"}
+
+    monkeypatch.setattr(zlw, "_close_zotero", lambda: close_result)
+    monkeypatch.setattr(zlw, "_start_zotero", _start)
+    assert zlw.cli_main(["on", "--profile", str(folder), "--restart"]) == 1
+    assert started == []
+    assert zlw.read_state(folder) == "on"
+
+
+def test_cli_close_failed_restart_prints_why_zotero_was_not_started(tmp_path, capsys, monkeypatch):
+    folder = _profile(tmp_path)
+    monkeypatch.setattr(zlw, "_close_zotero", lambda: "close_failed")
+    monkeypatch.setattr(zlw, "_start_zotero", lambda: pytest.fail("Zotero must not be started after a failed close"))
+    assert zlw.cli_main(["on", "--profile", str(folder), "--restart"]) == 1
+    assert "did not close, so it was not started again" in capsys.readouterr().out
+
+
+def test_cli_restart_exits_0_when_zotero_was_not_running_and_starts_it(tmp_path, capsys, monkeypatch):
+    folder = _profile(tmp_path)
+    started = []
+
+    def _start():
+        started.append(True)
+        return {"action": "started", "exe": "Z", "api_ready": True}
+
+    monkeypatch.setattr(zlw, "_close_zotero", lambda: "not_running")
+    monkeypatch.setattr(zlw, "_start_zotero", _start)
+    assert zlw.cli_main(["on", "--profile", str(folder), "--restart"]) == 0
+    assert started == [True]
+    assert "Zotero was not running, so it was started. The setting applies." in capsys.readouterr().out
+
+
+def test_cli_restart_refuses_a_split_setting_line_and_restarts_nothing(tmp_path, capsys, restart_calls):
+    folder = _profile(tmp_path, user_js=f'user_pref("{PREF}",\n true);\n')
+    before = _snapshot(folder)
+    assert zlw.cli_main(["on", "--profile", str(folder), "--restart"]) == 1
+    assert "cannot read safely" in capsys.readouterr().out
+    assert _snapshot(folder) == before
+    assert restart_calls == []
+
+
+def test_cli_status_refuses_a_split_setting_line_and_says_so(tmp_path, capsys):
+    folder = _profile(tmp_path, user_js=f'user_pref("{PREF}",\n true);\n')
+    assert zlw.cli_main(["status", "--profile", str(folder)]) == 1
+    assert "cannot read safely" in capsys.readouterr().out
 
 
 def test_cli_dry_run_prints_the_plan_and_writes_nothing(tmp_path, capsys, restart_calls):
@@ -611,7 +727,10 @@ def test_install_on_an_already_current_plugin_with_the_pref_already_set_says_so(
     assert zpi.cli_main(["--profile", str(signed_install), "--local-writes", "on"]) == 0
     capsys.readouterr()
     assert zpi.cli_main(["--profile", str(signed_install), "--local-writes", "on"]) == 0
-    assert "already on in user.js" in capsys.readouterr().out
+    out = capsys.readouterr().out
+    assert "already on in user.js" in out
+    assert "the setting applies only after Zotero restarts" in out
+    assert "Nothing was restarted" in out
 
 
 def test_install_refused_while_zotero_runs_does_not_set_the_pref(signed_install, capsys, monkeypatch):
@@ -656,6 +775,63 @@ def test_install_failed_local_writes_step_is_reported_and_fails_the_run(signed_i
     assert rc == 1
     assert "Local writes were not set: disk full" in capsys.readouterr().out
     assert (signed_install / "extensions" / XPI_NAME).is_file()
+
+
+def _make_default_profile(monkeypatch, tmp_path, folder):
+    """Point the data dir at a profiles.ini that marks ``folder`` as Zotero's default profile."""
+    root = tmp_path / "default-root"
+    root.mkdir(exist_ok=True)
+    (root / "profiles.ini").write_text(
+        f"[Profile0]\nName=default\nIsRelative=0\nPath={folder}\nDefault=1\n", encoding="utf-8",
+    )
+    monkeypatch.setenv(ENV_DATA_DIR, str(root))
+
+
+def _failing_repair(profile, result):
+    return {**result, "status": "failed", "error": "repair broke"}
+
+
+def test_install_on_an_already_current_plugin_whose_repair_fails_does_not_set_the_pref(
+    signed_install, capsys, monkeypatch,
+):
+    assert zpi.cli_main(["--profile", str(signed_install)]) == 0
+    monkeypatch.setattr(zpi, "_repair_profile", _failing_repair)
+    rc = zpi.cli_main(["--profile", str(signed_install), "--local-writes", "on"])
+    assert rc == 1
+    assert "Local writes were not set: the profile repair failed" in capsys.readouterr().out
+    assert zlw.read_state(signed_install) == "unset"
+    assert zlw.MARK not in (signed_install / "user.js").read_text(encoding="utf-8")
+
+
+def test_install_on_the_default_profile_whose_repair_fails_sets_no_pref_and_enables_nothing(
+    signed_install, capsys, monkeypatch, tmp_path,
+):
+    assert zpi.cli_main(["--profile", str(signed_install)]) == 0
+    _make_default_profile(monkeypatch, tmp_path, signed_install)
+    monkeypatch.setattr(zpi, "_repair_profile", _failing_repair)
+    monkeypatch.setattr(zpi, "_register_default", lambda *args, **kwargs: pytest.fail("the enable step must not run"))
+    rc = zpi.cli_main(["--profile", str(signed_install), "--local-writes", "on"])
+    assert rc == 1
+    assert "Local writes were not set: the profile repair failed" in capsys.readouterr().out
+    assert zlw.read_state(signed_install) == "unset"
+
+
+def test_install_on_the_default_profile_writes_the_pref_before_the_enable_step(
+    signed_install, capsys, monkeypatch, tmp_path,
+):
+    assert zpi.cli_main(["--profile", str(signed_install)]) == 0
+    _make_default_profile(monkeypatch, tmp_path, signed_install)
+    seen = []
+
+    def _register(profile, running, close, launch, timeout_s):
+        seen.append(zlw.read_state(profile))
+        return {"status": "already_enabled"}
+
+    monkeypatch.setattr(zpi, "_register_default", _register)
+    rc = zpi.cli_main(["--profile", str(signed_install), "--local-writes", "on"])
+    assert rc == 0
+    assert seen == ["on"]
+    assert zlw.read_state(signed_install) == "on"
 
 
 def test_print_local_writes_passes_the_code_through_when_not_asked():
@@ -859,8 +1035,20 @@ def test_menu_survives_an_unexpected_error_without_raising(tmp_path, dialogs, mo
     assert dialogs.questions == []
 
 
+def test_menu_reports_a_setting_line_it_cannot_read_and_changes_nothing(tmp_path, dialogs):
+    folder = _profile(tmp_path, user_js=f'user_pref("{PREF}",\n true);\n')
+    before = _snapshot(folder)
+    queue = _UiQueue()
+    tray._toggle_zotero_local_writes_from_menu(queue, profile=folder)
+    queue.run_all()
+    assert len(dialogs.errors) == 1
+    assert "could not be read" in dialogs.errors[0]
+    assert dialogs.questions == []
+    assert _snapshot(folder) == before
+
+
 def test_restart_result_is_shown_through_the_queue(dialogs, monkeypatch):
-    monkeypatch.setattr(tray.zotero_local_writes, "restart_zotero", lambda: "Zotero was started.")
+    monkeypatch.setattr(tray.zotero_local_writes, "restart_zotero", lambda: (True, "Zotero was started."))
     queue = _UiQueue()
     text = tray._restart_zotero_and_report(queue)
     queue.run_all()

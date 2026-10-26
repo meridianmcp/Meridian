@@ -1442,7 +1442,7 @@ def _offer_zotero_local_writes_restart(dispatch: Any, *, parent: Any | None) -> 
 def _restart_zotero_and_report(dispatch: Any, *, parent: Any | None = None) -> str:
     """Worker-thread body: close and start Zotero with the restart helper, then show the result. Never raises."""
     try:
-        text = zotero_local_writes.restart_zotero()
+        _started, text = zotero_local_writes.restart_zotero()
     except Exception as exc:  # noqa: BLE001 -- the helper reports its own failures; this is a last guard
         text = f"Zotero was not restarted: {exc}"
     try:
@@ -1472,7 +1472,7 @@ def _toggle_zotero_local_writes_from_menu(
             _write_zotero_local_writes(False, dispatch, parent=parent, target=target)
             return
         dispatch(lambda: _confirm_turn_on_zotero_local_writes(dispatch, parent=parent, target=target))
-    except OSError as exc:
+    except (OSError, ValueError) as exc:
         dispatch(
             lambda error=exc: _show_error_dialog(
                 ZOTERO_LOCAL_WRITES_TITLE, f"Zotero's user.js could not be read: {error}", parent=parent,

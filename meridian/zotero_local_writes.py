@@ -33,11 +33,15 @@ STATE_OFF = "off"
 STATE_UNSET = "unset"
 STATE_UNKNOWN = "unknown"  # only the tray reports this, for a user.js that cannot be read
 
-# A line that sets the pref, in any form. Used to find the lines this module replaces.
-_PREF_LINE = re.compile(r'\s*user_pref\(\s*"' + re.escape(PREF) + r'"', re.ASCII)
-# A line that sets the pref to a boolean, exactly. Only these lines count when the state is read.
-_VALUE_LINE = re.compile(
-    r'\s*user_pref\(\s*"' + re.escape(PREF) + r'"\s*,\s*(true|false)\s*\)\s*;?\s*', re.ASCII,
+# The one form this module reads and writes: a whole line, with only spaces or tabs before and after the statement,
+# that sets the pref to a boolean. Every line that names the pref must match it exactly, or the file is refused.
+_STATEMENT = re.compile(
+    r'[ \t]*user_pref[ \t]*\([ \t]*"' + re.escape(PREF) + r'"[ \t]*,[ \t]*(true|false)[ \t]*\)[ \t]*;[ \t\r]*',
+    re.ASCII,
+)
+_REFUSED_TEXT = (
+    "a line for the Zotero local writes setting is in a form Meridian cannot read safely. "
+    "The setting must be one complete user_pref statement on its own line."
 )
 
 _STATE_TEXT = {
@@ -67,27 +71,47 @@ def _state_for(enabled: bool) -> str:
     return STATE_ON if enabled else STATE_OFF
 
 
-def _state_of_lines(lines: Iterable[str]) -> str:
-    """The state set by the last matching line. Lines that do not match exactly are ignored, as the spec asks."""
-    state = STATE_UNSET
-    for line in lines:
-        match = _VALUE_LINE.fullmatch(line.rstrip("\r\n"))
-        if match is not None:
-            state = STATE_ON if match.group(1) == "true" else STATE_OFF
-    return state
+def _split_lines(text: str) -> "list[str]":
+    """The lines of ``text``, each keeping its line feed. Only LF ends a line, so joining the lines gives ``text`` back."""
+    return re.findall(r"[^\n]*\n|[^\n]+", text)
+
+
+def _statements(lines: "Iterable[str]") -> "list[tuple[int, bool]]":
+    """The pref's statements in file order, as (line index, value). Raises ValueError for a bad line.
+
+    Every line that names the pref must be exactly one complete statement. A split call, two statements on one line or
+    any other syntax raises ValueError, so nothing is read from such a file and nothing is written to it.
+    """
+    found: "list[tuple[int, bool]]" = []
+    for index, line in enumerate(lines):
+        if PREF not in line:
+            continue
+        match = _STATEMENT.fullmatch(line.rstrip("\n"))
+        if match is None:
+            raise ValueError(_REFUSED_TEXT)
+        found.append((index, match.group(1) == "true"))
+    return found
+
+
+def _state_of_statements(statements: "list[tuple[int, bool]]") -> str:
+    """The state the last statement sets, as Zotero reads the file. Unset when there are none."""
+    if not statements:
+        return STATE_UNSET
+    return STATE_ON if statements[-1][1] else STATE_OFF
 
 
 def read_state(profile_dir: "Path | str") -> str:
     """``on``, ``off`` or ``unset`` for the profile's user.js. A missing file or folder reads as unset.
 
-    The file is read as latin-1, the same bytes in and out, so a non-ASCII line is never misread.
+    The file is read as latin-1, the same bytes in and out, so a non-ASCII line is never misread. A line that names the
+    pref in any form other than one complete statement raises ValueError, the same refusal the write path makes.
     Other errors (for example a file that cannot be read) are raised as OSError.
     """
     try:
         text = user_js_path(profile_dir).read_bytes().decode("latin-1")
     except (FileNotFoundError, NotADirectoryError):
         return STATE_UNSET
-    return _state_of_lines(text.splitlines())
+    return _state_of_statements(_statements(_split_lines(text)))
 
 
 def _require_profile(profile_dir: "Path | str") -> Path:
@@ -103,9 +127,10 @@ def _require_profile(profile_dir: "Path | str") -> Path:
 def _plan(profile_dir: "Path | str", enabled: bool) -> "tuple[str, bytes | None]":
     """The state before, and the new user.js bytes, or None when the file would not change.
 
-    The file would not change when the state already matches and exactly one line sets the pref.
-    Every line is kept byte for byte, except the pref lines and the MARK line this module wrote before,
-    which are replaced. The MARK and the pref line are appended at the end.
+    A file with any line that names the pref in a form other than one complete statement raises ValueError before
+    anything is planned. The file would not change when the state already matches and exactly one statement sets the
+    pref. Every other line is kept byte for byte. The statements and the MARK line this module wrote before are
+    replaced, and the MARK and the pref line are appended at the end.
     """
     folder = _require_profile(profile_dir)
     try:
@@ -113,13 +138,14 @@ def _plan(profile_dir: "Path | str", enabled: bool) -> "tuple[str, bytes | None]
     except FileNotFoundError:
         original = b""
     text = original.decode("latin-1")
-    lines = text.splitlines(keepends=True)
-    before = _state_of_lines(line.rstrip("\r\n") for line in lines)
-    pref_lines = sum(1 for line in lines if _PREF_LINE.match(line))
-    if before == _state_for(enabled) and pref_lines == 1:
+    lines = _split_lines(text)
+    statements = _statements(lines)
+    before = _state_of_statements(statements)
+    if before == _state_for(enabled) and len(statements) == 1:
         return before, None
     newline = "\r\n" if "\r\n" in text else "\n"
-    kept = [line for line in lines if not _PREF_LINE.match(line) and line.strip() != MARK]
+    replaced = {index for index, _value in statements}
+    kept = [line for index, line in enumerate(lines) if index not in replaced and line.strip() != MARK]
     if kept and not kept[-1].endswith(("\n", "\r")):
         kept[-1] += newline
     kept.append(MARK + newline)
@@ -227,29 +253,34 @@ def _started_text(closed: str, action: str) -> str:
     return _START_TEXT.get((closed, action), _START_FAILED_TEXT)
 
 
+# The launch results that leave Zotero running. "not_installed" means no program was started.
+_RUNNING_ACTIONS = ("started", "already_running", "timeout")
+
+
 def restart_zotero(
     close: "Callable[[], str] | None" = None,
     start: "Callable[[], Any] | None" = None,
-) -> str:
+) -> "tuple[bool, str]":
     """Close Zotero gracefully, then start it again, so a changed setting takes effect. Never raises.
 
-    Returns a short status. ``close`` defaults to ``zotero_plugin_install.close_zotero_gracefully``. That only ever
-    sends a normal close request and never force-kills. ``start`` defaults to ``zotero_launcher.start_zotero``.
-    Zotero is started only when the close reports ``closed`` (it stopped) or ``not_running`` (it was not open).
-    Any other result leaves Zotero as it is.
+    Returns ``(started, message)``. ``started`` is True only when Zotero is running again after the call: the close
+    stopped it (or it was not open) and the launch reported that Zotero is running. ``close`` defaults to
+    ``zotero_plugin_install.close_zotero_gracefully``. That only ever sends a normal close request and never
+    force-kills. ``start`` defaults to ``zotero_launcher.start_zotero``. Zotero is started only when the close reports
+    ``closed`` (it stopped) or ``not_running`` (it was not open). Any other result leaves Zotero as it is.
     """
     try:
         closed = str((close if close is not None else _close_zotero)() or "")
     except Exception:  # noqa: BLE001 -- a close that raises is a close that did not happen
         closed = "close_failed"
     if closed not in ("closed", "not_running"):
-        return _NOT_STARTED_TEXT.get(closed, _NOT_RESTARTED_TEXT)
+        return False, _NOT_STARTED_TEXT.get(closed, _NOT_RESTARTED_TEXT)
     try:
         launched = (start if start is not None else _start_zotero)()
     except Exception as exc:  # noqa: BLE001 -- a launch that raises is reported, never raised
-        return f"Zotero could not be started ({exc}). Start Zotero yourself."
+        return False, f"Zotero could not be started ({exc}). Start Zotero yourself."
     action = str(launched.get("action") if isinstance(launched, Mapping) else launched or "")
-    return _started_text(closed, action)
+    return action in _RUNNING_ACTIONS, _started_text(closed, action)
 
 
 # ---------------------------------------------------------------------------
@@ -282,7 +313,7 @@ _NO_PROFILE_TEXT = (
 def _print_status(profile: Path) -> int:
     try:
         state = read_state(profile)
-    except OSError as exc:
+    except (OSError, ValueError) as exc:
         print(f"Local writes could not be read from {user_js_path(profile)}: {exc}")
         return 1
     print(f"Local writes are {state_text(state)} in {user_js_path(profile)}.")
@@ -304,7 +335,7 @@ def _print_dry_run(profile: Path, enabled: bool, *, restart: bool) -> int:
     print(f"Zotero profile: {profile}")
     try:
         plan = plan_local_writes(profile, enabled)
-    except OSError as exc:
+    except (OSError, ValueError) as exc:
         print(f"Local writes could not be read: {exc}")
         return 1
     if plan["changed"]:
@@ -326,7 +357,8 @@ def cli_main(argv: "list[str] | None" = None) -> int:
 
     ``status`` prints the setting. ``on`` and ``off`` set it. ``--restart`` is the only way this command closes Zotero:
     it closes Zotero gracefully (never a force kill) and starts it again after the change, even when the file did not
-    change. Without it, the command says that Zotero must restart. ``--dry-run`` prints the plan and writes nothing.
+    change. With ``--restart``, a run in which Zotero was not restarted returns 1. Without it, the command says that
+    Zotero must restart. ``--dry-run`` prints the plan and writes nothing.
     """
     parser = argparse.ArgumentParser(
         prog="python -m meridian zotero local-writes",
@@ -370,7 +402,10 @@ def cli_main(argv: "list[str] | None" = None) -> int:
         return 1
     _print_change(change, profile)
     if args.restart:
-        print(restart_zotero())
+        started, message = restart_zotero()
+        print(message)
+        if not started:
+            return 1
     elif change["changed"]:
         print(_RESTART_HINT)
     return 0
