@@ -128,17 +128,34 @@ function createItemWrites(deps) {
     return { entries: entries, problems: problems };
   }
 
+  // Refuses every key a creator row does not read, the same way refuseUnknownKeys does for the top level: each one is
+  // listed under creators[i].<key> with the place its value belongs, in one 422 invalid_fields reply. Before this check a
+  // snake_case key such as first_name was dropped, and the creator was saved empty.
+  function refuseUnknownCreatorKeys(rows) {
+    var problems = [];
+    rows.forEach(function (row, index) {
+      Object.keys(row).forEach(function (key) {
+        if (CREATOR_KEYS.indexOf(key) === -1) {
+          problems.push({
+            field: 'creators[' + index + '].' + key,
+            reason: 'is not a creator key. Use creatorType, firstName and lastName for a person, or name for an institution',
+          });
+        }
+      });
+    });
+    throwIfProblems(problems, 'Some keys are not valid in a creator. A creator takes creatorType, firstName, lastName or name.');
+  }
+
   // Zotero's setCreators() quietly swaps a role the item type does not allow for the primary role.
   // Each role is checked here, before anything is mutated, so the caller hears about it.
   function planCreators(list, itemType, itemTypeID) {
-    return v.optionalList(list, 'creators', v.LIMITS.creators).map(function (row, index) {
+    var rows = v.optionalList(list, 'creators', v.LIMITS.creators);
+    rows.forEach(function (row, index) {
+      v.requireObject(row, 'creators[' + index + ']');
+    });
+    refuseUnknownCreatorKeys(rows);
+    return rows.map(function (row, index) {
       var label = 'creators[' + index + ']';
-      v.requireObject(row, label);
-      Object.keys(row).forEach(function (key) {
-        if (CREATOR_KEYS.indexOf(key) === -1) {
-          throw invalid(label + '.' + key, 'is not a creator key. Use creatorType, firstName and lastName for a person, or name for an institution');
-        }
-      });
       var type = v.requireString(row.creatorType === undefined ? 'author' : row.creatorType, label + '.creatorType', 64);
       var typeID = zotero.CreatorTypes.getID(type);
       if (!typeID) throw invalid(label + '.creatorType', 'is not a known creator type');

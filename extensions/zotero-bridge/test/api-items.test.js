@@ -621,17 +621,63 @@ test('updateItem still accepts every key it reads, including the precondition fi
 
 test('a creator with a snake_case key is refused by name, and nothing is saved as an empty creator', async () => {
   const { zotero, items } = setup();
-  for (const [key, row] of [
-    ['first_name', { creatorType: 'author', first_name: 'Ada', last_name: 'Lovelace' }],
-    ['creator_type', { creator_type: 'author', lastName: 'Lovelace' }],
-  ]) {
-    await assert.rejects(
-      items.createItem({ item_type: 'book', fields: { title: 'T' }, creators: [row] }),
-      (error) => error.httpStatus === 422 && error.code === 'invalid_value' && new RegExp('creators\\[0\\]\\.' + key + ' is not a creator key').test(error.message),
-      key
-    );
-  }
+  await assert.rejects(
+    items.createItem({ item_type: 'book', fields: { title: 'T' }, creators: [{ creatorType: 'author', first_name: 'Ada', last_name: 'Lovelace' }] }),
+    (error) => {
+      assert.equal(error.httpStatus, 422);
+      assert.equal(error.code, 'invalid_fields');
+      assert.deepEqual(Object.keys(reasonsByField(error)).sort(), ['creators[0].first_name', 'creators[0].last_name']);
+      assert.match(reasonsByField(error)['creators[0].first_name'], /is not a creator key/);
+      return true;
+    }
+  );
+  await assert.rejects(
+    items.createItem({ item_type: 'book', fields: { title: 'T' }, creators: [{ creator_type: 'author', lastName: 'Lovelace' }] }),
+    (error) => {
+      assert.equal(error.code, 'invalid_fields');
+      assert.deepEqual(Object.keys(reasonsByField(error)), ['creators[0].creator_type']);
+      return true;
+    }
+  );
   assert.equal(zotero._state.items.length, 0);
+});
+
+test('every unknown creator key is named, across all creators, and nothing is saved', async () => {
+  const { zotero, items } = setup();
+  await assert.rejects(
+    items.createItem({
+      item_type: 'book',
+      fields: { title: 'T' },
+      creators: [
+        { creatorType: 'author', firstName: 'Ada', lastName: 'Lovelace' },
+        { creatorType: 'editor', first_name: 'Grace', lastName: 'Hopper' },
+        { name: 'Working Group', institution: 'Somewhere' },
+      ],
+    }),
+    (error) => {
+      assert.equal(error.code, 'invalid_fields');
+      assert.deepEqual(Object.keys(reasonsByField(error)).sort(), ['creators[1].first_name', 'creators[2].institution']);
+      return true;
+    }
+  );
+  assert.equal(zotero._state.items.length, 0);
+});
+
+test('valid creators with each allowed key still save in the same shape', async () => {
+  const { zotero, items } = setup();
+  const result = await items.createItem({
+    item_type: 'book',
+    fields: { title: 'T' },
+    creators: [
+      { creatorType: 'author', firstName: 'Ada', lastName: 'Lovelace' },
+      { creatorType: 'editor', name: 'Working Group' },
+      { lastName: 'Hopper' },
+    ],
+  });
+  const saved = zotero._state.items.find((item) => item.key === result.key);
+  assert.deepEqual(saved.creators[0], { creatorType: 'author', firstName: 'Ada', lastName: 'Lovelace', fieldMode: 0 });
+  assert.deepEqual(saved.creators[1], { creatorType: 'editor', lastName: 'Working Group', fieldMode: 1 });
+  assert.deepEqual(saved.creators[2], { creatorType: 'author', firstName: '', lastName: 'Hopper', fieldMode: 0 });
 });
 
 test('a creator with snake_case keys is refused on update too, and the item is unchanged', async () => {
@@ -639,7 +685,12 @@ test('a creator with snake_case keys is refused on update too, and the item is u
   const item = zotero._addItem('book', { title: 'Keep' });
   await assert.rejects(
     items.updateItem(item.key, { fields: { title: 'Changed' }, creators: [{ first_name: 'Ada', last_name: 'L' }] }),
-    apiErrorMatch(422, 'invalid_value')
+    (error) => {
+      assert.equal(error.httpStatus, 422);
+      assert.equal(error.code, 'invalid_fields');
+      assert.deepEqual(Object.keys(reasonsByField(error)).sort(), ['creators[0].first_name', 'creators[0].last_name']);
+      return true;
+    }
   );
   assert.equal(item.fields.title, 'Keep');
   assert.deepEqual(item.creators, []);
