@@ -2,7 +2,7 @@
   "manifest_version": 2,
   "name": "Meridian Zotero Bridge",
   "version": "0.1.5",
-  "description": "Import BibTeX into a chosen collection with duplicate checks, and attach PDFs from a folder by BibTeX key. Runs only from menus inside Zotero. No server, no network, no watchers.",
+  "description": "Import BibTeX into a chosen collection with duplicate checks, remove duplicate empty sources after approval, and attach PDFs from a folder by BibTeX key. Runs only from menus inside Zotero. No server, no network, no watchers.",
   "author": "Meridian",
   "applications": {
     "zotero": {

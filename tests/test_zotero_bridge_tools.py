@@ -434,6 +434,13 @@ def test_the_path_argument_of_attach_pdf_is_documented_as_absolute():
     assert "absolute" in path_description.lower()
 
 
+def test_zotero_batch_description_states_the_item_body_keys_the_bridge_reads():
+    description = next(t for t in _MCP_TOOLS_LIST if t["name"] == "zotero_batch")["description"]
+    for name in ("`item_type`", "`fields`", "`creators`", "`collection_keys`", "creatorType", "firstName", "lastName"):
+        assert name in description
+    assert "refused" in description and "`title`" in description
+
+
 def test_batch_schema_bounds_the_operation_count_to_the_client_limit():
     schema = next(t for t in _MCP_TOOLS_LIST if t["name"] == "zotero_batch")["inputSchema"]
     operations = schema["properties"]["operations"]

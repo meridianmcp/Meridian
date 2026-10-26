@@ -108,7 +108,7 @@ function meridianLoadLib(rootURI) {
     }
     return loaded[key];
   };
-  ['normalize', 'bibkey', 'pdf', 'collections', 'duplicates'].concat(MERIDIAN_API_MODULES).forEach(function (key) {
+  ['normalize', 'bibkey', 'pdf', 'collections', 'duplicates', 'empty_duplicates'].concat(MERIDIAN_API_MODULES).forEach(function (key) {
     var sandbox = { module: { exports: {} }, require: require };
     Services.scriptloader.loadSubScript(rootURI + 'lib/' + key + '.js', sandbox);
     loaded[key] = sandbox.module.exports;
@@ -154,6 +154,15 @@ function meridianRegisterMenus() {
         onCommand: function (event, context) {
           meridianRun('BibTeX import', function () {
             return meridianImportBibtex(context);
+          });
+        },
+      },
+      {
+        menuType: 'menuitem',
+        label: 'Remove duplicate empty sources here...',
+        onCommand: function (event, context) {
+          meridianRun('Duplicate cleanup', function () {
+            return meridianRemoveEmptyDuplicates(context);
           });
         },
       },
@@ -241,7 +250,7 @@ async function meridianPlanBibtex(text, libraryID) {
   }
 
   var entries = parsed.map(function (json) {
-    return { title: json.title, doi: json.DOI, json: json };
+    return { title: json.title, doi: json.DOI, key: meridianCitationKeyFromJson(json), json: json };
   });
   return { plan: meridianLib.duplicates.planImport(entries, before), parsedCount: parsed.length };
 }
@@ -321,7 +330,11 @@ async function meridianLibraryEntries(libraryID) {
   var entries = [];
   items.forEach(function (item) {
     if (!item.isRegularItem()) return;
-    entries.push({ title: meridianField(item, 'title'), doi: meridianField(item, 'DOI') });
+    entries.push({
+      title: meridianField(item, 'title'),
+      doi: meridianField(item, 'DOI'),
+      key: meridianLib.bibkey.readBibKey(meridianField(item, 'extra')),
+    });
   });
   return entries;
 }
@@ -392,6 +405,60 @@ function meridianImportSummary(collectionName, report) {
     lines.push('', 'Failed to save: ' + report.failed.join('; '));
   }
   return lines.join('\n');
+}
+
+// ---------------------------------------------------------------------------
+// F3: Remove duplicate empty sources from the collection the menu was opened on. Trash only, and only after approval.
+// ---------------------------------------------------------------------------
+
+async function meridianRemoveEmptyDuplicates(context) {
+  var collection = await meridianResolveCollection(context);
+  var items = await Zotero.Items.getAsync(collection.getChildItems(true, false));
+  var candidates = [];
+  items.forEach(function (item) {
+    if (!item || !item.isRegularItem()) return;
+    candidates.push({
+      id: item.id,
+      key: meridianLib.bibkey.readBibKey(meridianField(item, 'extra')),
+      title: meridianField(item, 'title'),
+      doi: meridianField(item, 'DOI'),
+      dateAdded: item.dateAdded,
+      hasChildren: item.getAttachments(false).length + item.getNotes(false).length > 0,
+    });
+  });
+
+  var found = meridianLib.empty_duplicates.findEmptyDuplicates(candidates);
+  if (found.trash.length === 0) {
+    meridianAlert('Collection: ' + collection.name + '\nNo duplicate empty sources were found.');
+    return;
+  }
+
+  var lines = [
+    'Collection: ' + collection.name,
+    'Found ' + found.trash.length + ' duplicate empty source' + (found.trash.length === 1 ? '' : 's') +
+      ' (no title, no DOI, same BibTeX key). The oldest copy of each is kept.',
+  ];
+  if (found.skipped.length) {
+    lines.push(found.skipped.length + ' later copy' + (found.skipped.length === 1 ? '' : 'ies') +
+      ' with attachments or notes will be kept.');
+  }
+  lines.push('', 'Move the ' + found.trash.length + ' copies to the Zotero trash? You can restore them from there.');
+  // Keep is the default and the second button, so Enter and Escape both leave the library as it is.
+  var index = Zotero.Prompt.confirm({
+    title: 'Meridian Zotero Bridge: remove duplicates',
+    text: lines.join('\n'),
+    button0: 'Move to trash',
+    button1: 'Keep',
+    defaultButton: 1,
+  });
+  if (index !== 0) return;
+
+  var ids = found.trash.map(function (entry) {
+    return entry.id;
+  });
+  await Zotero.Items.trashTx(ids);
+  meridianAlert('Collection: ' + collection.name + '\nMoved to trash: ' + ids.length + '.' +
+    (found.skipped.length ? '\nKept, with attachments or notes: ' + found.skipped.length + '.' : ''));
 }
 
 // ---------------------------------------------------------------------------
