@@ -22,7 +22,10 @@ the grant key and of token-shaped strings. A transport or reader exception is re
 which may hold the token, is never kept, and the exception chain is cleared.
 
 Duplicates. ``attach_pdf`` returns "already_attached", and ``add_child_note`` returns "already_present", without
-writing, when the item already has a PDF or a child note already holds the marker. Otherwise each returns the new key.
+writing, when the item already has a PDF or a child note already holds the marker. ``ensure_collection`` and
+``ensure_collection_chain`` reuse a collection with the same exact name under the same parent, and refuse, with no
+write, when more than one matches. ``create_webpage`` returns "already_present" when the collections it names already
+hold a webpage with the same exact URL. Otherwise each creates and returns the new key.
 """
 
 from __future__ import annotations
@@ -34,7 +37,7 @@ import time
 from collections.abc import Callable
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any
+from typing import Any, NamedTuple
 from urllib.parse import urlsplit
 
 from meridian.exception_chain import raise_unchained
@@ -48,10 +51,16 @@ IMPORT_LIMIT_BYTES = 24 * 1024 * 1024
 BATCH_LIMIT = 200
 ALREADY_ATTACHED = "already_attached"
 ALREADY_PRESENT = "already_present"
+ALREADY_EXISTS = "already_exists"
+CREATED = "created"
 DEFAULT_GRANT_POLLS = 300
 DEFAULT_GRANT_POLL_SECONDS = 1.0
 CHILD_PAGE_SIZE = 100
 CHILD_PAGE_LIMIT = 50
+COLLECTION_PAGE_SIZE = 100
+COLLECTION_PAGE_LIMIT = 100
+ITEM_PAGE_SIZE = 100
+ITEM_PAGE_LIMIT = 100
 
 _LOCAL_USER_ID = "0"
 _PDF_MAGIC = b"%PDF-"
@@ -132,6 +141,9 @@ _BATCH_KEY = r"[A-Za-z0-9]{8}"
 # The only routes a batch may carry, as (method, path pattern). extensions/zotero-bridge/README.md lists the same set
 # under "Batches": item create, update, trash and restore; note create and update; relation add and remove; collection
 # create, update, trash and restore; and adding or removing items in a collection. Every other route is refused.
+# This client deliberately leaves out note create (POST /v1/items/<key>/notes), although the plugin accepts it. A note
+# created in a batch skips the dedup marker check, so note creates go through add_child_note instead. The README is
+# not edited to match. Item and collection creates stay on the list and are not deduplicated inside a batch.
 _BATCHABLE_ROUTES: tuple[tuple[str, re.Pattern[str]], ...] = tuple(
     (method, re.compile(pattern))
     for method, pattern in (
@@ -139,7 +151,6 @@ _BATCHABLE_ROUTES: tuple[tuple[str, re.Pattern[str]], ...] = tuple(
         ("PATCH", rf"/v1/items/{_BATCH_KEY}"),
         ("POST", rf"/v1/items/{_BATCH_KEY}/trash"),
         ("POST", rf"/v1/items/{_BATCH_KEY}/restore"),
-        ("POST", rf"/v1/items/{_BATCH_KEY}/notes"),
         ("PATCH", rf"/v1/notes/{_BATCH_KEY}"),
         ("POST", rf"/v1/items/{_BATCH_KEY}/relations"),
         ("DELETE", rf"/v1/items/{_BATCH_KEY}/relations"),
@@ -155,6 +166,10 @@ _BATCH_REFUSED_ROUTE = (
     "targets an attachment, a tag rename or a BibTeX import. The bridge refuses those inside a batch, "
     "so send them on their own."
 )
+_BATCH_NOTE_CREATE_REFUSAL = (
+    "creates a child note. Use zotero_add_child_note instead, which checks the dedup marker first, so a rerun does "
+    "not add the note twice."
+)
 
 
 def _batch_refusal(method: str, path: str) -> str | None:
@@ -162,6 +177,8 @@ def _batch_refusal(method: str, path: str) -> str | None:
     segments = [part for part in path.split("?", 1)[0].split("/") if part]
     if len(segments) == 4 and segments[:2] == ["v1", "items"] and segments[3] == "attachments":
         return _BATCH_REFUSED_ROUTE
+    if method == "POST" and len(segments) == 4 and segments[:2] == ["v1", "items"] and segments[3] == "notes":
+        return _BATCH_NOTE_CREATE_REFUSAL
     if segments in (["v1", "tags", "rename"], ["v1", "import", "bibtex"]):
         return _BATCH_REFUSED_ROUTE
     if segments[:2] == ["v1", "grants"]:
@@ -236,11 +253,86 @@ def _is_pdf_attachment(child: dict[str, Any]) -> bool:
 
 
 def _is_note_with_marker(child: dict[str, Any], marker: str) -> bool:
+    """True when the note carries the marker as written by add_child_note: a quoted attribute, not the bare text.
+
+    The bare text would match a longer marker that starts with it (v1 inside v10), and a note that merely quotes the
+    marker in its prose. The quoted attribute matches neither.
+    """
     data = child.get("data")
     if not isinstance(data, dict) or data.get("itemType") != "note":
         return False
     note = data.get("note")
-    return isinstance(note, str) and marker in note
+    return isinstance(note, str) and f'data-meridian-dedup="{marker}"' in note
+
+
+def _unreadable_collection() -> ZoteroBridgeError:
+    return ZoteroBridgeError(
+        "reader_failed",
+        "The Zotero local API returned a collection this check cannot read, so the duplicate check did not run.",
+    )
+
+
+def _collection_row(row: Any) -> dict[str, Any]:
+    """One collection from Zotero's local API as {key, name, parent_key}.
+
+    Raises rather than guess at a row it cannot read. Zotero reports a top-level collection with ``parentCollection``
+    set to false. Any other value must be a key.
+    """
+    data = row.get("data") if isinstance(row, dict) else None
+    if not isinstance(data, dict):
+        raise _unreadable_collection()
+    key = data.get("key") or row.get("key")
+    name = data.get("name")
+    if not isinstance(key, str) or not _KEY.fullmatch(key) or not isinstance(name, str):
+        raise _unreadable_collection()
+    if "parentCollection" not in data:
+        # A missing field is not the same as a top-level collection, so it is refused rather than guessed at.
+        raise _unreadable_collection()
+    parent = data["parentCollection"]
+    if parent is False or parent is None or parent == "":
+        parent_key = None
+    elif isinstance(parent, str) and _KEY.fullmatch(parent):
+        parent_key = parent
+    else:
+        raise _unreadable_collection()
+    return {"key": key, "name": name, "parent_key": parent_key}
+
+
+def _matching_keys(collections: list[dict[str, Any]], name: str, parent_key: str | None) -> list[str]:
+    """Keys of the collections whose name and parent are exactly these. A top-level match has parent_key None."""
+    return [row["key"] for row in collections if row["name"] == name and row["parent_key"] == parent_key]
+
+
+def _ambiguous_collection() -> ZoteroBridgeError:
+    return ZoteroBridgeError(
+        "ambiguous_collection",
+        "More than one collection has that exact name under the same parent, so nothing was written. "
+        "Rename one of them, then retry.",
+    )
+
+
+def _webpage_key(row: Any, url: str) -> str | None:
+    """The key of a webpage item in ``row`` whose URL is exactly ``url``, or None for any other row."""
+    if not isinstance(row, dict):
+        return None
+    data = row.get("data")
+    if not isinstance(data, dict) or data.get("itemType") != "webpage" or data.get("url") != url:
+        return None
+    key = data.get("key") or row.get("key")
+    return key if isinstance(key, str) and _KEY.fullmatch(key) else None
+
+
+class CollectionChain(NamedTuple):
+    """A Meridian project mapped to a top-level collection, and an optional subproject under it.
+
+    Each status is "created" or "already_exists". ``subproject_key`` and its status are None when no subproject
+    was asked for.
+    """
+
+    project_key: str
+    project_status: str
+    subproject_key: str | None
+    subproject_status: str | None
 
 
 class ZoteroBridgeClient:
@@ -285,6 +377,67 @@ class ZoteroBridgeClient:
         parent = None if parent_key is None else _key(parent_key, "parent_key")
         return self._write("PATCH", f"/v1/collections/{key}", {"parent_key": parent})
 
+    def list_collections(self) -> list[dict[str, Any]]:
+        """Every collection in the local library as {key, name, parent_key}. parent_key is None at the top level.
+
+        Read-only, through the reader. It fails rather than returning a partial list, and it fails on any row it
+        cannot read.
+        """
+        rows = self._read_pages(
+            f"/api/users/{_LOCAL_USER_ID}/collections",
+            COLLECTION_PAGE_SIZE,
+            COLLECTION_PAGE_LIMIT,
+            "The library has more collections than the duplicate check reads, so it did not run.",
+        )
+        return [_collection_row(row) for row in rows]
+
+    def ensure_collection(self, name: str, parent_key: str | None = None) -> tuple[str, str]:
+        """Returns ``(status, key)``: ("already_exists", key) when one collection has this name under ``parent_key``,
+        or ("created", key) after creating it there. ``parent_key`` None means the top level.
+
+        Names match exactly and case-sensitively, with no trimming. More than one match raises
+        ``ambiguous_collection`` with no write, because the name cannot tell them apart. A renamed collection is not
+        found, so a second one is created.
+        """
+        name = _text(name, "name")
+        parent = None if parent_key is None else _key(parent_key, "parent_key")
+        matches = _matching_keys(self.list_collections(), name, parent)
+        if len(matches) > 1:
+            raise _ambiguous_collection()
+        if matches:
+            return ALREADY_EXISTS, matches[0]
+        return CREATED, self.create_collection(name, parent)
+
+    def ensure_collection_chain(self, project_name: str, subproject_name: str | None = None) -> CollectionChain:
+        """Maps a Meridian project to a top-level collection, and an optional subproject to a collection under it.
+
+        One read of the library serves both lookups, and every ambiguity is refused before any write. A subproject is
+        matched by its exact name under the project's collection, so one subproject name under two projects gives two
+        collections. A project with no collection yet gets a new one, and so does its subproject. A missing project
+        cannot already hold a subproject, so the subproject is created without a lookup.
+        """
+        project = _text(project_name, "project_name")
+        subproject = None if subproject_name is None else _text(subproject_name, "subproject_name")
+        collections = self.list_collections()
+        parents = _matching_keys(collections, project, None)
+        if len(parents) > 1:
+            raise _ambiguous_collection()
+        existing_parent = parents[0] if parents else None
+        children: list[str] = []
+        if subproject is not None and existing_parent is not None:
+            children = _matching_keys(collections, subproject, existing_parent)
+            if len(children) > 1:
+                raise _ambiguous_collection()
+        if existing_parent is None:
+            project_key, project_status = self.create_collection(project), CREATED
+        else:
+            project_key, project_status = existing_parent, ALREADY_EXISTS
+        if subproject is None:
+            return CollectionChain(project_key, project_status, None, None)
+        if children:
+            return CollectionChain(project_key, project_status, children[0], ALREADY_EXISTS)
+        return CollectionChain(project_key, project_status, self.create_collection(subproject, project_key), CREATED)
+
     # ----- items -------------------------------------------------------------------------------
 
     def move_item(
@@ -308,13 +461,33 @@ class ZoteroBridgeClient:
             body["remove_collections"] = remove
         return self._write("PATCH", f"/v1/items/{item_key}", body)
 
-    def create_webpage(self, title: str, url: str, parent_collection_keys: list[str] | tuple[str, ...] = ()) -> str:
+    def create_webpage(
+        self, title: str, url: str, parent_collection_keys: list[str] | tuple[str, ...] = ()
+    ) -> tuple[str, str]:
+        """Creates a webpage item and returns ``(status, key)``: ("created", the new key), or ("already_present", the
+        existing key) with no write.
+
+        With collection keys, each collection is read first. When every one of them already holds a webpage item with
+        exactly this URL, the existing key comes back. A URL in some of the collections but not all raises
+        ``partial_match`` with no write, so a copy is neither duplicated nor silently skipped. Without collection keys
+        nothing is read, so a rerun creates the item again.
+        """
         fields = {"title": _text(title, "title"), "url": _http_url(url)}
         body: dict[str, Any] = {"item_type": "webpage", "fields": fields}
         collections = _keys(list(parent_collection_keys), "parent_collection_keys")
         if collections:
+            found = [keys[0] for keys in self._webpage_keys_by_collection(collections, fields["url"]) if keys]
+            per_collection = len(dict.fromkeys(collections))
+            if found and len(found) == per_collection:
+                return ALREADY_PRESENT, found[0]
+            if found:
+                raise ZoteroBridgeError(
+                    "partial_match",
+                    "Some of the collections already hold this URL and others do not, so nothing was written. "
+                    "Add the existing item to the missing collections, or remove it, then retry.",
+                )
             body["collection_keys"] = collections
-        return _new_key(self._write("POST", "/v1/items", body))
+        return CREATED, _new_key(self._write("POST", "/v1/items", body))
 
     def attach_pdf(self, item_key: str, path: str, title: str | None = None) -> str:
         """Attaches a PDF to ``item_key``. Returns the new attachment key, or "already_attached" with no write.
@@ -507,21 +680,39 @@ class ZoteroBridgeClient:
             )
         return body
 
+    def _read_pages(self, base: str, page_size: int, page_limit: int, too_many: str) -> list[Any]:
+        """Every row under ``base``, read a page at a time. Past ``page_limit`` pages it fails with ``too_many``."""
+        found: list[Any] = []
+        for page in range(page_limit):
+            rows = self._read_list(f"{base}?format=json&limit={page_size}&start={page * page_size}")
+            found.extend(rows)
+            if len(rows) < page_size:
+                return found
+        raise ZoteroBridgeError("reader_failed", too_many)
+
     def _children(self, parent_key: str) -> list[dict[str, Any]]:
         """Every child of an item, read a page at a time. Fails rather than returning a partial list."""
-        found: list[dict[str, Any]] = []
-        for page in range(CHILD_PAGE_LIMIT):
-            path = (
-                f"/api/users/{_LOCAL_USER_ID}/items/{parent_key}/children"
-                f"?format=json&limit={CHILD_PAGE_SIZE}&start={page * CHILD_PAGE_SIZE}"
-            )
-            rows = self._read_list(path)
-            found.extend(row for row in rows if isinstance(row, dict))
-            if len(rows) < CHILD_PAGE_SIZE:
-                return found
-        raise ZoteroBridgeError(
-            "reader_failed", "The item has more children than the duplicate check reads, so it did not run."
+        rows = self._read_pages(
+            f"/api/users/{_LOCAL_USER_ID}/items/{parent_key}/children",
+            CHILD_PAGE_SIZE,
+            CHILD_PAGE_LIMIT,
+            "The item has more children than the duplicate check reads, so it did not run.",
         )
+        return [row for row in rows if isinstance(row, dict)]
+
+    def _webpage_keys_by_collection(self, collection_keys: list[str], url: str) -> list[list[str]]:
+        """For each distinct collection, the keys of its webpage items whose URL is exactly ``url``. Reads only."""
+        by_collection: list[list[str]] = []
+        for collection_key in dict.fromkeys(collection_keys):
+            rows = self._read_pages(
+                f"/api/users/{_LOCAL_USER_ID}/collections/{collection_key}/items",
+                ITEM_PAGE_SIZE,
+                ITEM_PAGE_LIMIT,
+                "A collection has more items than the duplicate check reads, so it did not run.",
+            )
+            keys = [key for key in (_webpage_key(row, url) for row in rows) if key is not None]
+            by_collection.append(keys)
+        return by_collection
 
     def _clean(self, text: Any) -> str:
         out = str(text)

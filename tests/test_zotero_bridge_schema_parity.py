@@ -122,7 +122,7 @@ async def test_a_stdio_call_reaches_the_zotero_handler(db, monkeypatch):
 
     result = await _stdio_call(server, "zotero_create_collection", {"name": "Reading list"})
 
-    assert result == {"ok": True, "error": None, "collection_key": "NEWCOLL01"}
+    assert result == {"ok": True, "error": None, "collection_key": "NEWCOLL01", "status": "created"}
     assert fake.calls == [("create_collection", ("Reading list", None))]
 
 

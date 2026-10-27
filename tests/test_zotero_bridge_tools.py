@@ -73,6 +73,9 @@ class FakeClient:
     def create_collection(self, name, parent_key=None):
         return self._record("create_collection", name, parent_key)
 
+    def ensure_collection(self, name, parent_key=None):
+        return self._record("ensure_collection", name, parent_key)
+
     def move_collection(self, key, parent_key):
         return self._record("move_collection", key, parent_key)
 
@@ -124,14 +127,14 @@ CASES = [
         {"name": "Reading list", "parent_key": "ABCD1234"},
         ("create_collection", ("Reading list", "ABCD1234")),
         "NEWCOLL01",
-        {"collection_key": "NEWCOLL01"},
+        {"collection_key": "NEWCOLL01", "status": "created"},
     ),
     (
         "zotero_create_collection",
-        {"name": "Top level"},
+        {"name": "Top level", "reuse_existing": False},
         ("create_collection", ("Top level", None)),
         "NEWCOLL02",
-        {"collection_key": "NEWCOLL02"},
+        {"collection_key": "NEWCOLL02", "status": "created"},
     ),
     (
         "zotero_move_collection",
@@ -172,8 +175,15 @@ CASES = [
         "zotero_create_webpage",
         {"title": "Pricing", "url": "https://example.com/pricing", "collection_keys": ["ABCD1234"]},
         ("create_webpage", ("Pricing", "https://example.com/pricing", ["ABCD1234"])),
-        "WEB00001",
-        {"item_key": "WEB00001"},
+        ("created", "WEB00001"),
+        {"item_key": "WEB00001", "status": "created"},
+    ),
+    (
+        "zotero_create_webpage",
+        {"title": "Pricing", "url": "https://example.com/pricing", "collection_keys": ["ABCD1234"]},
+        ("create_webpage", ("Pricing", "https://example.com/pricing", ["ABCD1234"])),
+        ("already_present", "WEB00001"),
+        {"item_key": "WEB00001", "status": "already_present"},
     ),
     (
         "zotero_attach_pdf",
@@ -234,8 +244,50 @@ async def test_the_mcp_dispatcher_reaches_each_zotero_tool(db, tmp_path, fake):
         "zotero_create_collection", {"name": "Reading list"}, db, str(tmp_path)
     )
 
-    assert payload == {"ok": True, "error": None, "collection_key": "NEWCOLL01"}
+    assert payload == {"ok": True, "error": None, "collection_key": "NEWCOLL01", "status": "created"}
     assert fake.calls == [("create_collection", ("Reading list", None))]
+
+
+@pytest.mark.asyncio
+async def test_reuse_existing_true_routes_to_ensure_and_reports_already_exists(fake):
+    fake.returns["ensure_collection"] = ("already_exists", "ABCD1234")
+
+    payload = await handlers.handle_zotero_create_collection(
+        {"name": "Reading list", "parent_key": "PARENT01", "reuse_existing": True}
+    )
+
+    assert payload == {"ok": True, "error": None, "collection_key": "ABCD1234", "status": "already_exists"}
+    assert fake.calls == [("ensure_collection", ("Reading list", "PARENT01"))]
+
+
+@pytest.mark.asyncio
+async def test_reuse_existing_true_reports_created_when_nothing_matched(fake):
+    fake.returns["ensure_collection"] = ("created", "NEWCOLL03")
+
+    payload = await handlers.handle_zotero_create_collection({"name": "Reading list", "reuse_existing": True})
+
+    assert payload == {"ok": True, "error": None, "collection_key": "NEWCOLL03", "status": "created"}
+    assert fake.calls == [("ensure_collection", ("Reading list", None))]
+
+
+@pytest.mark.asyncio
+async def test_reuse_existing_that_is_not_a_boolean_is_refused_before_any_client_call(fake):
+    payload = await handlers.handle_zotero_create_collection({"name": "Reading list", "reuse_existing": "yes"})
+
+    assert payload["ok"] is False
+    assert payload["error"]["code"] == "invalid_input"
+    assert "reuse_existing must be true or false" in payload["error"]["message"]
+    assert fake.calls == []
+
+
+@pytest.mark.asyncio
+async def test_an_ambiguous_collection_comes_back_with_its_code_and_nothing_is_created(fake):
+    fake.error = ZoteroBridgeError("ambiguous_collection", "More than one collection has that exact name.")
+
+    payload = await handlers.handle_zotero_create_collection({"name": "Methods", "reuse_existing": True})
+
+    assert payload["ok"] is False
+    assert payload["error"]["code"] == "ambiguous_collection"
 
 
 # ---------------------------------------------------------------------------

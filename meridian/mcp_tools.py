@@ -77,7 +77,7 @@ _TOOL_EXAMPLES: dict[str, str] = {
     "list_remote_tasks": 'list_remote_tasks(project_id="abc-123")',
     "runpod_check_key": 'runpod_check_key(credential_ref="env:RUNPOD_API_KEY")',
     "runpod_list_pods": 'runpod_list_pods(credential_ref="keyring:meridian-desktop/runpod-api-key")',
-    "zotero_create_collection": 'zotero_create_collection(name="Reading list", parent_key="ABCD1234")',
+    "zotero_create_collection": 'zotero_create_collection(name="Reading list", parent_key="ABCD1234", reuse_existing=true)',
     "zotero_move_collection": 'zotero_move_collection(key="ABCD1234", parent_key=null)',
     "zotero_move_item": 'zotero_move_item(item_key="WXYZ5678", add_collections=["ABCD1234"], remove_collections=["EFGH5678"])',
     "zotero_create_webpage": 'zotero_create_webpage(title="Pricing page", url="https://example.com/pricing", collection_keys=["ABCD1234"])',
@@ -4871,12 +4871,16 @@ _MCP_TOOLS_LIST: list[dict[str, Any]] = [
     # plugin on 127.0.0.1 (meridian/zotero_bridge_transport.py). Hosted Meridian refuses them in the handlers.
     {"name": "zotero_create_collection", "description":
         "Creates a collection named `name` in the local Zotero library, under `parent_key` when it is given and at the "
-        "top level when it is not. Returns the new collection key. Writes to the Zotero library on this machine only, "
-        "through the Zotero Bridge plugin. A grant prompt may appear in the Zotero desktop app the first time, and a "
-        "person must approve it; the call waits for that answer. Local only: refused on hosted Meridian.",
+        "top level when it is not. Returns the new collection key and status created. With `reuse_existing` true, a "
+        "collection with exactly this name under the same parent is reused instead: the result is status already_exists "
+        "with its key, and nothing is written. Names match exactly and case-sensitively. More than one match is refused "
+        "with nothing written. Writes to the Zotero library on this machine only, through the Zotero Bridge plugin. A "
+        "grant prompt may appear in the Zotero desktop app the first time, and a person must approve it; the call waits "
+        "for that answer. Local only: refused on hosted Meridian.",
      "inputSchema": {"type": "object", "properties": {
          "name": {"type": "string", "description": "Name of the new collection. Must not be blank."},
-         "parent_key": {"type": "string", "description": "Optional. The 8-character key of the collection to create this one under. Omit it to create the collection at the top level."}},
+         "parent_key": {"type": "string", "description": "Optional. The 8-character key of the collection to create this one under. Omit it to create the collection at the top level."},
+         "reuse_existing": {"type": "boolean", "description": "Optional. When true, reuse the collection with this exact name under the same parent instead of creating a second one. Defaults to false, which always creates."}},
          "required": ["name"]}},
     {"name": "zotero_move_collection", "description":
         "Moves the collection `key` under `parent_key`. Omit `parent_key` or pass null to move it to the top level. "
@@ -4900,10 +4904,13 @@ _MCP_TOOLS_LIST: list[dict[str, Any]] = [
          "required": ["item_key"]}},
     {"name": "zotero_create_webpage", "description":
         "Creates a webpage item in the local Zotero library with the given title and absolute http or https URL. With "
-        "`collection_keys`, the item is added to those collections. Returns the new item key. Writes to the Zotero "
-        "library on this machine only, through the Zotero Bridge plugin. A grant prompt may appear in the Zotero desktop "
-        "app the first time, and a person must approve it; the call waits for that answer. Local only: refused on "
-        "hosted Meridian.",
+        "`collection_keys`, the item is added to those collections, and first the call checks those collections: when "
+        "every one already holds a webpage item with exactly this URL, nothing is written and the result is status "
+        "already_present with that item's key. A URL held by only some of them is refused with nothing written. Without "
+        "`collection_keys` no check runs, so each call creates an item. Otherwise the result is status created with the "
+        "new item key. Writes to the Zotero library on this machine only, through the Zotero Bridge plugin. A grant "
+        "prompt may appear in the Zotero desktop app the first time, and a person must approve it; the call waits for "
+        "that answer. Local only: refused on hosted Meridian.",
      "inputSchema": {"type": "object", "properties": {
          "title": {"type": "string", "description": "Title of the webpage item. Must not be blank."},
          "url": {"type": "string", "description": "Absolute http or https URL of the page. It must not contain spaces."},
@@ -4935,11 +4942,12 @@ _MCP_TOOLS_LIST: list[dict[str, Any]] = [
     {"name": "zotero_batch", "description":
         "Runs 1 to 200 Zotero bridge write operations in one bridge transaction. Each operation is an object with `method`, "
         "`path` and an optional object `body`. Only these routes can be batched: POST /v1/items; PATCH /v1/items/<key>; "
-        "POST /v1/items/<key>/trash and /restore; POST /v1/items/<key>/notes; PATCH /v1/notes/<key>; POST and DELETE "
-        "/v1/items/<key>/relations; POST /v1/collections; PATCH /v1/collections/<key>; POST /v1/collections/<key>/trash "
-        "and /restore; POST and DELETE /v1/collections/<key>/items. Every other route or method is refused before anything "
-        "is sent, including grant routes, the status route, attachments, tag renames and BibTeX imports (attach a PDF with "
-        "zotero_attach_pdf). All operations apply or none do. Writes to the Zotero library on this machine only, through "
+        "POST /v1/items/<key>/trash and /restore; PATCH /v1/notes/<key>; POST and DELETE /v1/items/<key>/relations; "
+        "POST /v1/collections; PATCH /v1/collections/<key>; POST /v1/collections/<key>/trash and /restore; POST and DELETE "
+        "/v1/collections/<key>/items. Every other route or method is refused before anything is sent, including child note "
+        "creation (use zotero_add_child_note, which checks the dedup marker), grant routes, the status route, attachments, "
+        "tag renames and BibTeX imports (attach a PDF with zotero_attach_pdf). Item and collection creates in a batch are "
+        "not checked for duplicates. All operations apply or none do. Writes to the Zotero library on this machine only, through "
         "the Zotero Bridge plugin. A grant prompt may appear in the Zotero desktop app the first time, and a person must "
         "approve it; the call waits for that answer. Local only: refused on hosted Meridian.",
      "inputSchema": {"type": "object", "properties": {

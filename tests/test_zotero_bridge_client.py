@@ -414,9 +414,9 @@ def test_create_webpage_sends_url_and_collections():
     bridge = FakeBridge()
     client, _ = make_client(bridge)
 
-    key = client.create_webpage("A page", "https://example.org/paper", parent_collection_keys=["COLL0001"])
+    status, key = client.create_webpage("A page", "https://example.org/paper", parent_collection_keys=["COLL0001"])
 
-    assert key == "WEB00001"
+    assert (status, key) == ("created", "WEB00001")
     call = writes_of(bridge)[0]
     assert call["path"] == "/v1/items"
     assert call["body"] == {
@@ -448,6 +448,38 @@ def test_child_note_is_skipped_when_the_marker_is_present_and_written_otherwise(
     assert call["path"] == "/v1/items/ITEM0001/notes"
     assert marker in call["body"]["html"]
     assert "<p>Summary</p>" in call["body"]["html"]
+
+
+def test_marker_is_matched_as_a_whole_quoted_attribute_not_a_prefix():
+    # A longer marker that starts with the new one must not block the new one: v10 is not v1.
+    longer_note = '<div data-meridian-dedup="meridian-summary-v10">x</div>'
+    longer = FakeReader(children={"ITEM0001": [note_child("NOTE0009", longer_note)]})
+    bridge = FakeBridge()
+    client, _ = make_client(bridge, longer)
+
+    assert client.add_child_note("ITEM0001", "<p>Summary</p>", "meridian-summary-v1") == "NOTE0001"
+    assert writes_of(bridge)[0]["path"] == "/v1/items/ITEM0001/notes"
+
+    # And the reverse: the exact marker still blocks a rerun when a longer one sits beside it.
+    exact_note = '<div data-meridian-dedup="meridian-summary-v1">x</div>'
+    exact = FakeReader(children={"ITEM0001": [note_child("NOTE0009", exact_note)]})
+    bridge2 = FakeBridge()
+    client2, _ = make_client(bridge2, exact)
+
+    assert client2.add_child_note("ITEM0001", "<p>Summary</p>", "meridian-summary-v10") == "NOTE0001"
+    assert client2.add_child_note("ITEM0001", "<p>Summary</p>", "meridian-summary-v1") == ALREADY_PRESENT
+
+
+def test_a_note_that_only_mentions_the_bare_marker_does_not_block_a_write():
+    prose = FakeReader(
+        children={"ITEM0001": [note_child("NOTE0009", "<p>Remember meridian-summary-v1 is the old format.</p>")]}
+    )
+    bridge = FakeBridge()
+    client, _ = make_client(bridge, prose)
+
+    assert client.add_child_note("ITEM0001", "<p>Summary</p>", "meridian-summary-v1") == "NOTE0001"
+    assert len(writes_of(bridge)) == 1
+
 
 
 # ---------------------------------------------------------------------------------------------
@@ -508,13 +540,13 @@ def test_batch_size_limit_and_success_results():
     assert len(client.batch([one] * zbc.BATCH_LIMIT)) == zbc.BATCH_LIMIT
 
 
-# The routes a batch may carry, as the bridge README lists them under "Batches".
+# The routes a batch may carry: the bridge README's "Batches" list, less note create, which add_child_note owns so the
+# dedup marker is checked. Note create is refused below.
 ALLOWED_BATCH_ROUTES = [
     ("POST", "/v1/items", {"item_type": "webpage", "fields": {"title": "T"}}),
     ("PATCH", "/v1/items/ITEM0001", {"fields": {"title": "T"}}),
     ("POST", "/v1/items/ITEM0001/trash", None),
     ("POST", "/v1/items/ITEM0001/restore", None),
-    ("POST", "/v1/items/ITEM0001/notes", {"html": "<p>x</p>"}),
     ("PATCH", "/v1/notes/NOTE0001", {"html": "<p>x</p>"}),
     ("POST", "/v1/items/ITEM0001/relations", {"related_key": "ITEM0002"}),
     ("DELETE", "/v1/items/ITEM0001/relations", {"related_key": "ITEM0002"}),
@@ -538,6 +570,7 @@ REFUSED_BATCH_ROUTES = [
     ("POST", "/v1/items/PARENT01/attachments", {"mode": "linked_file"}, ATTACHMENT_TAG_BIBTEX),
     ("POST", "/v1/tags/rename", {"from": "a", "to": "b"}, ATTACHMENT_TAG_BIBTEX),
     ("POST", "/v1/import/bibtex", {"bibtex": "@article{x}"}, ATTACHMENT_TAG_BIBTEX),
+    ("POST", "/v1/items/ITEM0001/notes", {"html": "<p>x</p>"}, "creates a child note"),
     ("GET", "/v1/items/ITEM0001", None, "is not a route a batch may carry"),
     ("PUT", "/v1/items/ITEM0001", {"fields": {}}, "is not a route a batch may carry"),
     ("DELETE", "/v1/items/ITEM0001", None, "is not a route a batch may carry"),

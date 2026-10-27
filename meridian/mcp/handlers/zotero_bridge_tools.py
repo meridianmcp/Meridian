@@ -23,6 +23,7 @@ from meridian._deps import _hosted_mode as _deps_hosted_mode
 from meridian.zotero_bridge_client import (
     ALREADY_ATTACHED,
     ALREADY_PRESENT,
+    CREATED,
     BatchRolledBackError,
     ZoteroBridgeClient,
     ZoteroBridgeError,
@@ -66,6 +67,16 @@ def _list_arg(args: dict[str, Any], key: str) -> list[Any]:
     return value
 
 
+def _flag_arg(args: dict[str, Any], key: str) -> bool:
+    """An optional true/false argument. Omitted or null is false; anything else that is not a boolean is refused."""
+    value = args.get(key)
+    if value is None:
+        return False
+    if not isinstance(value, bool):
+        raise ZoteroBridgeError("invalid_input", f"{key} must be true or false.")
+    return value
+
+
 async def _run(action: Callable[[ZoteroBridgeClient], dict[str, Any]]) -> dict[str, Any]:
     """Runs one client call in a worker thread (a grant wait can take minutes) and maps the outcome to a payload."""
     if _hosted_mode():
@@ -81,10 +92,14 @@ async def _run(action: Callable[[ZoteroBridgeClient], dict[str, Any]]) -> dict[s
 
 
 async def handle_zotero_create_collection(args: dict[str, Any]) -> dict[str, Any]:
-    """MCP tool: zotero_create_collection. Creates a collection in the local Zotero library."""
+    """MCP tool: zotero_create_collection. Creates a collection, or with reuse_existing reuses a same-named one."""
 
     def action(client: ZoteroBridgeClient) -> dict[str, Any]:
-        return {"collection_key": client.create_collection(args.get("name"), args.get("parent_key"))}
+        if _flag_arg(args, "reuse_existing"):
+            status, key = client.ensure_collection(args.get("name"), args.get("parent_key"))
+            return {"collection_key": key, "status": status}
+        key = client.create_collection(args.get("name"), args.get("parent_key"))
+        return {"collection_key": key, "status": CREATED}
 
     return await _run(action)
 
@@ -115,8 +130,8 @@ async def handle_zotero_create_webpage(args: dict[str, Any]) -> dict[str, Any]:
     """MCP tool: zotero_create_webpage. Creates a webpage item, optionally in collections."""
 
     def action(client: ZoteroBridgeClient) -> dict[str, Any]:
-        key = client.create_webpage(args.get("title"), args.get("url"), _list_arg(args, "collection_keys"))
-        return {"item_key": key}
+        status, key = client.create_webpage(args.get("title"), args.get("url"), _list_arg(args, "collection_keys"))
+        return {"item_key": key, "status": status}
 
     return await _run(action)
 
