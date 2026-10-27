@@ -5955,6 +5955,33 @@ async def _migrate_pg_structural_patch(conn: PostgresConnection) -> None:
     )
 
 
+async def _migrate_pg_guidestones(conn: PostgresConnection) -> None:
+    """Postgres mirror of meridian/db/guidestones.py's _migrate_guidestones.
+
+    Named, append-only research waypoints. Same columns and index as SQLite;
+    created_at is written from Python in one format on both backends. See the
+    guidestones module docstring for the freeze-once contract."""
+    await conn.executescript(
+        "CREATE TABLE IF NOT EXISTS guidestones ("
+        "    id TEXT PRIMARY KEY,"
+        "    project_id TEXT NOT NULL REFERENCES projects(id) ON DELETE CASCADE,"
+        "    name TEXT NOT NULL,"
+        "    question TEXT,"
+        "    session_id TEXT,"
+        "    state_json TEXT NOT NULL,"
+        "    state_bytes INTEGER NOT NULL,"
+        "    findings_count INTEGER NOT NULL DEFAULT 0,"
+        "    sources_count INTEGER NOT NULL DEFAULT 0,"
+        "    decisions_count INTEGER NOT NULL DEFAULT 0,"
+        "    open_runs_count INTEGER NOT NULL DEFAULT 0,"
+        "    next_steps_count INTEGER NOT NULL DEFAULT 0,"
+        "    created_at TEXT NOT NULL"
+        ");"
+        "CREATE INDEX IF NOT EXISTS idx_guidestones_project_created "
+        "ON guidestones(project_id, created_at);"
+    )
+
+
 # Late migrations — run on every DB after the hosted-only set.
 _PG_MIGRATIONS_LATE = (
     _migrate_pg_workspace_tenant_isolation,
@@ -6097,4 +6124,5 @@ _PG_MIGRATIONS_LATE = (
     _migrate_pg_backfill_finding_note_kind,
     _migrate_pg_project_state_milestones,
     _migrate_pg_project_use_mode,
+    _migrate_pg_guidestones,
 )

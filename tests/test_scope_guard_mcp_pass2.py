@@ -1127,6 +1127,10 @@ _exempt(
     ("complete_workspace_sprint_item", "item_id"), ("add_workspace_sprint_item", "human_id"),
     ("update_workspace_sprint_item", "human_id"), ("save_blog_post", "id"), ("zotero_search", "library_id"),
 )
+_exempt(
+    "bound", "guidestone id / experiment id looked up with the call's project_id (meridian/db/guidestones.py: WHERE project_id = ?; the experiment is read with project_id, 'not found in this project'); tests/test_guidestones.py refuses a foreign id",
+    ("create_guidestone", "experiment_id"), ("load_guidestone", "guidestone_id"),
+)
 
 
 def test_every_id_argument_of_every_tool_is_guarded_or_exempted():
@@ -1342,6 +1346,10 @@ _CUSTOM_PROOFS = {
     ("complete_sprint_item", "foreign_claim_override_hitl_id"), ("update_sprint_item", "override_hitl_id"),
     ("complete_wave_gate", "override_hitl_id"), ("complete_wave_gate", "verification_run_id"),
     ("get_citation_edges", "document_id"),
+    # Guidestones: proved by dedicated tests, not probes. A foreign experiment is refused as not found
+    # (tests/test_guidestones_contract.py::test_an_experiment_from_another_project_is_refused_as_not_found);
+    # a foreign guidestone id reads as not found (tests/test_guidestones.py::test_load_is_scoped_to_its_project_and_reports_nothing_when_empty).
+    ("create_guidestone", "experiment_id"), ("load_guidestone", "guidestone_id"),
 }
 
 #: Probes whose call is allowed to write ONE kind of row, and why. None of them may touch the FOREIGN

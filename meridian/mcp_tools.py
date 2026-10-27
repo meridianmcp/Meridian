@@ -75,6 +75,9 @@ _TOOL_EXAMPLES: dict[str, str] = {
     "start_remote_task": 'start_remote_task(project_id="abc-123", session_id="session-uuid", host="gpu-pod-1", command="python train.py")',
     "get_remote_task_status": 'get_remote_task_status(project_id="abc-123", job_id="job-uuid")',
     "list_remote_tasks": 'list_remote_tasks(project_id="abc-123")',
+    "create_guidestone": 'create_guidestone(project_id="abc-123", name="after watchlist sweep", question="Which sources support claim X?")',
+    "list_guidestones": 'list_guidestones(project_id="abc-123")',
+    "load_guidestone": 'load_guidestone(project_id="abc-123")',
     "runpod_check_key": 'runpod_check_key(credential_ref="env:RUNPOD_API_KEY")',
     "runpod_list_pods": 'runpod_list_pods(credential_ref="keyring:meridian-desktop/runpod-api-key")',
     "zotero_create_collection": 'zotero_create_collection(name="Reading list", parent_key="ABCD1234")',
@@ -3870,6 +3873,43 @@ _MCP_TOOLS_LIST: list[dict[str, Any]] = [
          "status": {"type": "string", "enum": ["active", "completed", "failed", "abandoned", "expired"]},
          "limit": {"type": "integer", "minimum": 1, "maximum": 500}},
          "required": []}},
+    {"name": "create_guidestone", "description":
+        "Freeze a project's current research state into a named, append-only guidestone: "
+        "an impromptu milestone a cold session can resume from. Gathers the findings captured "
+        "so far (newest first) with their sources, the pinned decisions they cite, open scratch "
+        "and experiment runs, and open sprint items, then returns guidestone_id to keep. "
+        "Project-scoped: findings from every session in the project are included. Writes only "
+        "the guidestones table; never touches handoffs, pending_goal, /goal tokens or repo files. "
+        "The copies persist until the project is deleted: there is no per-snapshot delete, so do not "
+        "put anything in a snapshot that must later be removable on its own.",
+     "inputSchema": {"type": "object", "properties": {
+         "project_id": {"type": "string"},
+         "project_name": {"type": "string", "description": "Project name — an alternative to project_id; resolved to the id internally. project_id wins if both are given."},
+         "name": {"type": "string", "maxLength": 200, "description": "Short label. Defaults to a UTC timestamp. Duplicates are allowed; the id is the handle."},
+         "question": {"type": "string", "maxLength": 500, "description": "The research question in your own words. Strongly recommended: a cold session cannot resume without it."},
+         "session_id": {"type": "string", "description": "Optional session taking the snapshot. Must belong to the project."},
+         "experiment_id": {"type": "string", "description": "Optional experiment in this project. Adds its name, status and hypothesis."},
+         "open_threads": {"type": "array", "items": {"type": "string"}, "maxItems": 50, "description": "Open threads the next session should see, as plain text."},
+         "next_steps": {"type": "array", "items": {"type": "string"}, "maxItems": 50, "description": "Next steps, as plain text. Open sprint items are added automatically."},
+         "findings_limit": {"type": "integer", "minimum": 1, "maximum": 200, "description": "How many of the newest findings to consider (default 50). The oldest are dropped first if the state would exceed 32 KB."}},
+         "required": []}},
+    {"name": "list_guidestones", "description":
+        "List a project's guidestones, newest first: guidestone_id, name, question, created_at "
+        "and counts. Omits the saved state. Read-only.",
+     "inputSchema": {"type": "object", "properties": {
+         "project_id": {"type": "string"},
+         "project_name": {"type": "string", "description": "Project name — an alternative to project_id; resolved to the id internally. project_id wins if both are given."},
+         "limit": {"type": "integer", "minimum": 1, "maximum": 100}},
+         "required": []}},
+    {"name": "load_guidestone", "description":
+        "Load one guidestone as frozen data: the saved state plus a bounded resume_markdown block. "
+        "Omit guidestone_id to load the newest. Read-only. Everything returned is a snapshot from "
+        "when it was saved, never live state, and is marked untrusted.",
+     "inputSchema": {"type": "object", "properties": {
+         "project_id": {"type": "string"},
+         "project_name": {"type": "string", "description": "Project name — an alternative to project_id; resolved to the id internally. project_id wins if both are given."},
+         "guidestone_id": {"type": "string"}},
+         "required": []}},
     {"name": "promote_research_run", "description":
         "a5343387 — explicitly promote a completed, disposition='promote' research "
         "run into a durable, addressable project finding (kind='finding' note, "
@@ -4989,6 +5029,7 @@ _READ_ONLY_TOOLS = {
     "list_resumable_sessions", "get_session_recovery",
     "get_project_state_milestones",
     "get_research_run", "list_research_runs",
+    "list_guidestones", "load_guidestone",
     "get_experiment", "list_experiments", "get_experiment_run", "list_experiment_runs",
     "get_experiment_events",
     "list_hitl_requests", "list_sessions", "get_sprint_notes",
@@ -5190,6 +5231,9 @@ _TOOL_CATEGORY: dict[str, str] = {
     "complete_research_run":    "research",
     "get_research_run":         "research",
     "list_research_runs":       "research",
+    "create_guidestone":        "research",
+    "list_guidestones":         "research",
+    "load_guidestone":          "research",
     "promote_research_run":     "research",
     # 3f6b8715 — W1-M Experiment Registry: categorized alongside the research
     # run family above (same "adjacent research primitive" territory).
@@ -5526,6 +5570,9 @@ _TOOL_ROLE_RELEVANCE: dict[str, str] = {
     "complete_research_run":      "both",
     "get_research_run":           "both",
     "list_research_runs":         "both",
+    "create_guidestone":          "both",
+    "list_guidestones":           "both",
+    "load_guidestone":            "both",
     "promote_research_run":       "both",
     # 3f6b8715 — W1-M Experiment Registry: "both", mirroring research_run's
     # own role_relevance immediately above (an executor runs the experiment;
@@ -5791,6 +5838,9 @@ _TOOL_WORKFLOW_TIER: dict[str, str] = {
     "complete_research_run":       "common-support",
     "get_research_run":            "common-support",
     "list_research_runs":          "common-support",
+    "create_guidestone":           "main-workflow",
+    "list_guidestones":            "common-support",
+    "load_guidestone":             "common-support",
     "promote_research_run":        "common-support",
     # 3f6b8715 — W1-M Experiment Registry: common-support, same tier as the
     # research_run family immediately above.

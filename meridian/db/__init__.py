@@ -1386,6 +1386,8 @@ async def init_db(db_path: str) -> aiosqlite.Connection:
     await _migrate_experiment_registry_runs(db)
     # 32d3d5de -- W1-E Durable Remote Task primitive v1.
     await _migrate_remote_tasks(db)
+    # Guidestones: named, append-only research waypoints (meridian/db/guidestones.py).
+    await _migrate_guidestones(db)
     # W1-G (G1) -- projects.repo_identity: canonical repo binding.
     await _migrate_repo_identity(db)
     # W1-K -- derivative-document (DOCX) provenance tracking.
@@ -2091,6 +2093,7 @@ _MERGE_PROJECT_TABLES: tuple[str, ...] = (
     "session_graph_snapshots",
     "sprint_item_pointers",
     "proposal_evidence_links",
+    "guidestones",
 )
 
 
@@ -3120,6 +3123,9 @@ async def _delete_project_data(
         (f"DELETE FROM codebase_graph_entities WHERE project_id IN ({placeholders})", ids_params),
         # sprint_version_descriptions: FK → projects(id) ON DELETE CASCADE.
         (f"DELETE FROM sprint_version_descriptions WHERE project_id IN ({placeholders})", ids_params),
+        # guidestones: project_id TEXT with ON DELETE CASCADE, listed explicitly so a
+        # project delete never leaves frozen research snapshots behind.
+        (f"DELETE FROM guidestones WHERE project_id IN ({placeholders})", ids_params),
         # --- project row(s) itself ---
         (f"DELETE FROM projects WHERE id IN ({placeholders})", ids_params),
     ]
@@ -15211,6 +15217,17 @@ from .paper_strategy_graph import (  # noqa: F401
     supersede_strategy_node,
     create_strategy_edge,
     get_strategy_edges_for_node,
+)
+
+# Guidestones -- named, append-only research waypoints. Imported LAST: the module
+# depends only on meridian.experiment, meridian.research_run and
+# meridian.secret_redaction at import time. See meridian/db/guidestones.py for the
+# freeze-once contract and the 32 KB state cap.
+from .guidestones import (  # noqa: F401
+    _migrate_guidestones,
+    create_guidestone,
+    list_guidestones,
+    load_guidestone,
 )
 
 # d2539453 — lint_finding: structured, version-pinned paper/manuscript audit
