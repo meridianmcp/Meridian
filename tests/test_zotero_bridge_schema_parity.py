@@ -1,4 +1,4 @@
-"""Schema parity for the seven Zotero bridge write tools across the MCP transports (the 325276f8 pattern).
+"""Schema parity for the eight Zotero bridge write tools across the MCP transports (the 325276f8 pattern).
 
 The canonical schema is meridian/mcp_tools.py's _MCP_TOOLS_LIST. The HTTP transport advertises it through /tools and
 the JSON-RPC tools/list. The stdio transport advertises it through _shared_tool(). A stdio call reaches the same
@@ -16,9 +16,11 @@ from meridian import db as db_module
 from meridian import zotero_bridge_transport as transport_mod
 from meridian.mcp import handler as mh
 from meridian.mcp_tools import _MCP_TOOLS_LIST
+from meridian.zotero_bridge_client import CollectionChain
 
 ZOTERO_TOOLS = (
     "zotero_create_collection",
+    "zotero_ensure_collection_chain",
     "zotero_move_collection",
     "zotero_move_item",
     "zotero_create_webpage",
@@ -38,9 +40,13 @@ class FakeClient:
     def __init__(self):
         self.calls: list[tuple[str, tuple]] = []
 
-    def create_collection(self, name, parent_key=None):
-        self.calls.append(("create_collection", (name, parent_key)))
-        return "NEWCOLL01"
+    def ensure_collection(self, name, parent_key=None):
+        self.calls.append(("ensure_collection", (name, parent_key)))
+        return ("created", "NEWCOLL01")
+
+    def ensure_collection_chain(self, project_name, subproject_name=None):
+        self.calls.append(("ensure_collection_chain", (project_name, subproject_name)))
+        return CollectionChain("PROJ0001", "created", None, None)
 
 
 def _build_stdio_server(monkeypatch, db):
@@ -122,8 +128,27 @@ async def test_a_stdio_call_reaches_the_zotero_handler(db, monkeypatch):
 
     result = await _stdio_call(server, "zotero_create_collection", {"name": "Reading list"})
 
-    assert result == {"ok": True, "error": None, "collection_key": "NEWCOLL01"}
-    assert fake.calls == [("create_collection", ("Reading list", None))]
+    assert result == {"ok": True, "error": None, "collection_key": "NEWCOLL01", "status": "created"}
+    assert fake.calls == [("ensure_collection", ("Reading list", None))]
+
+
+@pytest.mark.asyncio
+async def test_a_stdio_call_reaches_the_chain_handler(db, monkeypatch):
+    fake = FakeClient()
+    monkeypatch.setattr(transport_mod, "get_client", lambda: fake)
+    server = _build_stdio_server(monkeypatch, db)
+
+    result = await _stdio_call(server, "zotero_ensure_collection_chain", {"project_name": "Project A"})
+
+    assert result == {
+        "ok": True,
+        "error": None,
+        "project_key": "PROJ0001",
+        "project_status": "created",
+        "subproject_key": None,
+        "subproject_status": None,
+    }
+    assert fake.calls == [("ensure_collection_chain", ("Project A", None))]
 
 
 @pytest.mark.asyncio
@@ -138,4 +163,4 @@ async def test_stdio_and_http_dispatch_to_the_same_handler(db, monkeypatch, tmp_
     )
 
     assert via_stdio == via_http
-    assert [call[0] for call in fake.calls] == ["create_collection", "create_collection"]
+    assert [call[0] for call in fake.calls] == ["ensure_collection", "ensure_collection"]

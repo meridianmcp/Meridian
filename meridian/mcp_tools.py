@@ -77,7 +77,8 @@ _TOOL_EXAMPLES: dict[str, str] = {
     "list_remote_tasks": 'list_remote_tasks(project_id="abc-123")',
     "runpod_check_key": 'runpod_check_key(credential_ref="env:RUNPOD_API_KEY")',
     "runpod_list_pods": 'runpod_list_pods(credential_ref="keyring:meridian-desktop/runpod-api-key")',
-    "zotero_create_collection": 'zotero_create_collection(name="Reading list", parent_key="ABCD1234")',
+    "zotero_create_collection": 'zotero_create_collection(name="Reading list", parent_key="ABCD1234", reuse_existing=true)',
+    "zotero_ensure_collection_chain": 'zotero_ensure_collection_chain(project_name="Project A", subproject_name="Methods")',
     "zotero_move_collection": 'zotero_move_collection(key="ABCD1234", parent_key=null)',
     "zotero_move_item": 'zotero_move_item(item_key="WXYZ5678", add_collections=["ABCD1234"], remove_collections=["EFGH5678"])',
     "zotero_create_webpage": 'zotero_create_webpage(title="Pricing page", url="https://example.com/pricing", collection_keys=["ABCD1234"])',
@@ -4871,13 +4872,37 @@ _MCP_TOOLS_LIST: list[dict[str, Any]] = [
     # plugin on 127.0.0.1 (meridian/zotero_bridge_transport.py). Hosted Meridian refuses them in the handlers.
     {"name": "zotero_create_collection", "description":
         "Creates a collection named `name` in the local Zotero library, under `parent_key` when it is given and at the "
-        "top level when it is not. Returns the new collection key. Writes to the Zotero library on this machine only, "
-        "through the Zotero Bridge plugin. A grant prompt may appear in the Zotero desktop app the first time, and a "
-        "person must approve it; the call waits for that answer. Local only: refused on hosted Meridian.",
+        "top level when it is not. By default (`reuse_existing` true) a collection with exactly this name under the same "
+        "parent is reused instead: the result is status already_exists with its key, and nothing is written. Pass "
+        "`reuse_existing` false to always create a new collection. Names match exactly and case-sensitively. More than one "
+        "match is refused with nothing written. With `reuse_existing` true the check reads the collections through the "
+        "Zotero local API first, so a failed read stops the call with reader_failed and nothing is written. Otherwise the "
+        "result is status created with the new collection key. "
+        "Writes to the Zotero library on this machine only, through the Zotero Bridge plugin. A "
+        "grant prompt may appear in the Zotero desktop app the first time, and a person must approve it; the call waits "
+        "for that answer. Local only: refused on hosted Meridian.",
      "inputSchema": {"type": "object", "properties": {
          "name": {"type": "string", "description": "Name of the new collection. Must not be blank."},
-         "parent_key": {"type": "string", "description": "Optional. The 8-character key of the collection to create this one under. Omit it to create the collection at the top level."}},
+         "parent_key": {"type": "string", "description": "Optional. The 8-character key of the collection to create this one under. Omit it to create the collection at the top level."},
+         "reuse_existing": {"type": "boolean", "description": "Optional. Defaults to true: reuse the collection with this exact name under the same parent instead of creating a second one. Pass false to always create a new collection."}},
          "required": ["name"]}},
+    {"name": "zotero_ensure_collection_chain", "description":
+        "Maps a Meridian project to a top-level collection named `project_name` in the local Zotero library, and, when "
+        "`subproject_name` is given, maps it to a collection of that name under the project collection. Each level is "
+        "reused when exactly one collection has that name under the same parent, and created otherwise. Returns, for the "
+        "project and for the subproject, its collection key and status: created or already_exists. The subproject fields "
+        "are null when no subproject is given. A level that already exists is not written again, so a rerun creates "
+        "nothing new. Names match exactly and case-sensitively. A name held by more than one collection under the same "
+        "parent is refused with nothing written. The library is read first through the Zotero local API, so a failed read "
+        "stops the call with reader_failed and nothing is written. It is not atomic: the project collection is written "
+        "before the subproject, so a failed subproject write leaves the project collection in place, and a rerun completes "
+        "the chain. Writes to the Zotero library on this machine only, through the Zotero "
+        "Bridge plugin. A grant prompt may appear in the Zotero desktop app the first time, and a person must approve it; "
+        "the call waits for that answer. Local only: refused on hosted Meridian.",
+     "inputSchema": {"type": "object", "properties": {
+         "project_name": {"type": "string", "description": "Name of the project's top-level collection. Must not be blank."},
+         "subproject_name": {"type": "string", "description": "Optional. Name of the subproject's collection, created or reused under the project collection. Must not be blank when given."}},
+         "required": ["project_name"]}},
     {"name": "zotero_move_collection", "description":
         "Moves the collection `key` under `parent_key`. Omit `parent_key` or pass null to move it to the top level. "
         "Writes to the Zotero library on this machine only, through the Zotero Bridge plugin. A grant prompt may appear "
@@ -4900,10 +4925,15 @@ _MCP_TOOLS_LIST: list[dict[str, Any]] = [
          "required": ["item_key"]}},
     {"name": "zotero_create_webpage", "description":
         "Creates a webpage item in the local Zotero library with the given title and absolute http or https URL. With "
-        "`collection_keys`, the item is added to those collections. Returns the new item key. Writes to the Zotero "
-        "library on this machine only, through the Zotero Bridge plugin. A grant prompt may appear in the Zotero desktop "
-        "app the first time, and a person must approve it; the call waits for that answer. Local only: refused on "
-        "hosted Meridian.",
+        "`collection_keys`, the item is added to those collections, and first the call checks those collections: when "
+        "every one already holds a webpage item with exactly this URL, nothing is written and the result is status "
+        "already_present with that item's key. A URL held by only some of them is refused with nothing written. The check "
+        "reads the library through the Zotero local API first, so a failed read stops the call with reader_failed and "
+        "nothing is written. Without "
+        "`collection_keys` no check runs, so each call creates an item. Otherwise the result is status created with the "
+        "new item key. Writes to the Zotero library on this machine only, through the Zotero Bridge plugin. A grant "
+        "prompt may appear in the Zotero desktop app the first time, and a person must approve it; the call waits for "
+        "that answer. Local only: refused on hosted Meridian.",
      "inputSchema": {"type": "object", "properties": {
          "title": {"type": "string", "description": "Title of the webpage item. Must not be blank."},
          "url": {"type": "string", "description": "Absolute http or https URL of the page. It must not contain spaces."},
@@ -4935,11 +4965,16 @@ _MCP_TOOLS_LIST: list[dict[str, Any]] = [
     {"name": "zotero_batch", "description":
         "Runs 1 to 200 Zotero bridge write operations in one bridge transaction. Each operation is an object with `method`, "
         "`path` and an optional object `body`. Only these routes can be batched: POST /v1/items; PATCH /v1/items/<key>; "
-        "POST /v1/items/<key>/trash and /restore; POST /v1/items/<key>/notes; PATCH /v1/notes/<key>; POST and DELETE "
-        "/v1/items/<key>/relations; POST /v1/collections; PATCH /v1/collections/<key>; POST /v1/collections/<key>/trash "
-        "and /restore; POST and DELETE /v1/collections/<key>/items. Every other route or method is refused before anything "
-        "is sent, including grant routes, the status route, attachments, tag renames and BibTeX imports (attach a PDF with "
-        "zotero_attach_pdf). All operations apply or none do. Writes to the Zotero library on this machine only, through "
+        "POST /v1/items/<key>/trash and /restore; PATCH /v1/notes/<key>; POST and DELETE /v1/items/<key>/relations; "
+        "POST /v1/collections; PATCH /v1/collections/<key>; POST /v1/collections/<key>/trash and /restore; POST and DELETE "
+        "/v1/collections/<key>/items. Every other route or method is refused before anything is sent, including child note "
+        "creation (use zotero_add_child_note, which checks the dedup marker), grant routes, the status route, attachments, "
+        "tag renames and BibTeX imports (attach a PDF with zotero_attach_pdf). Item creates (POST /v1/items, webpages "
+        "included) and collection creates (POST /v1/collections) are not deduplicated inside a batch. Each one is written, "
+        "and a rerun of the same batch writes them again. This is documented here, not refused. Use zotero_create_webpage "
+        "with collection_keys, or zotero_create_collection with `reuse_existing` left at its default of true, which check "
+        "first. All operations apply or none do. Writes to the "
+        "Zotero library on this machine only, through "
         "the Zotero Bridge plugin. A grant prompt may appear in the Zotero desktop app the first time, and a person must "
         "approve it; the call waits for that answer. Local only: refused on hosted Meridian.",
      "inputSchema": {"type": "object", "properties": {
@@ -5176,6 +5211,7 @@ _TOOL_CATEGORY: dict[str, str] = {
     "runpod_list_pods":         "session",
     # Zotero bridge write tools (local only), grouped with the research tools that read Zotero.
     "zotero_create_collection": "research",
+    "zotero_ensure_collection_chain": "research",
     "zotero_move_collection":   "research",
     "zotero_move_item":         "research",
     "zotero_create_webpage":    "research",
@@ -5512,6 +5548,7 @@ _TOOL_ROLE_RELEVANCE: dict[str, str] = {
     "runpod_check_key":           "both",
     "runpod_list_pods":           "both",
     "zotero_create_collection":   "both",
+    "zotero_ensure_collection_chain": "both",
     "zotero_move_collection":     "both",
     "zotero_move_item":           "both",
     "zotero_create_webpage":      "both",
@@ -5781,6 +5818,7 @@ _TOOL_WORKFLOW_TIER: dict[str, str] = {
     "runpod_check_key":            "common-support",
     "runpod_list_pods":            "common-support",
     "zotero_create_collection":    "maintenance-only",
+    "zotero_ensure_collection_chain": "maintenance-only",
     "zotero_move_collection":      "maintenance-only",
     "zotero_move_item":            "maintenance-only",
     "zotero_create_webpage":       "maintenance-only",

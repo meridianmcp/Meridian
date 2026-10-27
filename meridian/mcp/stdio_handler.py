@@ -2090,6 +2090,7 @@ def build_mcp_server():
             # Local-only Zotero bridge writes. _shared_tool() pulls the schema HTTP MCP advertises from _MCP_TOOLS_LIST,
             # and call_tool routes them through _dispatch_mcp_tool, so the transports cannot drift apart.
             _shared_tool("zotero_create_collection"),
+            _shared_tool("zotero_ensure_collection_chain"),
             _shared_tool("zotero_move_collection"),
             _shared_tool("zotero_move_item"),
             _shared_tool("zotero_create_webpage"),
@@ -2713,7 +2714,8 @@ def build_mcp_server():
                     name, arguments, db, state["data_dir"]
                 )
             elif name in (
-                "zotero_create_collection", "zotero_move_collection", "zotero_move_item",
+                "zotero_create_collection", "zotero_ensure_collection_chain",
+                "zotero_move_collection", "zotero_move_item",
                 "zotero_create_webpage", "zotero_attach_pdf", "zotero_add_child_note", "zotero_batch",
             ):
                 # Local-only Zotero bridge writes: share dispatch with HTTP MCP (the _handle_zotero_bridge_tools group).
