@@ -14,10 +14,13 @@ Menu actions and a local write API for Zotero:
   notes, attachments, relations, collections and tags, and it imports BibTeX. Reads stay on Zotero's own local API.
   See "Local write API" below.
 
-Plugin ID: `meridian-zotero@usemeridian.us`. Version `0.1.6` (source; not yet signed or released). `0.1.6` combines
-the untitled-entry BibTeX key match and the duplicate-empty-source cleanup from `0.1.5`, the 30-day standing approval
-and open local writes, and the request-validation fixes for large PDFs and unknown keys (see Status).
-Earlier builds: `0.1.5` (source), `0.1.4` (Mozilla-signed and on the update channel), `0.1.3` (released; it had the write API,
+Plugin ID: `meridian-zotero@usemeridian.us`. Version `0.1.6` is Mozilla-signed as an unlisted add-on and installed on the
+owner's machine. It is not on the update channel. `0.1.6` combines the untitled-entry BibTeX key match and the
+duplicate-empty-source cleanup, the 30-day standing approval and open local writes, and the request-validation fixes for
+large PDFs and unknown keys (see Status).
+Earlier builds: `0.1.5` (Mozilla-signed and installed briefly on the owner's machine, then superseded by `0.1.6`; it has
+the standing approval and open local writes but not the request-validation fixes; not on the update channel), `0.1.4`
+(Mozilla-signed and on the update channel), `0.1.3` (released; it had the write API,
 but accepted any readable file as a linked attachment, which 0.1.4 closes), `0.1.2` (Mozilla-signed, menus only, no
 write API), `0.1.1` (on Mozilla, uploaded by the owner, with the old placeholder `update_url`, so it does not
 auto-update from GitHub), `0.1.0` (Mozilla-approved, no `strict_max_version`).
@@ -63,8 +66,13 @@ auto-update from GitHub), `0.1.0` (Mozilla-approved, no `strict_max_version`).
   through the API. The duplicate-empty-source cleanup is checked in node only: the pure logic, the key match, and the
   design-line checks. Its Zotero calls (`getChildItems`, `getNotes`, `Items.trashTx`, `Prompt.confirm`) are not
   live-checked.
-- **Not yet done:** a Mozilla-signed `0.1.6` build, and its release to the update channel. Until that happens,
-  Meridian's install step prints the signing command.
+- **Signed and installed, 2026-10-26.** `0.1.6` is signed as an unlisted Mozilla add-on and installed on the owner's
+  machine. The running bridge reports plugin version `0.1.6`. Publishing it to the update channel is a separate step, and
+  it has not been done. Meridian's install step prints the signing command when no signed file is stored.
+- **Live on the owner's machine, with `0.1.5`, 2026-10-26:** an item created with `fields` and a collection key, a 2 MB
+  PDF attached, 22 untitled items left by an earlier faulty run moved to the trash (restorable), and an open-local-writes write granted with no prompt.
+- **Not yet live-checked on `0.1.6`:** the refusal of unknown top-level and creator keys, attachments of about 4.5 MB and
+  up, the duplicate-cleanup menu, and the 30-day standing approval.
 
 Two bugs were found and fixed while verifying. The BibTeX duplicate check called `Zotero.Items.getAll` with its first
 two arguments swapped, so the import failed before it wrote anything. The menu import and the API import share that
