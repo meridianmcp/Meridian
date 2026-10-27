@@ -863,6 +863,13 @@ No auth required.
 | `POST` | `/demo-auth` | Validate demo password and set a signed access cookie |
 
 
+### `/desktop`
+
+| Method | Path | Description |
+|--------|------|-------------|
+| `GET` | `/desktop/research/search` | Desktop Search tab: read-only research search across the named sources (loopback only) |
+
+
 ### `/docs`
 
 | Method | Path | Description |
