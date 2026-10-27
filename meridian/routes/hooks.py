@@ -186,6 +186,9 @@ async def get_hooks_diagnostics() -> dict[str, Any]:
     Mode and runtime are computed from THIS server process's environment,
     which can differ from the Claude Code session that runs the hooks.
     """
+    if _hosted_mode():
+        # P0 (spec 6.10): hosted deployments never return this process's own paths or hook commands.
+        raise HTTPException(status_code=404)
     repo_root = hook_paths_module.resolve_active_repo_root(cwd=str(Path.cwd()))
     settings_path = (repo_root / ".claude" / "settings.json") if repo_root else None
     if settings_path is None or not settings_path.exists():

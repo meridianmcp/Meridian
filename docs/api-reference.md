@@ -1365,6 +1365,7 @@ No auth required.
 | `DELETE` | `/workspace/notes/{note_id}` | Hard-delete a workspace note. Returns 204 or 404 |
 | `PATCH` | `/workspace/notes/{note_id}` | Patch title/body/tags on a workspace note |
 | `POST` | `/workspace/notes/{note_id}/move` | Move a workspace note to a project (converts it to a project note and |
+| `GET` | `/workspace/overview` | Read-only local overview of repos, indexes, sessions, projects and guard state |
 | `GET` | `/workspace/settings` | Read the workspace-global default settings (singleton) |
 | `PATCH` | `/workspace/settings` | Patch workspace-global defaults. Only the fields passed are changed |
 | `GET` | `/workspace/sprint-items` | Workspace sprint items, grouped by item_group. ``?status=`` and |

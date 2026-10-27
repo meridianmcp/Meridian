@@ -76,6 +76,8 @@ import {
   eligibleParents,
   type HierProject,
 } from "./dashboard-subprojects";
+// Local overview: read-only repos, indexes, sessions and guard state (dashboard-workspace.ts).
+import { mountWorkspaceView, type WorkspaceViewControls } from "./dashboard-workspace";
 // fc779141 — goal fields that never lose an in-progress edit to a live update or a stale save
 // (Changed elsewhere bar, Esc-to-discard, 409-aware saves, leave guards).
 import {
@@ -2990,7 +2992,31 @@ async function _detachSubproject(t: any) {
 
 
 
+// Local overview controls, set by mountWorkspaceView at boot. openTab closes the view.
+let _workspaceOverview: WorkspaceViewControls | null = null;
+
+// Selecting a project tab (strip click, overflow menu, or closing the active tab) closes the
+// Local overview first (spec 7.1), so the tab strip is never dead behind the view.
+function selectProjectTab(id: any) {
+  _workspaceOverview?.close();
+  activateTab(id);
+}
+
+// The Workspace entry (#workspace-entry) opens the active project's Settings. It closes the
+// Local overview first, even when the project's tab body already exists (spec 7.1: its own
+// behaviour does not change; it closes the view, as openTab does).
+function openWorkspaceEntry() {
+  _workspaceOverview?.close();
+  const targetId = state.activeTab || state.projects[0]?.id;
+  const project = state.projects.find(p => p.id === targetId);
+  if (!project) return;
+  if (!document.getElementById(`tab-body-${targetId}`)) openTab(project);
+  document.querySelector(`#vtab-strip-${targetId} [data-vtab="settings"]`)?.click();
+}
+
 function openTab(project: any) {
+
+  _workspaceOverview?.close();
 
   const existing = state.tabs.find(t => t.id === project.id);
 
@@ -3050,7 +3076,7 @@ function closeTab(id: any) {
 
     state.activeTab = next ? next.id : null;
 
-    if (next) activateTab(next.id);
+    if (next) selectProjectTab(next.id);
 
     else document.getElementById('tab-bodies')!.innerHTML = '<div class="empty">no project open — pick one on the left</div>';
 
@@ -3144,7 +3170,7 @@ function renderTabs() {
 
         item.onmouseleave = () => item.style.background = '';
 
-        item.onclick = () => { menu.remove(); activateTab(t.id); };
+        item.onclick = () => { menu.remove(); selectProjectTab(t.id); };
 
         menu.appendChild(item);
 
@@ -3174,7 +3200,7 @@ function _makeTabEl(t: any) {
 
   div.dataset.tabId = t.id;
 
-  div.onclick = () => activateTab(t.id);
+  div.onclick = () => selectProjectTab(t.id);
 
 
 
@@ -13599,6 +13625,19 @@ async function restoreTabs() {
 
   ensureFeedbackButton();
 
+  // Local overview: mounted before the first-run return below, so a user with zero projects still
+  // gets the sidebar button. Mounting runs once per page load (the guard is defensive). openTab,
+  // selectProjectTab and the Workspace entry close the view. One GET per open or Refresh.
+  if (!_workspaceOverview) _workspaceOverview = mountWorkspaceView(document, {
+    hosted: !!window.MERIDIAN_HOSTED,
+    fetchOverview: async () => {
+      const r = await fetch('/workspace/overview', { cache: 'no-store', headers: { Accept: 'application/json' } });
+      let body: unknown = null;
+      try { body = await r.json(); } catch { body = null; }
+      return { status: r.status, body };
+    },
+  });
+
   // v0.6.6 — EZ first-run wizard: if no projects exist, show the overlay
 
   // Skip in demo mode — demo DB always has projects seeded.
@@ -13759,23 +13798,12 @@ async function restoreTabs() {
 
   }
 
+  // Workspace entry (#workspace-entry): opens the active project's Settings. See openWorkspaceEntry.
   const workspaceEntry = document.getElementById('workspace-entry');
 
   if (workspaceEntry) {
 
-    workspaceEntry.onclick = () => {
-
-      const targetId = state.activeTab || state.projects[0]?.id;
-
-      const project = state.projects.find(p => p.id === targetId);
-
-      if (!project) return;
-
-      if (!document.getElementById(`tab-body-${targetId}`)) openTab(project);
-
-      document.querySelector(`#vtab-strip-${targetId} [data-vtab="settings"]`)?.click();
-
-    };
+    workspaceEntry.onclick = () => openWorkspaceEntry();
 
   }
 

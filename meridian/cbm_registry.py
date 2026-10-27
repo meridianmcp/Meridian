@@ -63,6 +63,7 @@ from __future__ import annotations
 import argparse
 import calendar
 import json
+import math
 import os
 import re
 import sqlite3
@@ -537,15 +538,23 @@ def git_roots(target: str, fs: FsProbe) -> tuple[str | None, str | None, bool]:
 _ROW_REQUIRED = {"name": str, "root": str, "root_key": str, "db": str}
 
 
+def _is_finite_number(value: Any) -> bool:
+    """An int, or a float that is neither NaN nor Infinity. json.loads accepts both literals."""
+    if not isinstance(value, (int, float)):
+        return False
+    return not isinstance(value, float) or math.isfinite(value)
+
+
 def _valid_row(row: Any) -> bool:
     if not isinstance(row, dict):
         return False
     for k, t in _ROW_REQUIRED.items():
         if not isinstance(row.get(k), t) or not row.get(k):
             return False
-    if not isinstance(row.get("indexed_epoch", 0), (int, float)):
+    # A NaN or Infinity stamp or count makes the row unreadable, as a non-number does.
+    if not _is_finite_number(row.get("indexed_epoch", 0)):
         return False
-    if not isinstance(row.get("nodes", 0), (int, float)):
+    if not _is_finite_number(row.get("nodes", 0)):
         return False
     return True
 

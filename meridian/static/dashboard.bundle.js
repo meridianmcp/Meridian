@@ -169,10 +169,10 @@
   }
   var _HUMAN_COLORS = ["#6c8fff", "#a78bfa", "#22d3ee", "#4ade80", "#fbbf24", "#f87171", "#fb923c", "#e879f9"];
   function _colorForHuman2(humanId) {
-    let h3 = 0;
+    let h4 = 0;
     const id = humanId || "";
-    for (let i3 = 0; i3 < id.length; i3++) h3 = (h3 << 5) - h3 + id.charCodeAt(i3) | 0;
-    return _HUMAN_COLORS[Math.abs(h3) % _HUMAN_COLORS.length];
+    for (let i3 = 0; i3 < id.length; i3++) h4 = (h4 << 5) - h4 + id.charCodeAt(i3) | 0;
+    return _HUMAN_COLORS[Math.abs(h4) % _HUMAN_COLORS.length];
   }
   function suggestedFsRoots2(execCfg, currentRoots) {
     const have = new Set(
@@ -3716,9 +3716,9 @@ stop = ${JSON.stringify(stop)}`;
       <div style="font-weight:600;font-size:13px;color:var(--text);margin-bottom:4px">Known Locations</div>
       <div style="font-size:11px;color:var(--muted);margin-bottom:10px">First hook from a new machine auto-registers it here. All future sessions from that machine route to this project regardless of directory.</div>
       <div style="font-size:10px;font-weight:600;color:var(--text);margin-bottom:4px">Registered Machines</div>
-      <div id="exec-ez-hosts-tbl-${projectId}" style="margin-bottom:8px;font-size:10px;font-family:var(--font-mono)">${_klHosts.length ? '<table style="width:100%;border-collapse:collapse">' + _klHosts.map((h3, i3) => `<tr>
-              <td style="padding:2px 6px 2px 0;color:var(--text)">${escapeHtml(h3.hostname || "")}</td>
-              <td style="padding:2px 6px 2px 0;color:var(--muted)"><label style="display:flex;align-items:center;gap:4px;cursor:pointer;font-size:9px"><input type="checkbox" class="exec-ez-host-autocwd" data-pid="${escapeHtml(projectId)}" data-idx="${i3}" ${h3.auto_add_cwds ? "checked" : ""} style="cursor:pointer"> Auto-add new cwds</label></td>
+      <div id="exec-ez-hosts-tbl-${projectId}" style="margin-bottom:8px;font-size:10px;font-family:var(--font-mono)">${_klHosts.length ? '<table style="width:100%;border-collapse:collapse">' + _klHosts.map((h4, i3) => `<tr>
+              <td style="padding:2px 6px 2px 0;color:var(--text)">${escapeHtml(h4.hostname || "")}</td>
+              <td style="padding:2px 6px 2px 0;color:var(--muted)"><label style="display:flex;align-items:center;gap:4px;cursor:pointer;font-size:9px"><input type="checkbox" class="exec-ez-host-autocwd" data-pid="${escapeHtml(projectId)}" data-idx="${i3}" ${h4.auto_add_cwds ? "checked" : ""} style="cursor:pointer"> Auto-add new cwds</label></td>
               <td style="padding:2px 0;text-align:right"><button class="exec-ez-del-host" data-pid="${escapeHtml(projectId)}" data-idx="${i3}" style="font-size:9px;padding:1px 6px;background:transparent;border:1px solid var(--border);border-radius:3px;color:var(--muted);cursor:pointer">Remove</button></td>
             </tr>`).join("") + "</table>" : '<div style="color:var(--muted);font-style:italic;font-size:10px">No machines registered yet \u2014 first hook auto-registers.</div>'}</div>
       <div style="font-size:10px;font-weight:600;color:var(--text);margin-bottom:4px">Specific Paths (cwd overrides)</div>
@@ -3732,7 +3732,7 @@ stop = ${JSON.stringify(stop)}`;
         <input id="exec-ez-add-host-${projectId}" type="text" placeholder="hostname" list="exec-ez-host-options-${projectId}" value="${escapeHtml(String(_klHosts[0] && _klHosts[0].hostname || ""))}" style="flex:1;box-sizing:border-box;background:var(--surface-1);border:1px solid var(--border);border-radius:3px;color:var(--text);font-size:10px;font-family:var(--font-mono);padding:3px 6px">
         <button id="exec-ez-add-btn-${projectId}" class="secondary" style="font-size:10px;padding:3px 10px">Add</button>
       </div>
-      <datalist id="exec-ez-host-options-${projectId}">${_klHosts.map((h3) => `<option value="${escapeHtml(String(h3.hostname || ""))}"></option>`).join("")}</datalist>
+      <datalist id="exec-ez-host-options-${projectId}">${_klHosts.map((h4) => `<option value="${escapeHtml(String(h4.hostname || ""))}"></option>`).join("")}</datalist>
       <div style="display:flex;gap:8px;align-items:center">
         <button id="exec-ez-save-${projectId}" class="primary" style="font-size:10px;padding:3px 10px">Save</button>
         <button id="exec-ez-clear-${projectId}" class="secondary" style="font-size:10px;padding:3px 10px">Clear all</button>
@@ -6396,9 +6396,9 @@ project_id = "${displayPid}"`;
         const _rerenderHostsTbl = () => {
           const tbl = document.getElementById(`exec-ez-hosts-tbl-${projectId}`);
           if (!tbl) return;
-          tbl.innerHTML = _ezHosts.length ? '<table style="width:100%;border-collapse:collapse">' + _ezHosts.map((h3, i3) => `<tr>
-            <td style="padding:2px 6px 2px 0;color:var(--text);font-size:10px;font-family:var(--font-mono)">${escapeHtml(h3.hostname || "")}</td>
-            <td style="padding:2px 6px 2px 0;color:var(--muted)"><label style="display:flex;align-items:center;gap:4px;cursor:pointer;font-size:9px"><input type="checkbox" class="exec-ez-host-autocwd" data-pid="${escapeHtml(projectId)}" data-idx="${i3}" ${h3.auto_add_cwds ? "checked" : ""} style="cursor:pointer"> Auto-add new cwds</label></td>
+          tbl.innerHTML = _ezHosts.length ? '<table style="width:100%;border-collapse:collapse">' + _ezHosts.map((h4, i3) => `<tr>
+            <td style="padding:2px 6px 2px 0;color:var(--text);font-size:10px;font-family:var(--font-mono)">${escapeHtml(h4.hostname || "")}</td>
+            <td style="padding:2px 6px 2px 0;color:var(--muted)"><label style="display:flex;align-items:center;gap:4px;cursor:pointer;font-size:9px"><input type="checkbox" class="exec-ez-host-autocwd" data-pid="${escapeHtml(projectId)}" data-idx="${i3}" ${h4.auto_add_cwds ? "checked" : ""} style="cursor:pointer"> Auto-add new cwds</label></td>
             <td style="padding:2px 0;text-align:right"><button class="exec-ez-del-host" data-pid="${escapeHtml(projectId)}" data-idx="${i3}" style="font-size:9px;padding:1px 6px;background:transparent;border:1px solid var(--border);border-radius:3px;color:var(--muted);cursor:pointer">\u2715</button></td>
           </tr>`).join("") + "</table>" : '<div style="color:var(--muted);font-style:italic;font-size:10px">No machines registered yet \u2014 first hook auto-registers.</div>';
           _wireHostBtns();
@@ -7172,7 +7172,7 @@ project_id = "${displayPid}"`;
         zotero_active: !!active.zotero,
         slot_status: slotStatus.zotero ? { zotero: slotStatus.zotero } : {}
       }) : "";
-      const _sectionLabel = (text, note) => `<div style="font-size:9px;font-weight:700;color:var(--muted);text-transform:uppercase;letter-spacing:.5px;margin:2px 0 6px">${text} <span style="font-weight:400;text-transform:none">${note}</span></div>`;
+      const _sectionLabel = (text, note2) => `<div style="font-size:9px;font-weight:700;color:var(--muted);text-transform:uppercase;letter-spacing:.5px;margin:2px 0 6px">${text} <span style="font-weight:400;text-transform:none">${note2}</span></div>`;
       const rows = `
       ${coreRows ? _sectionLabel("Core Tools", "\u2014 always on") + coreRows : ""}
       ${zoteroRow ? _sectionLabel("Reference manager", "\u2014 citation resolution (Zotero)") + zoteroRow : ""}
@@ -7182,9 +7182,9 @@ project_id = "${displayPid}"`;
       const installCard = (label, cmds, prominent) => `
       <div style="border:1px solid var(--border);border-radius:4px;padding:8px;margin-bottom:6px;background:var(--surface-1)${prominent ? "" : ";opacity:.85"}">
         <div style="font-size:10px;color:var(--text);font-weight:600;margin-bottom:6px">${escapeHtml(label)}${prominent ? ' <span style="color:var(--muted);font-weight:400">(detected)</span>' : ""}</div>
-        ${[["uv", "powers uvx plugins", cmds.uv], ["Node.js", "powers npx plugins", cmds.node]].map(([dep, note, command]) => `
+        ${[["uv", "powers uvx plugins", cmds.uv], ["Node.js", "powers npx plugins", cmds.node]].map(([dep, note2, command]) => `
           <div style="margin-bottom:6px">
-            <div style="font-size:9px;color:var(--muted);margin-bottom:3px">${escapeHtml(dep)} <span style="opacity:.8">\u2014 ${escapeHtml(note)}</span></div>
+            <div style="font-size:9px;color:var(--muted);margin-bottom:3px">${escapeHtml(dep)} <span style="opacity:.8">\u2014 ${escapeHtml(note2)}</span></div>
             <div style="display:flex;gap:6px;align-items:center">
               <code style="flex:1;box-sizing:border-box;background:var(--surface-2);border:1px solid var(--border);border-radius:4px;color:var(--text);font-size:10px;font-family:var(--font-mono);padding:4px 7px;overflow-x:auto;white-space:nowrap">${escapeHtml(command)}</code>
               <button class="secondary tp-copy" data-copy="${escapeHtml(command)}" style="padding:2px 8px;font-size:10px;flex-shrink:0">Copy</button>
@@ -7261,7 +7261,7 @@ project_id = "${displayPid}"`;
         <span style="font-size:10px;color:var(--muted)">Machine:</span>
         <select id="tp-host-${projectId}" style="background:var(--surface-1);border:1px solid var(--border);border-radius:4px;color:var(--text);font-size:10px;font-family:var(--font-mono);padding:3px 6px;outline:none">
           <option value="" ${!_selHost ? "selected" : ""}>Default (all machines)</option>
-          ${_tpHosts.map((h3) => `<option value="${escapeHtml(h3)}" ${h3 === _selHost ? "selected" : ""}>${escapeHtml(h3)}${_tpConfigured.has(h3) ? " \u25CF" : ""}</option>`).join("")}
+          ${_tpHosts.map((h4) => `<option value="${escapeHtml(h4)}" ${h4 === _selHost ? "selected" : ""}>${escapeHtml(h4)}${_tpConfigured.has(h4) ? " \u25CF" : ""}</option>`).join("")}
         </select>
         <span style="font-size:9px;color:var(--muted)">${_selHost ? "editing " + escapeHtml(_selHost) : "default \u2014 applies to machines without their own config"}</span>
       </div>` : "";
@@ -9061,13 +9061,13 @@ ${n2.tags || ""}`.toLowerCase();
     }
   }
   function L(n2, l3, u4, t3, i3, r3, o3, e3, f4, c3, a3) {
-    var s3, h3, p3, v3, y3, _2, g2, m3 = t3 && t3.__k || w, b2 = l3.length;
-    for (f4 = T(u4, l3, m3, f4, b2), s3 = 0; s3 < b2; s3++) null != (p3 = u4.__k[s3]) && (h3 = -1 != p3.__i && m3[p3.__i] || d, p3.__i = s3, _2 = q(n2, p3, h3, i3, r3, o3, e3, f4, c3, a3), v3 = p3.__e, p3.ref && h3.ref != p3.ref && (h3.ref && J(h3.ref, null, p3), a3.push(p3.ref, p3.__c || v3, p3)), null == y3 && null != v3 && (y3 = v3), (g2 = !!(4 & p3.__u)) || h3.__k === p3.__k ? (f4 = j(p3, f4, n2, g2), g2 && h3.__e && (h3.__e = null)) : "function" == typeof p3.type && void 0 !== _2 ? f4 = _2 : v3 && (f4 = v3.nextSibling), p3.__u &= -7);
+    var s3, h4, p3, v3, y3, _2, g2, m3 = t3 && t3.__k || w, b2 = l3.length;
+    for (f4 = T(u4, l3, m3, f4, b2), s3 = 0; s3 < b2; s3++) null != (p3 = u4.__k[s3]) && (h4 = -1 != p3.__i && m3[p3.__i] || d, p3.__i = s3, _2 = q(n2, p3, h4, i3, r3, o3, e3, f4, c3, a3), v3 = p3.__e, p3.ref && h4.ref != p3.ref && (h4.ref && J(h4.ref, null, p3), a3.push(p3.ref, p3.__c || v3, p3)), null == y3 && null != v3 && (y3 = v3), (g2 = !!(4 & p3.__u)) || h4.__k === p3.__k ? (f4 = j(p3, f4, n2, g2), g2 && h4.__e && (h4.__e = null)) : "function" == typeof p3.type && void 0 !== _2 ? f4 = _2 : v3 && (f4 = v3.nextSibling), p3.__u &= -7);
     return u4.__e = y3, f4;
   }
   function T(n2, l3, u4, t3, i3) {
-    var r3, o3, e3, f4, c3, a3 = u4.length, s3 = a3, h3 = 0;
-    for (n2.__k = new Array(i3), r3 = 0; r3 < i3; r3++) null != (o3 = l3[r3]) && "boolean" != typeof o3 && "function" != typeof o3 ? ("string" == typeof o3 || "number" == typeof o3 || "bigint" == typeof o3 || o3.constructor == String ? o3 = n2.__k[r3] = x(null, o3, null, null, null) : g(o3) ? o3 = n2.__k[r3] = x(S, { children: o3 }, null, null, null) : void 0 === o3.constructor && o3.__b > 0 ? o3 = n2.__k[r3] = x(o3.type, o3.props, o3.key, o3.ref ? o3.ref : null, o3.__v) : n2.__k[r3] = o3, f4 = r3 + h3, o3.__ = n2, o3.__b = n2.__b + 1, e3 = null, -1 != (c3 = o3.__i = O(o3, u4, f4, s3)) && (s3--, (e3 = u4[c3]) && (e3.__u |= 2)), null == e3 || null == e3.__v ? (-1 == c3 && (i3 > a3 ? h3-- : i3 < a3 && h3++), "function" != typeof o3.type && (o3.__u |= 4)) : c3 != f4 && (c3 == f4 - 1 ? h3-- : c3 == f4 + 1 ? h3++ : (c3 > f4 ? h3-- : h3++, o3.__u |= 4))) : n2.__k[r3] = null;
+    var r3, o3, e3, f4, c3, a3 = u4.length, s3 = a3, h4 = 0;
+    for (n2.__k = new Array(i3), r3 = 0; r3 < i3; r3++) null != (o3 = l3[r3]) && "boolean" != typeof o3 && "function" != typeof o3 ? ("string" == typeof o3 || "number" == typeof o3 || "bigint" == typeof o3 || o3.constructor == String ? o3 = n2.__k[r3] = x(null, o3, null, null, null) : g(o3) ? o3 = n2.__k[r3] = x(S, { children: o3 }, null, null, null) : void 0 === o3.constructor && o3.__b > 0 ? o3 = n2.__k[r3] = x(o3.type, o3.props, o3.key, o3.ref ? o3.ref : null, o3.__v) : n2.__k[r3] = o3, f4 = r3 + h4, o3.__ = n2, o3.__b = n2.__b + 1, e3 = null, -1 != (c3 = o3.__i = O(o3, u4, f4, s3)) && (s3--, (e3 = u4[c3]) && (e3.__u |= 2)), null == e3 || null == e3.__v ? (-1 == c3 && (i3 > a3 ? h4-- : i3 < a3 && h4++), "function" != typeof o3.type && (o3.__u |= 4)) : c3 != f4 && (c3 == f4 - 1 ? h4-- : c3 == f4 + 1 ? h4++ : (c3 > f4 ? h4-- : h4++, o3.__u |= 4))) : n2.__k[r3] = null;
     if (s3) for (r3 = 0; r3 < a3; r3++) null != (e3 = u4[r3]) && 0 == (2 & e3.__u) && (e3.__e == t3 && (t3 = $(e3)), K(e3, e3));
     return t3;
   }
@@ -9123,11 +9123,11 @@ ${n2.tags || ""}`.toLowerCase();
     };
   }
   function q(n2, u4, t3, i3, r3, o3, e3, f4, c3, a3) {
-    var s3, h3, p3, v3, y3, d3, _2, k3, x2, M, $2, I2, P2, A3, H2, T3, j3 = u4.type;
+    var s3, h4, p3, v3, y3, d3, _2, k3, x2, M, $2, I2, P2, A3, H2, T3, j3 = u4.type;
     if (void 0 !== u4.constructor) return null;
     128 & t3.__u && (c3 = !!(32 & t3.__u), o3 = [f4 = u4.__e = t3.__e]), (s3 = l.__b) && s3(u4);
     n: if ("function" == typeof j3) {
-      h3 = e3.length;
+      h4 = e3.length;
       try {
         if (x2 = u4.props, M = j3.prototype && j3.prototype.render, $2 = (s3 = j3.contextType) && i3[s3.__c], I2 = s3 ? $2 ? $2.props.value : s3.__ : i3, t3.__c ? k3 = (p3 = u4.__c = t3.__c).__ = p3.__E : (M ? u4.__c = p3 = new j3(x2, I2) : (u4.__c = p3 = new C(x2, I2), p3.constructor = j3, p3.render = Q), $2 && $2.sub(p3), p3.state || (p3.state = {}), p3.__n = i3, v3 = p3.__d = true, p3.__h = [], p3._sb = []), M && null == p3.__s && (p3.__s = p3.state), M && null != j3.getDerivedStateFromProps && (p3.__s == p3.state && (p3.__s = m({}, p3.__s)), m(p3.__s, j3.getDerivedStateFromProps(x2, p3.__s))), y3 = p3.props, d3 = p3.state, p3.__v = u4, v3) M && null == j3.getDerivedStateFromProps && null != p3.componentWillMount && p3.componentWillMount(), M && null != p3.componentDidMount && p3.__h.push(p3.componentDidMount);
         else {
@@ -9147,7 +9147,7 @@ ${n2.tags || ""}`.toLowerCase();
         } while (p3.__d && ++A3 < 25);
         p3.state = p3.__s, null != p3.getChildContext && (i3 = m(m({}, i3), p3.getChildContext())), M && !v3 && null != p3.getSnapshotBeforeUpdate && (_2 = p3.getSnapshotBeforeUpdate(y3, d3)), H2 = null != s3 && s3.type === S && null == s3.key ? E(s3.props.children) : s3, f4 = L(n2, g(H2) ? H2 : [H2], u4, t3, i3, r3, o3, e3, f4, c3, a3), p3.base = u4.__e, u4.__u &= -161, p3.__h.length && e3.push(p3), k3 && (p3.__E = p3.__ = null);
       } catch (n3) {
-        if (e3.length = h3, u4.__v = null, c3 || null != o3) if (n3.then) {
+        if (e3.length = h4, u4.__v = null, c3 || null != o3) if (n3.then) {
           for (u4.__u |= c3 ? 160 : 128; f4 && 8 == f4.nodeType && f4.nextSibling; ) f4 = f4.nextSibling;
           null != o3 && (o3[o3.indexOf(f4)] = null), u4.__e = f4;
         } else {
@@ -9179,7 +9179,7 @@ ${n2.tags || ""}`.toLowerCase();
     return "object" != typeof n2 || null == n2 || n2.__b > 0 ? n2 : g(n2) ? n2.map(E) : void 0 !== n2.constructor ? null : m({}, n2);
   }
   function G(u4, t3, i3, r3, o3, e3, f4, c3, a3) {
-    var s3, h3, p3, v3, y3, w3, _2, m3 = i3.props || d, k3 = t3.props, x2 = t3.type;
+    var s3, h4, p3, v3, y3, w3, _2, m3 = i3.props || d, k3 = t3.props, x2 = t3.type;
     if ("svg" == x2 ? o3 = "http://www.w3.org/2000/svg" : "math" == x2 ? o3 = "http://www.w3.org/1998/Math/MathML" : o3 || (o3 = "http://www.w3.org/1999/xhtml"), null != e3) {
       for (s3 = 0; s3 < e3.length; s3++) if ((y3 = e3[s3]) && "setAttribute" in y3 == !!x2 && (x2 ? y3.localName == x2 : 3 == y3.nodeType)) {
         u4 = y3, e3[s3] = null;
@@ -9194,8 +9194,8 @@ ${n2.tags || ""}`.toLowerCase();
     else {
       if (e3 = "textarea" == x2 && null != k3.defaultValue ? null : e3 && n.call(u4.childNodes), !c3 && null != e3) for (m3 = {}, s3 = 0; s3 < u4.attributes.length; s3++) m3[(y3 = u4.attributes[s3]).name] = y3.value;
       for (s3 in m3) y3 = m3[s3], "dangerouslySetInnerHTML" == s3 ? p3 = y3 : "children" == s3 || s3 in k3 || "value" == s3 && "defaultValue" in k3 || "checked" == s3 && "defaultChecked" in k3 || N(u4, s3, null, y3, o3);
-      for (s3 in k3) y3 = k3[s3], "children" == s3 ? v3 = y3 : "dangerouslySetInnerHTML" == s3 ? h3 = y3 : "value" == s3 ? w3 = y3 : "checked" == s3 ? _2 = y3 : c3 && "function" != typeof y3 || m3[s3] === y3 || N(u4, s3, y3, m3[s3], o3);
-      if (h3) c3 || p3 && (h3.__html == p3.__html || h3.__html == u4.innerHTML) || (u4.innerHTML = h3.__html), t3.__k = [];
+      for (s3 in k3) y3 = k3[s3], "children" == s3 ? v3 = y3 : "dangerouslySetInnerHTML" == s3 ? h4 = y3 : "value" == s3 ? w3 = y3 : "checked" == s3 ? _2 = y3 : c3 && "function" != typeof y3 || m3[s3] === y3 || N(u4, s3, y3, m3[s3], o3);
+      if (h4) c3 || p3 && (h4.__html == p3.__html || h4.__html == u4.innerHTML) || (u4.innerHTML = h4.__html), t3.__k = [];
       else if (p3 && (u4.innerHTML = ""), L("template" == t3.type ? u4.content : u4, g(v3) ? v3 : [v3], t3, i3, r3, "foreignObject" == x2 ? "http://www.w3.org/1999/xhtml" : o3, e3, f4, e3 ? e3[0] : i3.__k && $(i3, 0), c3, a3), null != e3) for (s3 = e3.length; s3--; ) b(e3[s3]);
       c3 && "textarea" != x2 || (s3 = "value", "progress" == x2 && null == w3 ? u4.removeAttribute("value") : null != w3 && (w3 !== u4[s3] || "progress" == x2 && !w3 || "option" == x2 && w3 != m3[s3]) && N(u4, s3, w3, m3[s3], o3), s3 = "checked", null != _2 && _2 != u4[s3] && N(u4, s3, _2, m3[s3], o3));
     }
@@ -11013,8 +11013,8 @@ ${n2.tags || ""}`.toLowerCase();
     return query.toLowerCase().split(/\s+/).filter(Boolean);
   }
   function matchesTokens(haystack, tokens) {
-    const h3 = haystack.toLowerCase();
-    return tokens.every((t3) => h3.includes(t3));
+    const h4 = haystack.toLowerCase();
+    return tokens.every((t3) => h4.includes(t3));
   }
   function tabMatches(meta, query) {
     const tokens = tokenize(query);
@@ -11700,6 +11700,513 @@ ${n2.tags || ""}`.toLowerCase();
     }
   }
 
+  // meridian/static/dashboard-workspace.ts
+  var REPO_GROUP_ORDER = [
+    "enforced_fresh",
+    "guard_not_enforcing",
+    "installed_no_index",
+    "index_only",
+    "not_installed"
+  ];
+  var REPO_GROUP_LABEL = {
+    enforced_fresh: "Enforced and fresh",
+    guard_not_enforcing: "Guard not enforcing",
+    installed_no_index: "Installed, no index",
+    index_only: "Index only, no guard",
+    not_installed: "Nothing registered"
+  };
+  var GUARD_COMPONENTS = ["pre", "post", "brief"];
+  var STALE_DAYS = 7;
+  function guardStateUnknown(g2) {
+    return g2.settings_state === "unreadable" || g2.settings_state === "not_scanned";
+  }
+  function indexUnread(i3) {
+    return i3.mode == null;
+  }
+  function unreadIndexReason(i3) {
+    return i3.why ? i3.why : "not recorded";
+  }
+  function isEnforcedFresh(r3, ctx) {
+    const g2 = r3.guard;
+    const i3 = r3.codebase_memory.index;
+    return g2.settings_state === "present" && g2.registered === true && g2.components.includes("pre") && g2.installed_mode === "enforce" && g2.runtime_ok === true && ctx.serverGuardMode === "enforce" && !indexUnread(i3) && (i3.mode === "own" || i3.mode === "pin") && i3.present === true && i3.fresh === true && i3.partial !== true && i3.covers_repo_root === true && ctx.snapshotState === "ok";
+  }
+  function isGuardNotEnforcing(r3) {
+    const i3 = r3.codebase_memory.index;
+    return (r3.guard.registered === true || guardStateUnknown(r3.guard)) && (indexUnread(i3) || i3.mode !== "none");
+  }
+  function isInstalledNoIndex(r3) {
+    return (r3.guard.registered === true || r3.codebase_memory.managed_entry === true) && r3.codebase_memory.index.mode === "none";
+  }
+  function isIndexOnly(r3) {
+    const i3 = r3.codebase_memory.index;
+    return (r3.guard.settings_state === "present" || r3.guard.settings_state === "absent") && r3.guard.registered === false && !indexUnread(i3) && i3.mode !== "none";
+  }
+  function classifySuffixes(r3, ctx) {
+    let text = "";
+    const i3 = r3.codebase_memory.index;
+    if (indexUnread(i3)) text += `; index unknown (${unreadIndexReason(i3)})`;
+    if (guardStateUnknown(r3.guard)) text += `; guard state unknown (settings.json ${r3.guard.settings_state})`;
+    if (r3.codebase_memory.managed_entry == null) text += "; .mcp.json unreadable";
+    if (r3.guard.registered === true && ctx.serverGuardMode !== "enforce") {
+      text += `; server guard mode is ${ctx.serverGuardMode}`;
+    }
+    return text;
+  }
+  function notEnforcingReason(r3, ctx) {
+    const g2 = r3.guard;
+    const i3 = r3.codebase_memory.index;
+    if (g2.installed_mode === "advisory") return "Installed in advisory mode; denies are advisory only";
+    if (g2.registered === true && g2.runtime_ok === false) {
+      return g2.problems.length > 0 ? `Guard runtime missing: ${g2.problems.join("; ")}` : "Guard runtime check failed";
+    }
+    if (g2.registered === true) {
+      const missing = GUARD_COMPONENTS.filter((c3) => !g2.components.includes(c3));
+      if (missing.length > 0) return `Guard hooks incomplete: missing ${missing.join(", ")}`;
+    }
+    if (ctx.serverGuardMode !== "enforce") {
+      return `Server guard mode is ${ctx.serverGuardMode} (server process); not enforcing`;
+    }
+    if (guardStateUnknown(g2)) return `Guard state unknown: settings.json ${g2.settings_state}`;
+    if (indexUnread(i3)) return `Index unknown (${unreadIndexReason(i3)})`;
+    if (i3.partial === true) return "Index is partial (unfinished or broken build)";
+    if (i3.present === false) return "Index database missing; snapshot row is stale";
+    if (i3.mode === "canonical") return "Index inherited from the canonical checkout";
+    if (i3.mode === "ancestor") return "Index inherited from a parent directory";
+    if (i3.covers_repo_root == null) return "Index coverage unknown (index read failed)";
+    if (i3.covers_repo_root === false) return "Index does not cover the repo root";
+    if (i3.fresh === false) {
+      return i3.age_days == null ? `index stale, last write time unknown (limit ${STALE_DAYS})` : `index stale, last write ${i3.age_days} days ago (limit ${STALE_DAYS})`;
+    }
+    return "Guard not enforcing; no single cause recorded";
+  }
+  function installedNoIndexReason(r3, ctx) {
+    let text;
+    if (ctx.snapshotState !== "ok") {
+      text = `Index state unknown: snapshot ${ctx.snapshotState}`;
+    } else if (r3.guard.registered === true) {
+      text = "Installed, no index covers this repo";
+    } else {
+      text = "Configured in .mcp.json; no index covers this repo";
+    }
+    return text + classifySuffixes(r3, ctx);
+  }
+  function indexOnlyReason(r3) {
+    const i3 = r3.codebase_memory.index;
+    if (indexUnread(i3)) return `Index unknown (${unreadIndexReason(i3)}); no guard registered in this repo`;
+    switch (i3.mode) {
+      case "own":
+        return "Index present (own); no guard registered in this repo";
+      case "pin":
+        return "Index pinned to this repo (own); no guard registered in this repo";
+      case "canonical":
+        return "Index inherited from the canonical checkout; no guard registered in this repo";
+      case "ancestor":
+        return "Index inherited from a parent directory; no guard registered in this repo";
+      default:
+        return "Index present; no guard registered in this repo";
+    }
+  }
+  function notInstalledReason(r3, ctx) {
+    let text = "Nothing registered for this repo";
+    if (ctx.snapshotState !== "ok") text += `; index state unknown (snapshot ${ctx.snapshotState})`;
+    return text + classifySuffixes(r3, ctx);
+  }
+  function classifyRepo(repo, ctx) {
+    if (isEnforcedFresh(repo, ctx)) {
+      const age = repo.codebase_memory.index.age_days;
+      return {
+        group: "enforced_fresh",
+        reason: age == null ? "Guard enforcing; index fresh (age unknown)" : `Guard enforcing; index fresh (age ${age} days)`
+      };
+    }
+    if (isGuardNotEnforcing(repo)) return { group: "guard_not_enforcing", reason: notEnforcingReason(repo, ctx) };
+    if (isInstalledNoIndex(repo)) return { group: "installed_no_index", reason: installedNoIndexReason(repo, ctx) };
+    if (isIndexOnly(repo)) return { group: "index_only", reason: indexOnlyReason(repo) };
+    return { group: "not_installed", reason: notInstalledReason(repo, ctx) };
+  }
+  function groupRepos(repos, ctx) {
+    const groups = {
+      enforced_fresh: [],
+      guard_not_enforcing: [],
+      installed_no_index: [],
+      index_only: [],
+      not_installed: []
+    };
+    const counts = {
+      enforced_fresh: 0,
+      guard_not_enforcing: 0,
+      installed_no_index: 0,
+      index_only: 0,
+      not_installed: 0
+    };
+    for (const repo of repos) {
+      const { group, reason } = classifyRepo(repo, ctx);
+      groups[group].push({ ...repo, reason });
+      counts[group] += 1;
+    }
+    return { groups, counts };
+  }
+  function countProjectsWithGuard(projects, repos) {
+    const registered = /* @__PURE__ */ new Set();
+    for (const repo of repos) {
+      if (repo.guard.registered === true) registered.add(repo.key);
+    }
+    let count = 0;
+    for (const project of projects) {
+      if (project.repo_keys.some((key) => registered.has(key))) count += 1;
+    }
+    return count;
+  }
+  function unknownText(reason) {
+    return `unknown: ${reason}`;
+  }
+  function formatAgeSeconds(s3) {
+    if (typeof s3 !== "number" || !Number.isFinite(s3)) return "unknown";
+    const magnitude = Math.abs(s3);
+    const sign = s3 < 0 && magnitude >= 1 ? "-" : "";
+    if (magnitude < 60) return `${sign}${Math.floor(magnitude)}s`;
+    if (magnitude < 3600) return `${sign}${Math.floor(magnitude / 60)}m`;
+    if (magnitude < 86400) return `${sign}${Math.floor(magnitude / 3600)}h`;
+    return `${sign}${Math.floor(magnitude / 86400)}d`;
+  }
+  function h3(value) {
+    return escapeHtml2(value);
+  }
+  function show(value, fallback = unknownText("not recorded")) {
+    return value === null || value === void 0 || value === "" ? h3(fallback) : h3(value);
+  }
+  function chip(text, unknown = false, title) {
+    const cls = unknown ? "ws-chip ws-chip--unknown" : "ws-chip";
+    const tip = title ? ` title="${h3(title)}"` : "";
+    return `<span class="${cls}"${tip}>${h3(text)}</span>`;
+  }
+  function note(text) {
+    return `<p class="ws-note">${h3(text)}</p>`;
+  }
+  function locationChip(r3) {
+    const loc = r3.location;
+    if (loc && (loc.match === "same_machine" || loc.match === "other_machine")) {
+      const names = (loc.hostnames ?? r3.hostnames ?? []).filter((n2) => n2 !== "").join(", ");
+      return chip(`recorded hostname: ${names || "unknown"} (unverified)`);
+    }
+    return chip("location unknown: no recorded hostname for this repo", true);
+  }
+  function guardChip(g2) {
+    if (g2.registered === true) {
+      const problems = g2.problems.length > 0 ? `<span class="ws-problems">${g2.problems.map(h3).join("; ")}</span>` : "";
+      const mode = g2.installed_mode == null ? chip(unknownText("guard install mode not recorded"), true) : chip(`guard: ${g2.installed_mode}`);
+      return mode + problems;
+    }
+    if (g2.registered === false) return chip("guard: none");
+    return chip(`guard: unknown (settings.json ${g2.settings_state})`, true);
+  }
+  function managedChip(managed) {
+    if (managed === true) return chip("MCP configured");
+    if (managed === false) return chip("MCP not configured");
+    return chip(unknownText(".mcp.json unreadable"), true);
+  }
+  function indexChip(i3) {
+    if (indexUnread(i3)) return chip(`index: unknown (${unreadIndexReason(i3)})`, true);
+    if (i3.mode === "none") return chip("index: none");
+    const parts = [
+      `index: ${i3.mode}`,
+      i3.age_days == null ? unknownText("no last-write time recorded") : `${i3.age_days} days`,
+      i3.nodes == null ? unknownText("node count not recorded") : `${i3.nodes} nodes`,
+      i3.db_bytes == null ? unknownText("database size not read") : `${(i3.db_bytes / 1048576).toFixed(1)} MB`
+    ];
+    if (i3.partial === true) parts.push("partial");
+    if (i3.present === false) parts.push("database file missing");
+    return chip(parts.join(" \xB7 "), i3.age_days == null && i3.nodes == null && i3.db_bytes == null);
+  }
+  function receiptUnknownReason(gaps) {
+    const reasons = gaps.filter((g2) => g2.code === "receipts_default_root_excluded" || g2.code === "receipts_window_truncated").map((g2) => g2.message);
+    return reasons.length > 0 ? reasons.join(" ") : null;
+  }
+  function activityItems(a3, receiptReason) {
+    const guardText = a3?.last_guard_event_at ?? a3?.last_guard_event_reason ?? unknownText("no guard event reason reported");
+    let receiptText;
+    if (a3?.last_prospect_receipt_at) receiptText = a3.last_prospect_receipt_at;
+    else if (receiptReason !== null) receiptText = unknownText(receiptReason);
+    else receiptText = `none attributed in the last ${a3?.receipt_window_days ?? 7} days`;
+    const sessionText = a3?.last_session_seen_at ?? "no active or idle session";
+    return `<li>last guard event: ${h3(guardText)}</li><li>last prospect receipt: ${h3(receiptText)}</li><li>last session seen (project-level): ${h3(sessionText)}</li>`;
+  }
+  function renderRepoRow(r3, receiptReason) {
+    return `<li class="ws-row"><div class="ws-row-head"><strong>${show(r3.name)}</strong></div><div class="ws-path">${show(r3.path)}</div><div class="ws-chips">${locationChip(r3)}${guardChip(r3.guard)}${managedChip(r3.codebase_memory.managed_entry)}${indexChip(r3.codebase_memory.index)}</div><ul class="ws-activity">${activityItems(r3.activity, receiptReason)}</ul><div class="ws-reason">${h3(r3.reason)}</div></li>`;
+  }
+  function renderHeader(model) {
+    const rt = model.runtime;
+    const mode = rt.guard.mode;
+    const banner = mode === "enforce" ? "" : `<p class="ws-banner" role="status">${h3(`Server guard mode is ${mode}. Repos show installed mode, not effective enforcement.`)}</p>`;
+    const tunnel = rt.tunnel.client_process === "running" ? "tunnel process found" : "tunnel process not detected";
+    const hosted = rt.tunnel.hosted_connection || "unknown";
+    const hostChip = rt.hostname == null ? chip(unknownText("hostname not reported"), true) : chip(`host: ${rt.hostname}`);
+    const versionChip = rt.version == null ? chip(unknownText("version not reported"), true) : chip(`version: ${rt.version}`);
+    return `<div class="ws-header"><div class="ws-chips">${hostChip}${versionChip}${chip(`location: ${rt.location}`)}</div><div class="ws-chips">${chip(`guard mode: ${mode} (server process)`)}</div>` + banner + `<p class="ws-meta">${h3(tunnel)} \xB7 hosted connection: ${show(hosted)}</p></div>`;
+  }
+  function renderErrors(model) {
+    return model.errors.map((e3) => note(`${e3.section}: This section could not be read (${e3.code}).`)).join("");
+  }
+  function renderCounts(model, counts) {
+    const repos = model.repos;
+    const shownLimit = repos.limit ?? repos.items.length;
+    const shownNote = repos.truncated ? ` (of the ${shownLimit} shown)` : "";
+    const repoChips = REPO_GROUP_ORDER.map((g2) => chip(`${REPO_GROUP_LABEL[g2]}: ${counts[g2]}${shownNote}`)).join("");
+    const sessions = model.sessions.totals ?? {
+      total: model.sessions.items.length,
+      live: model.sessions.items.filter(sessionIsLive).length,
+      status_active: model.sessions.items.filter((s3) => s3.status === "active").length,
+      status_idle: model.sessions.items.filter((s3) => s3.status === "idle").length
+    };
+    const sessionChips = chip(`live: ${sessions.live}`) + chip(`status active: ${sessions.status_active}`) + chip(`status idle: ${sessions.status_idle}`);
+    const activity = { live: 0, recent: 0, idle: 0, none: 0 };
+    for (const p3 of model.projects.items) {
+      if (p3.activity in activity) activity[p3.activity] += 1;
+    }
+    const projectChips = chip(`live: ${activity.live}`) + chip(`recent: ${activity.recent}`) + chip(`idle: ${activity.idle}`) + chip(`none: ${activity.none}`);
+    const guardProjects = countProjectsWithGuard(model.projects.items, repos.items);
+    const guardNote = repos.truncated ? ` (counted over the ${shownLimit} repos shown)` : "";
+    return `<section class="ws-section"><h3 class="ws-heading">Counts</h3><p class="ws-muted">Repo groups</p><div class="ws-chips">${repoChips}</div><p class="ws-muted">Sessions</p><div class="ws-chips">${sessionChips}</div><p class="ws-muted">Projects</p><div class="ws-chips">${projectChips}</div><div class="ws-chips">${chip(`projects with a registered guard: ${guardProjects}${guardNote}`)}</div></section>`;
+  }
+  function renderReposSection(model, grouped) {
+    const repos = model.repos;
+    const receiptReason = receiptUnknownReason(model.gaps);
+    const parts = ['<section class="ws-section"><h3 class="ws-heading">Repos</h3>'];
+    if (repos.truncated) {
+      parts.push(note(`Showing ${repos.limit ?? repos.items.length} of ${repos.total ?? repos.items.length} repos, sorted by path.`));
+    }
+    if (repos.items.length === 0) {
+      parts.push(note("No repos known on this machine yet. Repos appear once a project reports a working directory, a worktree is registered, or a guard is installed."));
+    } else {
+      if (!repos.items.some((r3) => r3.guard.registered === true)) {
+        parts.push(note("No Meridian guard registered in any known repo."));
+      }
+      for (const group of REPO_GROUP_ORDER) {
+        const rows = grouped.groups[group];
+        const open = rows.length > 0 ? " open" : "";
+        const body = rows.length > 0 ? `<ul class="ws-list">${rows.map((r3) => renderRepoRow(r3, receiptReason)).join("")}</ul>` : '<p class="ws-muted">No repos in this group.</p>';
+        parts.push(
+          `<details class="ws-group"${open}><summary>${h3(REPO_GROUP_LABEL[group])} <span class="ws-count">${rows.length}</span></summary>${body}</details>`
+        );
+      }
+    }
+    parts.push("</section>");
+    return parts.join("");
+  }
+  function sessionIsLive(s3) {
+    return typeof s3.live === "boolean" ? s3.live : isLiveSession2({ status: s3.status, last_seen: s3.last_seen ?? null });
+  }
+  function sessionRank(s3) {
+    if (sessionIsLive(s3)) return 0;
+    if (s3.status === "active") return 1;
+    if (s3.status === "idle") return 2;
+    return 3;
+  }
+  function renderSessionRow(s3) {
+    const live = sessionRank(s3) === 0;
+    const framework = s3.client_type ?? s3.agent_framework ?? null;
+    const branch = s3.worktree ? show(s3.worktree.branch, unknownText("branch not recorded")) : h3("no worktree");
+    const seen = s3.age_s == null ? `last seen ${unknownText("last_seen did not parse")}` : s3.age_s < 0 ? "last seen ahead of server clock" : `last seen ${formatAgeSeconds(s3.age_s)} ago`;
+    const stateChip = live ? chip("live") : chip(s3.status === "active" ? "active, not live" : s3.status);
+    return `<li class="ws-row"><div class="ws-row-head"><strong>${show(s3.name, "unnamed session")}</strong></div><div class="ws-chips">${stateChip}${chip("location unknown: sessions record no working directory or hostname", true)}</div><div class="ws-meta">project: ${show(s3.project_name)} \xB7 human: ${show(s3.human_id)} \xB7 client: ${show(framework)}</div><div class="ws-meta">${h3(seen)} \xB7 worktree: ${branch}</div></li>`;
+  }
+  function renderSessionsSection(model) {
+    const sessions = model.sessions;
+    const parts = ['<section class="ws-section"><h3 class="ws-heading">Sessions</h3>'];
+    if (sessions.truncated) {
+      parts.push(note(`Showing ${sessions.items.length} of ${sessions.total ?? sessions.items.length} sessions, newest first.`));
+    }
+    if (sessions.items.length === 0) {
+      parts.push(note("No sessions recorded."));
+    } else {
+      const ordered = sessions.items.map((s3, index) => ({ s: s3, index, rank: sessionRank(s3) })).sort((a3, b2) => a3.rank - b2.rank || a3.index - b2.index);
+      parts.push(`<ul class="ws-list">${ordered.map((x2) => renderSessionRow(x2.s)).join("")}</ul>`);
+    }
+    parts.push("</section>");
+    return parts.join("");
+  }
+  function renderProjectRow(p3) {
+    const c3 = p3.session_counts;
+    const counts = c3 ? `sessions: ${c3.total} total, ${c3.live} live, ${c3.status_active} active, ${c3.status_idle} idle` : `sessions: ${unknownText("session counts not reported")}`;
+    const manualChip = p3.status == null ? chip(unknownText("manual status not reported"), true, "Manual project flag, not derived from activity.") : chip(`manual: ${p3.status}`, false, "Manual project flag, not derived from activity.");
+    return `<li class="ws-row"><div class="ws-row-head"><strong>${show(p3.name)}</strong></div><div class="ws-chips">${manualChip}${chip(`activity: ${p3.activity}`)}</div><div class="ws-meta">${h3(counts)} \xB7 ${h3(`${p3.repo_keys.length} repos`)}</div></li>`;
+  }
+  function renderProjectsSection(model) {
+    const parts = ['<section class="ws-section"><h3 class="ws-heading">Projects</h3>'];
+    if (model.projects.items.length === 0) {
+      parts.push(note("No projects."));
+    } else {
+      parts.push(`<ul class="ws-list">${model.projects.items.map(renderProjectRow).join("")}</ul>`);
+    }
+    parts.push("</section>");
+    return parts.join("");
+  }
+  function renderSnapshotSection(model) {
+    const s3 = model.repos.snapshot;
+    const parts = ['<section class="ws-section"><h3 class="ws-heading">Index snapshot</h3>'];
+    if (s3.error === "missing") {
+      parts.push(note("No codebase-memory index snapshot yet. It is written when a Claude Code session starts in a repo with the guard installed."));
+    } else if (s3.error === "corrupt" || s3.error === "unreadable") {
+      parts.push(`<p class="ws-banner">${h3(`The index snapshot could not be read (${s3.error}). Index state is unknown.`)}</p>`);
+    } else {
+      const built = s3.built_age_s == null ? unknownText("snapshot built time not recorded") : `built ${formatAgeSeconds(s3.built_age_s)} ago`;
+      const stats = s3.stats ?? {};
+      const statLine = ["read", "reused", "dropped_missing_root", "kept_last_good"].map((key) => `${key} ${show(stats[key])}`).join(", ");
+      parts.push(`<p class="ws-path">${show(s3.path)}</p>`);
+      parts.push(`<p class="ws-meta">${h3(built)} \xB7 ${h3(statLine)}</p>`);
+      parts.push(note("Machine-wide, written at SessionStart."));
+    }
+    parts.push("</section>");
+    return parts.join("");
+  }
+  function renderGapsSection(model) {
+    const parts = ['<section class="ws-section"><h3 class="ws-heading">Gaps</h3>'];
+    const scan = model.repos.scan;
+    if (scan && !scan.complete) {
+      parts.push(note(`The filesystem scan stopped at its budget (${scan.stopped_reason ?? "unknown"}). Repos after the stop show guard state not scanned.`));
+    }
+    if (model.gaps.length === 0) {
+      parts.push(note("No gaps reported."));
+    } else {
+      parts.push('<ul class="ws-list ws-gaps">');
+      for (const gap of model.gaps) {
+        parts.push(`<li><code>${h3(gap.code)}</code> ${h3(gap.message)}</li>`);
+      }
+      parts.push("</ul>");
+    }
+    parts.push("</section>");
+    return parts.join("");
+  }
+  function contextFor(model) {
+    return {
+      serverGuardMode: model.runtime.guard.mode,
+      snapshotState: model.repos.snapshot.error ?? "ok"
+    };
+  }
+  function renderWorkspaceOverview(model) {
+    const grouped = groupRepos(model.repos.items, contextFor(model));
+    return renderHeader(model) + renderErrors(model) + renderCounts(model, grouped.counts) + renderReposSection(model, grouped) + renderSessionsSection(model) + renderProjectsSection(model) + renderSnapshotSection(model) + renderGapsSection(model);
+  }
+  function renderWorkspaceRenderError() {
+    return `<div class="ws-banner ws-banner--error" role="alert"><p>${h3("Could not render this overview. Details are in the browser console.")}</p><button type="button" class="ws-btn" data-ws-action="retry">Retry</button></div>`;
+  }
+  function renderWorkspaceFetchError(status) {
+    const detail = status == null ? "no response" : `HTTP ${status}`;
+    return `<div class="ws-banner ws-banner--error" role="alert"><p>${h3(`Could not read the workspace overview (${detail}).`)}</p><button type="button" class="ws-btn" data-ws-action="retry">Retry</button></div>`;
+  }
+  function isObject(value) {
+    return typeof value === "object" && value !== null && !Array.isArray(value);
+  }
+  function isWorkspaceOverview(value) {
+    if (!isObject(value)) return false;
+    const repos = value.repos;
+    const sessions = value.sessions;
+    const projects = value.projects;
+    return isObject(value.runtime) && isObject(repos) && Array.isArray(repos.items) && isObject(repos.snapshot) && isObject(sessions) && Array.isArray(sessions.items) && isObject(projects) && Array.isArray(projects.items) && Array.isArray(value.gaps) && Array.isArray(value.errors);
+  }
+  var BUTTON_ID = "workspace-overview-btn";
+  var VIEW_ID = "workspace-overview-view";
+  var VIEW_CHROME = '<div class="ws-view-bar"><h2 class="ws-view-title">Local overview</h2><div class="ws-view-actions"><button type="button" class="ws-btn" data-ws-action="refresh">Refresh</button><button type="button" class="ws-btn" data-ws-action="close">Close</button></div></div><div class="ws-overview-body" data-ws-body></div>';
+  function mountWorkspaceView(doc, opts) {
+    const tabBodies = doc.getElementById("tab-bodies");
+    const anchor = doc.getElementById("workspace-entry");
+    let button = doc.getElementById(BUTTON_ID);
+    if (!button && anchor) {
+      button = doc.createElement("button");
+      button.id = BUTTON_ID;
+      button.type = "button";
+      button.className = "ws-sidebar-btn";
+      button.title = "Repos, indexes, sessions and guard state on this machine.";
+      button.textContent = "Local overview";
+      anchor.after(button);
+    }
+    if (button) button.hidden = opts.hosted;
+    let view = doc.getElementById(VIEW_ID);
+    if (!view && tabBodies) {
+      view = doc.createElement("section");
+      view.id = VIEW_ID;
+      view.className = "ws-overview ws-overview-view";
+      view.hidden = true;
+      view.setAttribute("aria-label", "Local overview");
+      tabBodies.before(view);
+    }
+    if (view && !view.querySelector("[data-ws-body]")) view.innerHTML = VIEW_CHROME;
+    const bodyEl = () => view?.querySelector("[data-ws-body]") ?? null;
+    const refreshButton = () => view?.querySelector('[data-ws-action="refresh"]') ?? null;
+    let isOpen = false;
+    let savedBodiesDisplay = "";
+    let inFlight = null;
+    const setButtonState = (on) => {
+      button?.classList.toggle("active", on);
+      button?.setAttribute("aria-pressed", on ? "true" : "false");
+    };
+    const renderSafely = (model) => {
+      try {
+        return renderWorkspaceOverview(model);
+      } catch (error) {
+        console.error("Local overview: render failed", error);
+        return renderWorkspaceRenderError();
+      }
+    };
+    const refresh = () => {
+      if (inFlight) return inFlight;
+      const target = bodyEl();
+      if (!target || opts.hosted) return Promise.resolve();
+      const refreshBtn = refreshButton();
+      if (refreshBtn) refreshBtn.disabled = true;
+      if (!target.hasChildNodes()) {
+        target.innerHTML = '<p class="ws-muted">Loading the workspace overview\u2026</p>';
+      }
+      const pending = (async () => {
+        let html;
+        try {
+          const result = await opts.fetchOverview();
+          const body = result.body;
+          html = result.status === 200 && isWorkspaceOverview(body) ? renderSafely(body) : renderWorkspaceFetchError(result.status);
+        } catch {
+          html = renderWorkspaceFetchError(null);
+        }
+        target.innerHTML = html;
+      })();
+      inFlight = pending.finally(() => {
+        inFlight = null;
+        if (refreshBtn) refreshBtn.disabled = false;
+      });
+      return inFlight;
+    };
+    const open = () => {
+      if (opts.hosted || !view || isOpen) return;
+      isOpen = true;
+      view.hidden = false;
+      if (tabBodies) {
+        savedBodiesDisplay = tabBodies.style.display;
+        tabBodies.style.display = "none";
+      }
+      setButtonState(true);
+      void refresh();
+    };
+    const close = () => {
+      if (!isOpen) return;
+      isOpen = false;
+      if (view) view.hidden = true;
+      if (tabBodies) tabBodies.style.display = savedBodiesDisplay;
+      setButtonState(false);
+    };
+    const toggle = () => {
+      if (isOpen) close();
+      else open();
+    };
+    button?.addEventListener("click", () => toggle());
+    view?.addEventListener("click", (event) => {
+      const origin = event.target;
+      const action = origin?.closest?.("[data-ws-action]")?.getAttribute("data-ws-action");
+      if (action === "close") close();
+      else if (action === "refresh" || action === "retry") void refresh();
+    });
+    return { open, close, toggle, refresh };
+  }
+
   // meridian/static/dashboard-goal-conflict.ts
   function normalizeGoalText(key, text) {
     const t3 = String(text ?? "").replace(/\r\n?/g, "\n");
@@ -12116,14 +12623,14 @@ ${n2.tags || ""}`.toLowerCase();
       if (bar.hidden) return;
       const lead = bar.querySelector(".goal-conflict-lead");
       const detail = bar.querySelector(".goal-conflict-detail");
-      const show = (act, on) => {
+      const show2 = (act, on) => {
         const b2 = bar.querySelector(`button[data-act="${act}"]`);
         if (b2) b2.hidden = !on;
       };
-      show("keep", conflict);
-      show("take", conflict);
-      show("both", conflict);
-      show("retry", failed);
+      show2("keep", conflict);
+      show2("take", conflict);
+      show2("both", conflict);
+      show2("retry", failed);
       const diff = bar.querySelector(".goal-conflict-diff");
       if (failed) {
         lead.textContent = "Save failed";
@@ -12217,9 +12724,9 @@ ${n2.tags || ""}`.toLowerCase();
       dlg.setAttribute("role", "dialog");
       dlg.setAttribute("aria-modal", "true");
       dlg.setAttribute("aria-label", "Unsaved goal changes");
-      const h3 = doc.createElement("div");
-      h3.className = "goal-leave-title";
-      h3.textContent = "Unsaved changes";
+      const h4 = doc.createElement("div");
+      h4.className = "goal-leave-title";
+      h4.textContent = "Unsaved changes";
       const p3 = doc.createElement("div");
       p3.className = "goal-leave-body";
       p3.textContent = `You have unsaved changes to the ${fields.map((f4) => f4.cfg.label).join(" and the ")}.`;
@@ -12241,7 +12748,7 @@ ${n2.tags || ""}`.toLowerCase();
       };
       const save = mk("primary", "Save", "save");
       row.append(save, mk("secondary", "Discard", "discard"), mk("secondary", "Stay here", "stay"));
-      dlg.append(h3, p3, row);
+      dlg.append(h4, p3, row);
       overlay.append(dlg);
       overlay.addEventListener("click", (e3) => {
         if (e3.target === overlay) finish("stay");
@@ -13763,7 +14270,21 @@ Existing folders: ${existing.join(", ")}` : "";
       toast("Could not detach: " + e3.message, true);
     }
   }
+  var _workspaceOverview = null;
+  function selectProjectTab(id) {
+    _workspaceOverview?.close();
+    activateTab(id);
+  }
+  function openWorkspaceEntry() {
+    _workspaceOverview?.close();
+    const targetId = state.activeTab || state.projects[0]?.id;
+    const project = state.projects.find((p3) => p3.id === targetId);
+    if (!project) return;
+    if (!document.getElementById(`tab-body-${targetId}`)) openTab(project);
+    document.querySelector(`#vtab-strip-${targetId} [data-vtab="settings"]`)?.click();
+  }
   function openTab(project) {
+    _workspaceOverview?.close();
     const existing = state.tabs.find((t3) => t3.id === project.id);
     if (existing) {
       activateTab(project.id);
@@ -13792,7 +14313,7 @@ Existing folders: ${existing.join(", ")}` : "";
     if (state.activeTab === id) {
       const next = state.tabs[state.tabs.length - 1];
       state.activeTab = next ? next.id : null;
-      if (next) activateTab(next.id);
+      if (next) selectProjectTab(next.id);
       else document.getElementById("tab-bodies").innerHTML = '<div class="empty">no project open \u2014 pick one on the left</div>';
     }
     syncSidebarActiveProject();
@@ -13837,7 +14358,7 @@ Existing folders: ${existing.join(", ")}` : "";
           item.onmouseleave = () => item.style.background = "";
           item.onclick = () => {
             menu.remove();
-            activateTab(t3.id);
+            selectProjectTab(t3.id);
           };
           menu.appendChild(item);
         });
@@ -13855,7 +14376,7 @@ Existing folders: ${existing.join(", ")}` : "";
     const div = document.createElement("div");
     div.className = "tab" + (state.activeTab === t3.id ? " active" : "");
     div.dataset.tabId = t3.id;
-    div.onclick = () => activateTab(t3.id);
+    div.onclick = () => selectProjectTab(t3.id);
     if (t3.project.icon) {
       const iconSpan = document.createElement("span");
       iconSpan.textContent = t3.project.icon;
@@ -15530,9 +16051,9 @@ Current: ${current2 || "(none)"}`,
       else unassigned.push(it);
     }
     const _hue = (s3) => {
-      let h3 = 0;
-      for (let i3 = 0; i3 < s3.length; i3++) h3 = (h3 * 31 + s3.charCodeAt(i3)) % 360;
-      return h3;
+      let h4 = 0;
+      for (let i3 = 0; i3 < s3.length; i3++) h4 = (h4 * 31 + s3.charCodeAt(i3)) % 360;
+      return h4;
     };
     const _elapsed = (ts) => {
       if (!ts) return "";
@@ -15920,12 +16441,12 @@ Current: ${current2 || "(none)"}`,
       toast("Feedback failed: " + e3.message, true);
     }
   }
-  async function sprintFeedbackNote(projectId, itemId, note) {
-    if (!note || !note.trim()) return;
+  async function sprintFeedbackNote(projectId, itemId, note2) {
+    if (!note2 || !note2.trim()) return;
     try {
       await api(
         `/projects/${projectId}/sprint-items/${itemId}`,
-        { method: "PATCH", body: JSON.stringify({ feedback_note: note.trim() }) }
+        { method: "PATCH", body: JSON.stringify({ feedback_note: note2.trim() }) }
       );
       await refreshSprintSurfaces(projectId);
     } catch (e3) {
@@ -16916,12 +17437,12 @@ get_context_block(project_id="${PROJECT_QUOTE}", mode="full")`;
     if (hot.length) {
       const maxFan = Math.max(...hot.map((d3) => num(d3.fan_in)), 1);
       html += `<div style="margin-bottom:14px"><div style="font-size:9px;color:var(--muted);text-transform:uppercase;letter-spacing:.5px;margin-bottom:6px">Hotspots (fan-in)</div>`;
-      for (const h3 of hot) {
-        const pct = Math.round(num(h3.fan_in) / maxFan * 100);
+      for (const h4 of hot) {
+        const pct = Math.round(num(h4.fan_in) / maxFan * 100);
         html += `<div style="display:flex;align-items:center;gap:8px;margin-bottom:4px">
-        <div style="flex:1;min-width:0;font-size:10px;color:var(--text);font-family:var(--font-mono);white-space:nowrap;overflow:hidden;text-overflow:ellipsis" title="${escapeHtml(String(h3.name))}">${escapeHtml(String(h3.name))}</div>
+        <div style="flex:1;min-width:0;font-size:10px;color:var(--text);font-family:var(--font-mono);white-space:nowrap;overflow:hidden;text-overflow:ellipsis" title="${escapeHtml(String(h4.name))}">${escapeHtml(String(h4.name))}</div>
         <div style="flex:1;background:var(--surface-1);border-radius:3px;height:10px;overflow:hidden"><div style="width:${pct}%;height:100%;background:var(--accent)"></div></div>
-        <div style="width:30px;text-align:right;font-size:10px;color:var(--muted)">${num(h3.fan_in)}</div>
+        <div style="width:30px;text-align:right;font-size:10px;color:var(--muted)">${num(h4.fan_in)}</div>
       </div>`;
       }
       html += `</div>`;
@@ -17154,8 +17675,8 @@ get_context_block(project_id="${PROJECT_QUOTE}", mode="full")`;
     } else {
       const buckets = { permanent: [], year: [], quarter: [] };
       for (const ins of insights) {
-        const h3 = String(ins.horizon || "quarter").toLowerCase();
-        (buckets[h3] || buckets.quarter).push(ins);
+        const h4 = String(ins.horizon || "quarter").toLowerCase();
+        (buckets[h4] || buckets.quarter).push(ins);
       }
       const _renderCard = (ins) => {
         const tags = String(ins.tags || "").split(",").map((t3) => t3.trim()).filter(Boolean);
@@ -17467,9 +17988,9 @@ get_context_block(project_id="${PROJECT_QUOTE}", mode="full")`;
             return;
           }
           const headings = st && st.headings || [];
-          const tree = headings.map((h3) => {
-            const lvl = Math.max(1, Math.min(6, parseInt(h3.level, 10) || 1));
-            return `<div style="font-size:10px;color:var(--text);padding-left:${(lvl - 1) * 12}px">${escapeHtml(String(h3.text || ""))}</div>`;
+          const tree = headings.map((h4) => {
+            const lvl = Math.max(1, Math.min(6, parseInt(h4.level, 10) || 1));
+            return `<div style="font-size:10px;color:var(--text);padding-left:${(lvl - 1) * 12}px">${escapeHtml(String(h4.text || ""))}</div>`;
           }).join("");
           target.innerHTML = `<div style="font-size:9px;color:var(--muted);margin-bottom:3px">${st.paragraph_count} paragraphs \xB7 ${st.heading_count} headings</div>${tree || '<span style="font-size:9px;color:var(--muted)">No headings found.</span>'}`;
         } catch (e3) {
@@ -18270,14 +18791,14 @@ get_context_block(project_id="${PROJECT_QUOTE}", mode="full")`;
       return;
     }
     const items = events.map((ev) => {
-      const chip = _EXPERIMENT_EVENT_CHIP[ev.event_type] || { bg: "#6b7280", label: String(ev.event_type || "").toUpperCase() };
+      const chip2 = _EXPERIMENT_EVENT_CHIP[ev.event_type] || { bg: "#6b7280", label: String(ev.event_type || "").toUpperCase() };
       const label = ev.label ? `<span style="color:var(--muted);font-size:10px">${escapeHtml(ev.label)}</span>` : "";
       const when = ev.created_at ? `<span style="color:var(--muted);font-size:9px;margin-left:auto">${escapeHtml(String(ev.created_at))}</span>` : "";
       const eventBody = ev.body ? `<div style="color:var(--text);font-size:11px">${escapeHtml(ev.body)}</div>` : "";
       return `
-      <div class="event-item" style="border-left:3px solid ${chip.bg};padding:4px 8px;background:var(--surface-1)">
+      <div class="event-item" style="border-left:3px solid ${chip2.bg};padding:4px 8px;background:var(--surface-1)">
         <div style="display:flex;align-items:center;gap:6px;margin-bottom:2px">
-          <span style="background:${chip.bg};color:#0b0b0f;font-size:9px;font-weight:700;padding:1px 6px;border-radius:8px">${chip.label}</span>
+          <span style="background:${chip2.bg};color:#0b0b0f;font-size:9px;font-weight:700;padding:1px 6px;border-radius:8px">${chip2.label}</span>
           ${label}
           ${when}
         </div>
@@ -18307,30 +18828,30 @@ get_context_block(project_id="${PROJECT_QUOTE}", mode="full")`;
           return;
         }
         const dotColor = { active: "#4ade80", recent: "#fbbf24", idle: "#6b7280" };
-        const cards = humans.map((h3) => {
-          const c3 = _colorForHuman(h3.human_id);
-          const dc = dotColor[h3.presence] || dotColor.idle;
-          const fw = h3.agent_framework && h3.agent_framework !== "claude_code" ? `<span style="background:var(--surface-2);color:var(--accent);font-size:9px;font-weight:600;padding:1px 5px;border-radius:3px;margin-left:4px">${escapeHtml(h3.agent_framework)}</span>` : "";
-          const tasksLine = `${h3.tasks_done} done \xB7 ${h3.tasks_pending} pending${h3.tasks_failed ? " \xB7 " + h3.tasks_failed + " failed" : ""}`;
-          const lastSeen = h3.last_seen ? formatRelativeTime(h3.last_seen) : "never";
-          const recent = (h3.recent || []).slice(0, 3).map((t3) => {
+        const cards = humans.map((h4) => {
+          const c3 = _colorForHuman(h4.human_id);
+          const dc = dotColor[h4.presence] || dotColor.idle;
+          const fw = h4.agent_framework && h4.agent_framework !== "claude_code" ? `<span style="background:var(--surface-2);color:var(--accent);font-size:9px;font-weight:600;padding:1px 5px;border-radius:3px;margin-left:4px">${escapeHtml(h4.agent_framework)}</span>` : "";
+          const tasksLine = `${h4.tasks_done} done \xB7 ${h4.tasks_pending} pending${h4.tasks_failed ? " \xB7 " + h4.tasks_failed + " failed" : ""}`;
+          const lastSeen = h4.last_seen ? formatRelativeTime(h4.last_seen) : "never";
+          const recent = (h4.recent || []).slice(0, 3).map((t3) => {
             const s3 = (t3.status || "?").toUpperCase();
             const desc = (t3.description || "").slice(0, 90);
             return `<div style="color:var(--muted);font-size:10px;padding:1px 0">[${escapeHtml(s3)}] ${escapeHtml(desc)}</div>`;
           }).join("");
-          return `<div class="team-card" data-search="${escapeHtml((h3.human_id || "") + " " + (h3.active_session || "") + " " + (h3.agent_framework || ""))}" style="background:var(--surface-2);border:1px solid var(--border);border-left:3px solid ${c3};border-radius:4px;padding:10px 12px;margin-bottom:8px">
+          return `<div class="team-card" data-search="${escapeHtml((h4.human_id || "") + " " + (h4.active_session || "") + " " + (h4.agent_framework || ""))}" style="background:var(--surface-2);border:1px solid var(--border);border-left:3px solid ${c3};border-radius:4px;padding:10px 12px;margin-bottom:8px">
 
           <div style="display:flex;align-items:center;gap:8px;margin-bottom:4px">
 
             <span style="display:inline-block;width:8px;height:8px;border-radius:50%;background:${dc}"></span>
 
-            <span style="color:${c3};font-weight:600">${escapeHtml(h3.human_id)}</span>${fw}
+            <span style="color:${c3};font-weight:600">${escapeHtml(h4.human_id)}</span>${fw}
 
             <span style="color:var(--muted);font-size:10px;margin-left:auto">${escapeHtml(lastSeen)}</span>
 
           </div>
 
-          <div style="color:var(--text);font-size:11px;margin-bottom:2px">${escapeHtml(h3.active_session || "(no active session)")}</div>
+          <div style="color:var(--text);font-size:11px;margin-bottom:2px">${escapeHtml(h4.active_session || "(no active session)")}</div>
 
           <div style="color:var(--accent);font-size:10px;margin-bottom:4px">${escapeHtml(tasksLine)}</div>
 
@@ -18374,12 +18895,12 @@ get_context_block(project_id="${PROJECT_QUOTE}", mode="full")`;
           ));
         } catch (_2) {
         }
-        const standup = humans.map((h3) => {
-          const c3 = _colorForHuman(h3.human_id);
-          const last = (h3.recent || []).map((t3) => (t3.description || "").slice(0, 60)).slice(0, 4).join("; ");
+        const standup = humans.map((h4) => {
+          const c3 = _colorForHuman(h4.human_id);
+          const last = (h4.recent || []).map((t3) => (t3.description || "").slice(0, 60)).slice(0, 4).join("; ");
           return `<div style="padding:3px 0;border-left:2px solid ${c3};padding-left:8px;font-size:11px">
 
-          <span style="color:${c3};font-weight:600">${escapeHtml(h3.human_id)}</span> \xB7 ${h3.tasks_done} done \u2014 <span style="color:var(--muted)">${escapeHtml(last) || "\u2014"}</span>
+          <span style="color:${c3};font-weight:600">${escapeHtml(h4.human_id)}</span> \xB7 ${h4.tasks_done} done \u2014 <span style="color:var(--muted)">${escapeHtml(last) || "\u2014"}</span>
 
         </div>`;
         }).join("");
@@ -20077,19 +20598,19 @@ get_context_block(project_id="${PROJECT_QUOTE}", mode="full")`;
       const groups = {};
       const order = [];
       for (const s3 of sessions) {
-        const h3 = s3.human_id || "\0unknown";
-        if (!groups[h3]) {
-          groups[h3] = [];
-          order.push(h3);
+        const h4 = s3.human_id || "\0unknown";
+        if (!groups[h4]) {
+          groups[h4] = [];
+          order.push(h4);
         }
-        groups[h3].push(s3);
+        groups[h4].push(s3);
       }
-      for (const h3 of order) {
-        groups[h3] = sortSessionsMostRecentFirst(groups[h3]);
+      for (const h4 of order) {
+        groups[h4] = sortSessionsMostRecentFirst(groups[h4]);
       }
-      const rows = order.map((h3) => {
-        const humanSessions = groups[h3];
-        const label = h3 === "\0unknown" ? humanSessions.length === 1 ? humanSessions[0].name : "unknown" : h3;
+      const rows = order.map((h4) => {
+        const humanSessions = groups[h4];
+        const label = h4 === "\0unknown" ? humanSessions.length === 1 ? humanSessions[0].name : "unknown" : h4;
         const topDot = _sessionPresenceDot(humanSessions[0]?.last_seen);
         const header = `<div class="session-row" style="font-weight:600;padding-top:4px"><span class="name">${topDot} ${escapeHtml(label)}</span><span class="meta">${humanSessions.length} session${humanSessions.length > 1 ? "s" : ""}</span></div>`;
         const children = humanSessions.map((s3) => {
@@ -20664,6 +21185,19 @@ get_context_block(project_id="${PROJECT_QUOTE}", mode="full")`;
     showLocalServerControls();
     ensureTourButton();
     ensureFeedbackButton();
+    if (!_workspaceOverview) _workspaceOverview = mountWorkspaceView(document, {
+      hosted: !!window.MERIDIAN_HOSTED,
+      fetchOverview: async () => {
+        const r3 = await fetch("/workspace/overview", { cache: "no-store", headers: { Accept: "application/json" } });
+        let body = null;
+        try {
+          body = await r3.json();
+        } catch {
+          body = null;
+        }
+        return { status: r3.status, body };
+      }
+    });
     if (state.projects.length === 0 && !isDemoMode()) {
       document.getElementById("ez-wizard").style.display = "flex";
       return;
@@ -20731,13 +21265,7 @@ get_context_block(project_id="${PROJECT_QUOTE}", mode="full")`;
     }
     const workspaceEntry = document.getElementById("workspace-entry");
     if (workspaceEntry) {
-      workspaceEntry.onclick = () => {
-        const targetId = state.activeTab || state.projects[0]?.id;
-        const project = state.projects.find((p3) => p3.id === targetId);
-        if (!project) return;
-        if (!document.getElementById(`tab-body-${targetId}`)) openTab(project);
-        document.querySelector(`#vtab-strip-${targetId} [data-vtab="settings"]`)?.click();
-      };
+      workspaceEntry.onclick = () => openWorkspaceEntry();
     }
   })();
   var _sprintBoardReloaders = {};
