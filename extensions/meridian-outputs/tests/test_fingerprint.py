@@ -185,6 +185,35 @@ class TestTagOutputAgainstPdf:
         assert tagged.generating_script == "train.py"
 
 
+class TestTagOutputAgainstNpz:
+    """An .npz output reports the npz_content kind (header-only indexing,
+    stdlib parser), not the binary_metadata kind it used to fall into."""
+
+    def test_kind_is_npz_content(self, tmp_path: Path) -> None:
+        import struct
+        import zipfile
+
+        header = "{'descr': '<f8', 'fortran_order': False, 'shape': (4, 2), }"
+        pad = (64 - (10 + len(header) + 1) % 64) % 64
+        header_bytes = (header + " " * pad + "\n").encode("latin1")
+        npy = (
+            b"\x93NUMPY\x01\x00" + struct.pack("<H", len(header_bytes))
+            + header_bytes + b"\0" * 64
+        )
+        buf = io.BytesIO()
+        with zipfile.ZipFile(buf, "w") as zf:
+            zf.writestr("embedding.npy", npy)
+        output = tmp_path / "vectors.npz"
+        output.write_bytes(buf.getvalue())
+
+        tagged = FP.tag_output(str(output), str(tmp_path))
+
+        assert tagged.kind == "npz_content"
+        assert tagged.csv_columns is None
+        assert tagged.json_keys is None
+        assert tagged.generating_script is None
+
+
 # ---------------------------------------------------------------------------
 # find_stale_by_script -- compatibility path (code-review fix, fa600e42)
 # ---------------------------------------------------------------------------
@@ -321,3 +350,101 @@ class TestCheckStalenessCompatPath:
         script.write_text("print('v2 fixed')\n", encoding="utf-8")
         results = FP.check_staleness(str(tmp_path))
         assert results[0].is_stale is True
+
+
+# ---------------------------------------------------------------------------
+# Rows that cannot be checked are unknown (is_stale None), and
+# find_stale_by_script agrees with check_staleness about every row
+# ---------------------------------------------------------------------------
+
+def _write_row(outputs_dir: Path, output: Path, *, script_path, script_hash) -> None:
+    with open(FP._ledger_path(str(outputs_dir)), "w", encoding="utf-8") as fh:
+        json.dump({
+            str(output): {
+                "path": str(output),
+                "kind": "text_content",
+                "csv_columns": None,
+                "json_keys": None,
+                "generating_script": "train.py",
+                "script_path": script_path,
+                "script_hash": script_hash,
+                "tagged_at": "2026-01-01T00:00:00+00:00",
+            },
+        }, fh)
+
+
+class TestUncheckableRowsAreUnknown:
+    def test_row_without_resolvable_script_is_unknown_not_unchanged(
+        self, tmp_path: Path,
+    ) -> None:
+        output = tmp_path / "predictions.csv"
+        output.write_text("a,b\n1,2\n", encoding="utf-8")  # no generating_script hint
+        tagged = FP.tag_output(str(output), str(tmp_path))
+        assert tagged.script_path is None  # sanity: nothing resolved at tag time
+
+        results = FP.check_staleness(str(tmp_path))
+        assert len(results) == 1
+        assert results[0].is_stale is None
+        assert results[0].reason.startswith("no generating script resolved at tag time")
+        assert "cannot be confirmed" in results[0].reason
+        assert results[0].to_dict()["is_stale"] is None
+
+    def test_row_without_recorded_hash_is_unknown_in_both_readers(
+        self, tmp_path: Path,
+    ) -> None:
+        """A script path was recorded but no hash (the script could not be
+        read at tag time). check_staleness used to call the row "unchanged"
+        while find_stale_by_script listed it as stale."""
+        script = tmp_path / "train.py"
+        script.write_text("print('v1')\n", encoding="utf-8")
+        output = tmp_path / "predictions.csv"
+        output.write_text("a,b\n1,2\n", encoding="utf-8")
+        _write_row(tmp_path, output, script_path=str(script), script_hash=None)
+
+        results = FP.check_staleness(str(tmp_path))
+        assert len(results) == 1
+        assert results[0].is_stale is None
+        assert results[0].current_script_hash == FP.script_content_hash(str(script))
+        assert "no script hash was recorded" in results[0].reason
+        assert FP.find_stale_by_script(str(tmp_path), str(script)) == []
+
+    def test_missing_script_without_recorded_hash_is_stale_in_both_readers(
+        self, tmp_path: Path,
+    ) -> None:
+        """A script that can no longer be read is stale whatever was
+        recorded; find_stale_by_script used to skip this row because the
+        missing current hash equalled the missing tagged hash."""
+        script = tmp_path / "gone.py"  # never created
+        output = tmp_path / "predictions.csv"
+        output.write_text("a,b\n1,2\n", encoding="utf-8")
+        _write_row(tmp_path, output, script_path=str(script), script_hash=None)
+
+        results = FP.check_staleness(str(tmp_path))
+        assert results[0].is_stale is True
+        assert results[0].reason == "generating script no longer readable/present"
+        assert FP.find_stale_by_script(str(tmp_path), str(script)) == [str(output)]
+
+    def test_find_stale_by_script_lists_exactly_the_rows_check_staleness_calls_stale(
+        self, tmp_path: Path,
+    ) -> None:
+        script = tmp_path / "train.py"
+        script.write_text("print('v1')\n", encoding="utf-8")
+        v1_hash = FP.script_content_hash(str(script))
+        rows = {"same.csv": v1_hash, "no_hash.csv": None, "old.csv": "0" * 64}
+        ledger = {}
+        for name, script_hash in rows.items():
+            out = tmp_path / name
+            out.write_text("a\n1\n", encoding="utf-8")
+            ledger[str(out)] = {
+                "path": str(out), "kind": "text_content", "csv_columns": None,
+                "json_keys": None, "generating_script": "train.py",
+                "script_path": str(script), "script_hash": script_hash,
+                "tagged_at": "2026-01-01T00:00:00+00:00",
+            }
+        with open(FP._ledger_path(str(tmp_path)), "w", encoding="utf-8") as fh:
+            json.dump(ledger, fh)
+
+        by_name = {Path(r.path).name: r.is_stale for r in FP.check_staleness(str(tmp_path))}
+        assert by_name == {"same.csv": False, "no_hash.csv": None, "old.csv": True}
+        listed = FP.find_stale_by_script(str(tmp_path), str(script))
+        assert [Path(p).name for p in listed] == ["old.csv"]

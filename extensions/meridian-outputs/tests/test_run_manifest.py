@@ -21,7 +21,11 @@ Covers:
 """
 from __future__ import annotations
 
+import hashlib
+import os
 import sys
+import threading
+from contextlib import contextmanager
 from pathlib import Path
 
 import pytest
@@ -29,6 +33,7 @@ import pytest
 sys.path.insert(0, str(Path(__file__).parent.parent))
 from meridian_outputs import artifact_registry as AR
 from meridian_outputs import fingerprint as FP
+from meridian_outputs import ledger_io as LIO
 from meridian_outputs import research_evidence as RE
 from meridian_outputs import run_manifest as RM
 
@@ -211,6 +216,294 @@ class TestFinalizeRunManifest:
         rec = RM.get_run_manifest(str(tmp_path), "r1")
         assert rec is not None
         assert rec["phase"] == "complete"
+
+    @pytest.mark.parametrize("damage", ["truncated", "unreadable"])
+    def test_broken_registry_refuses_finalize_and_persists_nothing(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, damage: str,
+    ) -> None:
+        """S-R4-7: the artifact check read the registry leniently, so a corrupt
+        or unreadable registry recorded every artifact id as not found,
+        downgraded "complete" to "partial" and persisted that verdict with no
+        error."""
+        od = str(tmp_path)
+        art = AR.register_artifact(od, "output", generator="gen.py", source_locator="src")
+        RM.start_run_manifest(od, run_id="r1", command_name="build")
+        cache = tmp_path / ".meridian-outputs-cache"
+        registry = cache / "artifact_registry.json"
+        ledger = cache / "run_manifest_ledger.json"
+        expected: type[Exception] = OSError
+        if damage == "truncated":
+            raw = registry.read_bytes()
+            registry.write_bytes(raw[: len(raw) // 2])
+            expected = LIO.LedgerCorruptError
+        registry_before, ledger_before = registry.read_bytes(), ledger.read_bytes()
+        if damage == "unreadable":
+            real_open = open
+
+            def _eio(file, mode="r", *args, **kwargs):
+                if "r" in mode and os.path.basename(os.fspath(file)) == registry.name:
+                    raise OSError(5, "I/O error")
+                return real_open(file, mode, *args, **kwargs)
+
+            monkeypatch.setattr("builtins.open", _eio)
+
+        with pytest.raises(expected):
+            RM.finalize_run_manifest(od, "r1", artifact_ids=[art["artifact_id"]], status="complete")
+        monkeypatch.undo()
+
+        assert ledger.read_bytes() == ledger_before  # no verdict persisted
+        assert registry.read_bytes() == registry_before
+        rec = RM.get_run_manifest(od, "r1")
+        assert rec["phase"] == "in_progress"
+        assert rec["unknown_artifact_ids"] == []
+        # A finalize that names no artifact never consults the registry.
+        assert RM.finalize_run_manifest(od, "r1", status="complete")["phase"] == "complete"
+
+    @pytest.mark.parametrize("before", ["x\n1\n", None], ids=["rewritten", "appeared"])
+    def test_output_changed_between_hash_and_commit_is_recorded_as_it_is_now(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, before: "str | None",
+    ) -> None:
+        """R6-B: the outputs were hashed, and convergence read, before the
+        transaction, and nothing was checked again under it. An output
+        rewritten (or first written) in between was committed with its old
+        hash (or as missing, downgrading the phase to "partial")."""
+        od = str(tmp_path)
+        out = tmp_path / "out.csv"
+        if before is not None:
+            _write(out, before)
+        RM.start_run_manifest(od, run_id="r1", command_name="build")
+        real_txn = RM._ledger_write_transaction
+        held = {"now": False, "at_snapshot": None}
+
+        @contextmanager
+        def _changed_before_the_lock(outputs_dir: str):
+            _write(out, "x\n1\n2\n")  # after finalize hashed, before it locks
+            with real_txn(outputs_dir) as txn:
+                held["now"] = True
+                try:
+                    yield txn
+                finally:
+                    held["now"] = False
+
+        def _convergence(outputs_dir: str) -> dict:
+            held["at_snapshot"] = held["now"]
+            return {"converged": True}
+
+        monkeypatch.setattr(RM, "_ledger_write_transaction", _changed_before_the_lock)
+        monkeypatch.setattr(RM, "_safe_convergence", _convergence)
+        rec = RM.finalize_run_manifest(od, "r1", output_paths=[str(out)], status="complete")
+
+        current = FP.script_content_hash(str(out))
+        assert rec["output_identity"]["file_hashes"] == {str(out): current}
+        assert rec["output_identity"]["file_set_hash"] == RM._file_set_hash({str(out): current})
+        assert rec["output_identity"]["missing_or_unreadable"] == []
+        assert rec["phase"] == "complete" and rec["status_reason"] is None
+        assert held["at_snapshot"] is True  # convergence read under the lock
+        assert RM.get_run_manifest(od, "r1") == rec
+
+    def test_two_threads_finalizing_one_run_never_leave_an_older_hash(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """R6-B: finalize A hashes v1 and is about to lock; the output is
+        rewritten to v2 and finalize B hashes, snapshots and commits v2;
+        then A commits. A's pre-lock v1 hash and older convergence snapshot
+        used to overwrite B's newer ones."""
+        od = str(tmp_path)
+        out = tmp_path / "out.csv"
+        _write(out, "v1\n")
+        RM.start_run_manifest(od, run_id="r1", command_name="build")
+        snapshots = {"n": 0}
+        snapshot_lock = threading.Lock()
+
+        def _convergence(outputs_dir: str) -> dict:
+            with snapshot_lock:
+                snapshots["n"] += 1
+                return {"snapshot": snapshots["n"]}
+
+        real_txn = RM._ledger_write_transaction
+        a_hashed, b_done = threading.Event(), threading.Event()
+
+        @contextmanager
+        def _a_waits_for_b(outputs_dir: str):
+            if threading.current_thread().name == "finalize-a":
+                a_hashed.set()
+                assert b_done.wait(30)
+            with real_txn(outputs_dir) as txn:
+                yield txn
+
+        monkeypatch.setattr(RM, "_safe_convergence", _convergence)
+        monkeypatch.setattr(RM, "_ledger_write_transaction", _a_waits_for_b)
+        returned: dict[str, dict] = {}
+        errors: list[BaseException] = []
+
+        def _finalize(name: str) -> None:
+            try:
+                returned[name] = RM.finalize_run_manifest(
+                    od, "r1", output_paths=[str(out)], status="complete",
+                )
+            except BaseException as exc:  # surfaced below
+                errors.append(exc)
+
+        a = threading.Thread(target=_finalize, args=("a",), name="finalize-a", daemon=True)
+        a.start()
+        assert a_hashed.wait(30)  # A has hashed v1 and has not locked yet
+        _write(out, "v2, rewritten\n")
+        b = threading.Thread(target=_finalize, args=("b",), name="finalize-b", daemon=True)
+        b.start()
+        b.join(30)
+        b_done.set()
+        a.join(30)
+        assert not a.is_alive() and not b.is_alive()
+        assert errors == []
+
+        current = FP.script_content_hash(str(out))
+        stored = RM.get_run_manifest(od, "r1")
+        # A returned last: the ledger holds exactly what it returned, which
+        # is the current hash, never A's pre-lock one.
+        assert stored == returned["a"]
+        assert stored["output_identity"]["file_hashes"] == {str(out): current}
+        assert returned["b"]["output_identity"]["file_hashes"] == {str(out): current}
+        assert stored["convergence_at_finish"] == {"snapshot": snapshots["n"]}
+        assert stored["phase"] == "complete"
+
+
+# ---------------------------------------------------------------------------
+# Writers on a damaged ledger (S-F3): refuse, quarantine, write nothing
+# ---------------------------------------------------------------------------
+
+def _truncated_ledger(tmp_path: Path) -> tuple[Path, bytes]:
+    """A real two-run ledger cut off mid-file."""
+    RM.start_run_manifest(str(tmp_path), run_id="r0", command_name="build")
+    RM.start_run_manifest(str(tmp_path), run_id="r1", command_name="build")
+    ledger = tmp_path / ".meridian-outputs-cache" / "run_manifest_ledger.json"
+    raw = ledger.read_bytes()
+    truncated = raw[: len(raw) // 2]
+    ledger.write_bytes(truncated)
+    return ledger, truncated
+
+
+class TestCorruptLedgerWriters:
+    def test_start_on_truncated_ledger_raises_quarantines_and_writes_nothing(
+        self, tmp_path: Path,
+    ) -> None:
+        ledger, truncated = _truncated_ledger(tmp_path)
+        with pytest.raises(LIO.LedgerCorruptError) as info:
+            RM.start_run_manifest(str(tmp_path), run_id="r2", command_name="build")
+        # The damaged ledger is not replaced by a ledger holding only r2.
+        assert ledger.read_bytes() == truncated
+        quarantined = info.value.quarantine_path
+        assert quarantined is not None
+        assert Path(quarantined).name.startswith("run_manifest_ledger.json.corrupt-")
+        assert Path(quarantined).read_bytes() == truncated
+        assert str(tmp_path) not in str(info.value)  # basename only in the message
+
+    def test_finalize_on_truncated_ledger_raises_not_run_missing(self, tmp_path: Path) -> None:
+        ledger, truncated = _truncated_ledger(tmp_path)
+        with pytest.raises(LIO.LedgerCorruptError):
+            RM.finalize_run_manifest(str(tmp_path), "r0", status="complete")
+        assert ledger.read_bytes() == truncated
+
+    def test_quarantine_holds_the_bytes_that_failed_not_a_reread(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """S-R4-9: raise_quarantined re-read the ledger to copy it, so a file
+        replaced between the failed parse and the copy (the run-manifest
+        writers hold only an in-process lock) quarantined the new bytes
+        instead of the ones that failed."""
+        ledger, truncated = _truncated_ledger(tmp_path)
+        real_read = LIO._read_bytes
+        reads = {"n": 0}
+
+        def _replaced_after_the_parse(path: str) -> "bytes | None":
+            if os.path.basename(path) == ledger.name:
+                reads["n"] += 1
+                if reads["n"] > 1:  # another process rewrote the ledger
+                    return b"{}"
+            return real_read(path)
+
+        monkeypatch.setattr(LIO, "_read_bytes", _replaced_after_the_parse)
+        with pytest.raises(LIO.LedgerCorruptError) as info:
+            RM.start_run_manifest(str(tmp_path), run_id="r2", command_name="build")
+        copy = Path(info.value.quarantine_path)
+        assert copy.read_bytes() == truncated
+        digest = hashlib.sha256(truncated).hexdigest()[:16]
+        assert copy.name == f"run_manifest_ledger.json.corrupt-{digest}"  # named by content
+        assert ledger.read_bytes() == truncated
+
+    def test_retry_reuses_one_quarantine_copy(self, tmp_path: Path) -> None:
+        _truncated_ledger(tmp_path)
+        paths = set()
+        for _ in range(2):
+            with pytest.raises(LIO.LedgerCorruptError) as info:
+                RM.start_run_manifest(str(tmp_path), run_id="r2", command_name="build")
+            paths.add(info.value.quarantine_path)
+        assert len(paths) == 1
+
+    def test_transient_read_error_is_not_read_as_empty(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """An OSError reading the ledger used to read as ``{}``, so the write
+        replaced every other run with this one."""
+        RM.start_run_manifest(str(tmp_path), run_id="r0", command_name="build")
+        ledger = tmp_path / ".meridian-outputs-cache" / "run_manifest_ledger.json"
+        before = ledger.read_bytes()
+        real_open = open
+
+        def _flaky_open(file, mode="r", *args, **kwargs):
+            if "r" in mode and os.path.basename(os.fspath(file)) == ledger.name:
+                raise OSError(5, "I/O error")
+            return real_open(file, mode, *args, **kwargs)
+
+        monkeypatch.setattr("builtins.open", _flaky_open)
+        with pytest.raises(OSError):
+            RM.start_run_manifest(str(tmp_path), run_id="r1", command_name="build")
+        monkeypatch.undo()
+        assert ledger.read_bytes() == before
+
+
+# ---------------------------------------------------------------------------
+# Ledger writes: unique temp file, fsync, atomic replace (S-R4-6)
+# ---------------------------------------------------------------------------
+
+class TestLedgerAtomicWrite:
+    def test_failed_replace_keeps_prior_ledger_and_leaves_no_temp(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """S-R4-6: _write_ledger_entry wrote a fixed run_manifest_ledger.json.tmp
+        with no fsync before the rename, so a crash could leave a zero-length
+        or truncated ledger that the strict read then refused for good."""
+        RM.start_run_manifest(str(tmp_path), run_id="r0", command_name="build")
+        ledger = tmp_path / ".meridian-outputs-cache" / "run_manifest_ledger.json"
+        before = ledger.read_bytes()
+        events: list[str] = []
+        real_fsync, real_replace = os.fsync, os.replace
+
+        def _fsync(fd: int) -> None:
+            events.append("fsync")
+            real_fsync(fd)
+
+        def _replace(src: str, dst: str) -> None:
+            if os.path.basename(dst) != ledger.name:
+                return real_replace(src, dst)
+            events.append("replace:" + os.path.basename(src))
+            raise OSError("simulated failure before the replace")
+
+        with monkeypatch.context() as m:
+            m.setattr(os, "fsync", _fsync)
+            m.setattr(os, "replace", _replace)
+            with pytest.raises(OSError, match="simulated"):
+                RM.start_run_manifest(str(tmp_path), run_id="r1", command_name="build")
+            with pytest.raises(OSError, match="simulated"):
+                RM.finalize_run_manifest(str(tmp_path), "r0", status="complete")
+
+        assert ledger.read_bytes() == before
+        replaces = [e for e in events if e.startswith("replace:")]
+        assert len(replaces) == 2, events
+        assert "replace:run_manifest_ledger.json.tmp" not in replaces  # unique temp names
+        assert "fsync" in events[: events.index(replaces[0])]  # fsynced before the rename
+        assert [n for n in os.listdir(ledger.parent) if n.endswith(".tmp")] == []
+        assert RM.get_run_manifest(str(tmp_path), "r0")["phase"] == "in_progress"
+        assert RM.get_run_manifest(str(tmp_path), "r1") is None
 
 
 # ---------------------------------------------------------------------------

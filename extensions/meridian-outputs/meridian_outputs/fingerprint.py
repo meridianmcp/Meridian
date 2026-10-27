@@ -35,15 +35,13 @@ rest of the ``meridian_outputs`` package.
 from __future__ import annotations
 
 import hashlib
-import json
 import logging
 import os
-import threading
 from dataclasses import asdict, dataclass, replace
 from datetime import datetime, timezone
 from typing import Any
 
-from . import outputs_local
+from . import ledger_io, outputs_local
 from .path_security import (
     relative_output_path,
     relative_reference,
@@ -56,22 +54,26 @@ _log = logging.getLogger(__name__)
 _LEDGER_FILENAME = "fingerprint_ledger.json"
 _CACHE_DIRNAME = ".meridian-outputs-cache"
 
-# Guards read-modify-write of the on-disk ledger file. A threading.Lock (not
-# cross-process) mirrors the scope of outputs_local's own in-process
-# _index_cache_lock -- the ledger is a lower-stakes, append-mostly sidecar,
-# not the FTS index itself, so cross-process locking is not warranted here.
-_write_lock = threading.Lock()
+# Read-modify-write of the on-disk ledger runs inside
+# ledger_io.ledger_transaction: outputs_local.IndexFileLock on the ledger file
+# (cross-process as well as cross-thread), a unique fsynced temporary file and
+# an atomic os.replace. The earlier in-process-only threading.Lock let two
+# processes drop each other's entries; see ledger_io's module docstring.
 
 
 # ---------------------------------------------------------------------------
 # Ledger location (reuses the existing .meridian-outputs-cache convention)
 # ---------------------------------------------------------------------------
 
-def _cache_dir(outputs_dir: str) -> str:
+def _cache_dir(outputs_dir: str, *, create: bool = True) -> str:
     """The same ``.meridian-outputs-cache`` directory outputs_local's FTS
-    index already lives under -- created + gitignored on first use so the
-    ledger never needs its own separate cache-safety story."""
+    index already lives under -- created + gitignored on first write so the
+    ledger never needs its own separate cache-safety story. ``create=False``
+    (every read path) only computes the path: a read never creates the
+    directory or edits a ``.gitignore``."""
     cache_dir = os.path.join(outputs_dir, _CACHE_DIRNAME)
+    if not create:
+        return cache_dir
     try:
         os.makedirs(cache_dir, exist_ok=True)
         outputs_local.ensure_gitignored(cache_dir)
@@ -83,8 +85,8 @@ def _cache_dir(outputs_dir: str) -> str:
     return cache_dir
 
 
-def _ledger_path(outputs_dir: str) -> str:
-    return os.path.join(_cache_dir(outputs_dir), _LEDGER_FILENAME)
+def _ledger_path(outputs_dir: str, *, create: bool = True) -> str:
+    return os.path.join(_cache_dir(outputs_dir, create=create), _LEDGER_FILENAME)
 
 
 # ---------------------------------------------------------------------------
@@ -239,6 +241,13 @@ def tag_output(
 
     Returns:
       The :class:`ScriptTaggedFingerprint` that was written to the ledger.
+
+    The write is one cross-process ledger transaction (see
+    :mod:`meridian_outputs.ledger_io`). Raises
+    ``outputs_local.IndexLockAcquireError`` when another process holds the
+    ledger lock past its timeout; a corrupt existing ledger is quarantined to
+    ``fingerprint_ledger.json.corrupt-<utc>`` (with a logged warning) before
+    it is replaced.
     """
     resolved_output = _require_within(outputs_dir, output_path)
     stored_output = relative_output_path(outputs_dir, resolved_output)
@@ -290,18 +299,32 @@ def tag_output(
 
 
 def _read_ledger(outputs_dir: str) -> dict[str, dict[str, Any]]:
-    path = _ledger_path(outputs_dir)
-    try:
-        with open(path, "r", encoding="utf-8") as fh:
-            return json.load(fh)
-    except (OSError, ValueError):
-        return {}
+    """Strict read: ``{}`` only for a missing ledger. A corrupt ledger raises
+    ``ledger_io.LedgerCorruptError`` instead of reading as empty, so
+    :func:`check_staleness` and :func:`find_stale_by_script` can never report
+    "nothing stale" for a ledger they could not parse. A row that is not a
+    JSON object (e.g. ``{"a.csv": null}``) is corruption too: it raises
+    ``LedgerCorruptError`` here rather than ``AttributeError`` in a caller."""
+    path = _ledger_path(outputs_dir, create=False)  # a read never creates the cache dir
+    ledger = ledger_io.read_ledger_strict(path)
+    for entry in ledger.values():
+        if not isinstance(entry, dict):
+            kind = "null" if entry is None else type(entry).__name__
+            raise ledger_io.LedgerCorruptError(path, f"a row is {kind}, not an object")
+    return ledger
 
 
-def _write_ledger_entry(outputs_dir: str, tagged: ScriptTaggedFingerprint) -> None:
+def _write_ledger_entry(outputs_dir: str, tagged: ScriptTaggedFingerprint) -> str | None:
+    """Upsert ``tagged`` inside one cross-process ledger transaction.
+
+    Returns the quarantine path when a corrupt ledger had to be set aside
+    first (a warning is logged), else ``None``. Raises
+    ``outputs_local.IndexLockAcquireError`` when another process holds the
+    ledger lock past its timeout.
+    """
     path = _ledger_path(outputs_dir)
-    with _write_lock:
-        ledger = _read_ledger(outputs_dir)
+    with ledger_io.ledger_transaction(path) as txn:
+        ledger = txn.load()
         portable: dict[str, dict[str, Any]] = {}
         for old_key, old_record in ledger.items():
             if not isinstance(old_record, dict):
@@ -328,11 +351,8 @@ def _write_ledger_entry(outputs_dir: str, tagged: ScriptTaggedFingerprint) -> No
             safe_key = os.path.normcase(os.path.normpath(safe_path)).replace("\\", "/")
             portable[safe_key] = entry
         portable[tagged.path] = tagged.to_dict()
-        ledger = portable
-        tmp = path + ".tmp"
-        with open(tmp, "w", encoding="utf-8") as fh:
-            json.dump(ledger, fh, indent=2, sort_keys=True)
-        os.replace(tmp, path)  # atomic on both POSIX and Windows
+        txn.commit(portable)  # unique tmp + fsync + atomic os.replace
+        return txn.quarantined_path
 
 
 # ---------------------------------------------------------------------------
@@ -342,17 +362,48 @@ def _write_ledger_entry(outputs_dir: str, tagged: ScriptTaggedFingerprint) -> No
 @dataclass
 class StalenessResult:
     """Whether one previously-tagged output is stale relative to its
-    generating script's CURRENT on-disk content."""
+    generating script's CURRENT on-disk content. ``is_stale`` is ``None``
+    (unknown, never "not stale") when the row cannot be checked: no
+    generating script was resolved at tag time, or no script hash was
+    recorded at tag time."""
 
     path: str
     script_path: str | None
     tagged_script_hash: str | None
     current_script_hash: str | None
-    is_stale: bool
+    is_stale: bool | None
     reason: str
 
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)
+
+
+_NO_SCRIPT_REASON = (
+    "no generating script resolved at tag time -- staleness cannot be "
+    "confirmed either way"
+)
+
+
+def _script_staleness(
+    tagged_hash: str | None, current_hash: str | None,
+) -> tuple[bool | None, str]:
+    """``(is_stale, reason)`` for one ledger row whose script path is known.
+
+    The single rule :func:`check_staleness` and :func:`find_stale_by_script`
+    both apply, so the two readers can never disagree about the same row. A
+    script that can no longer be read is stale; a row with no recorded hash
+    is unknown (``None``), since there is nothing to compare the current
+    content against."""
+    if current_hash is None:
+        return True, "generating script no longer readable/present"
+    if tagged_hash is None:
+        return None, (
+            "no script hash was recorded at tag time -- staleness cannot be "
+            "confirmed either way"
+        )
+    if current_hash != tagged_hash:
+        return True, "generating script content changed since tagging"
+    return False, "generating script unchanged since tagging"
 
 
 def check_staleness(outputs_dir: str) -> list[StalenessResult]:
@@ -367,7 +418,14 @@ def check_staleness(outputs_dir: str) -> list[StalenessResult]:
     flagged stale if the generating script can no longer be read at all
     (deleted/moved -- provenance can no longer be confirmed either way).
 
-    Returns results in stable sorted order (by output path).
+    A row that cannot be checked -- no generating script was resolved at
+    tag time, or no script hash was recorded then -- gets ``is_stale``
+    ``None`` with a reason saying so. It is never reported as ``False``
+    ("unchanged"), since nothing was compared.
+
+    Returns results in stable sorted order (by output path). Raises
+    ``ledger_io.LedgerCorruptError`` for a corrupt ledger rather than
+    reporting nothing stale.
     """
     ledger = _read_ledger(outputs_dir)
     results: list[StalenessResult] = []
@@ -383,35 +441,20 @@ def check_staleness(outputs_dir: str) -> list[StalenessResult]:
         if not script_path:
             results.append(StalenessResult(
                 path=output_path, script_path=None, tagged_script_hash=tagged_hash,
-                current_script_hash=None, is_stale=False,
-                reason="no generating script resolved at tag time",
+                current_script_hash=None, is_stale=None,
+                reason=_NO_SCRIPT_REASON,
             ))
             continue
         resolved_script = resolve_reference(outputs_dir, script_path)
         if resolved_script not in script_hash_cache:
             script_hash_cache[resolved_script] = script_content_hash(resolved_script)
         current_hash = script_hash_cache[resolved_script]
-        if current_hash is None:
-            results.append(StalenessResult(
-                path=output_path, script_path=resolved_script,
-                tagged_script_hash=tagged_hash, current_script_hash=None,
-                is_stale=True,
-                reason="generating script no longer readable/present",
-            ))
-        elif tagged_hash is not None and current_hash != tagged_hash:
-            results.append(StalenessResult(
-                path=output_path, script_path=resolved_script,
-                tagged_script_hash=tagged_hash, current_script_hash=current_hash,
-                is_stale=True,
-                reason="generating script content changed since tagging",
-            ))
-        else:
-            results.append(StalenessResult(
-                path=output_path, script_path=resolved_script,
-                tagged_script_hash=tagged_hash, current_script_hash=current_hash,
-                is_stale=False,
-                reason="generating script unchanged since tagging",
-            ))
+        is_stale, reason = _script_staleness(tagged_hash, current_hash)
+        results.append(StalenessResult(
+            path=output_path, script_path=resolved_script,
+            tagged_script_hash=tagged_hash, current_script_hash=current_hash,
+            is_stale=is_stale, reason=reason,
+        ))
     return results
 
 
@@ -426,7 +469,15 @@ def find_stale_by_script(outputs_dir: str, script_path: str) -> list[str]:
     hash was generated by a script content-state that no longer exists on
     disk -- i.e. potentially the just-fixed bug.
 
-    Returns paths in stable sorted order.
+    A row is listed exactly when :func:`check_staleness` reports it
+    ``is_stale`` ``True`` (both apply :func:`_script_staleness`): a script
+    that can no longer be read lists every row tagged against it, and a row
+    with no recorded script hash is NOT listed, because its staleness is
+    unknown rather than confirmed -- :func:`check_staleness` reports such a
+    row with ``is_stale`` ``None``.
+
+    Returns paths in stable sorted order. Raises
+    ``ledger_io.LedgerCorruptError`` for a corrupt ledger.
     """
     script_abspath = os.path.realpath(os.path.abspath(script_path))
     current_hash = script_content_hash(script_abspath)
@@ -447,6 +498,6 @@ def find_stale_by_script(outputs_dir: str, script_path: str) -> list[str]:
         # this item) would let a NEW-style row that somehow lacks
         # script_hash disagree with check_staleness about the same data.
         tagged_hash = _digest_hex(entry.get("content_digest")) or entry.get("script_hash")
-        if tagged_hash != current_hash:
+        if _script_staleness(tagged_hash, current_hash)[0] is True:
             stale.append(resolve_reference(outputs_dir, path))
     return stale

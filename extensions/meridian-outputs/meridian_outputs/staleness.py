@@ -226,4 +226,8 @@ def _map_script_check(source: str, result: dict[str, Any], path: str | None) -> 
             + reason,
             resolved,
         )
+    if result.get("is_stale") is None:
+        # The check could not be made (an unreadable ledger or row): unknown,
+        # never fresh.
+        return StalenessRecord(source, UNKNOWN, reason, resolved)
     return StalenessRecord(source, FRESH, reason, resolved)

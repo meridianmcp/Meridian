@@ -309,13 +309,15 @@ producers ``outputs_indexer.check_promotion_source_freshness`` and
 """
 from __future__ import annotations
 
+import functools
 import logging
 import os
 from datetime import datetime, timezone
 from typing import Any
 
-from . import annotate, fingerprint, outputs_local, research_evidence
+from . import annotate, fingerprint, ledger_io, outputs_local, research_evidence
 from . import staleness as staleness_vocab
+from .path_security import resolve_reference
 
 _log = logging.getLogger(__name__)
 
@@ -448,18 +450,164 @@ def _stale_by_script_result(outputs_dir: str, path: str) -> dict[str, Any] | Non
     Returns ``None`` when ``path`` was never fingerprint-tagged (nothing to
     compare) -- this is NOT the same as "not stale"; callers must check for
     ``None`` before reading ``is_stale``. Otherwise the matching
-    :class:`fingerprint.StalenessResult`, as a dict. Its ``path`` is the path
-    of the record whose tag produced this result. For a content-hash
-    :data:`RELOCATED` status, that can be the matched record's path rather
-    than the queried path.
+    :class:`fingerprint.StalenessResult`, as a dict, passed through
+    unchanged: its ``is_stale`` is ``True``, ``False``, or ``None`` when the
+    tagged row could not be checked (no generating script was resolved at
+    tag time, or no script hash was recorded). ``None`` means unknown, and
+    callers must never read it as "not stale".
+
+    When the fingerprint ledger exists but cannot be read
+    (``ledger_io.LedgerCorruptError`` or an ``OSError``), whether ``path``
+    was tagged and whether its script changed are both unknown: the result
+    is a dict of the same shape with ``is_stale`` ``None``, a ``reason``
+    saying why, and ``error="ledger_unreadable"`` -- never ``None`` ("never
+    tagged") and never an exception that would lose the exact record.
+
+    ``path`` is resolved the way :func:`annotate.get_provenance` resolves it:
+    a relative path against ``outputs_dir`` (never the working directory),
+    through ``realpath``, so it compares equal to the ``realpath``-resolved
+    paths :func:`fingerprint.check_staleness` returns, also when
+    ``outputs_dir`` is reached through a symlink. Otherwise a relative
+    spelling of a tagged file would miss its row and read as "never tagged".
     """
-    target = annotate._normalize_path(path)
+    if not isinstance(path, str) or not path.strip():
+        return None
+    try:
+        resolved = resolve_reference(outputs_dir, path.strip())
+    except (OSError, TypeError, ValueError):
+        resolved = path
+    target = annotate._normalize_path(resolved)
     if not target:
         return None
-    for result in fingerprint.check_staleness(outputs_dir):
+    try:
+        results = fingerprint.check_staleness(outputs_dir)
+    except (ledger_io.LedgerCorruptError, OSError) as exc:
+        return {
+            "path": path,
+            "script_path": None,
+            "tagged_script_hash": None,
+            "current_script_hash": None,
+            "is_stale": None,
+            "reason": (
+                f"fingerprint ledger could not be read ({_store_error_detail(exc)}) "
+                "-- script staleness cannot be confirmed either way"
+            ),
+            "error": "ledger_unreadable",
+        }
+    for result in results:
         if annotate._normalize_path(result.path) == target:
             return result.to_dict()
     return None
+
+
+def _row_signature_differs(outputs_dir: str, path: str) -> bool:
+    """True when the fingerprint row tagged for ``path`` records
+    ``csv_columns``/``json_keys`` (read by ``fingerprint.tag_output`` from
+    the output's bytes) that the file now at ``path`` does not have: that
+    row was tagged on other bytes.
+
+    A fingerprint row records no hash of the output it was tagged on, so
+    this can only refute a row, never confirm one. ``False`` when the row
+    records neither field, or when the row or the file cannot be read.
+    ``path`` is matched to a row the way :func:`_stale_by_script_result`
+    matches it."""
+    try:
+        resolved = resolve_reference(outputs_dir, path.strip())
+    except (OSError, TypeError, ValueError):
+        resolved = path
+    target = annotate._normalize_path(resolved)
+    try:
+        ledger = fingerprint._read_ledger(outputs_dir)
+    except (ledger_io.LedgerCorruptError, OSError):
+        return False
+    for key, row in ledger.items():
+        if annotate._normalize_path(resolve_reference(outputs_dir, key)) != target:
+            continue
+        recorded = (row.get("csv_columns"), row.get("json_keys"))
+        if recorded == (None, None):
+            return False
+        try:
+            current = outputs_local.file_fingerprint(path)
+        except Exception:  # noqa: BLE001 -- unreadable file: cannot refute
+            return False
+        return recorded != (current.csv_columns, current.json_keys)
+    return False
+
+
+def _store_error_detail(exc: BaseException) -> str:
+    """Short, portable description of a store read failure. A
+    ``LedgerCorruptError`` names only the ledger's basename; any other error
+    is reduced to its type name, since an ``OSError``'s text can carry a
+    machine-local absolute path."""
+    if isinstance(exc, ledger_io.LedgerCorruptError):
+        return str(exc)
+    return type(exc).__name__
+
+
+def _relocated_script_staleness(
+    outputs_dir: str, path: str, match_path: Any, record_hash: str | None,
+) -> dict[str, Any] | None:
+    """Script staleness for a :data:`RELOCATED` copy at ``path``.
+
+    Two fingerprint rows can describe this copy's bytes: the row at ``path``
+    (its own tag) and the row at ``match_path`` (the matched record's path). A
+    row describes the copy only while the file at its path still holds the
+    bytes it was tagged on: the copy's own row when the copy holds
+    ``record_hash`` and its row's csv/json signature still matches; the matched
+    row when the matched file and the copy both hold ``record_hash``.
+
+    A stale result from a describing row wins, matched row first, then the
+    copy's own row (origin's precedence). Otherwise a describing row decides,
+    own row first. A matched row that holds other bytes (the matched path was
+    regenerated) never decides for this copy: ``None``, the same answer as
+    never tagged. A matched row with no readable file to tie it to, or a copy
+    that cannot be hashed, reads unknown (``is_stale`` ``None``), never fresh
+    and never verified; if that row reports a changed or unreadable script it
+    still reads stale, the conservative direction.
+
+    An unreadable fingerprint ledger gives the ``error="ledger_unreadable"``
+    dict from :func:`_stale_by_script_result`.
+    """
+    own = _stale_by_script_result(outputs_dir, path)
+    if own is not None and own.get("error"):
+        return own
+    matched = _stale_by_script_result(outputs_dir, match_path)
+    if matched is not None and matched.get("error"):
+        return matched
+    current_hash = fingerprint.script_content_hash(path) if os.path.isfile(path) else None
+    expected = record_hash if record_hash is not None else current_hash
+    holds_record = current_hash is not None and current_hash == expected
+    own_describes = (
+        own is not None and holds_record and not _row_signature_differs(outputs_dir, path)
+    )
+    match_hash = (
+        fingerprint.script_content_hash(match_path) if os.path.isfile(match_path) else None
+    )
+    matched_describes = matched is not None and holds_record and match_hash == expected
+    # A matched row that holds other bytes (the matched path was regenerated)
+    # never decides for this copy.
+    matched_regenerated = holds_record and match_hash is not None and match_hash != expected
+    # A stale matched row wins, tied to these bytes or not: a changed or
+    # unreadable script is the conservative signal.
+    if matched is not None and matched.get("is_stale") is True and not matched_regenerated:
+        return matched
+    if own_describes and own.get("is_stale") is True:
+        return own
+    if own_describes:
+        return own
+    if matched_describes:
+        return matched
+    if matched is None or matched_regenerated:
+        return None
+    return {
+        **matched,
+        "is_stale": None,
+        "reason": (
+            f"the fingerprint row at {match_path!r} cannot be tied to this "
+            "copy's bytes (no readable file there, or this copy could not be "
+            "hashed) -- script staleness cannot be confirmed either way"
+        ),
+    }
 
 
 def _directory_fallback(outputs_dir: str, path: str) -> dict[str, Any] | None:
@@ -613,6 +761,121 @@ def _basename_relocation_lookup(
     return best
 
 
+def _input_staleness(
+    outputs_dir: str, path: str, status: dict[str, Any],
+) -> dict[str, Any] | None:
+    """Input-change staleness for ``path`` from the run manifests that cover
+    it: runs whose finalized outputs list ``path``, plus the ``run_id`` of
+    the exact record or, for :data:`RELOCATED`, of the matched record (the
+    run that produced it before it moved). ``None`` when no run manifest
+    covers ``path``.
+
+    ``stale`` is ``True`` when any covering run's inputs changed, ``False``
+    when every covering run was checked and none changed, and ``None``
+    (unknown) when the run-manifest ledger could not be read or a run's
+    check failed and no other run is stale -- staleness cannot be confirmed
+    either way, so it is never reported as ``False``. An unreadable ledger
+    gives ``{"stale": None, "runs": [], "reason": ..., "error": ...}``; a
+    failed run is listed with ``stale: None`` and ``error``. Run manifests
+    only: tag_output and artifact source edges record no input hashes."""
+    from . import run_manifest  # noqa: PLC0415 -- lazy: keep module import order unchanged
+
+    record = status.get("record")
+    record_run_id = (
+        record.get("run_id")
+        if isinstance(record, dict)
+        and status.get("provenance_type") in (EXACT, STALE_BY_SCRIPT, RELOCATED)
+        else None
+    )
+    try:
+        run_ids = run_manifest.run_ids_for_output(outputs_dir, path, record_run_id=record_run_id)
+    except Exception as exc:  # noqa: BLE001 -- additive signal, never breaks the status call
+        _log.debug("get_provenance_status: run lookup failed for %r", path, exc_info=True)
+        return {
+            "stale": None,
+            "runs": [],
+            "reason": (
+                f"run manifest ledger could not be read ({_store_error_detail(exc)}) "
+                "-- input staleness cannot be confirmed either way"
+            ),
+            "error": type(exc).__name__,
+        }
+    if not run_ids:
+        return None
+    runs: list[dict[str, Any]] = []
+    for run_id in run_ids:
+        try:
+            result = run_manifest.check_input_staleness(outputs_dir, run_id)
+        except Exception as exc:  # noqa: BLE001
+            runs.append({"run_id": run_id, "stale": None, "error": str(exc)})
+            continue
+        runs.append({
+            "run_id": run_id,
+            "stale": result["stale"],
+            "stale_inputs": result["stale_inputs"],
+            "reason": result["reason"],
+        })
+    stale_runs = [r for r in runs if r["stale"] is True]
+    unknown_runs = [r for r in runs if r["stale"] is None]
+    if stale_runs:
+        return {
+            "stale": True,
+            "runs": runs,
+            "reason": "; ".join(f"run {r['run_id']}: {r['reason']}" for r in stale_runs),
+        }
+    if unknown_runs:
+        return {
+            "stale": None,
+            "runs": runs,
+            "reason": (
+                "input staleness check failed for "
+                + ", ".join(f"run {r['run_id']}" for r in unknown_runs)
+                + " -- cannot be confirmed either way"
+            ),
+        }
+    return {
+        "stale": False,
+        "runs": runs,
+        "reason": "no input of a covering run changed since that run started",
+    }
+
+
+def _with_input_staleness(fn: Any) -> Any:
+    """Adds the ``input_staleness`` key to every non-error answer and, when
+    an input of a covering run changed, sets ``staleness["stale"]`` and
+    appends the reason -- only on branches that carry a ``staleness`` dict
+    (EXACT, STALE_BY_SCRIPT, RELOCATED). When input staleness is unknown
+    (``stale`` ``None``), a ``staleness["stale"]`` that is not already
+    ``True`` becomes ``None`` with the reason appended: it is never left
+    reading as a clean ``False``. Every existing key is unchanged."""
+    @functools.wraps(fn)
+    def wrapper(outputs_dir: str, path: str) -> dict[str, Any]:
+        status = fn(outputs_dir, path)
+        if not isinstance(status, dict) or "error" in status:
+            return status
+        input_staleness = _input_staleness(outputs_dir, path, status)
+        status["input_staleness"] = input_staleness
+        staleness = status.get("staleness")
+        if input_staleness and isinstance(staleness, dict):
+            if input_staleness["stale"] is True:
+                staleness["stale"] = True
+                note = f"an input changed since its run started ({input_staleness['reason']})"
+            elif input_staleness["stale"] is None:
+                if staleness.get("stale") is not True:
+                    staleness["stale"] = None
+                note = f"input staleness unknown ({input_staleness['reason']})"
+            else:
+                note = None
+            if note:
+                staleness["reason"] = (
+                    f"{staleness['reason']}; {note}" if staleness.get("reason") else note
+                )
+        return status
+
+    return wrapper
+
+
+@_with_input_staleness
 def _build_provenance_status(outputs_dir: str, path: str) -> dict[str, Any]:
     """The richer, authoritative answer to "what do we know about this
     file's provenance", composed from both underlying systems and ranked by
@@ -724,23 +987,11 @@ def _build_provenance_status(outputs_dir: str, path: str) -> dict[str, Any]:
     if len(relocation_matches) == 1:
         match = relocation_matches[0]
         current_hash = match.get("content_hash")
-        # Stale-tag precedence for a content-hash relocation: a stale result
-        # from either the matched record's own fingerprint tag or this path's
-        # own tag wins (matched record checked first). Otherwise the matched
-        # record's result is preferred, falling back to this path's own tag.
-        # provenance_type stays RELOCATED either way.
-        matched_script = _stale_by_script_result(
-            outputs_dir, match.get("path") or path,
+        # The generating script of this copy, read through the rule in
+        # _relocated_script_staleness. provenance_type stays RELOCATED.
+        script_staleness = _relocated_script_staleness(
+            outputs_dir, path, match.get("path") or path, current_hash,
         )
-        query_script = _stale_by_script_result(outputs_dir, path)
-        if matched_script is not None and matched_script.get("is_stale"):
-            script_staleness = matched_script
-        elif query_script is not None and query_script.get("is_stale"):
-            script_staleness = query_script
-        else:
-            script_staleness = (
-                matched_script if matched_script is not None else query_script
-            )
         return {
             "path": path,
             "provenance_type": RELOCATED,
@@ -881,6 +1132,13 @@ def get_provenance_status(outputs_dir: str, path: str) -> dict[str, Any]:
     An ``{"error": ...}`` response (missing ``outputs_dir``/``path``) is
     returned unchanged, with no ``staleness_record``: there is no provenance
     state to map, so a record would only carry a misleading reason.
+
+    Raises:
+      ledger_io.LedgerCorruptError: the provenance ledger cannot be read (a
+        corrupt file, or a row that is not an object). It is not reported as
+        an absent record. The fingerprint ledger never raises here: an
+        unreadable one is reported as ``script_staleness`` with
+        ``is_stale`` ``None`` and ``error="ledger_unreadable"``.
     """
     status = _build_provenance_status(outputs_dir, path)
     if "error" in status:
@@ -905,14 +1163,20 @@ def _staleness_record_for_status(status: dict[str, Any]) -> "staleness_vocab.Sta
     block = status.get("staleness")
     provenance_type = status.get("provenance_type")
     script = status.get("script_staleness")
-    relocated_script_changed = (
+    # A content-hash relocation whose script was checked reads through the script
+    # source: changed reads stale, unknown (a moved copy, or an unreadable
+    # ledger) reads unknown, and never the fresh reading of its content block.
+    relocated_script_checked = (
         provenance_type == RELOCATED
         and isinstance(script, dict)
-        and bool(script.get("is_stale"))
+        and (
+            status.get("relocation_evidence") == "content_hash"
+            or bool(script.get("is_stale"))
+        )
     )
     if (
         provenance_type != STALE_BY_SCRIPT
-        and not relocated_script_changed
+        and not relocated_script_checked
         and isinstance(block, dict)
     ):
         return staleness_vocab.map_staleness(
@@ -956,6 +1220,10 @@ def get_manifest_backed_provenance_status(
     shape). This function never re-derives aggregation logic -- it only
     cross-references the ALREADY-COMPUTED verdict against this one path.
 
+    Raises ``ledger_io.LedgerCorruptError`` exactly as :func:`get_provenance_status`
+    does when the provenance ledger cannot be read; it is never reported as
+    absent.
+
     Returns ``get_provenance_status(outputs_dir, path)``'s exact dict (or
     its ``{"error": ...}`` shape, unchanged, when ``outputs_dir``/``path``
     are missing) with one additive key:
@@ -972,7 +1240,8 @@ def get_manifest_backed_provenance_status(
     package already uses elsewhere, never a new hash scheme) matches the
     recorded one. Fail-closed on every other combination (missing/not-ok
     aggregation, path not recorded, unreadable file, hash mismatch) — never
-    silently treats "we could not check" as "verified". Never raises.
+    silently treats "we could not check" as "verified". Raises only what
+    :func:`get_provenance_status` raises (``ledger_io.LedgerCorruptError``).
     """
     base = get_provenance_status(outputs_dir, path)
     if "error" in base:
@@ -1086,6 +1355,31 @@ def _resolver_state_for_provenance_status(
     staleness = status.get("staleness") or {}
     script_staleness = status.get("script_staleness") or {}
     inconclusive = bool(status.get("inconclusive"))
+    input_staleness = status.get("input_staleness")
+    input_unknown = (
+        research_evidence.ResolverState(
+            status=research_evidence.ResolverStatus.AMBIGUOUS,
+            confidence=0.5,
+            reason=(
+                input_staleness.get("reason")
+                or "input staleness could not be confirmed either way"
+            ),
+        )
+        if isinstance(input_staleness, dict) and input_staleness.get("stale") is None
+        else None
+    )
+    script_unknown = (
+        research_evidence.ResolverState(
+            status=research_evidence.ResolverStatus.AMBIGUOUS,
+            confidence=0.5,
+            reason=(
+                script_staleness.get("reason")
+                or "script staleness could not be confirmed either way"
+            ),
+        )
+        if script_staleness and script_staleness.get("is_stale") is None
+        else None
+    )
 
     if ptype == STALE_BY_SCRIPT:
         return research_evidence.ResolverState(
@@ -1106,6 +1400,10 @@ def _resolver_state_for_provenance_status(
                     or "content changed since provenance was recorded"
                 ),
             )
+        if script_unknown is not None:
+            return script_unknown
+        if input_unknown is not None:
+            return input_unknown
         if (
             staleness.get("recorded_content_hash") is None
             or staleness.get("current_content_hash") is None
@@ -1146,6 +1444,20 @@ def _resolver_state_for_provenance_status(
                 confidence=0.3,
                 reason=f"relocated output: {script_reason}",
             )
+        if isinstance(input_staleness, dict) and input_staleness.get("stale") is True:
+            return research_evidence.ResolverState(
+                status=research_evidence.ResolverStatus.STALE,
+                confidence=0.3,
+                reason=(
+                    staleness.get("reason")
+                    or "an input changed since its run started "
+                    f"({input_staleness.get('reason')})"
+                ),
+            )
+        if script_unknown is not None:
+            return script_unknown
+        if input_unknown is not None:
+            return input_unknown
         # Identity confirmed by content hash keeps the full 0.75. Identity
         # confirmed by basename alone is lower (0.6) and is not authoritative.
         # evidence_record_from_provenance_status marks it partial for that
@@ -1394,6 +1706,39 @@ def evidence_record_from_provenance_status(
     )
 
 
+def _store_unreadable_evidence_record(
+    path: str, exc: BaseException,
+) -> "research_evidence.EvidenceRecord":
+    """OUTPUT record for a path whose provenance lookup hit a store that
+    cannot be read: ``AMBIGUOUS`` at confidence 0.0 (provenance unknown,
+    not confirmed either way -- never ``VERIFIED``, and not ``UNAVAILABLE``,
+    which this module reserves for confirmed absence) and ``partial``."""
+    detail = _store_error_detail(exc)
+    reason = (
+        f"a provenance store could not be read ({detail}) -- this path's "
+        "provenance is unknown"
+    )
+    now = _now_iso()
+    return research_evidence.EvidenceRecord(
+        identity=research_evidence.EvidenceIdentity(
+            id=path, kind=research_evidence.EvidenceKind.OUTPUT, locator=path,
+        ),
+        timestamps=research_evidence.EvidenceTimestamps(observed_at=now, updated_at=now),
+        resolver=research_evidence.ResolverState(
+            status=research_evidence.ResolverStatus.AMBIGUOUS,
+            confidence=0.0,
+            reason=reason,
+        ),
+        partial=True,
+        partial_reason=reason,
+        attributes={
+            "provenance_type": None,
+            "store_error": "ledger_unreadable",
+            "error": detail,
+        },
+    )
+
+
 def build_provenance_envelope(
     outputs_dir: str,
     paths: "list[str]",
@@ -1442,7 +1787,11 @@ def build_provenance_envelope(
 
     records: "list[research_evidence.EvidenceRecord]" = []
     for path in paths:
-        status = get_provenance_status(outputs_dir, path)
+        try:
+            status = get_provenance_status(outputs_dir, path)
+        except (ledger_io.LedgerCorruptError, OSError) as exc:
+            records.append(_store_unreadable_evidence_record(path, exc))
+            continue
         if "error" in status:
             raise research_evidence.EnvelopeValidationError(
                 f"cannot build provenance envelope: {status['error']} "

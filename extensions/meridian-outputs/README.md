@@ -31,7 +31,7 @@ Or add to your MCP client config:
 
 | Tool | Description |
 |------|-------------|
-| `search_outputs` | BM25 full-text search over CSV/JSON/text/PDF files (body content) plus filename-only search over everything else (NPY etc.), with a literal-filename-match boost and an optional `subtree` scope |
+| `search_outputs` | BM25 full-text search over CSV/JSON/text/PDF files (body content) and NPZ archives (array names, shape tokens such as `100x3`, dtypes; headers only, stdlib, never unpickled), plus filename-only search over everything else (NPY etc.), with a literal-filename-match boost and an optional `subtree` scope. `content_extractors` in the response reports `pypdf_missing` when PDFs fall back to filename-only |
 | `register_output_paths` | Directly register a known list of output paths so they're searchable immediately, without waiting for the ambient walk |
 | `get_convergence_state` | Read-only snapshot of how far the index walk has progressed (never triggers indexing) |
 | `search_logs` | Disposable regex search over a log directory tree (ripgrep tier 0, pure-Python fallback, timestamp/JSON sniffing tier 1) |
@@ -70,12 +70,14 @@ and reported a real parse error) — never a raised exception, never a hang.
 | Tool | Description |
 |------|-------------|
 | `annotate_outputs` | Add/update a human annotation for a file or directory |
-| `record_provenance` | Attach machine-oriented reproducibility metadata (generating script, params, content hash) to one output file |
+| `record_provenance` | Attach machine-oriented reproducibility metadata (generating script, params, content hash, optional `run_id`) to one output file; every record also stores a `reproduction` block (Python version, platform, package version, installed versions of the direct runtime dependencies) |
 | `get_provenance` | Exact-match lookup of one file's `record_provenance` record (ambiguous `None` on a miss — see `get_provenance_status`) |
 | `get_provenance_status` | Richer, ranked per-file provenance answer: exact / directory-fallback / unregistered / unknown / stale-by-script, plus staleness, archival identity, and index-convergence awareness |
 | `list_provenance` | List the latest `record_provenance` record for every path recorded under an outputs directory |
+| `get_provenance_history` | Every retained `record_provenance` record for one file, oldest first with 1-based versions; re-recording keeps the newest 50 superseded records, written in the same atomic ledger update as the new one |
 | `resolve_figure_output` | Forward resolution: a document figure's file path → its generating source (exact match, then relocation-tolerant basename fallback) |
-| `find_outputs_by_source` | Reverse resolution: a script/data source path → the outputs it produced |
+| `find_outputs_by_source` | Reverse resolution: a script/data source path → the outputs it produced (one hop; `limit` ≤ 1000, `search_limit` ≤ 5000; a `truncated` block flags a saturated scan, a partial index, or capped outputs) |
+| `trace_forward_outputs` | Bounded transitive forward trace: a source → every output depending on it through other outputs (BFS, `max_depth` 3 / `max_nodes` 200 by default; caps set a `truncated` flag and reason, never an error; `max_depth=1` equals `find_outputs_by_source`) |
 | `bind_artifact_provenance` | Join a document's structural artifacts (figures/tables/equations) to authoritative per-file provenance, fail-closed |
 | `tag_output` | Fingerprint an output and record it in a persistent ledger stamped with its generating script's content hash |
 | `check_staleness` | Re-hash every ledger-tagged generating script and report which previously-tagged outputs are now stale |
@@ -89,7 +91,7 @@ in the core repo) resolves against:
 
 | Tool | Description |
 |------|-------------|
-| `record_provenance` | Attach reproducibility metadata (generating script, params, sprint item/decision) to one output file |
+| `record_provenance` | Attach reproducibility metadata (generating script, params, sprint item/decision, run id, interpreter and dependency versions) to one output file |
 | `get_provenance` | Exact-match lookup of one output file's recorded provenance; a bare `None` is ambiguous, prefer `get_provenance_status` |
 | `get_provenance_status` | Richer, authoritative per-file provenance answer — exact record vs. directory-note fallback vs. unregistered vs. unknown, plus content-hash staleness |
 | `list_provenance` | List the latest provenance record for every path recorded under an outputs directory |
@@ -159,6 +161,7 @@ always surfaced together, never silently narrowed to one.
 | `bind_artifact_source_edge` | Record a typed edge between a registered artifact and a source locator (idempotent) |
 | `get_artifact_sources` | Artifact → its bound sources |
 | `get_source_artifacts` | Source → the artifacts it produced |
+| `get_output_lineage` | Joined lineage for one output: the union of registry source edges, the `record_provenance` generating script and the `tag_output` script, each tagged with its origin, each in-tree source joined to its own provenance record (out-of-tree ones marked `not_recorded_outside_outputs_dir`), a script-hash `stale` flag, and the run's inputs (`scope: "run"`); `complete` is false whenever anything is unresolved; one hop |
 | `list_registered_artifacts` | All registered artifacts, optionally filtered by kind/lifecycle_state |
 | `reconcile_legacy_artifact_outputs` | Migration/reconciliation report for legacy outputs (defaults to the `record_provenance` ledger); dry-run preview or real registration; ambiguous/unanchored entries are never silently registered |
 
@@ -204,7 +207,28 @@ this package, with no second codec.
 | `finalize_run_manifest` | Bind exact (re-hashed now) output paths and validated artifact-id references to a started run, and mark its final phase — fails closed to `partial` on anything unverified |
 | `get_run_manifest` | Look up the current run-manifest record for a `run_id`, whatever phase it's in |
 | `list_run_manifests` | List every run-manifest record started under an outputs directory |
+| `check_input_staleness` | Report which of a run's inputs changed, went missing, or appeared since `start_run_manifest`, and the run's outputs that are therefore stale. Stat first, re-hash only on a size/mtime mismatch; `strict=True` re-hashes every input. `get_provenance_status` adds the same signal as `input_staleness` |
 | `get_run_manifest_envelope` | Typed, lossless `RUN`-kind `ProvenanceEnvelope` for one run manifest |
+
+### Ledger backup / export bundle (gap set C)
+
+`meridian_outputs.bundle` writes the four ledgers above (provenance,
+fingerprint, run manifest, artifact registry) plus an `index_meta` record
+to ONE JSON file: `{"format": "meridian-outputs-bundle", "schema_version":
+1, "members": {name: {sha256, size, payload}}, "bundle_digest"}`. Each
+member's sha256 is over its canonical JSON; `bundle_digest` covers every
+member digest bound to its name, so two exports of identical state have the
+same digest. The file is written through a temp file and an atomic replace.
+`index.duckdb` is not included (it is rebuildable), and registry
+`local_only_path` values are stripped. Checksums detect corruption, not
+deliberate tampering. Bundle paths must lie inside `outputs_dir`; the default
+sits under `.meridian-outputs-cache/bundles/`, which the index walk skips.
+
+| Tool | Description |
+|------|-------------|
+| `export_outputs_bundle` | Write every ledger plus index metadata to one checksummed bundle; refuses if a ledger file is empty or not valid JSON rather than backing it up as empty, if a file already exists at `bundle_path` (unless `overwrite`), or if the path is inside `.meridian-outputs-cache` outside its `bundles/` subdirectory |
+| `verify_outputs_bundle` | Recompute every member digest and the bundle digest; reports `mismatches`, `missing`, `unexpected`, `malformed`, `errors` (read-only) |
+| `import_outputs_bundle` | Verify, then merge a bundle into `outputs_dir`; dry run by default, refuses on any verification failure, hash-algorithm version mismatch (unless accepted), unreadable target ledger, or conflict (unless `overwrite`) |
 
 ### Derived-artifact cache & fast variant rendering (item 19917525)
 
@@ -265,7 +289,14 @@ self-consistent, not merely present.
   `*credential*`, `config.*`, `*.pem`, and many others).
 - The local index cache is auto-added to `.gitignore` on first use.
 - Concurrent index writes are serialised through `IndexFileLock`
-  (threading + optional cross-process portalocker).
+  (threading + a cross-process atomic-create lease file, the same in every
+  process whatever optional packages are installed).
+- Provenance and fingerprint ledger writes hold the same cross-process
+  `IndexFileLock` on the ledger file (`meridian_outputs.ledger_io`), write a
+  unique fsynced temporary file, and replace the ledger atomically. A
+  corrupt ledger is copied to `<ledger>.corrupt-<utc>` before it is
+  rewritten and is never read as empty; lock contention past the timeout
+  raises `IndexLockAcquireError` instead of dropping the write.
 - Same inputs always produce the same results (deterministic path ordering,
   stable sort, no non-reproducible set/dict iteration in output paths).
 

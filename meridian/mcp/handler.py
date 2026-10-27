@@ -7477,6 +7477,34 @@ async def _handle_paper_contract_tools(
     return _MISS
 
 
+async def _handle_guidestone_tools(
+    name: str,
+    args: dict[str, Any],
+    db: Any,
+    data_dir: str,
+    tenant: dict[str, Any] | None,
+    _mcp_tenant_id: Any,
+) -> Any:
+    """Dispatch group: guidestones -- create_guidestone, list_guidestones and
+    load_guidestone, the impromptu research waypoints. Own module and group
+    function, matching _handle_paper_contract_tools; see
+    meridian/mcp/handlers/guidestone_tools.py and meridian/db/guidestones.py."""
+    from .handlers.guidestone_tools import (  # noqa: PLC0415
+        handle_create_guidestone,
+        handle_list_guidestones,
+        handle_load_guidestone,
+    )
+
+    _standard_dispatch: dict[str, Any] = {
+        "create_guidestone": handle_create_guidestone,
+        "list_guidestones": handle_list_guidestones,
+        "load_guidestone": handle_load_guidestone,
+    }
+    if name in _standard_dispatch:
+        return await _standard_dispatch[name](args, db, data_dir, tenant, _mcp_tenant_id)
+    return _MISS
+
+
 async def _handle_runpod_tools(
     name: str,
     args: dict[str, Any],
@@ -7919,6 +7947,7 @@ async def _dispatch_mcp_tool(
         _handle_experiment_tools,
         _handle_docx_derivative_tools,
         _handle_paper_contract_tools,
+        _handle_guidestone_tools,
         _handle_runpod_tools,
         _handle_zotero_bridge_tools,
     )

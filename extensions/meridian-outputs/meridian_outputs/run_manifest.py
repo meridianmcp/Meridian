@@ -10,8 +10,10 @@ package already own -- it COMPOSES them behind one run-scoped receipt:
     module ever computes (never a second hash scheme).
   * :func:`outputs_local.get_convergence_state` for the walk/index's own
     convergence snapshot (never a second progress tracker).
-  * :func:`artifact_registry.get_artifact` to VALIDATE a caller-declared
-    artifact id already exists (never a second artifact identity store).
+  * the artifact registry's strict reader
+    (``artifact_registry._read_registry_strict``) to VALIDATE a
+    caller-declared artifact id already exists (never a second artifact
+    identity store).
   * :class:`research_evidence.EvidenceRecord` (kind ``RUN`` -- a slot that
     module's own ``EvidenceKind`` enum already reserved but nothing in this
     codebase ever populated) so a run manifest is representable inside the
@@ -23,7 +25,8 @@ What IS new here: one more atomic-JSON ledger --
 ``<outputs_dir>/.meridian-outputs-cache/run_manifest_ledger.json`` -- keyed
 by ``run_id``, following the exact same convention ``annotate.py``/
 ``fingerprint.py``/``artifact_registry.py`` already established (same cache
-dir, same ``os.replace`` atomic write, same in-process ``RLock``, same
+dir, same ``os.replace`` atomic write, same cross-process
+``ledger_io.ledger_transaction`` around every read-modify-write, same
 "never raises on I/O, degrade instead" discipline). This is deliberately
 the ONLY new piece of durable state this module owns -- every other field
 in a run-manifest record is either a caller-supplied identity input or a
@@ -66,15 +69,14 @@ import hashlib
 import json
 import logging
 import os
-import platform
 import subprocess
-import sys
 import threading
+from contextlib import contextmanager
 from datetime import datetime, timezone
-from typing import Any, Callable
+from typing import Any, Callable, Iterator
 
-from . import __version__ as _PACKAGE_VERSION
-from . import artifact_registry, fingerprint, outputs_local, research_evidence
+from . import artifact_registry, environment, fingerprint, ledger_io, outputs_local, research_evidence
+from .path_security import relative_reference
 
 _log = logging.getLogger(__name__)
 
@@ -85,6 +87,8 @@ __all__ = [
     "finalize_run_manifest",
     "get_run_manifest",
     "list_run_manifests",
+    "check_input_staleness",
+    "run_ids_for_output",
     "run_manifest_hash",
     "check_run_manifest_immutable",
     "run_manifest_to_evidence_record",
@@ -95,12 +99,12 @@ _CACHE_DIRNAME = ".meridian-outputs-cache"
 _LEDGER_FILENAME = "run_manifest_ledger.json"
 _SCHEMA_VERSION = 1
 
-# In-process only (not cross-process) -- see module docstring: this ledger
-# follows the SAME lower-stakes, mostly-single-writer sidecar convention
-# annotate.py/fingerprint.py already established. RLock (not Lock): several
-# functions below do their own read-modify-write and may be called reentrantly
-# from within a caller already holding this lock via a wrapping helper --
-# mirrors annotate.py's own fa600e42 fix for the identical hazard.
+# In-process lock, taken INSIDE the cross-process ledger transaction by every
+# writer (_ledger_write_transaction) and by bundle.import_bundle, in that
+# order, so neither can hold it while waiting for the transaction. The
+# transaction alone already serialises writers in every process (its own
+# per-path thread lock included); this lock is kept because bundle's import
+# takes it. Never take a ledger transaction for this ledger while holding it.
 _write_lock = threading.RLock()
 
 _VALID_START_PHASE = "in_progress"
@@ -136,8 +140,13 @@ class RunManifestError(ValueError):
 # Ledger location + atomic read/write (same convention as annotate.py)
 # ---------------------------------------------------------------------------
 
-def _cache_dir(outputs_dir: str) -> str:
+def _cache_dir(outputs_dir: str, *, create: bool = True) -> str:
+    """``<outputs_dir>/.meridian-outputs-cache``, created + gitignored on a
+    write. ``create=False`` (every read path) only computes the path: a read
+    never creates the directory or edits a ``.gitignore``."""
     cache_dir = os.path.join(outputs_dir, _CACHE_DIRNAME)
+    if not create:
+        return cache_dir
     try:
         os.makedirs(cache_dir, exist_ok=True)
         outputs_local.ensure_gitignored(cache_dir)
@@ -146,12 +155,12 @@ def _cache_dir(outputs_dir: str) -> str:
     return cache_dir
 
 
-def _ledger_path(outputs_dir: str) -> str:
-    return os.path.join(_cache_dir(outputs_dir), _LEDGER_FILENAME)
+def _ledger_path(outputs_dir: str, *, create: bool = True) -> str:
+    return os.path.join(_cache_dir(outputs_dir, create=create), _LEDGER_FILENAME)
 
 
 def _read_ledger(outputs_dir: str) -> dict[str, dict[str, Any]]:
-    path = _ledger_path(outputs_dir)
+    path = _ledger_path(outputs_dir, create=False)
     try:
         with open(path, "r", encoding="utf-8") as fh:
             data = json.load(fh)
@@ -160,15 +169,64 @@ def _read_ledger(outputs_dir: str) -> dict[str, dict[str, Any]]:
     return data if isinstance(data, dict) else {}
 
 
-def _write_ledger_entry(outputs_dir: str, key: str, record: dict[str, Any]) -> None:
-    path = _ledger_path(outputs_dir)
-    with _write_lock:
-        ledger = _read_ledger(outputs_dir)
-        ledger[key] = record
-        tmp = path + ".tmp"
-        with open(tmp, "w", encoding="utf-8") as fh:
-            json.dump(ledger, fh, indent=2, sort_keys=True)
-        os.replace(tmp, path)  # atomic on both POSIX and Windows
+def _read_ledger_strict(outputs_dir: str) -> dict[str, dict[str, Any]]:
+    """Strict read for staleness lookups (:func:`check_input_staleness`,
+    :func:`run_ids_for_output`), the writers (:func:`_read_ledger_for_write`)
+    and bundle export/import: ``{}`` only for a missing ledger. Bytes that
+    are not a JSON object, or a run row that is not an object, raise
+    ``ledger_io.LedgerCorruptError`` -- an unreadable ledger is never read
+    as "no run covers this output". :func:`_read_ledger` keeps its lenient
+    behaviour for plain listings."""
+    path = _ledger_path(outputs_dir, create=False)
+    return _parse_ledger_strict(path, ledger_io._read_bytes(path))
+
+
+def _parse_ledger_strict(path: str, raw: "bytes | None") -> dict[str, dict[str, Any]]:
+    """:func:`_read_ledger_strict`'s checks over bytes already read
+    (``None``: no ledger file)."""
+    ledger = {} if raw is None else ledger_io.parse_ledger_bytes(path, raw)
+    for record in ledger.values():
+        if not isinstance(record, dict):
+            kind = "null" if record is None else type(record).__name__
+            raise ledger_io.LedgerCorruptError(path, f"a run row is {kind}, not an object")
+    return ledger
+
+
+def _read_ledger_for_write(outputs_dir: str) -> dict[str, dict[str, Any]]:
+    """The writers' read, taken inside :func:`_ledger_write_transaction`.
+    Strict: a corrupt ledger is quarantined and
+    ``ledger_io.LedgerCorruptError`` raised (``ledger_io.raise_quarantined``),
+    so it is never read as ``{}`` and replaced by an entry-only ledger.
+    Continuing from empty (as the provenance ledger's writer does) would also
+    drop the per-run immutability check :func:`start_run_manifest` makes
+    against the existing record. Any other read ``OSError`` propagates;
+    nothing is written. The file is read once and the quarantine copies
+    exactly the bytes that failed. Takes no lock itself: the transaction's
+    lock is not reentrant."""
+    path = _ledger_path(outputs_dir, create=False)
+    raw = ledger_io._read_bytes(path)
+    try:
+        return _parse_ledger_strict(path, raw)
+    except ledger_io.LedgerCorruptError as exc:
+        ledger_io.raise_quarantined(exc, raw)
+
+
+@contextmanager
+def _ledger_write_transaction(outputs_dir: str) -> Iterator[ledger_io.LedgerTransaction]:
+    """Hold the run-manifest ledger for one read-modify-write.
+
+    ``ledger_io.ledger_transaction`` on the path the readers use (lock file
+    ``run_manifest_ledger.json.lock``), so a writer in another process can
+    no longer commit between this writer's read and its replace and have
+    its row dropped; then ``_write_lock`` inside it, the order
+    ``bundle.import_bundle`` takes the two in. Read with
+    :func:`_read_ledger_for_write` and write with ``txn.commit`` (unique temp
+    file, fsync, ``os.replace``). Not reentrant: never open a second one, or
+    any other transaction on this ledger, inside it. Raises
+    ``outputs_local.IndexLockAcquireError`` when another process holds the
+    ledger past the lock timeout; nothing is written then."""
+    with ledger_io.ledger_transaction(_ledger_path(outputs_dir)) as txn, _write_lock:
+        yield txn
 
 
 def _utcnow_iso() -> str:
@@ -249,6 +307,113 @@ def _file_set_hash(hashes: "dict[str, str | None]") -> str:
     exactly (independently implemented, package boundary -- see module
     docstring)."""
     return hashlib.sha256(_canonical_json(dict(sorted(hashes.items()))).encode("utf-8")).hexdigest()
+
+
+# ---------------------------------------------------------------------------
+# Input-change baseline (input_stat) -- see check_input_staleness
+# ---------------------------------------------------------------------------
+
+def _resolve_ref(outputs_dir: str, raw: str) -> str:
+    """Absolute real path for an input/output reference. A relative reference
+    is resolved against ``outputs_dir`` (the package-wide convention, see
+    ``annotate.record_provenance``), never the process's working directory."""
+    p = os.fspath(raw)
+    root = os.path.realpath(os.path.abspath(os.fspath(outputs_dir)))
+    candidate = p if os.path.isabs(p) else os.path.join(root, p)
+    return os.path.realpath(os.path.abspath(candidate))
+
+
+def _input_key(outputs_dir: str, resolved: str) -> str:
+    """Stable input_stat key: outputs_dir-relative (``../data/x.csv`` for a
+    sibling tree), or the absolute path when it is on another volume.
+    Case-normalised like the provenance ledger's keys, so two spellings of
+    one file share a key."""
+    rel = relative_reference(outputs_dir, resolved)
+    key = rel if rel is not None else resolved
+    return os.path.normcase(os.path.normpath(key)).replace("\\", "/")
+
+
+def _key_path(outputs_dir: str, key: str) -> str:
+    if os.path.isabs(key):
+        return key
+    root = os.path.realpath(os.path.abspath(os.fspath(outputs_dir)))
+    return os.path.normpath(os.path.join(root, key))
+
+
+def _stat_or_none(path: str) -> "os.stat_result | None":
+    """``os.stat`` of a regular file, else ``None``. A path ``os.stat``
+    rejects outright (ValueError, e.g. an embedded NUL byte) names no file
+    either: ``None``, as the hash of such a path already is."""
+    try:
+        st = os.stat(path)
+    except (OSError, ValueError):
+        return None
+    return st if os.path.isfile(path) else None
+
+
+def _stat_signature(path: str) -> "tuple[int, int] | None":
+    """``(size, mtime_ns)`` of ``path`` (as given, the way :func:`_hash_paths`
+    opens it), or ``None`` when it is not a regular file :func:`_stat_or_none`
+    can stat. :func:`finalize_run_manifest` compares it before hashing and
+    again under the ledger lock to tell whether a hash is still current."""
+    st = _stat_or_none(path)
+    return None if st is None else (st.st_size, st.st_mtime_ns)
+
+
+def _snapshot_inputs(
+    outputs_dir: str, input_paths: "list[str] | None",
+) -> "tuple[dict[str, str | None], dict[str, dict[str, Any]]]":
+    """``(file_hashes, input_stat)`` for ``input_paths``.
+
+    ``file_hashes`` is identity: it feeds ``manifest_hash``. It is exactly
+    what :func:`_hash_paths` has always produced -- keyed by the path as
+    given, hashed by :func:`fingerprint.script_content_hash` of that path,
+    so a relative input resolves against the process working directory.
+    Computing it any other way would change ``manifest_hash`` for a run
+    started before ``input_stat`` existed and make its resume fail with a
+    DIFFERENT-hash :class:`RunManifestError`.
+
+    ``input_stat`` is the staleness baseline (excluded from the hash): each
+    input resolved ONCE by :func:`_resolve_ref` (a relative path against
+    ``outputs_dir``, the resolver :func:`check_input_staleness` uses), and
+    that one file stat-ed and hashed, under its normalised key as
+    ``{exists, size, mtime_ns, sha256}``. The two hashes differ only for a
+    relative input whose working-directory and ``outputs_dir`` resolutions
+    are different files; staleness always uses the ``input_stat`` one. When
+    both resolve to the same file, its hash is reused rather than read
+    twice. Each file is stat-ed BEFORE it is hashed: if it changes in
+    between, a later check sees a stat mismatch and re-hashes, so a change
+    during capture can cost one extra hash but can never be missed.
+
+    A path the OS rejects outright (an embedded NUL byte raises ValueError,
+    from ``os.stat`` and, on POSIX, already from ``realpath``) names no
+    file: it is recorded absent under its normalised given spelling, and
+    its identity hash is ``None`` -- never an exception out of
+    :func:`start_run_manifest`.
+    """
+    file_hashes: "dict[str, str | None]" = {}
+    input_stat: dict[str, dict[str, Any]] = {}
+    for raw in input_paths or []:
+        given = str(raw)
+        try:
+            resolved = _resolve_ref(outputs_dir, given)
+            key = _input_key(outputs_dir, resolved)
+        except ValueError:
+            file_hashes[given] = fingerprint.script_content_hash(given)
+            input_stat[os.path.normcase(os.path.normpath(given)).replace("\\", "/")] = {
+                "exists": False, "size": None, "mtime_ns": None, "sha256": None,
+            }
+            continue
+        st = _stat_or_none(resolved)
+        sha = fingerprint.script_content_hash(resolved) if st is not None else None
+        same_file = st is not None and os.path.realpath(os.path.abspath(given)) == resolved
+        file_hashes[given] = sha if same_file else fingerprint.script_content_hash(given)
+        if st is None:
+            entry: dict[str, Any] = {"exists": False, "size": None, "mtime_ns": None, "sha256": None}
+        else:
+            entry = {"exists": True, "size": st.st_size, "mtime_ns": st.st_mtime_ns, "sha256": sha}
+        input_stat[key] = entry
+    return file_hashes, dict(sorted(input_stat.items()))
 
 
 # ---------------------------------------------------------------------------
@@ -347,6 +512,11 @@ _HASH_EXCLUDED_KEYS = (
     # class of nondeterminism -- it is recorded for audit on every call, but
     # never treated as part of what makes two runs "the same identity".
     "bounds",
+    # Per-input size/mtime_ns/sha256 baseline for check_input_staleness. The
+    # input identity is already input_identity.file_hashes; a touch that
+    # leaves the bytes unchanged must not turn an idempotent re-start into
+    # an identity collision.
+    "input_stat",
 )
 
 
@@ -432,11 +602,18 @@ def start_run_manifest(
     ``repo_dir``), package/tool version (``meridian_outputs.__version__``,
     the interpreter version, platform), command identity (``command_name``
     + ``command_args``), input hashes (:func:`fingerprint.script_content_hash`
-    over ``input_paths``), the bounds actually in effect
+    over ``input_paths`` as given, unchanged since this module's first
+    version so existing runs keep their identity -- see
+    :func:`_snapshot_inputs`), the bounds actually in effect
     (:func:`_snapshot_bounds`), the on-disk location of every ledger this
     run can reference (this module's own, plus the provenance/fingerprint/
     artifact-registry ledgers this package already maintains), and a
-    convergence-state snapshot taken right now.
+    convergence-state snapshot taken right now. ``input_stat`` keeps each
+    input's size, mtime_ns and hash -- a relative input resolved against
+    ``outputs_dir``, never the working directory -- under an
+    outputs_dir-relative key as the baseline for
+    :func:`check_input_staleness`; it is excluded from ``manifest_hash``
+    (see ``_HASH_EXCLUDED_KEYS``).
 
     Idempotent: calling this again with identical identity inputs (same
     ``run_id`` and everything :func:`run_manifest_hash` covers) returns the
@@ -450,6 +627,11 @@ def start_run_manifest(
       manifest already exists for this ``run_id`` with a DIFFERENT identity
       hash (see :func:`check_run_manifest_immutable`) -- fails closed rather
       than silently overwriting a different run's identity.
+      ledger_io.LedgerCorruptError: the run-manifest ledger exists but cannot
+      be parsed. Its bytes are quarantined (``quarantine_path``) and nothing
+      is written: a damaged ledger is never replaced by this one record.
+      outputs_local.IndexLockAcquireError: another process held the ledger's
+      cross-process lock past its timeout; nothing is written.
     """
     if not outputs_dir or not str(outputs_dir).strip():
         raise RunManifestError("outputs_dir is required")
@@ -466,12 +648,18 @@ def start_run_manifest(
             )
         expected_counts_normalized[str(k)] = v
 
-    input_hashes = _hash_paths(input_paths)
+    input_hashes, input_stat = _snapshot_inputs(outputs_dir, input_paths)
     git_state = (
         capture_git_state(repo_dir, run=_git_runner)
         if repo_dir else {"head": None, "dirty_files": []}
     )
     cache_dir = _cache_dir(outputs_dir)
+    # Same snapshot record_provenance stores as `reproduction`, so the run's
+    # package identity and each output's record cannot drift apart. Only the
+    # four long-standing fields go into package_identity: adding the
+    # dependency versions here would change manifest_hash and make a resumed
+    # run that was started before this change look like an identity collision.
+    env = environment.capture_environment()
 
     manifest: dict[str, Any] = {
         "schema_version": _SCHEMA_VERSION,
@@ -486,10 +674,10 @@ def start_run_manifest(
             "args": dict(command_args or {}),
         },
         "package_identity": {
-            "name": "meridian_outputs",
-            "version": _PACKAGE_VERSION,
-            "python_version": sys.version.split()[0],
-            "platform": platform.platform(),
+            "name": env["package_name"],
+            "version": env["package_version"],
+            "python_version": env["python_version"],
+            "platform": env["platform"],
         },
         "repo_identity": {"repo_dir": repo_dir, **git_state},
         "input_identity": {
@@ -516,6 +704,8 @@ def start_run_manifest(
         "status_reason": None,
         "convergence_at_start": _safe_convergence(outputs_dir),
         "convergence_at_finish": None,
+        # Baseline for check_input_staleness (excluded from the hash).
+        "input_stat": input_stat,
     }
     manifest["manifest_hash"] = run_manifest_hash(manifest)
     now = _utcnow_iso()
@@ -523,15 +713,18 @@ def start_run_manifest(
     manifest["updated_at"] = now
 
     key = manifest["run_id"]
-    with _write_lock:
-        ledger = _read_ledger(outputs_dir)
+    # One transaction for the read, the immutability check and the write:
+    # a concurrent writer in any process cannot commit in between.
+    with _ledger_write_transaction(outputs_dir) as txn:
+        ledger = _read_ledger_for_write(outputs_dir)
         existing = ledger.get(key)
         ok, reason = check_run_manifest_immutable(existing, manifest)
         if not ok:
             raise RunManifestError(reason)
         if existing is not None and existing.get("manifest_hash") == manifest["manifest_hash"]:
             return dict(existing)
-        _write_ledger_entry(outputs_dir, key, manifest)
+        ledger[key] = manifest
+        txn.commit(ledger)
     return dict(manifest)
 
 
@@ -550,15 +743,21 @@ def finalize_run_manifest(
 
     Fail-closed exact output binding: every path in ``output_paths`` is
     RE-HASHED right now via :func:`fingerprint.script_content_hash` --
-    never trusts a caller-declared hash. A path that is missing/unreadable
+    never trusts a caller-declared hash -- and its ``(size, mtime_ns)`` is
+    checked again under the ledger lock; an output that changed since its
+    hash is hashed again there, so the hash committed (and the convergence
+    snapshot, read under the lock) is current at commit time even when two
+    finalizes of one run race. A path that is missing/unreadable
     at finalize time is recorded under ``output_identity.missing_or_unreadable``
     and downgrades an attempted ``status="complete"`` to ``"partial"``
     automatically (never silently reported as a clean, fully-verified
     run). The same fail-closed treatment applies to ``artifact_ids``: each
-    one is checked against :func:`artifact_registry.get_artifact` (never
-    re-derived or duplicated here) and an id that does not resolve is
-    recorded under ``unknown_artifact_ids`` and likewise downgrades
-    ``"complete"`` to ``"partial"``.
+    one is looked up in the artifact registry, read once through its strict
+    reader (``artifact_registry._read_registry_strict``; never re-derived
+    or duplicated here), and an id that is not registered is recorded under
+    ``unknown_artifact_ids`` and likewise downgrades ``"complete"`` to
+    ``"partial"``. A registry that cannot be read is an error, never "not
+    registered" (see Raises).
 
     Args:
       outputs_dir:    Absolute path to the outputs directory.
@@ -583,6 +782,15 @@ def finalize_run_manifest(
       RunManifestError: ``outputs_dir``/``run_id`` missing, ``status`` not
       one of the valid values, or no manifest was ever started for this
       ``run_id`` -- finalize never creates a fresh identity on its own.
+      ledger_io.LedgerCorruptError: the run-manifest ledger exists but cannot
+      be parsed (quarantined, nothing written; see :func:`start_run_manifest`),
+      or ``artifact_ids`` is non-empty and the artifact registry exists but
+      cannot be parsed (nothing written; the registry is only read, so it is
+      not quarantined here).
+      OSError: ``artifact_ids`` is non-empty and the artifact registry cannot
+      be read; nothing is written.
+      outputs_local.IndexLockAcquireError: another process held the ledger's
+      cross-process lock past its timeout; nothing is written.
     """
     if not outputs_dir or not str(outputs_dir).strip():
         raise RunManifestError("outputs_dir is required")
@@ -594,8 +802,20 @@ def finalize_run_manifest(
             f"status must be one of {_VALID_FINAL_STATUSES}, got {status!r}"
         )
 
-    with _write_lock:
-        ledger = _read_ledger(outputs_dir)
+    # Hashing the outputs reads no ledger, so it runs before the
+    # cross-process lock: hashing large outputs while holding it would stall
+    # every other process's run-manifest writer. Each output's (size,
+    # mtime_ns) is taken BEFORE it is hashed and compared again under the
+    # lock below, so a change at any point after the stat is caught there.
+    output_list = [str(p) for p in output_paths or []]
+    signatures = {p: _stat_signature(p) for p in output_list}
+    output_hashes = _hash_paths(output_list)
+
+    # The registry is read inside this transaction without a lock of its own
+    # (a strict, lock-free read of a different ledger path), so no second
+    # transaction is ever nested here.
+    with _ledger_write_transaction(outputs_dir) as txn:
+        ledger = _read_ledger_for_write(outputs_dir)
         existing = ledger.get(key)
         if existing is None:
             raise RunManifestError(
@@ -604,26 +824,38 @@ def finalize_run_manifest(
                 "never creates a fresh identity)"
             )
 
-        output_hashes = _hash_paths(output_paths)
+        resolved_artifact_ids: list[str] = []
+        unknown_artifact_ids: list[str] = []
+        # One strict registry read, only when ids were given. A registry that
+        # is corrupt (LedgerCorruptError) or cannot be read (OSError) raises
+        # here, before anything is written: read leniently it looked empty,
+        # so every id was recorded as not found and a "partial" verdict was
+        # persisted for a store failure.
+        registered = (
+            artifact_registry._read_registry_strict(outputs_dir)["artifacts"]
+            if artifact_ids else {}
+        )
+        for aid in (artifact_ids or []):
+            if isinstance(aid, str) and aid in registered:
+                resolved_artifact_ids.append(aid)
+            else:
+                unknown_artifact_ids.append(aid)
+
+        # Commit only what is current now. Another finalize of this run, or
+        # the producer, may have rewritten an output while this one waited
+        # for the lock: an output whose signature moved since its hash is
+        # hashed again here, and the (cheap) convergence snapshot is read
+        # here, so a late committer never puts an older hash, snapshot or
+        # "missing" verdict over a newer one.
+        changed = [p for p, sig in signatures.items() if _stat_signature(p) != sig]
+        output_hashes.update(_hash_paths(changed))
         missing = sorted(p for p, h in output_hashes.items() if h is None)
         output_identity = {
             "file_hashes": dict(sorted(output_hashes.items())),
             "file_set_hash": _file_set_hash(output_hashes),
             "missing_or_unreadable": missing,
         }
-
-        resolved_artifact_ids: list[str] = []
-        unknown_artifact_ids: list[str] = []
-        for aid in (artifact_ids or []):
-            try:
-                rec = artifact_registry.get_artifact(outputs_dir, aid)
-            except Exception:  # noqa: BLE001 -- treat a lookup failure like "unknown"
-                _log.debug("run_manifest: get_artifact failed for %r", aid, exc_info=True)
-                rec = None
-            if rec is None:
-                unknown_artifact_ids.append(aid)
-            else:
-                resolved_artifact_ids.append(aid)
+        convergence_at_finish = _safe_convergence(outputs_dir)
 
         effective_status = status
         problems: list[str] = []
@@ -648,11 +880,12 @@ def finalize_run_manifest(
         updated["artifact_ids"] = sorted(set(resolved_artifact_ids))
         updated["unknown_artifact_ids"] = sorted(set(unknown_artifact_ids))
         updated["status_reason"] = status_reason
-        updated["convergence_at_finish"] = _safe_convergence(outputs_dir)
+        updated["convergence_at_finish"] = convergence_at_finish
         updated["updated_at"] = _utcnow_iso()
         # manifest_hash is an IDENTITY hash fixed at start_run_manifest time
         # -- deliberately untouched here (see _HASH_EXCLUDED_KEYS).
-        _write_ledger_entry(outputs_dir, key, updated)
+        ledger[key] = updated
+        txn.commit(ledger)
     return dict(updated)
 
 
@@ -674,6 +907,194 @@ def list_run_manifests(outputs_dir: str) -> "list[dict[str, Any]]":
     existing no-hidden-dict-order convention)."""
     ledger = _read_ledger(outputs_dir)
     return [dict(ledger[k]) for k in sorted(ledger)]
+
+
+# ---------------------------------------------------------------------------
+# Input-change staleness
+# ---------------------------------------------------------------------------
+
+_STALE_INPUT_STATUSES = ("changed", "missing", "appeared", "unreadable", "unverifiable")
+_LEGACY_RELATIVE_REASON = (
+    "relative input recorded before input_stat existed: its only hash is of the "
+    "path as given against the run's start-time working directory, which was not "
+    "recorded, so the file it describes is unknown -- staleness cannot be "
+    "confirmed either way"
+)
+
+
+def _classify_input(
+    path: str, base: dict[str, Any], *, strict: bool,
+) -> "tuple[str, str, bool]":
+    """``(status, reason, hashed)`` for one input against its baseline."""
+    st = _stat_or_none(path)
+    if not base.get("exists"):
+        if st is None:
+            return "absent", "absent at run start and still absent", False
+        return "appeared", "absent at run start, present now", False
+    if st is None:
+        return "missing", "present at run start, missing now", False
+    if (
+        not strict
+        and base.get("size") is not None
+        and base.get("size") == st.st_size
+        and base.get("mtime_ns") == st.st_mtime_ns
+    ):
+        return "unchanged", "size and mtime unchanged since run start (not re-hashed)", False
+    current = fingerprint.script_content_hash(path)
+    recorded = base.get("sha256")
+    if current is None:
+        return "unreadable", "exists but cannot be read now", True
+    if recorded is None:
+        return "unverifiable", "no content hash was captured at run start", True
+    if current != recorded:
+        return "changed", "content hash differs from the hash recorded at run start", True
+    if strict:
+        return "unchanged", "content hash unchanged (strict re-hash)", True
+    return "unchanged", "size/mtime changed but content hash unchanged", True
+
+
+def check_input_staleness(
+    outputs_dir: str, run_id: str, *, strict: bool = False,
+) -> dict[str, Any]:
+    """Have any of ``run_id``'s inputs changed since the run started?
+
+    Compares every input recorded by :func:`start_run_manifest` with the file
+    on disk now. Stat first: an input whose size and mtime_ns both match the
+    start-time baseline is reported unchanged WITHOUT being read, so a sweep
+    over a large tree costs one ``stat`` per input. Only a stat mismatch (or
+    ``strict=True``) re-hashes, through the same
+    :func:`fingerprint.script_content_hash` used at start. Consequence of the
+    default: an edit that keeps both size and mtime_ns (for example a tool
+    that restores the timestamp) is missed; ``strict=True`` hashes every
+    input and catches it.
+
+    Each input gets a status: ``unchanged``, ``absent`` (absent at start and
+    still absent), ``unknown`` (see below), or one of the stale statuses
+    ``changed``, ``missing``, ``appeared`` (absent at start, present now),
+    ``unreadable`` and ``unverifiable`` (no start-time hash). Inputs are
+    keyed relative to ``outputs_dir`` (absolute when on another volume); a
+    relative input path is resolved against ``outputs_dir``, and compared
+    with the ``input_stat`` hash :func:`start_run_manifest` took of that
+    same file. A manifest written before ``input_stat`` existed has no stat
+    baseline, so every input is re-hashed against
+    ``input_identity.file_hashes`` (``baseline="legacy_hash_only"``). Those
+    identity hashes are of the path as given: an absolute input is compared
+    as before, but a relative one was hashed against the start-time working
+    directory, which the record does not keep, so which file its hash
+    describes is unknown. Such an input is reported ``unknown`` and never
+    compared, since a comparison against the ``outputs_dir`` file could
+    read a real change as ``unchanged``.
+
+    Returns ``{run_id, strict, baseline, stale, reason, inputs, stale_inputs,
+    stale_outputs, hashed_count}``. ``stale`` is ``True`` when any input is
+    stale, ``None`` (unknown, never ``False``) when none is stale but an
+    input is ``unknown``, else ``False``. ``stale_outputs`` lists the run's
+    finalized output paths (as recorded) when ``stale`` is ``True``, else
+    ``[]``; it is also ``[]`` for a run that was never finalized.
+
+    Raises:
+      RunManifestError: missing ``outputs_dir``/``run_id``, or no manifest
+      was ever started for ``run_id``.
+      ledger_io.LedgerCorruptError: the run-manifest ledger exists but
+      cannot be parsed (strict read) -- never reported as "no manifest".
+    """
+    if not outputs_dir or not str(outputs_dir).strip():
+        raise RunManifestError("outputs_dir is required")
+    key = str(run_id).strip() if run_id else ""
+    manifest = _read_ledger_strict(outputs_dir).get(key) if key else None
+    if manifest is None:
+        raise RunManifestError(f"no run manifest found for run_id={run_id!r}")
+
+    baseline = manifest.get("input_stat")
+    mode = "stat_and_hash"
+    unresolvable: set[str] = set()
+    if not isinstance(baseline, dict):
+        mode = "legacy_hash_only"
+        baseline = {}
+        hashes = (manifest.get("input_identity") or {}).get("file_hashes") or {}
+        for given, sha in hashes.items():
+            key = _input_key(outputs_dir, _resolve_ref(outputs_dir, given))
+            if os.path.isabs(str(given)):
+                baseline[key] = {"exists": sha is not None, "size": None, "mtime_ns": None, "sha256": sha}
+            else:
+                # The identity hash of a relative input is of the path as
+                # given against the start-time working directory, which the
+                # record does not keep: which file it describes is unknown.
+                unresolvable.add(key)
+        unresolvable.difference_update(baseline)  # an absolute spelling of it was recorded
+        for key in unresolvable:
+            baseline[key] = {}
+
+    inputs: list[dict[str, Any]] = []
+    hashed_count = 0
+    for key in sorted(baseline):
+        if key in unresolvable:
+            inputs.append({"input": key, "status": "unknown", "reason": _LEGACY_RELATIVE_REASON})
+            continue
+        base = baseline[key] if isinstance(baseline[key], dict) else {}
+        status, reason, hashed = _classify_input(
+            _key_path(outputs_dir, key), base, strict=strict,
+        )
+        hashed_count += int(hashed)
+        inputs.append({"input": key, "status": status, "reason": reason})
+
+    stale_inputs = [i["input"] for i in inputs if i["status"] in _STALE_INPUT_STATUSES]
+    unknown_inputs = [i["input"] for i in inputs if i["status"] == "unknown"]
+    outputs = sorted(((manifest.get("output_identity") or {}).get("file_hashes") or {}))
+    stale: "bool | None" = True if stale_inputs else (None if unknown_inputs else False)
+    if not inputs:
+        reason = "run recorded no inputs"
+    elif stale:
+        reason = (
+            f"{len(stale_inputs)} of {len(inputs)} input(s) changed since run start: "
+            + ", ".join(f"{i['input']} ({i['status']})" for i in inputs if i["input"] in stale_inputs)
+        )
+    elif unknown_inputs:
+        reason = (
+            f"{len(unknown_inputs)} of {len(inputs)} input(s) cannot be checked: "
+            + ", ".join(f"{k} (unknown)" for k in unknown_inputs)
+            + " -- staleness cannot be confirmed either way"
+        )
+    else:
+        reason = f"all {len(inputs)} input(s) unchanged since run start"
+    return {
+        "run_id": manifest.get("run_id"),
+        "strict": bool(strict),
+        "baseline": mode,
+        "stale": stale,
+        "reason": reason,
+        "inputs": inputs,
+        "stale_inputs": stale_inputs,
+        "stale_outputs": outputs if stale else [],
+        "hashed_count": hashed_count,
+    }
+
+
+def run_ids_for_output(
+    outputs_dir: str, path: str, *, record_run_id: "str | None" = None,
+) -> "list[str]":
+    """Run ids whose manifest covers output ``path``: every run whose
+    finalized ``output_identity`` lists it (relative paths resolved against
+    ``outputs_dir``), plus ``record_run_id`` (a provenance record's
+    ``run_id``) when that run exists. Sorted; one strict ledger read:
+    raises ``ledger_io.LedgerCorruptError`` for an unreadable ledger rather
+    than returning ``[]`` ("no run covers it")."""
+    if not path or not str(path).strip():
+        return []
+    target = os.path.normcase(_resolve_ref(outputs_dir, str(path)))
+    found: set[str] = set()
+    ledger = _read_ledger_strict(outputs_dir)
+    for manifest in (ledger[k] for k in sorted(ledger)):
+        rid = manifest.get("run_id")
+        if not isinstance(rid, str):
+            continue
+        if record_run_id is not None and rid == record_run_id:
+            found.add(rid)
+            continue
+        outputs = (manifest.get("output_identity") or {}).get("file_hashes") or {}
+        if any(os.path.normcase(_resolve_ref(outputs_dir, str(p))) == target for p in outputs):
+            found.add(rid)
+    return sorted(found)
 
 
 # ---------------------------------------------------------------------------

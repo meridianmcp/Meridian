@@ -79,11 +79,12 @@ import platform
 import threading
 import time
 import uuid
+from contextlib import contextmanager
 from dataclasses import asdict, dataclass, field
 from datetime import datetime, timezone
-from typing import Any
+from typing import Any, Iterator
 
-from . import annotate, fingerprint, outputs_local
+from . import annotate, fingerprint, ledger_io, outputs_local
 
 __all__ = [
     "RegistryError",
@@ -122,10 +123,12 @@ _REGISTRY_FILENAME = "artifact_registry.json"
 # artifact_id, so it is a constant, not configuration.
 _ARTIFACT_ID_NAMESPACE = uuid.UUID("6f1d6b6a-6d3a-4b1a-9a9b-e1c979e36d57")
 
-# In-process only, matching annotate.py's own reasoning: this is a
-# lower-stakes, mostly-single-writer sidecar ledger, not the shared FTS
-# index -- cross-process portalocker exclusivity is not warranted here
-# either.
+# In-process lock, taken INSIDE the cross-process registry transaction by
+# every writer (_registry_write_transaction) and by bundle.import_bundle, in
+# that order, so neither can hold it while waiting for the transaction. The
+# transaction alone already serialises writers in every process (its own
+# per-path thread lock included); this lock is kept because bundle's import
+# takes it. Never take a ledger transaction for the registry while holding it.
 _write_lock = threading.Lock()
 
 RESOLVED = "resolved"
@@ -156,8 +159,13 @@ class RegistryError(ValueError):
 # Storage
 # ---------------------------------------------------------------------------
 
-def _cache_dir(outputs_dir: str) -> str:
+def _cache_dir(outputs_dir: str, *, create: bool = True) -> str:
+    """``<outputs_dir>/.meridian-outputs-cache``, created + gitignored on a
+    write. ``create=False`` (every read path) only computes the path: a read
+    never creates the directory or edits a ``.gitignore``."""
     cache_dir = os.path.join(outputs_dir, _CACHE_DIRNAME)
+    if not create:
+        return cache_dir
     try:
         os.makedirs(cache_dir, exist_ok=True)
         outputs_local.ensure_gitignored(cache_dir)
@@ -166,8 +174,8 @@ def _cache_dir(outputs_dir: str) -> str:
     return cache_dir
 
 
-def _registry_path(outputs_dir: str) -> str:
-    return os.path.join(_cache_dir(outputs_dir), _REGISTRY_FILENAME)
+def _registry_path(outputs_dir: str, *, create: bool = True) -> str:
+    return os.path.join(_cache_dir(outputs_dir, create=create), _REGISTRY_FILENAME)
 
 
 def _empty_registry() -> dict[str, Any]:
@@ -175,7 +183,7 @@ def _empty_registry() -> dict[str, Any]:
 
 
 def _read_registry(outputs_dir: str) -> dict[str, Any]:
-    path = _registry_path(outputs_dir)
+    path = _registry_path(outputs_dir, create=False)
     try:
         with open(path, "r", encoding="utf-8") as fh:
             data = json.load(fh)
@@ -192,12 +200,73 @@ def _read_registry(outputs_dir: str) -> dict[str, Any]:
     return data
 
 
+def _parse_registry_strict(path: str, raw: bytes | None) -> dict[str, Any]:
+    """:func:`_read_registry_strict`'s checks over bytes already read
+    (``None``: no registry file)."""
+    data = {} if raw is None else ledger_io.parse_ledger_bytes(path, raw)
+    artifacts = data.setdefault("artifacts", {})
+    edges = data.setdefault("edges", [])
+    if not isinstance(artifacts, dict) or not all(isinstance(r, dict) for r in artifacts.values()):
+        raise ledger_io.LedgerCorruptError(path, "artifacts is not an object of artifact records")
+    if not isinstance(edges, list) or not all(isinstance(e, dict) for e in edges):
+        raise ledger_io.LedgerCorruptError(path, "edges is not a list of edge objects")
+    return data
+
+
+def _read_registry_strict(outputs_dir: str) -> dict[str, Any]:
+    """Strict read: an empty registry only for a missing file. Bytes that are
+    not a JSON object, ``artifacts`` that is not an object of objects, or
+    ``edges`` that is not a list of objects raise
+    ``ledger_io.LedgerCorruptError`` instead of being normalised to empty the
+    way :func:`_read_registry` does. An absent ``artifacts``/``edges`` key
+    reads as empty. Takes no lock."""
+    path = _registry_path(outputs_dir, create=False)
+    return _parse_registry_strict(path, ledger_io._read_bytes(path))
+
+
+def _read_registry_for_write(outputs_dir: str) -> dict[str, Any]:
+    """The writers' read, taken inside :func:`_registry_write_transaction`. A
+    corrupt registry is quarantined and ``ledger_io.LedgerCorruptError``
+    raised (``ledger_io.raise_quarantined``), so it is never read as empty
+    and replaced by a one-artifact registry. Continuing from empty would also
+    drop the content-hash conflict check :func:`register_artifact` makes
+    against the existing record. Nothing is written. The file is read once
+    and the quarantine copies exactly the bytes that failed. Takes no lock
+    itself: the transaction's lock is not reentrant."""
+    path = _registry_path(outputs_dir, create=False)
+    raw = ledger_io._read_bytes(path)
+    try:
+        return _parse_registry_strict(path, raw)
+    except ledger_io.LedgerCorruptError as exc:
+        ledger_io.raise_quarantined(exc, raw)
+
+
 def _write_registry(outputs_dir: str, registry: dict[str, Any]) -> None:
-    path = _registry_path(outputs_dir)
-    tmp = path + ".tmp"
-    with open(tmp, "w", encoding="utf-8") as fh:
-        json.dump(registry, fh, indent=2, sort_keys=True)
-    os.replace(tmp, path)  # atomic on both POSIX and Windows
+    """Unique temp file, fsync, then ``os.replace``
+    (``ledger_io.write_ledger_atomic``): a crash can never leave a zero-length
+    or truncated registry, which the strict read would refuse for good, and a
+    failed write leaves the previous registry and no temp file behind. Takes
+    no lock: the writers below read-modify-write inside
+    :func:`_registry_write_transaction` and commit through it instead."""
+    ledger_io.write_ledger_atomic(_registry_path(outputs_dir), registry)
+
+
+@contextmanager
+def _registry_write_transaction(outputs_dir: str) -> Iterator[ledger_io.LedgerTransaction]:
+    """Hold the registry for one read-modify-write.
+
+    ``ledger_io.ledger_transaction`` on the path the readers use (lock file
+    ``artifact_registry.json.lock``), so a writer in another process can no
+    longer commit between this writer's read and its replace and have its
+    artifact or edge dropped; then ``_write_lock`` inside it, the order
+    ``bundle.import_bundle`` takes the two in. Read with
+    :func:`_read_registry_for_write` and write with ``txn.commit`` (unique
+    temp file, fsync, ``os.replace``). Not reentrant: never open a second
+    one, or any other transaction on the registry, inside it. Raises
+    ``outputs_local.IndexLockAcquireError`` when another process holds the
+    registry past the lock timeout; nothing is written then."""
+    with ledger_io.ledger_transaction(_registry_path(outputs_dir)) as txn, _write_lock:
+        yield txn
 
 
 def _utcnow_iso() -> str:
@@ -403,6 +472,14 @@ def register_artifact(
           already on file for this id from a prior registration. Either way
           the write is refused rather than silently accepted or silently
           overwriting a conflicting prior hash.
+      ledger_io.LedgerCorruptError: the registry file exists but cannot be
+        parsed. Its bytes are quarantined (``quarantine_path``) and nothing
+        is written. :func:`set_lifecycle_state` and :func:`bind_source_edge`
+        refuse the same way.
+      outputs_local.IndexLockAcquireError: another process held the
+        registry's cross-process lock past its timeout; nothing is written.
+        :func:`set_lifecycle_state` and :func:`bind_source_edge` raise it
+        the same way.
     """
     if not outputs_dir or not str(outputs_dir).strip():
         raise RegistryError("register_artifact: outputs_dir is required")
@@ -431,8 +508,8 @@ def register_artifact(
         source_locator=source_locator,
     )
 
-    with _write_lock:
-        registry = _read_registry(outputs_dir)
+    with _registry_write_transaction(outputs_dir) as txn:
+        registry = _read_registry_for_write(outputs_dir)
         existing = registry["artifacts"].get(artifact_id)
         now = _utcnow_iso()
 
@@ -496,7 +573,7 @@ def register_artifact(
                 })
 
         registry["artifacts"][artifact_id] = record
-        _write_registry(outputs_dir, registry)
+        txn.commit(registry)
 
     return {**record, "created": existing is None}
 
@@ -770,8 +847,8 @@ def set_lifecycle_state(
             f"set_lifecycle_state: lifecycle_state must be one of "
             f"{LIFECYCLE_STATES}, got {lifecycle_state!r}"
         )
-    with _write_lock:
-        registry = _read_registry(outputs_dir)
+    with _registry_write_transaction(outputs_dir) as txn:
+        registry = _read_registry_for_write(outputs_dir)
         record = registry["artifacts"].get(artifact_id)
         if record is None:
             raise RegistryError(
@@ -785,7 +862,7 @@ def set_lifecycle_state(
             "from": previous, "to": lifecycle_state, "at": now, "reason": reason,
         })
         registry["artifacts"][artifact_id] = record
-        _write_registry(outputs_dir, registry)
+        txn.commit(registry)
     return dict(record)
 
 
@@ -808,15 +885,17 @@ def bind_source_edge(
 
     Raises:
       RegistryError: ``artifact_id`` was never registered, or
-        ``source_locator``/``relation`` is empty.
+        ``source_locator``/``relation`` is not a non-empty string. A
+        non-string would be stored as-is, and every later bundle export
+        refuses a registry whose edge fields are not strings.
     """
-    if not source_locator or not str(source_locator).strip():
-        raise RegistryError("bind_source_edge: source_locator is required")
-    if not relation or not str(relation).strip():
-        raise RegistryError("bind_source_edge: relation is required")
+    if not isinstance(source_locator, str) or not source_locator.strip():
+        raise RegistryError("bind_source_edge: source_locator must be a non-empty string")
+    if not isinstance(relation, str) or not relation.strip():
+        raise RegistryError("bind_source_edge: relation must be a non-empty string")
 
-    with _write_lock:
-        registry = _read_registry(outputs_dir)
+    with _registry_write_transaction(outputs_dir) as txn:
+        registry = _read_registry_for_write(outputs_dir)
         if artifact_id not in registry["artifacts"]:
             raise RegistryError(
                 f"bind_source_edge: cannot bind an edge to unregistered "
@@ -831,7 +910,7 @@ def bind_source_edge(
                     merged = dict(edge.get("metadata") or {})
                     merged.update(metadata)
                     edge["metadata"] = merged
-                _write_registry(outputs_dir, registry)
+                txn.commit(registry)
                 return dict(edge)
 
         edge = SourceEdge(
@@ -843,7 +922,7 @@ def bind_source_edge(
             metadata=dict(metadata or {}),
         ).to_dict()
         registry["edges"].append(edge)
-        _write_registry(outputs_dir, registry)
+        txn.commit(registry)
     return edge
 
 

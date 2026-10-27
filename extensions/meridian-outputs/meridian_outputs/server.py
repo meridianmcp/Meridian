@@ -66,8 +66,8 @@ Security notes:
   - The local index cache directory is auto-added to .gitignore on first use
     (via outputs_local.ensure_gitignored, called by the search tool when it
     creates a persistent DB).
-  - All index writes are serialised through IndexFileLock (threading + optional
-    cross-process portalocker) to prevent cache corruption.
+  - All index writes are serialised through IndexFileLock (threading + a
+    cross-process atomic-create lease file) to prevent cache corruption.
 """
 from __future__ import annotations
 
@@ -479,6 +479,7 @@ def record_provenance(
     decision_id: str | None = None,
     note: str | None = None,
     experiment_run_id: str | None = None,
+    run_id: str | None = None,
 ) -> dict[str, Any]:
     """Attach lightweight reproducibility metadata to one output file.
 
@@ -489,10 +490,12 @@ def record_provenance(
     (upsert by normalized path) at
     ``<outputs_dir>/.meridian-outputs-cache/provenance_ledger.json`` -- fully
     local, no hosted call, no DB engine. Calling this again for the same
-    path OVERWRITES the previous record in place; this is NOT an
-    append-only log and no history is kept (corrected bd5b8d79 -- an earlier
-    version of this docstring incorrectly described an append-only JSONL
-    sidecar, which was never the actual implementation).
+    path makes the new record current and moves the previous one into that
+    path's bounded version history (newest 50 superseded records, read with
+    ``get_provenance_history``); this is still one JSON object per path, not
+    an append-only log (corrected bd5b8d79 -- an earlier version of this
+    docstring incorrectly described an append-only JSONL sidecar, which was
+    never the actual implementation).
 
     Args:
       outputs_dir:        Absolute path to the outputs directory.
@@ -511,12 +514,19 @@ def record_provenance(
                           omitting it is unchanged behavior. Stored as an
                           opaque string, not validated against a live run
                           (this extension has no DB engine access).
+      run_id:              Optional ``start_run_manifest`` run id that
+                          produced this output; stored as an opaque string
+                          so the record joins to that run's manifest.
 
     Returns:
       The stored record as {path, generating_script, params, sprint_item_id,
       decision_id, note, recorded_at, recorded_at_iso, content_hash,
-      experiment_run_id}, or
-      {error: ...}. ``content_hash`` (bd5b8d79) is a best-effort SHA-256 of
+      script_content_hash, experiment_run_id, run_id, reproduction,
+      version}, or {error: ...}. ``version`` is the record's 1-based version
+      for this path. ``reproduction`` holds the interpreter version,
+      platform, this package's version and the installed versions of its
+      direct runtime dependencies at record time (``None`` for one that is
+      not installed); the command line is not recorded. ``content_hash`` (bd5b8d79) is a best-effort SHA-256 of
       ``path``'s on-disk bytes at record time (``None`` if unreadable) --
       used by ``get_provenance_status`` to later detect relocation/drift.
       This is a pure exact-record write; call ``get_provenance_status`` (not
@@ -532,6 +542,7 @@ def record_provenance(
         decision_id=decision_id,
         note=note,
         experiment_run_id=experiment_run_id,
+        run_id=run_id,
     )
 
 
@@ -565,6 +576,30 @@ def get_provenance(outputs_dir: str, path: str) -> dict[str, Any] | None:
 
 
 @mcp.tool()
+def get_provenance_history(outputs_dir: str, path: str) -> dict[str, Any] | None:
+    """Every retained ``record_provenance`` record for one output file,
+    oldest first, with the current record last.
+
+    Re-recording a path keeps its previous record in a bounded history (the
+    newest 50 superseded records) written in the same atomic ledger update
+    as the new one. ``get_provenance``/``list_provenance`` return only the
+    current record; use this tool to see what changed between runs.
+
+    Args:
+      outputs_dir:  Absolute path to the outputs directory.
+      path:         The output file to look up.
+
+    Returns:
+      None if nothing has been recorded for this path, else {path, versions,
+      current_version, history_dropped, history_limit}. Each entry of
+      ``versions`` has the ``get_provenance`` shape plus ``version``
+      (1-based; stays stable when old entries are dropped past the cap) and
+      ``is_current``.
+    """
+    return annotate.get_provenance_history(outputs_dir, path)
+
+
+@mcp.tool()
 def get_provenance_status(outputs_dir: str, path: str) -> dict[str, Any]:
     """Richer, authoritative per-file provenance answer (item bd5b8d79).
 
@@ -578,6 +613,12 @@ def get_provenance_status(outputs_dir: str, path: str) -> dict[str, Any]:
     Args:
       outputs_dir:  Absolute path to the outputs directory.
       path:         The output file to look up.
+
+    Raises:
+      ledger_io.LedgerCorruptError: the provenance ledger cannot be read (a
+      corrupt file, or a row that is not an object). The fingerprint ledger never
+      raises here: it is reported as ``script_staleness`` with ``is_stale`` ``None``
+      and ``error="ledger_unreadable"``.
 
     Returns:
       {error: ...} if outputs_dir/path are missing. Otherwise always
@@ -602,6 +643,18 @@ def get_provenance_status(outputs_dir: str, path: str) -> dict[str, Any]:
       ``record``/``directory_note``/``staleness`` are ``None`` whenever not
       applicable to the returned ``provenance_type`` -- always branch on
       ``provenance_type``, never infer status from field presence alone.
+
+    Raises:
+      ``ledger_io.LedgerCorruptError`` when the provenance ledger
+      (``provenance_ledger.json``) exists but is not a JSON object or holds
+      a row that is not an object, and ``OSError`` when it cannot be read --
+      unreadable provenance is never reported as "unregistered"/"unknown".
+      A corrupt fingerprint or run-manifest ledger does not raise; it shows
+      as unknown ``script_staleness``/``input_staleness``. For a batch that
+      must not fail, use ``get_provenance_status_envelope`` (maps the error
+      to an ``ambiguous`` record with ``store_error="ledger_unreadable"``)
+      or ``bind_artifact_provenance`` (an ``unresolved`` binding with
+      ``evidence="ledger_unreadable"``).
     """
     return provenance_status.get_provenance_status(outputs_dir, path)
 
@@ -652,7 +705,11 @@ def get_provenance_status_envelope(
       ``partial`` is ``True`` whenever ANY contained record is itself
       partial (e.g. a path that was never discovered, or is indexed but has
       no provenance record yet) -- never silently reported as fully
-      authoritative just because SOME paths resolved cleanly.
+      authoritative just because SOME paths resolved cleanly. A path whose
+      lookup hits an unreadable provenance store (a corrupt ledger) gets an
+      ``ambiguous``, confidence-0.0, partial record with
+      ``attributes.store_error="ledger_unreadable"`` instead of failing the
+      whole call.
 
     Raises:
       Nothing caught here escapes: an empty/missing ``outputs_dir`` or a
@@ -869,10 +926,54 @@ def find_outputs_by_source(
       canonical_path, kind, size, mtime, csv_columns, json_keys), sorted
       newest-first by mtime. ``total`` is the full match count before
       ``limit`` truncation. ``outputs`` is empty (not an error) when nothing
-      in the tree cites this source.
+      in the tree cites this source. ``truncated`` flags a possibly
+      incomplete answer (``scan_saturated``, ``index_partial``,
+      ``outputs_capped``); ``limits`` reports the effective limits after
+      clamping (``limit`` <= 1000, ``search_limit`` <= 5000).
     """
     return provenance.find_outputs_by_source(
         outputs_dir, source_path, limit=limit, search_limit=search_limit,
+    )
+
+
+@mcp.tool()
+def trace_forward_outputs(
+    outputs_dir: str,
+    source_path: str,
+    max_depth: int = 3,
+    max_nodes: int = 200,
+    limit: int = 25,
+    search_limit: int = 200,
+) -> dict[str, Any]:
+    """Bounded transitive forward trace: a source -> every output that
+    depends on it, directly or through other outputs (gap set C).
+
+    A breadth-first walk over ``find_outputs_by_source``. Hop 1 uses that
+    tool's match rule, so ``max_depth=1`` returns exactly its one-hop
+    answer; hops 2+ match only exact normalised paths. A visited set ends
+    cycles. Caps never raise: hitting one sets ``truncated`` and names the
+    reason.
+
+    Args:
+      outputs_dir:   Absolute path to the outputs directory.
+      source_path:   The script or data file to trace forward from.
+      max_depth:     Max hops from the source (default 3, ceiling 25).
+      max_nodes:     Max dependent outputs returned, source not counted
+                     (default 200, ceiling 5000).
+      limit:         Per-hop output limit (default 25, ceiling 1000).
+      search_limit:  Per-hop search window (default 200, ceiling 5000).
+
+    Returns:
+      ``{source_path, nodes, total, truncated, truncation, limits}``. Each
+      node is a one-hop output row plus ``depth`` and ``parent``.
+      ``truncation`` is ``{reason, reasons, depth_reached, nodes_visited,
+      scan_saturated, index_partial, outputs_capped}``; ``reason`` is one
+      of ``max_nodes``/``max_depth``/``outputs_capped``/``scan_saturated``/
+      ``index_partial``, or ``None`` when nothing was cut short.
+    """
+    return provenance.trace_forward_outputs(
+        outputs_dir, source_path, max_depth=max_depth, max_nodes=max_nodes,
+        limit=limit, search_limit=search_limit,
     )
 
 
@@ -908,7 +1009,10 @@ def bind_artifact_provenance(
       :func:`meridian_outputs.provenance.bind_artifact_provenance` for the
       full per-binding shape and status semantics (``resolved``/
       ``hash_mismatch``/``orphaned``/``unresolved``). ``all_clear`` is
-      ``True`` only when every artifact is ``resolved``.
+      ``True`` only when every artifact is ``resolved``. An artifact whose
+      lookup hits an unreadable provenance store is ``unresolved`` with
+      ``evidence="ledger_unreadable"``; the other artifacts still get their
+      own verdicts.
     """
     return provenance.bind_artifact_provenance(
         outputs_dir, artifacts, fuzzy_limit=fuzzy_limit,
@@ -1069,6 +1173,43 @@ def get_artifact_sources(outputs_dir: str, artifact_id: str) -> list[dict[str, A
 def get_source_artifacts(outputs_dir: str, source_locator: str) -> list[dict[str, Any]]:
     """Source -> the artifacts it produced (item e1c979e3). Sorted, deterministic."""
     return artifact_registry.get_source_artifacts(outputs_dir, source_locator)
+
+
+@mcp.tool()
+def get_output_lineage(
+    outputs_dir: str,
+    path: str | None = None,
+    artifact_id: str | None = None,
+    depth: int = 1,
+) -> dict[str, Any]:
+    """Joined lineage for one output (gap set C): output -> its generating
+    sources from every store -> each source's own provenance record, plus
+    the run's inputs, as one fail-closed view.
+
+    Sources are the union of the artifact registry's source edges, the
+    ``record_provenance`` ledger's ``generating_script`` and the
+    ``tag_output`` ledger's script. Each source names its ``origin``; the
+    same script seen by two stores is listed once per store, never merged.
+    A source inside ``outputs_dir`` gets its own provenance record (or is
+    marked ``no_provenance_record``/``not_found``); a source outside is
+    marked ``not_recorded_outside_outputs_dir``. ``stale`` compares a
+    recorded script hash with the script's current hash.
+
+    Args:
+      outputs_dir:  Absolute path to the outputs directory.
+      path:         The output file (must lie inside ``outputs_dir``).
+      artifact_id:  A registered artifact id, instead of or with ``path``.
+      depth:        Hops to follow; only 1 is accepted (deeper is reserved).
+
+    Returns:
+      ``{output, sources, run, complete, unresolved}``, or ``{"error": ...}``
+      for invalid arguments. ``complete`` is True only when at least one
+      source is known and nothing is unresolved. Every path in the result is
+      relative; no machine-local absolute path is returned.
+    """
+    return provenance.get_output_lineage(
+        outputs_dir, path=path, artifact_id=artifact_id, depth=depth,
+    )
 
 
 @mcp.tool()
@@ -1658,6 +1799,37 @@ def list_run_manifests(outputs_dir: str) -> list[dict[str, Any]]:
 
 
 @mcp.tool()
+def check_input_staleness(
+    outputs_dir: str, run_id: str, strict: bool = False,
+) -> dict[str, Any]:
+    """Have any of a run's inputs changed since ``start_run_manifest``?
+
+    Stat first: an input whose size and mtime are unchanged is reported
+    unchanged without being read; only a mismatch re-hashes it.
+    ``strict=True`` re-hashes every input and also catches an edit that kept
+    size and mtime (the default misses that case).
+
+    Args:
+      outputs_dir:  Absolute path to the outputs directory.
+      run_id:        The run started via ``start_run_manifest``.
+      strict:        Re-hash every input regardless of its stat.
+
+    Returns:
+      {run_id, strict, baseline, stale, reason, inputs, stale_inputs,
+      stale_outputs, hashed_count}. Each ``inputs`` entry has a status:
+      unchanged, absent, or one of the stale statuses changed, missing,
+      appeared (absent at start, present now), unreadable, unverifiable.
+      ``stale_outputs`` lists the run's finalized output paths when any
+      input is stale.
+
+    Raises:
+      ValueError (run_manifest.RunManifestError): no manifest exists for
+      ``run_id`` under ``outputs_dir``.
+    """
+    return run_manifest.check_input_staleness(outputs_dir, run_id, strict=strict)
+
+
+@mcp.tool()
 def get_run_manifest_envelope(outputs_dir: str, run_id: str) -> dict[str, Any]:
     """Typed, lossless research-evidence envelope for one run manifest (item
     37ce5537) -- a single ``RUN``-kind ``EvidenceRecord`` (the
@@ -1681,6 +1853,110 @@ def get_run_manifest_envelope(outputs_dir: str, run_id: str) -> dict[str, Any]:
     """
     envelope = run_manifest.build_run_manifest_envelope(outputs_dir, run_id)
     return research_evidence.envelope_to_dict(envelope)
+
+
+# Gap set C, "backup-export". ``bundle`` is imported inside each tool rather
+# than in the module-level import block above, so this addition does not
+# touch lines other in-flight changes to this file also edit.
+
+
+@mcp.tool()
+def export_outputs_bundle(
+    outputs_dir: str,
+    bundle_path: str = ".meridian-outputs-cache/bundles/meridian-outputs-bundle.json",
+    overwrite: bool = False,
+) -> dict[str, Any]:
+    """Back up every Outputs ledger (provenance, fingerprint, run manifest,
+    artifact registry) plus index metadata to ONE checksummed JSON file
+    (gap set C).
+
+    Each member carries a sha256 over its canonical JSON; ``bundle_digest``
+    covers every member digest bound to its name. The file is written via a
+    temp file and an atomic replace. ``index.duckdb`` is NOT included (it is
+    rebuildable). Registry ``local_only_path`` values are stripped (set to
+    null). A ledger that exists but is empty or not valid JSON refuses the
+    export instead of being backed up as empty.
+
+    Args:
+      outputs_dir:  Absolute path to the outputs directory.
+      bundle_path:  Where to write, inside ``outputs_dir`` (relative paths
+                    are relative to it). Defaults to a file under
+                    ``.meridian-outputs-cache/bundles/``, which the index
+                    walk skips. Inside ``.meridian-outputs-cache`` only that
+                    ``bundles/`` subdirectory is allowed, and a ``:`` outside
+                    a drive letter is refused.
+      overwrite:    Replace a file that already exists at ``bundle_path``
+                    (default False: an existing file refuses the export).
+
+    Returns:
+      ``{"exported": True, "bundle_path", "bundle_digest", "members",
+      "local_only_paths_stripped"}`` or ``{"exported": False, "error"}``.
+    """
+    from . import bundle
+
+    return bundle.export_bundle(outputs_dir, bundle_path, overwrite=overwrite)
+
+
+@mcp.tool()
+def verify_outputs_bundle(outputs_dir: str, bundle_path: str) -> dict[str, Any]:
+    """Recompute every checksum in an Outputs bundle and report what does
+    not match (gap set C). Read-only.
+
+    Checksums detect corruption and accidental edits, not deliberate
+    tampering by someone able to recompute them.
+
+    Args:
+      outputs_dir:  Absolute path to the outputs directory.
+      bundle_path:  The bundle file, inside ``outputs_dir``.
+
+    Returns:
+      ``{"verified", "format", "schema_version", "bundle_digest",
+      "bundle_digest_ok", "members", "mismatches", "missing", "unexpected",
+      "malformed", "errors"}``. ``verified`` is True only when everything
+      checks out.
+    """
+    from . import bundle
+
+    return bundle.verify_bundle(bundle_path, outputs_dir=outputs_dir)
+
+
+@mcp.tool()
+def import_outputs_bundle(
+    outputs_dir: str,
+    bundle_path: str,
+    dry_run: bool = True,
+    overwrite: bool = False,
+    accept_hash_algo_mismatch: bool = False,
+) -> dict[str, Any]:
+    """Verify an Outputs bundle and merge its ledgers into ``outputs_dir``
+    (gap set C). Dry run by default: pass ``dry_run=False`` to write.
+
+    Fail-closed: refuses (writing nothing) if verification fails, if the
+    bundle's hash-algorithm versions differ from this install's (unless
+    ``accept_hash_algo_mismatch=True``, which flags it), if a target ledger
+    exists but is unreadable, or if any key conflicts with a different
+    existing entry (unless ``overwrite=True``). Keys only in the target are
+    always kept; on overwrite a registry artifact keeps the target's own
+    local path sightings.
+
+    Args:
+      outputs_dir:                Absolute path to the outputs directory.
+      bundle_path:                The bundle file, inside ``outputs_dir``.
+      dry_run:                    Plan only (default True).
+      overwrite:                  Replace conflicting entries.
+      accept_hash_algo_mismatch:  Proceed, flagged, across a version
+                                  mismatch.
+
+    Returns:
+      ``{"imported", "dry_run", "refused", "reason", "verification",
+      "hash_algo", "members", "would_write", "written_members"}``.
+    """
+    from . import bundle
+
+    return bundle.import_bundle(
+        bundle_path, outputs_dir, dry_run=dry_run, overwrite=overwrite,
+        accept_hash_algo_mismatch=accept_hash_algo_mismatch,
+    )
 
 
 def main() -> None:

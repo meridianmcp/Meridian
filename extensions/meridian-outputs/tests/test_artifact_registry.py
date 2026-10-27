@@ -16,6 +16,8 @@ Covers:
 """
 from __future__ import annotations
 
+import hashlib
+import os
 import sys
 from pathlib import Path
 
@@ -23,7 +25,7 @@ import pytest
 
 sys.path.insert(0, str(Path(__file__).parent.parent))
 from meridian_outputs import artifact_registry as AR
-from meridian_outputs import annotate
+from meridian_outputs import annotate, ledger_io
 
 
 def _write(path: Path, content: str = "hello") -> str:
@@ -484,3 +486,156 @@ class TestStripLocalMetadata:
         )
         AR.strip_local_metadata(rec)
         assert "local_only_path" in rec["local_paths"][0]
+
+
+# ---------------------------------------------------------------------------
+# Writers on a corrupt registry (S-F3): refuse, quarantine, write nothing
+# ---------------------------------------------------------------------------
+
+class TestCorruptRegistryWriters:
+    @staticmethod
+    def _truncated_registry(tmp_path: Path) -> tuple[Path, bytes, str]:
+        """A real two-artifact registry cut off mid-file."""
+        od = str(tmp_path)
+        first = AR.register_artifact(od, "figure", generator="a.py")
+        AR.register_artifact(od, "figure", generator="b.py")
+        registry = tmp_path / ".meridian-outputs-cache" / "artifact_registry.json"
+        raw = registry.read_bytes()
+        truncated = raw[: len(raw) // 2]
+        registry.write_bytes(truncated)
+        return registry, truncated, first["artifact_id"]
+
+    @pytest.mark.parametrize("writer", ["register", "lifecycle", "edge"])
+    def test_writer_on_truncated_registry_raises_and_keeps_its_bytes(
+        self, tmp_path: Path, writer: str,
+    ) -> None:
+        registry, truncated, aid = self._truncated_registry(tmp_path)
+        od = str(tmp_path)
+        with pytest.raises(ledger_io.LedgerCorruptError) as info:
+            if writer == "register":
+                AR.register_artifact(od, "figure", generator="c.py")
+            elif writer == "lifecycle":
+                AR.set_lifecycle_state(od, aid, AR.DEPRECATED)
+            else:
+                AR.bind_source_edge(od, aid, "data/src.csv")
+        # Never replaced by a registry holding only this write.
+        assert registry.read_bytes() == truncated
+        quarantined = info.value.quarantine_path
+        assert quarantined is not None
+        assert Path(quarantined).name.startswith("artifact_registry.json.corrupt-")
+        assert Path(quarantined).read_bytes() == truncated
+        assert str(tmp_path) not in str(info.value)  # basename only in the message
+
+    def test_quarantine_holds_the_bytes_that_failed_not_a_reread(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """S-R4-9: raise_quarantined re-read the registry to copy it, so a file
+        replaced between the failed parse and the copy (the registry writers
+        hold only an in-process lock) quarantined the new bytes instead of the
+        ones that failed."""
+        registry, truncated, _aid = self._truncated_registry(tmp_path)
+        real_read = ledger_io._read_bytes
+        reads = {"n": 0}
+
+        def _replaced_after_the_parse(path: str) -> bytes | None:
+            if os.path.basename(path) == registry.name:
+                reads["n"] += 1
+                if reads["n"] > 1:  # another process rewrote the registry
+                    return b'{"artifacts": {}, "edges": []}'
+            return real_read(path)
+
+        monkeypatch.setattr(ledger_io, "_read_bytes", _replaced_after_the_parse)
+        with pytest.raises(ledger_io.LedgerCorruptError) as info:
+            AR.register_artifact(str(tmp_path), "figure", generator="c.py")
+        copy = Path(info.value.quarantine_path)
+        assert copy.read_bytes() == truncated
+        digest = hashlib.sha256(truncated).hexdigest()[:16]
+        assert copy.name == f"artifact_registry.json.corrupt-{digest}"  # named by content
+        assert registry.read_bytes() == truncated
+
+
+# ---------------------------------------------------------------------------
+# Registry writes: unique temp file, fsync, atomic replace (S-R4-6)
+# ---------------------------------------------------------------------------
+
+class TestRegistryAtomicWrite:
+    def test_failed_replace_keeps_prior_registry_and_leaves_no_temp(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """S-R4-6: the registry was written to a fixed artifact_registry.json.tmp
+        with no fsync before the rename, so a crash could leave a zero-length
+        or truncated registry that the strict read then refused for good."""
+        od = str(tmp_path)
+        AR.register_artifact(od, "figure", generator="a.py")
+        registry = tmp_path / ".meridian-outputs-cache" / "artifact_registry.json"
+        before = registry.read_bytes()
+        events: list[str] = []
+        real_fsync, real_replace = os.fsync, os.replace
+
+        def _fsync(fd: int) -> None:
+            events.append("fsync")
+            real_fsync(fd)
+
+        def _replace(src: str, dst: str) -> None:
+            if os.path.basename(dst) != registry.name:
+                return real_replace(src, dst)
+            events.append("replace:" + os.path.basename(src))
+            raise OSError("simulated failure before the replace")
+
+        with monkeypatch.context() as m:
+            m.setattr(os, "fsync", _fsync)
+            m.setattr(os, "replace", _replace)
+            with pytest.raises(OSError, match="simulated"):
+                AR.register_artifact(od, "figure", generator="b.py")
+
+        assert registry.read_bytes() == before
+        replaces = [e for e in events if e.startswith("replace:")]
+        assert replaces, events
+        assert replaces[0] != "replace:artifact_registry.json.tmp"  # unique temp name
+        assert "fsync" in events[: events.index(replaces[0])]  # fsynced before the rename
+        assert [n for n in os.listdir(registry.parent) if n.endswith(".tmp")] == []
+        # The next write goes through and keeps the earlier artifact.
+        AR.register_artifact(od, "figure", generator="b.py")
+        assert len(AR.list_artifacts(od)) == 2
+
+
+# ---------------------------------------------------------------------------
+# Strict read validates the containers (S-F9)
+# ---------------------------------------------------------------------------
+
+def _write_registry_text(tmp_path: Path, text: str) -> Path:
+    registry = tmp_path / ".meridian-outputs-cache" / "artifact_registry.json"
+    registry.parent.mkdir(parents=True, exist_ok=True)
+    registry.write_text(text, encoding="utf-8")
+    return registry
+
+
+class TestStrictRegistryShape:
+    @pytest.mark.parametrize("text", [
+        '{"artifacts": [], "edges": []}',
+        '{"artifacts": [{"artifact_id": "a"}], "edges": []}',
+        '{"artifacts": {"a": null}, "edges": []}',
+        '{"artifacts": null}',
+        '{"artifacts": {}, "edges": {}}',
+        '{"artifacts": {}, "edges": ["e"]}',
+    ])
+    def test_wrong_containers_raise_not_read_as_empty(self, tmp_path: Path, text: str) -> None:
+        _write_registry_text(tmp_path, text)
+        with pytest.raises(ledger_io.LedgerCorruptError):
+            AR._read_registry_strict(str(tmp_path))
+        # The lenient reader still normalises (plain lookups are unchanged).
+        assert isinstance(AR._read_registry(str(tmp_path))["artifacts"], dict)
+
+    def test_missing_file_or_keys_read_as_an_empty_registry(self, tmp_path: Path) -> None:
+        assert AR._read_registry_strict(str(tmp_path)) == {"artifacts": {}, "edges": []}
+        _write_registry_text(tmp_path, "{}")
+        assert AR._read_registry_strict(str(tmp_path)) == {"artifacts": {}, "edges": []}
+
+    def test_writer_refuses_a_registry_whose_artifacts_is_a_list(self, tmp_path: Path) -> None:
+        text = '{"artifacts": [{"artifact_id": "a"}], "edges": []}'
+        registry = _write_registry_text(tmp_path, text)
+        with pytest.raises(ledger_io.LedgerCorruptError) as info:
+            AR.register_artifact(str(tmp_path), "figure", generator="c.py")
+        assert registry.read_text(encoding="utf-8") == text
+        assert info.value.quarantine_path is not None
+        assert Path(info.value.quarantine_path).read_text(encoding="utf-8") == text

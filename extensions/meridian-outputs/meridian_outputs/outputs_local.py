@@ -12,8 +12,8 @@ Security requirements (non-negotiable, tested):
      FTS index.  The filter is applied in :func:`_iter_safe_output_files` which
      replaces the plain os.walk used in the original.
   2. File locking -- :class:`IndexFileLock` provides an exclusive write lock
-     (threading.Lock + optional portalocker for cross-process safety) so
-     concurrent index writes can never corrupt the cache.
+     (threading.Lock + an atomic-create lease file for cross-process safety)
+     so concurrent index writes can never corrupt the cache.
   3. Deterministic output -- path lists are always sorted (stable sort over
      absolute paths); dict/set iteration is avoided in any place where result
      ordering is observable.
@@ -23,6 +23,7 @@ Security requirements (non-negotiable, tested):
 """
 from __future__ import annotations
 
+import ast
 import concurrent.futures
 import copy
 import csv as csv_mod
@@ -37,10 +38,12 @@ import random
 import re
 import shutil
 import socket
+import struct
 import subprocess
 import tempfile
 import threading
 import time
+import zipfile
 from collections import OrderedDict
 from dataclasses import asdict, dataclass, replace
 from datetime import datetime, timezone
@@ -705,35 +708,65 @@ def ensure_gitignored(path: str) -> None:
 #
 # a52216e2 -- "Wave 10D found no confirmed orphan to kill: the lock was held
 # by one of several live concurrent server processes." Investigating that
-# incident surfaced the REAL bug: this environment does not have `portalocker`
-# installed (it is an optional, lazily-imported dependency -- see the
-# original docstring below), so on a real deployment without it, the
-# cross-process branch below used to be a complete no-op: `except ImportError:
-# pass`. Two separate Meridian server processes each running IndexFileLock
-# against the SAME on-disk db_path therefore had ZERO real mutual exclusion --
-# only the in-process threading.Lock protected against contention WITHIN one
-# process. Worse, a genuine (non-ImportError) acquisition failure was caught
-# and silently logged at DEBUG, then treated as "acquired" -- so ANY failure
-# to acquire the cross-process lock, for ANY reason, silently left ownership
+# incident surfaced the REAL bug: the cross-process layer used to rely on the
+# optional, never-declared `portalocker` package, and without it that branch
+# was a complete no-op: `except ImportError: pass`. Two separate Meridian
+# server processes each running IndexFileLock against the SAME on-disk
+# db_path therefore had ZERO real mutual exclusion -- only the in-process
+# threading.Lock protected against contention WITHIN one process. Worse, a
+# genuine (non-ImportError) acquisition failure was caught and silently
+# logged at DEBUG, then treated as "acquired" -- so ANY failure to acquire
+# the cross-process lock, for ANY reason, silently left ownership
 # non-deterministic. Neither gap was ever surfaced anywhere a caller could see.
 #
 # This section closes both gaps:
-#   1. A dependency-free, deterministic fallback lock (`os.O_CREAT |
-#      os.O_EXCL` -- atomic file creation, same guarantee on POSIX and
-#      Windows) is used automatically whenever portalocker is unavailable, so
-#      REAL cross-process exclusivity now always exists, with or without the
-#      optional dependency.
+#   1. Cross-process exclusivity is ONE primitive in EVERY process: an
+#      `os.O_CREAT | os.O_EXCL` lease file (atomic file creation, same
+#      guarantee on POSIX and Windows). No optional dependency changes that;
+#      portalocker is never used, even when it is importable. An earlier
+#      revision kept portalocker's OS-level lock whenever it imported and
+#      used the lease file only without it, but that OS lock and the lease
+#      file never see each other: in an install where only some processes
+#      could import it, a portalocker holder and a lease-file holder both
+#      entered the critical section and a ledger update was lost. One
+#      primitive for every acquirer rules that out.
 #   2. A genuine acquisition failure now RAISES IndexLockAcquireError instead
 #      of being silently swallowed -- see that class's docstring.
-#   3. Because the fallback lock's FILE (unlike portalocker's OS-level lock)
-#      is not auto-removed if its owner process crashes, every lock now
-#      carries a small lease (owner pid/hostname/session_id/started_at/
-#      heartbeat_at) written into the lock file, and read_index_lock_owner()
-#      lets any caller distinguish a lock held by a live, active owner from
-#      one left behind by a dead one -- WITHOUT ever touching the recorded
-#      process. Reclaiming a stale LOCK FILE and killing the process that
+#   3. Because the lease FILE (unlike an OS-level lock) is not auto-removed
+#      if its owner process crashes, every lock now carries a small lease
+#      (owner pid/hostname/session_id/started_at/heartbeat_at/token) written
+#      into the lock file, and read_index_lock_owner() lets any caller
+#      distinguish a lock held by a live, active owner from one left behind
+#      by a dead one -- WITHOUT ever touching the recorded process.
+#      Reclaiming a stale LOCK FILE and killing the process that
 #      (legitimately or not) still holds it are two entirely different
 #      things; this module only ever does the former.
+#   4. Two residuals of that reclaim are ACCEPTED, not closed:
+#      a. POSIX: two holders after a reclaim. _reclaim_stale_lock_file
+#         re-reads the lease and then removes the file as two separate steps
+#         (check-then-remove). Two waiters that judged the same lease stale
+#         can both pass the re-read; the first removes the file and creates
+#         its own, and the second's remove then deletes that successor's
+#         file, so both enter the critical section. IndexFileLock.release
+#         has the same window against a waiter that reclaims a hold which
+#         outlasted the stale threshold. Reachable only once a holder is
+#         already stale (dead pid, or a heartbeat silent past the threshold;
+#         long holds keep it fresh, see _LeaseHeartbeatPacer). Closing it
+#         needs a rename-then-verify reclaim. Accepted in
+#         _reclaim_stale_lock_file (and, for the release window, in
+#         IndexFileLock.release), where each is documented.
+#      b. Windows: reclaim blocked by an open handle. The lock file is
+#         opened without FILE_SHARE_DELETE, so while another LIVE process
+#         still has it open (a holder that is alive but stale by heartbeat,
+#         or any lingering reader), os.remove fails and the waiter cannot
+#         reclaim it. The waiter keeps polling and, if that handle is never
+#         closed, waits out its whole acquire timeout and raises
+#         IndexLockAcquireError. This fails closed: no second holder (which
+#         is also why (a) cannot happen on Windows), at the cost of
+#         availability. A dead holder's handles are closed by the OS, so a
+#         crashed holder is still reclaimed promptly. Accepted in
+#         IndexFileLock._acquire_atomic, which falls through to its deadline
+#         check and poll sleep whenever the reclaim did not remove the file.
 
 # Per-canonical-path threading locks (in-process).
 _THREADING_LOCKS: dict[str, threading.Lock] = {}
@@ -754,12 +787,9 @@ def _get_thread_lock(canonical: str) -> threading.Lock:
 _LOCK_STALE_SECONDS_DEFAULT = 120.0
 _LOCK_STALE_SECONDS_ENV_VAR = "MERIDIAN_OUTPUTS_LOCK_STALE_SECONDS"
 
-# How long the atomic-create fallback lock waits on a confirmed-ACTIVE (not
-# stale) owner before giving up and raising IndexLockAcquireError. Only
-# applies to the fallback mechanism -- the optional portalocker path keeps
-# its historical indefinite-block-by-default behaviour unless a caller
-# explicitly passes a timeout, so an environment where portalocker IS
-# installed sees no behaviour change from this item.
+# How long IndexFileLock waits on a confirmed-ACTIVE (not stale) owner before
+# giving up and raising IndexLockAcquireError, unless a caller passes its own
+# timeout.
 _LOCK_TIMEOUT_SECONDS_DEFAULT = 60.0
 _LOCK_TIMEOUT_SECONDS_ENV_VAR = "MERIDIAN_OUTPUTS_LOCK_TIMEOUT_SECONDS"
 
@@ -791,7 +821,7 @@ def _resolve_lock_timeout_seconds() -> float | None:
         return _LOCK_TIMEOUT_SECONDS_DEFAULT
     stripped = raw.strip()
     if stripped.lower() in ("0", "none", "unbounded", "infinite"):
-        return None  # explicit opt-in to block indefinitely, like portalocker
+        return None  # explicit opt-in to block indefinitely
     try:
         value = float(stripped)
     except ValueError:
@@ -921,9 +951,8 @@ class IndexLockOwner:
     pid on this host, or a silent heartbeat past the configured threshold when
     liveness can't be checked directly) -- i.e. the lock FILE may be safely
     reclaimed. It is never a signal to kill anything: a stale reading only
-    ever justifies deleting the leftover lock file, exactly like a crashed
-    process's OS-level lock would already have been released automatically
-    had portalocker's lock been in use instead.
+    ever justifies deleting the leftover lock file, which its crashed owner
+    could not remove itself.
     """
 
     db_path: str
@@ -947,6 +976,7 @@ class IndexLockOwner:
 def _write_lease_to_handle(
     fh: Any, *, pid: int, hostname: str, session_id: str | None,
     started_at: float, heartbeat_at: float, lock_mode: str,
+    token: str | None = None,
 ) -> None:
     """Overwrite ``fh`` (already positioned at a lock file this caller owns)
     with the current lease payload. Best-effort by design -- a lease-write
@@ -955,18 +985,23 @@ def _write_lease_to_handle(
 
     Deliberately does NOT ``os.fsync`` -- the lease is diagnostics-only
     (read_index_lock_owner never trusts it for the actual exclusivity
-    guarantee, only the atomic-create/portalocker primitive does that), and
+    guarantee, only the atomic create does that), and
     on the SAME live machine a plain ``flush()`` is already immediately
     visible to any other process reading the file through the shared OS page
     cache. ``fsync`` would only buy durability across a hard crash/power-loss
     of a value nobody reads across restarts, at a real, measured per-call
     cost (called on every lock acquire AND every heartbeat -- see a52216e2's
     investigation notes for the tight-rebuild-budget regression this caused
-    when it was here)."""
+    when it was here).
+
+    ``token`` is a random value unique to one acquisition. It lets a releasing
+    holder or a reclaiming waiter tell "this lock file is still the one I saw"
+    from "another process owns this path now"; see
+    :func:`_reclaim_stale_lock_file` and :meth:`IndexFileLock.release`."""
     payload = json.dumps({
         "pid": pid, "hostname": hostname, "session_id": session_id,
         "started_at": started_at, "heartbeat_at": heartbeat_at,
-        "lock_mode": lock_mode,
+        "lock_mode": lock_mode, "token": token,
     })
     fh.seek(0)
     fh.write(payload)
@@ -993,42 +1028,6 @@ def _read_lease_from_path(path: str) -> dict[str, Any] | None:
     return obj if isinstance(obj, dict) else None
 
 
-def _probe_portalocker_held(lock_path: str, portalocker_module: Any) -> bool | None:
-    """Best-effort, side-effect-minimal check: is ``lock_path`` CURRENTLY
-    locked via portalocker by ANY process (including this one, via a
-    different handle)? A non-blocking probe lock/unlock cycle on a fresh
-    handle is the standard technique for this -- if the probe itself
-    succeeds, nobody holds the real lock right now (the probe never keeps
-    it). Returns ``None`` on any I/O error -- genuinely indeterminate, never
-    guessed."""
-    try:
-        # Ensure the file exists so the probe targets the same path a real
-        # acquirer would -- mirrors the original acquire() path (which always
-        # opened the lock file in "w" mode on every attempt).
-        with open(lock_path, "a", encoding="utf-8"):
-            pass
-        probe = open(lock_path, "r+", encoding="utf-8")
-    except OSError:
-        return None
-    try:
-        try:
-            portalocker_module.lock(
-                probe, portalocker_module.LOCK_EX | portalocker_module.LOCK_NB,
-            )
-        except Exception:  # noqa: BLE001 -- LockException or a platform OSError
-            return True
-        try:
-            portalocker_module.unlock(probe)
-        except Exception:  # noqa: BLE001
-            pass
-        return False
-    finally:
-        try:
-            probe.close()
-        except Exception:  # noqa: BLE001
-            pass
-
-
 def read_index_lock_owner(
     db_path: str, *, stale_seconds: float | None = None,
 ) -> IndexLockOwner:
@@ -1038,30 +1037,78 @@ def read_index_lock_owner(
     from any read path (search, diagnostics, get_convergence_state) without
     disturbing a live writer. See :class:`IndexLockOwner` for field meanings.
     """
+    return _inspect_index_lock(db_path, stale_seconds=stale_seconds)[0]
+
+
+# What a reclaimer compares before removing a stale lock file: the parsed
+# lease (token included), or, when the file holds no parseable lease, its
+# (st_mtime_ns, st_size).
+_LockSnapshot = tuple[dict[str, Any] | None, tuple[int, int] | None]
+
+
+def _lock_file_signature(path: str) -> tuple[int, int] | None:
+    try:
+        st = os.stat(path)
+    except OSError:
+        return None
+    return st.st_mtime_ns, st.st_size
+
+
+def _lock_file_is_gone(path: str) -> bool:
+    """True only when ``path`` does not exist. Any other stat failure (e.g. a
+    Windows delete-pending file) is not proof the path is free."""
+    try:
+        os.stat(path)
+    except FileNotFoundError:
+        return True
+    except OSError:
+        return False
+    return False
+
+
+def _inspect_index_lock(
+    db_path: str, *, stale_seconds: float | None = None,
+) -> tuple[IndexLockOwner, _LockSnapshot]:
+    """:func:`read_index_lock_owner` plus a snapshot of the lock file it
+    judged, so a reclaimer can later check the file is still that same lease
+    (token included) before removing it. The token stays out of
+    :class:`IndexLockOwner`, which is surfaced as public diagnostics."""
     if not db_path or db_path == ":memory:":
-        return IndexLockOwner(db_path=db_path, lock_path=None, held=False)
+        return IndexLockOwner(db_path=db_path, lock_path=None, held=False), (None, None)
     canonical = os.path.abspath(db_path)
     lock_path = canonical + ".lock"
     meta = _read_lease_from_path(lock_path)
     threshold = stale_seconds if stale_seconds is not None else _resolve_lock_stale_seconds()
     now = time.time()
 
-    try:
-        import portalocker  # noqa: PLC0415 -- optional
-    except ImportError:
-        held: bool | None = os.path.exists(lock_path)
-    else:
-        held = _probe_portalocker_held(lock_path, portalocker)
+    # The lock file's existence IS the lock: every IndexFileLock acquirer
+    # creates it with O_EXCL and removes it on release. Never created here.
+    held = os.path.exists(lock_path)
 
     if meta is None:
         # No lease content -- either never used, cleanly released (atomic
         # mode always removes the file on release; see IndexFileLock.release),
-        # or a narrow race where the file was just created but its owner
-        # hasn't written a lease yet. None of those are "stale" -- there is
-        # nothing here to reclaim.
+        # a narrow race where the file was just created but its owner hasn't
+        # written a lease yet, or a holder whose best-effort lease write
+        # failed (or was torn) and which then died. The first three need no
+        # reclaim. The last would block every writer forever, so a held file
+        # with no parseable lease is stale once it has not been modified for
+        # longer than the heartbeat threshold: a live holder rewrites its
+        # lease (and so the file's mtime) on every heartbeat. The stat comes
+        # after the read, so a lease written in between reads as fresh.
+        signature = _lock_file_signature(lock_path) if held is True else None
+        idle = None if signature is None else now - signature[0] / 1e9
+        if idle is not None and idle > threshold:
+            return IndexLockOwner(
+                db_path=db_path, lock_path=lock_path, held=True, is_stale=True,
+                stale_reason=(
+                    f"lock file has no readable lease and was last modified "
+                    f"{idle:.1f}s ago (> {threshold:.0f}s threshold)"
+                ),
+            ), (None, signature)
         return IndexLockOwner(
-            db_path=db_path, lock_path=lock_path, held=bool(held) if held is not None else False,
-        )
+            db_path=db_path, lock_path=lock_path, held=held,
+        ), (None, signature)
 
     pid = meta.get("pid")
     hostname = meta.get("hostname")
@@ -1079,9 +1126,8 @@ def read_index_lock_owner(
     is_stale = False
     stale_reason: str | None = None
     if held is False:
-        # OS/atomic-file-confirmed: nobody holds it right now. Leftover
-        # metadata here is purely historical (portalocker mode leaves the
-        # file in place after a clean release) -- nothing to reclaim.
+        # The lock file went away after its lease was read (a release or a
+        # reclaim in between): nobody holds it now -- nothing to reclaim.
         is_stale = False
     elif pid_alive is False:
         is_stale = True
@@ -1091,36 +1137,185 @@ def read_index_lock_owner(
         stale_reason = f"heartbeat is {age:.1f}s old (> {threshold:.0f}s threshold)"
 
     return IndexLockOwner(
-        db_path=db_path, lock_path=lock_path,
-        held=bool(held) if held is not None else True,
+        db_path=db_path, lock_path=lock_path, held=held,
         pid=pid, hostname=hostname, session_id=session_id,
         started_at=started_at, heartbeat_at=heartbeat_at, age_seconds=age,
         lock_mode=meta.get("lock_mode"), pid_alive=pid_alive,
         is_stale=is_stale, stale_reason=stale_reason,
+    ), (meta, None)
+
+
+def _reclaim_stale_lock_file(lock_path: str, snapshot: _LockSnapshot) -> bool:
+    """Remove a lock file judged stale from ``snapshot``, but only if the
+    file still holds that same lease (pid, token, heartbeat and the rest),
+    or, for a file with no parseable lease, is still unparseable with the
+    same mtime and size. A lease that changed since the verdict belongs to a
+    holder that refreshed it or to a successor, and is left alone. Returns
+    True when the path is now free (removed here, or already gone).
+
+    Residual window, documented rather than closed: the re-read and the
+    remove are two steps, so on POSIX a second waiter can remove the same
+    stale file and create its own lock in between, and this remove then
+    deletes that successor's file. On Windows the successor holds its file
+    open without FILE_SHARE_DELETE, so the remove fails and nothing is lost.
+    Closing it on POSIX needs a rename-then-verify reclaim.
+    """
+    lease, signature = snapshot
+    if _read_lease_from_path(lock_path) != lease or (
+        lease is None and _lock_file_signature(lock_path) != signature
+    ):
+        # Changed since the verdict -- or already gone (another waiter
+        # reclaimed it, or its holder released it), which reads as a change
+        # too but leaves the path free: report that so the caller retries the
+        # create at once instead of sleeping, or failing at its deadline.
+        return _lock_file_is_gone(lock_path)
+    try:
+        os.remove(lock_path)
+    except FileNotFoundError:
+        return True
+    except OSError:
+        return False
+    return True
+
+
+def _lock_file_is_ours(lock_path: str, token: str | None, handle: Any) -> bool:
+    """True when ``lock_path`` is still this holder's lock file: the path
+    names the very file ``handle`` has open, and that file's lease names
+    ``token`` (or holds no readable lease, because this holder's own
+    best-effort lease write failed).
+
+    The lease is read through ``handle`` once the identity check passes.
+    Reopening the path instead costs several milliseconds per release on
+    Windows (on-access scanning of a just-written file), measured at about
+    10x the whole uncontended acquire/release cycle."""
+    try:
+        if not os.path.samestat(os.fstat(handle.fileno()), os.stat(lock_path)):
+            return False  # removed and re-created: a successor's file
+        handle.seek(0)
+        text = handle.read()
+    except (OSError, ValueError):
+        return False
+    try:
+        lease = json.loads(text) if text.strip() else None
+    except ValueError:
+        lease = None
+    if not isinstance(lease, dict):
+        return True
+    return token is not None and lease.get("token") == token
+
+
+# Windows: every waiting acquirer reads the holder's lease
+# (read_index_lock_owner), which keeps the lock file open for a moment
+# without FILE_SHARE_DELETE, so the holder's os.remove on release can fail
+# with a sharing violation. Swallowing that once left the lock file behind
+# carrying a LIVE pid: other processes waited it out as an active owner and
+# the holder deadlocked on its own next acquire (found by the ledger
+# multi-writer test, tests/test_ledger_concurrency.py). The reader's open is
+# brief, so a short bounded retry clears it.
+_LOCK_REMOVE_RETRIES = 100
+_LOCK_REMOVE_RETRY_SLEEP_SECONDS = 0.02
+# How long consecutive access-denied errors on the atomic create are treated
+# as a transient delete-pending lock file; see IndexFileLock._acquire_atomic.
+_LOCK_CREATE_DENIED_GRACE_SECONDS = 5.0
+
+
+def _remove_released_lock_file(lock_path: str) -> None:
+    for _ in range(_LOCK_REMOVE_RETRIES):
+        try:
+            os.remove(lock_path)
+            return
+        except FileNotFoundError:
+            return  # already reclaimed by another process: same end state
+        except PermissionError:
+            time.sleep(_LOCK_REMOVE_RETRY_SLEEP_SECONDS)
+        except OSError:
+            _log.debug("IndexFileLock: could not remove %r", lock_path, exc_info=True)
+            return
+    _log.warning(
+        "IndexFileLock: released lock file %r is still held open by another "
+        "process after %d attempts; waiters will treat it as held until its "
+        "heartbeat goes stale", lock_path, _LOCK_REMOVE_RETRIES,
     )
+
+
+# How often OutputsFtsIndex's long Tantivy loops (the delta commit in
+# _rebuild_fts and the one-time DuckDB-to-Tantivy migration) refresh the write
+# lock's lease while they run: after this many rows or this many seconds,
+# whichever comes first, plus once before and once after each commit. Both
+# loops run inside rebuild()'s write-lock section, which used to heartbeat only
+# once, before them: a delta or migration longer than the stale threshold
+# (_LOCK_STALE_SECONDS_DEFAULT) left a live holder with an old heartbeat, which
+# another process judges stale and reclaims, so both entered the critical
+# section. Both values sit far below that threshold; IndexFileLock.heartbeat's
+# own _HEARTBEAT_MIN_INTERVAL_SECONDS still caps the actual lease writes.
+_FTS_HEARTBEAT_EVERY_ROWS = 1000
+_FTS_HEARTBEAT_EVERY_SECONDS = 5.0
+
+
+# Set for the current thread while search() runs its lazy _rebuild_fts().
+# search() never holds the index write lock, so a lease heartbeat from that
+# build would rewrite the lease of whichever thread does hold it (rebuild()
+# in another thread), from a thread that does not hold it, racing the
+# holder's own lease writes and able to garble the lease JSON. The pacers in
+# _rebuild_fts() and the migration it runs then get _no_lease_heartbeat, so
+# only the lock owner writes the lease.
+_LAZY_FTS_BUILD = threading.local()
+
+
+def _no_lease_heartbeat() -> None:
+    """The pacer heartbeat in a thread that does not hold the write lock."""
+
+
+class _LeaseHeartbeatPacer:
+    """Calls ``heartbeat`` from a long per-row loop at a bounded interval
+    (:data:`_FTS_HEARTBEAT_EVERY_ROWS` rows or
+    :data:`_FTS_HEARTBEAT_EVERY_SECONDS`, whichever comes first) instead of on
+    every row. ``heartbeat`` is :meth:`IndexFileLock.heartbeat`, which is
+    best-effort, never raises, and is a no-op when the lock is not held, or
+    :func:`_no_lease_heartbeat` in search()'s lazy build."""
+
+    __slots__ = ("_heartbeat", "_rows", "_last")
+
+    def __init__(self, heartbeat: Callable[[], None]) -> None:
+        self._heartbeat = heartbeat
+        self._rows = 0
+        self._last = time.monotonic()
+
+    def beat(self) -> None:
+        """Heartbeat now, e.g. right before and right after a commit."""
+        self._heartbeat()
+        self._rows = 0
+        self._last = time.monotonic()
+
+    def tick(self) -> None:
+        """Count one row; heartbeat once either interval has been reached."""
+        self._rows += 1
+        if (
+            self._rows >= _FTS_HEARTBEAT_EVERY_ROWS
+            or time.monotonic() - self._last >= _FTS_HEARTBEAT_EVERY_SECONDS
+        ):
+            self.beat()
 
 
 class IndexFileLock:
     """Exclusive write lock for one index DB file.
 
-    Uses a per-path threading.Lock for in-process safety (always) PLUS one of
-    two real cross-process mechanisms for a persistent (non-``:memory:``)
-    path:
+    Uses a per-path threading.Lock for in-process safety (always) PLUS, for a
+    persistent (non-``:memory:``) path, one cross-process mechanism shared by
+    every acquirer in every process: an atomic-create lease file
+    (``os.O_CREAT | os.O_EXCL``, a52216e2) -- a real, deterministic,
+    dependency-free mutual-exclusion primitive on both POSIX and Windows. No
+    optional dependency changes it: ``portalocker`` is never used, even when
+    importable, because its OS-level lock and this lease file never see each
+    other, so mixing the two let two holders in at once.
+    Bounded by ``timeout`` (default :func:`_resolve_lock_timeout_seconds`)
+    against a confirmed-ACTIVE owner; a confirmed-STALE owner's lock file is
+    reclaimed automatically (never its process -- see
+    :func:`read_index_lock_owner`).
 
-    * ``portalocker`` (when importable) -- an OS-level advisory lock, kernel-
-      released automatically if the owning process dies. Unchanged from the
-      historical behaviour: blocks indefinitely by default.
-    * An atomic-create fallback (``os.O_CREAT | os.O_EXCL``) used whenever
-      portalocker is unavailable (a52216e2) -- a real, deterministic,
-      dependency-free mutual-exclusion primitive on both POSIX and Windows.
-      Bounded by ``timeout`` (default :func:`_resolve_lock_timeout_seconds`)
-      against a confirmed-ACTIVE owner; a confirmed-STALE owner's lock file is
-      reclaimed automatically (never its process -- see
-      :func:`read_index_lock_owner`).
-
-    Both mechanisms write a small lease (owner pid/hostname/session_id/
-    started_at/heartbeat_at) into the lock file once acquired, readable via
-    :func:`read_index_lock_owner` without holding the lock.
+    The holder writes a small lease (owner pid/hostname/session_id/
+    started_at/heartbeat_at/token) into the lock file once acquired, readable
+    via :func:`read_index_lock_owner` without holding the lock.
 
     A genuine acquisition failure now raises :class:`IndexLockAcquireError`
     instead of being silently treated as success (a52216e2) -- callers that
@@ -1151,6 +1346,7 @@ class IndexFileLock:
         self._lock_mode: str | None = None
         self._started_at: float | None = None
         self._last_heartbeat_write: float | None = None
+        self._token: str | None = None
 
     @property
     def session_id(self) -> str | None:
@@ -1162,43 +1358,15 @@ class IndexFileLock:
             return
         lock_path = self._canonical + ".lock"
         try:
-            import portalocker  # noqa: PLC0415 -- optional
-        except ImportError:
-            portalocker = None  # type: ignore[assignment]
-
-        try:
-            if portalocker is not None:
-                self._acquire_portalocker(portalocker, lock_path)
-            else:
-                self._acquire_atomic(lock_path, timeout)
+            self._acquire_atomic(lock_path, timeout)
         except BaseException:
             self._thread_lock.release()
             raise
 
         now = time.time()
         self._started_at = now
+        self._token = os.urandom(16).hex()
         self._write_lease(now)
-
-    def _acquire_portalocker(self, portalocker: Any, lock_path: str) -> None:
-        try:
-            self._file_handle = open(lock_path, "w", encoding="utf-8")  # noqa: WPS515
-            portalocker.lock(self._file_handle, portalocker.LOCK_EX)
-        except Exception as exc:  # noqa: BLE001 -- a52216e2: no longer swallowed
-            if self._file_handle is not None:
-                try:
-                    self._file_handle.close()
-                except Exception:  # noqa: BLE001
-                    pass
-                self._file_handle = None
-            _log.warning(
-                "IndexFileLock: portalocker acquire failed for %r -- refusing "
-                "to proceed without a real cross-process lock (a52216e2)",
-                lock_path, exc_info=True,
-            )
-            raise IndexLockAcquireError(
-                f"failed to acquire the cross-process lock at {lock_path!r}: {exc}"
-            ) from exc
-        self._lock_mode = "portalocker"
 
     def _acquire_atomic(self, lock_path: str, timeout: float | None) -> None:
         effective_timeout = (
@@ -1208,23 +1376,48 @@ class IndexFileLock:
         )
         deadline = None if effective_timeout is None else time.monotonic() + effective_timeout
         poll = self._ATOMIC_POLL_INITIAL
+        denied_since: float | None = None
         while True:
             try:
                 fd = os.open(lock_path, os.O_CREAT | os.O_EXCL | os.O_RDWR)
-            except FileExistsError:
-                owner = read_index_lock_owner(self._db_path)
-                if owner.is_stale:
-                    try:
-                        os.remove(lock_path)
-                    except OSError:
-                        _log.debug(
-                            "IndexFileLock: lost the race reclaiming stale "
-                            "lock %r -- retrying", lock_path,
-                        )
-                    continue
-                if deadline is not None and time.monotonic() >= deadline:
+            except PermissionError as exc:
+                # Windows: a lock file the previous holder just deleted can
+                # sit in delete-pending state while some other handle (an
+                # indexer, antivirus, a lease reader) is still open on it, and
+                # O_EXCL create then fails with access denied instead of
+                # FileExistsError. Transient: retry for a short grace period
+                # (and never past the deadline), then fail as before.
+                now = time.monotonic()
+                denied_since = now if denied_since is None else denied_since
+                if (
+                    now - denied_since > _LOCK_CREATE_DENIED_GRACE_SECONDS
+                    or (deadline is not None and now >= deadline)
+                ):
                     raise IndexLockAcquireError(
-                        f"index lock at {lock_path!r} is held by an active "
+                        f"failed to create lock file {lock_path!r}: {exc}"
+                    ) from exc
+                time.sleep(poll)
+                poll = min(poll * 1.5, self._ATOMIC_POLL_MAX)
+                continue
+            except FileExistsError:
+                denied_since = None
+                owner, lease = _inspect_index_lock(self._db_path)
+                if owner.is_stale:
+                    if _reclaim_stale_lock_file(lock_path, lease):
+                        continue  # freed: retry the create at once
+                    # Not removed: the lease changed hands since it was judged
+                    # stale, or (Windows) the stale holder still has the file
+                    # open. Fall through to the deadline check and the poll
+                    # sleep below instead of retrying at once, which
+                    # busy-spun past the timeout.
+                    _log.debug(
+                        "IndexFileLock: did not reclaim stale lock %r "
+                        "-- retrying after a poll interval", lock_path,
+                    )
+                if deadline is not None and time.monotonic() >= deadline:
+                    state = "a stale" if owner.is_stale else "an active"
+                    raise IndexLockAcquireError(
+                        f"index lock at {lock_path!r} is held by {state} "
                         f"owner (pid={owner.pid}, session={owner.session_id!r}) "
                         f"and did not become available within "
                         f"{effective_timeout}s", owner=owner,
@@ -1242,8 +1435,11 @@ class IndexFileLock:
                 return
 
     # a52216e2 -- heartbeat() is called from inside rebuild()'s write-lock
-    # section on every Phase 2 pass that reaches the Tantivy commit step, so
-    # it must be cheap on the common (fast, uncontended) call -- a full lease
+    # section on every Phase 2 pass that reaches the Tantivy commit step, and
+    # again from inside that step's long loops (the delta commit and the
+    # one-time DuckDB-to-Tantivy migration, paced by _LeaseHeartbeatPacer)
+    # so a hold longer than the stale threshold keeps a fresh lease. It
+    # must be cheap on the common (fast, uncontended) call -- a full lease
     # rewrite on every single call measurably ate into tight rebuild budgets
     # (see the investigation notes on _write_lease_to_handle re: fsync).
     # Skipping a redundant rewrite when the lease is already fresh keeps the
@@ -1261,6 +1457,7 @@ class IndexFileLock:
                 session_id=self._session_id,
                 started_at=self._started_at or heartbeat_at,
                 heartbeat_at=heartbeat_at, lock_mode=self._lock_mode or "unknown",
+                token=self._token,
             )
             self._last_heartbeat_write = heartbeat_at
         except Exception:  # noqa: BLE001 -- diagnostics-only, never fatal
@@ -1289,31 +1486,40 @@ class IndexFileLock:
     def release(self) -> None:
         try:
             if self._file_handle is not None:
-                if self._lock_mode == "portalocker":
-                    try:
-                        import portalocker  # noqa: PLC0415
-                        portalocker.unlock(self._file_handle)
-                    except Exception:  # noqa: BLE001
-                        pass
+                lock_path = self._canonical + ".lock"
+                # Checked before the handle is closed: _lock_file_is_ours
+                # compares the path with the open handle and reads through it.
+                owns_file = self._lock_mode == "atomic_create" and _lock_file_is_ours(
+                    lock_path, self._token, self._file_handle,
+                )
                 try:
                     self._file_handle.close()
                 except Exception:  # noqa: BLE001
                     pass
                 if self._lock_mode == "atomic_create":
-                    # a52216e2 -- unlike portalocker's OS-level lock, this is
-                    # a plain file: it is NOT released just by closing the
+                    # a52216e2 -- unlike an OS-level lock, the lease file is
+                    # an ordinary file: it is NOT released just by closing the
                     # handle, so a clean release must remove it explicitly to
-                    # make the path available to the next acquirer. Best-
-                    # effort: if this races a concurrent stale-reclaim from
-                    # another process, both sides converge on the same "free"
-                    # end state regardless of who wins.
-                    try:
-                        os.remove(self._canonical + ".lock")
-                    except OSError:
-                        pass
+                    # make the path available to the next acquirer. Only when
+                    # the on-disk lease still names this holder's token: if
+                    # this lease was reclaimed as stale, the path now belongs
+                    # to a successor and removing it would free a live lock.
+                    # Residual window: a waiter that reclaims this lease
+                    # between the check above and the remove below (possible
+                    # only once this hold has outlasted the stale threshold
+                    # without a heartbeat) still loses its file.
+                    if owns_file:
+                        _remove_released_lock_file(lock_path)
+                    else:
+                        _log.warning(
+                            "IndexFileLock: lock file %r no longer holds this "
+                            "holder's lease (reclaimed as stale while held?); "
+                            "leaving it for its current owner", lock_path,
+                        )
                 self._file_handle = None
                 self._lock_mode = None
                 self._last_heartbeat_write = None
+                self._token = None
         finally:
             self._thread_lock.release()
 
@@ -1380,6 +1586,36 @@ _PDF_SUFFIXES: frozenset[str] = frozenset({".pdf"})
 _PDF_MAX_BYTES = 10 * 1024 * 1024
 _PDF_MAX_PAGES = 200
 _PDF_TIMEOUT_SECONDS = 5.0
+
+# NPZ (numpy savez / savez_compressed) archives get their own kind,
+# "npz_content". Only the array headers are indexed: each member's name,
+# shape and dtype go into the FTS header text, and the body stays empty, so
+# any failure degrades to filename-only indexing. Parsing is stdlib only
+# (zipfile plus ast.literal_eval on the .npy header dict); no numpy, and
+# nothing is ever unpickled. Bounded on two axes: at most _NPZ_MAX_MEMBERS
+# members, counted by walking the central directory before zipfile parses
+# it (more, a malformed or inconsistent directory, or an unreadable archive
+# means filename-only; a well-formed ZIP64 archive, as numpy writes past
+# 2 GiB, is walked like any other) in a directory of at most
+# _NPZ_MAX_CENTRAL_DIRECTORY_BYTES, and at
+# most _NPZ_MAX_HEADER_BYTES decompressed bytes read from each member, which
+# must be stored or deflated. .npy stays filename-only
+# (_METADATA_ONLY_SUFFIXES).
+_NPZ_SUFFIXES: frozenset[str] = frozenset({".npz"})
+_NPZ_MAX_MEMBERS = 256
+_NPZ_MAX_HEADER_BYTES = 64 * 1024
+_NPZ_READABLE_COMPRESSION: frozenset[int] = frozenset({zipfile.ZIP_STORED, zipfile.ZIP_DEFLATED})
+_NPY_MAGIC = b"\x93NUMPY"
+
+# Version of the content the FTS index extracts per kind. Bump it whenever
+# extraction changes for files whose stat signature has not, so that rows
+# written by older code are re-analysed once (see
+# OutputsFtsIndex._check_content_index_version, modelled on
+# _check_hash_algo_version). Unset (0) = written before this marker existed.
+# 2 = NPZ array headers indexed (npz_content); existing pdf_content and .npz
+# rows are re-analysed once.
+_CONTENT_INDEX_VERSION = 2
+_CONTENT_INDEX_VERSION_KEY = "content_index_version"
 
 # fa600e42 follow-up (perf/memory) -- _analyse_file's single-read fast path
 # (below) reads a whole file into one in-memory buffer to derive hash +
@@ -1520,6 +1756,8 @@ def _classify_suffix(path: str) -> str:
         return "metadata_only"
     if suffix in _PDF_SUFFIXES:
         return "pdf_content"
+    if suffix in _NPZ_SUFFIXES:
+        return "npz_content"
     return "binary_metadata"
 
 
@@ -1752,6 +1990,7 @@ def _extract_pdf_text(
     try:
         import pypdf  # noqa: PLC0415 -- optional, lazy
     except ImportError:
+        _log_pypdf_missing_once()
         return None
     try:
         reader = pypdf.PdfReader(io.BytesIO(data))
@@ -1803,6 +2042,398 @@ def _extract_pdf_text_from_path(path: str) -> str | None:
     )
 
 
+# ---------------------------------------------------------------------------
+# Explicit content-extractor degradation (PDF and NPZ)
+# ---------------------------------------------------------------------------
+# Both extractors degrade to filename-only indexing rather than raising.
+# That degrade used to be silent; each cause is now logged once per process
+# at INFO (not per file, so a large tree cannot flood the log), and
+# content_extractor_status() reports the current state for search envelopes.
+
+_DEGRADE_LOG_LOCK = threading.Lock()
+_PYPDF_MISSING_LOGGED = False
+_NPZ_UNREADABLE_LOGGED = False
+
+
+def _log_pypdf_missing_once() -> None:
+    global _PYPDF_MISSING_LOGGED
+    with _DEGRADE_LOG_LOCK:
+        if _PYPDF_MISSING_LOGGED:
+            return
+        _PYPDF_MISSING_LOGGED = True
+    _log.info(
+        "meridian_outputs: pypdf is not importable, so PDF files are indexed "
+        "by filename only (no body text) until it is installed "
+        "(pip install 'pypdf>=4.0'). Logged once per process.",
+    )
+
+
+def _log_npz_unreadable_once(path: str, reason: str) -> None:
+    global _NPZ_UNREADABLE_LOGGED
+    with _DEGRADE_LOG_LOCK:
+        if _NPZ_UNREADABLE_LOGGED:
+            return
+        _NPZ_UNREADABLE_LOGGED = True
+    _log.info(
+        "meridian_outputs: .npz archive %r could not be read (%s), so it is "
+        "indexed by filename only. Further unreadable .npz files are not "
+        "logged in this process.",
+        os.path.basename(path), reason,
+    )
+
+
+def content_extractor_status() -> dict[str, str]:
+    """Current state of the optional body/header extractors.
+
+    ``{"pdf": "ok" | "pypdf_missing", "npz": "ok"}``. NPZ parsing is stdlib
+    only, so it is always available; an individual unreadable archive still
+    degrades to filename-only (logged once, see
+    :func:`_log_npz_unreadable_once`). Never raises.
+    """
+    try:
+        import pypdf  # noqa: F401, PLC0415 -- availability probe only
+        pdf = "ok"
+    except Exception:  # noqa: BLE001 -- any import failure means unavailable
+        pdf = "pypdf_missing"
+    return {"pdf": pdf, "npz": "ok"}
+
+
+# ---------------------------------------------------------------------------
+# NPZ header-only parsing (stdlib, never unpickles)
+# ---------------------------------------------------------------------------
+
+_NPY_KIND_NAMES: dict[str, str] = {
+    "f": "float", "i": "int", "u": "uint", "c": "complex",
+}
+
+
+def _npy_descr_to_dtype(descr: Any) -> str | None:
+    """numpy-style dtype name for an .npy header ``descr`` value.
+
+    ``'<f8'`` gives ``float64``, ``'|b1'`` gives ``bool``, ``'|O'`` gives
+    ``object``, ``'<M8[ns]'`` gives ``datetime64[ns]``. A structured dtype
+    (a list of fields) gives ``structured``. String, bytes and void types
+    keep their descr, matching numpy's own ``str(dtype)``.
+    """
+    if isinstance(descr, list):
+        return "structured"
+    if not isinstance(descr, str) or not descr:
+        return None
+    body = descr[1:] if descr[0] in "<>|=" else descr
+    if not body:
+        return None
+    kind, size = body[0], body[1:]
+    if kind == "b" and size in ("", "1"):
+        return "bool"
+    if kind == "O":
+        return "object"
+    if kind in _NPY_KIND_NAMES and size.isdigit():
+        return f"{_NPY_KIND_NAMES[kind]}{int(size) * 8}"
+    if kind in "Mm" and size.startswith("8"):
+        return ("datetime64" if kind == "M" else "timedelta64") + size[1:]
+    return descr
+
+
+def _parse_npy_header(head: bytes) -> tuple[list[int], str | None] | None:
+    """``(shape, dtype)`` from the first bytes of an .npy stream, or None.
+
+    Supports format versions 1.0, 2.0 and 3.0. The header dict is parsed
+    with :func:`ast.literal_eval`, which accepts only Python literals, so a
+    crafted header cannot run code. Returns None when the magic or version
+    is wrong, the header does not fit in ``head`` (the caller's bounded
+    read), or the dict is malformed.
+    """
+    if len(head) < 10 or not head.startswith(_NPY_MAGIC):
+        return None
+    major = head[6]
+    if major == 1:
+        header_len = struct.unpack_from("<H", head, 8)[0]
+        start, encoding = 10, "latin1"
+    elif major in (2, 3):
+        if len(head) < 12:
+            return None
+        header_len = struct.unpack_from("<I", head, 8)[0]
+        start, encoding = 12, ("latin1" if major == 2 else "utf8")
+    else:
+        return None
+    if start + header_len > len(head):
+        return None
+    try:
+        meta = ast.literal_eval(head[start:start + header_len].decode(encoding))
+    except Exception:  # noqa: BLE001 -- malformed or hostile header text
+        return None
+    if not isinstance(meta, dict):
+        return None
+    shape = meta.get("shape")
+    if not isinstance(shape, tuple) or not all(
+        isinstance(d, int) and not isinstance(d, bool) and d >= 0 for d in shape
+    ):
+        return None
+    return [int(d) for d in shape], _npy_descr_to_dtype(meta.get("descr"))
+
+
+_ZIP_END_SIG = b"PK\x05\x06"
+_ZIP_END_LEN = 22
+_ZIP64_LOCATOR_SIG = b"PK\x06\x07"
+_ZIP64_LOCATOR_LEN = 20
+_ZIP64_END_SIG = b"PK\x06\x06"
+_ZIP64_END_LEN = 56
+_ZIP64_EXTRA_ID = 0x0001
+_ZIP_CENTRAL_SIG = b"PK\x01\x02"
+_ZIP_CENTRAL_LEN = 46
+# zipfile reads the whole central directory into memory and splits each
+# record's extra field by repeated slicing, which is quadratic in the extra
+# length; 256 records with 64 KiB extras is about 16 MiB of directory and
+# far more work. numpy's directory for 256 members is about 15 KB, but a
+# valid archive at the member cap with long member names (4 KiB each) is
+# just over 1 MiB, so a 1 MiB cap refused it and lost its array names,
+# shapes and dtypes. At 4 MiB the cost stays bounded: at most about 64
+# records with full 64 KiB extra fields fit, which zipfile parses in about
+# 2.5 s (measured on CPython 3.12; budget up to ~5 s on slower machines),
+# and the record walk still stops at _NPZ_MAX_MEMBERS + 1 records.
+_NPZ_MAX_CENTRAL_DIRECTORY_BYTES = 4 << 20
+
+
+def _zip_end_record(fh: Any) -> tuple[int, bytes] | None:
+    """``(offset, bytes)`` of the end-of-central-directory record, found the
+    way ``zipfile`` finds it (a comment-free record at the very end first,
+    else the last signature in the final 64 KiB), or None for no record."""
+    fh.seek(0, os.SEEK_END)
+    size = fh.tell()
+    if size < _ZIP_END_LEN:
+        return None
+    fh.seek(size - _ZIP_END_LEN)
+    record = fh.read(_ZIP_END_LEN)
+    if record[:4] == _ZIP_END_SIG and record[-2:] == b"\0\0":
+        return size - _ZIP_END_LEN, record
+    start = max(size - (1 << 16) - _ZIP_END_LEN, 0)
+    fh.seek(start)
+    tail = fh.read(size - start)
+    pos = tail.rfind(_ZIP_END_SIG)
+    if pos < 0 or len(tail) - pos < _ZIP_END_LEN:
+        return None
+    return start + pos, tail[pos:pos + _ZIP_END_LEN]
+
+
+def _zip64_end_record(fh: Any, end_pos: int) -> tuple[int, int, int, int] | str | None:
+    """``(record_offset, entries, cd_size, cd_offset)`` from the ZIP64 end
+    record named by a ZIP64 locator directly before the end record at
+    ``end_pos``, located and checked the way ``zipfile`` reads it (the
+    locator's offset, any extensible data filling the gap up to the
+    locator). None when there is no locator; a reason string when the
+    locator or the record is malformed or inconsistent."""
+    locator_pos = end_pos - _ZIP64_LOCATOR_LEN
+    if locator_pos < 0:
+        return None
+    fh.seek(locator_pos)
+    locator = fh.read(_ZIP64_LOCATOR_LEN)
+    if len(locator) != _ZIP64_LOCATOR_LEN or locator[:4] != _ZIP64_LOCATOR_SIG:
+        return None
+    _sig, locator_disk, record_pos, disks = struct.unpack("<4sLQL", locator)
+    if locator_disk or disks > 1 or record_pos > locator_pos - _ZIP64_END_LEN:
+        return "inconsistent ZIP64 end-of-central-directory locator"
+    fh.seek(record_pos)
+    record = fh.read(_ZIP64_END_LEN)
+    if len(record) != _ZIP64_END_LEN or record[:4] != _ZIP64_END_SIG:
+        return "ZIP64 end-of-central-directory record not found"
+    (_sig, record_size, _made_by, _needed, disk, cd_disk,
+     disk_entries, total_entries, cd_size, cd_offset) = struct.unpack("<4sQ2H2L4Q", record)
+    # record_size counts everything after its first 12 bytes, extensible
+    # data included, so the record must end exactly at the locator.
+    if (record_size + 12 != locator_pos - record_pos or disk or cd_disk
+            or disk_entries != total_entries):
+        return "inconsistent ZIP64 end-of-central-directory record"
+    return record_pos, total_entries, cd_size, cd_offset
+
+
+def _zip64_extra_values(extra: bytes) -> list[int] | None:
+    """The 8-byte values of the first ZIP64 extended-information field (id 1)
+    in a central record's extra data, or None when there is none or a field
+    before it overruns the extra data. Walks by offset, never by slicing,
+    so it is linear in the extra length."""
+    pos = 0
+    while len(extra) - pos >= 4:
+        field_id, field_len = struct.unpack_from("<2H", extra, pos)
+        pos += 4
+        if pos + field_len > len(extra):
+            return None
+        if field_id == _ZIP64_EXTRA_ID:
+            return list(struct.unpack_from(f"<{field_len // 8}Q", extra, pos))
+        pos += field_len
+    return None
+
+
+def _zip_central_directory_problem(fh: Any) -> str | None:
+    """Why ``fh`` must not be handed to :class:`zipfile.ZipFile`, or None.
+
+    ``ZipFile`` parses every central-directory record before the member cap
+    can run, and it walks the directory by its byte size, ignoring the end
+    record's entry count (which an attacker sets freely). So the directory
+    is walked here first, record by record, reading only each record's
+    fixed 46-byte header (plus, for a record with a saturated 32-bit size
+    or offset, its extra field), and the walk stops at record
+    ``_NPZ_MAX_MEMBERS + 1``. A directory larger than
+    ``_NPZ_MAX_CENTRAL_DIRECTORY_BYTES`` is refused before the walk, since
+    ``zipfile`` would read all of it and parse every record's extra field.
+
+    ZIP64 is read the way ``zipfile`` reads it: numpy archives past 2 GiB
+    carry a ZIP64 end record and locator, and ZIP64 extra fields holding
+    the real sizes and offsets of large or late members. Saturated fields
+    with nothing to resolve them, a ZIP64 end record that disagrees with
+    the end record, and offsets that do not line up are refused rather than
+    interpreted.
+    """
+    found = _zip_end_record(fh)
+    if found is None:
+        return "not a zip archive"
+    end_pos, end = found
+    (_sig, disk, cd_disk, disk_entries, total_entries,
+     cd_size, cd_offset, _comment_len) = struct.unpack("<4s4H2LH", end)
+    cd_end = end_pos
+    zip64 = _zip64_end_record(fh, end_pos)
+    if isinstance(zip64, str):
+        return zip64
+    if zip64 is not None:
+        cd_end, entries64, size64, offset64 = zip64
+        # zipfile uses only the ZIP64 values. Each 32-bit field must be
+        # saturated or equal to its ZIP64 value (zipfile writes
+        # min(value, saturated)), so no reader can see another directory.
+        narrow_fields = (
+            (disk, 0, 0xFFFF), (cd_disk, 0, 0xFFFF),
+            (disk_entries, entries64, 0xFFFF), (total_entries, entries64, 0xFFFF),
+            (cd_size, size64, 0xFFFFFFFF), (cd_offset, offset64, 0xFFFFFFFF),
+        )
+        if any(value not in (wide, saturated) for value, wide, saturated in narrow_fields):
+            return "end-of-central-directory record disagrees with the ZIP64 end record"
+        disk = cd_disk = 0
+        disk_entries = total_entries = entries64
+        cd_size, cd_offset = size64, offset64
+    elif 0xFFFF in (disk_entries, total_entries) or 0xFFFFFFFF in (cd_size, cd_offset):
+        return "ZIP64 marker without a ZIP64 end record"
+    if disk or cd_disk or disk_entries != total_entries or cd_offset + cd_size != cd_end:
+        return "inconsistent end-of-central-directory offsets"
+    if cd_size > _NPZ_MAX_CENTRAL_DIRECTORY_BYTES:
+        return (
+            f"central directory of {cd_size} bytes exceeds the cap of "
+            f"{_NPZ_MAX_CENTRAL_DIRECTORY_BYTES} bytes"
+        )
+    count = 0
+    pos = cd_offset
+    while pos < cd_end:
+        if cd_end - pos < _ZIP_CENTRAL_LEN:
+            return "truncated central directory"
+        fh.seek(pos)
+        header = fh.read(_ZIP_CENTRAL_LEN)
+        if len(header) != _ZIP_CENTRAL_LEN or header[:4] != _ZIP_CENTRAL_SIG:
+            return "bad central directory record"
+        count += 1
+        if count > _NPZ_MAX_MEMBERS:
+            return f"more than {_NPZ_MAX_MEMBERS} members exceeds the cap"
+        compress_size, file_size = struct.unpack_from("<2L", header, 20)
+        name_len, extra_len, comment_len = struct.unpack_from("<3H", header, 28)
+        local_offset = struct.unpack_from("<L", header, 42)[0]
+        record_end = pos + _ZIP_CENTRAL_LEN + name_len + extra_len + comment_len
+        if record_end > cd_end:
+            return "inconsistent central directory size"
+        # zipfile resolves saturated fields from the ZIP64 extra in this
+        # order: uncompressed size, compressed size, local header offset.
+        saturated = (file_size, compress_size, local_offset).count(0xFFFFFFFF)
+        if saturated:
+            fh.seek(pos + _ZIP_CENTRAL_LEN + name_len)
+            values = _zip64_extra_values(fh.read(extra_len))
+            if values is None or len(values) < saturated:
+                return "ZIP64 field without a matching ZIP64 extra field"
+            if local_offset == 0xFFFFFFFF:
+                local_offset = values[saturated - 1]
+        if local_offset >= cd_offset:
+            return "inconsistent member offset"
+        pos = record_end
+    if count != total_entries:
+        return f"end record declares {total_entries} entries but the directory holds {count}"
+    return None
+
+
+def _npz_members(fh: Any, path: str) -> list[dict[str, Any]] | None:
+    problem = _zip_central_directory_problem(fh)
+    if problem is not None:
+        _log_npz_unreadable_once(path, problem)
+        return None
+    fh.seek(0)
+    with zipfile.ZipFile(fh) as zf:
+        infos = [info for info in zf.infolist() if not info.is_dir()]
+        if len(infos) > _NPZ_MAX_MEMBERS:
+            _log_npz_unreadable_once(
+                path, f"{len(infos)} members exceeds the cap of {_NPZ_MAX_MEMBERS}",
+            )
+            return None
+        # The bounded read below only bounds STORED and DEFLATED members:
+        # zipfile decompresses a whole BZIP2 or LZMA block per read, so a few
+        # KB of such a member can inflate to gigabytes. numpy writes only
+        # these two methods; any other one refuses the file before a single
+        # member is opened.
+        for info in infos:
+            if info.compress_type not in _NPZ_READABLE_COMPRESSION:
+                _log_npz_unreadable_once(
+                    path, f"member compression method {info.compress_type} "
+                          "is not stored or deflated",
+                )
+                return None
+        arrays: list[dict[str, Any]] = []
+        for info in infos:
+            name = info.filename
+            if name.endswith(".npy"):
+                name = name[:-4]
+            parsed: tuple[list[int], str | None] | None
+            try:
+                with zf.open(info) as member:
+                    parsed = _parse_npy_header(member.read(_NPZ_MAX_HEADER_BYTES))
+            except Exception:  # noqa: BLE001 -- encrypted/corrupt member
+                parsed = None
+            shape, dtype = parsed if parsed is not None else (None, None)
+            arrays.append({"name": name, "shape": shape, "dtype": dtype})
+        return arrays
+
+
+def _npz_array_summary(
+    path: str, data: bytes | None = None,
+) -> list[dict[str, Any]] | None:
+    """Array names, shapes and dtypes in an .npz archive, read from headers.
+
+    Each entry is ``{"name", "shape", "dtype"}``; ``shape`` and ``dtype``
+    are None for a member whose .npy header could not be parsed (its name
+    is still listed). ``data`` is the file's bytes when the caller already
+    holds them (the single-read analysis path); otherwise the file is opened
+    and only the zip directory and member headers are read. Returns None
+    (filename-only indexing, logged once) for a file that is not a readable
+    zip or that exceeds ``_NPZ_MAX_MEMBERS``. Never raises.
+    """
+    try:
+        if data is not None:
+            return _npz_members(io.BytesIO(data), path)
+        with open(path, "rb") as fh:
+            return _npz_members(fh, path)
+    except Exception as exc:  # noqa: BLE001 -- BadZipFile, OSError, ...
+        _log_npz_unreadable_once(path, type(exc).__name__)
+        return None
+
+
+def _npz_dims_token(shape: list[int]) -> str:
+    """``[100, 3]`` gives ``100x3``; a 0-d array gives ``scalar``."""
+    return "x".join(str(d) for d in shape) if shape else "scalar"
+
+
+def _npz_fts_terms(arrays: list[dict[str, Any]]) -> list[str]:
+    terms: list[str] = []
+    for arr in arrays:
+        terms.append(str(arr.get("name") or ""))
+        shape = arr.get("shape")
+        if shape is not None:
+            terms.append(_npz_dims_token(shape))
+        if arr.get("dtype"):
+            terms.append(str(arr["dtype"]))
+    return [t for t in terms if t]
+
+
 @dataclass
 class FileFingerprint:
     """Cheap content-derived signature for one output file."""
@@ -1819,6 +2450,10 @@ class FileFingerprint:
     # extraction is comparatively expensive -- computing it once in
     # file_fingerprint and reusing it avoids parsing the same PDF twice.
     pdf_text: str | None = None
+    # NPZ array headers (kind == "npz_content" only): one
+    # {"name", "shape", "dtype"} dict per member, from _npz_array_summary.
+    # None when the archive could not be read or the kind isn't NPZ.
+    npz_arrays: list[dict[str, Any]] | None = None
 
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)
@@ -1827,6 +2462,10 @@ class FileFingerprint:
 def file_fingerprint(path: str) -> FileFingerprint:
     """Compute a cheap FileFingerprint for one output file."""
     kind = _classify_suffix(path)
+    if kind == "npz_content":
+        return FileFingerprint(
+            path=path, kind=kind, npz_arrays=_npz_array_summary(path),
+        )
     if kind == "pdf_content":
         pdf_text = _extract_pdf_text_from_path(path)
         # aa423c7e -- extend the same generating-script-hint inference every
@@ -1877,6 +2516,10 @@ def _content_for_fts(
         terms.extend(fingerprint.json_keys)
     if fingerprint.generating_script:
         terms.append(fingerprint.generating_script)
+    if fingerprint.npz_arrays:
+        # Header-only: array names, dims tokens (e.g. "100x3") and dtypes.
+        # The npz_content body stays empty (the branch below returns header).
+        terms.extend(_npz_fts_terms(fingerprint.npz_arrays))
     header = " ".join(terms)
     if fingerprint.kind == "pdf_content":
         pdf_body = body if body is not None else fingerprint.pdf_text
@@ -1926,13 +2569,81 @@ class ArchivalClassification:
     reason: str = ""
 
 
+def _stat_size_or_none(path: str) -> int | None:
+    """``os.stat(path).st_size``, or ``None`` when the stat fails."""
+    try:
+        return os.stat(path).st_size
+    except (OSError, ValueError):
+        return None
+
+
+def _compare_content(
+    path_a: str,
+    path_b: str,
+    *,
+    hash_of: Callable[[str], str | None],
+    size_of: Callable[[str], int | None],
+) -> bool | None:
+    """Size-first byte-identity check for one pair of files.
+
+    Returns ``False`` without hashing when both sizes are known and differ,
+    since files of different sizes cannot be byte-identical. Otherwise,
+    including when either size is unknown, it compares the two hashes:
+    ``True`` when they are equal, ``False`` when they differ, and ``None``
+    when either hash is unavailable, which means the pair could not be
+    confirmed either way.
+    """
+    size_a = size_of(path_a)
+    size_b = size_of(path_b)
+    if size_a is not None and size_b is not None and size_a != size_b:
+        return False
+    hash_a = hash_of(path_a)
+    if hash_a is None:
+        return None
+    hash_b = hash_of(path_b)
+    if hash_b is None:
+        return None
+    return hash_a == hash_b
+
+
+def files_content_identical(
+    path_a: str,
+    path_b: str,
+    *,
+    hasher: Callable[[str], str | None] = _xxh3_file,
+) -> bool | None:
+    """Public byte-identity check for two files, size first.
+
+    ``False`` when the sizes differ (no hash is computed) or the hashes
+    differ, ``True`` when the hashes are equal, and ``None`` when a hash
+    could not be computed. A failed stat falls back to hashing. This is the
+    same pairwise rule :func:`classify_canonical_archival` applies to an
+    archival candidate and its twin, exposed for callers whose naming
+    heuristics that function's stage-1 filter does not recognise (see
+    :mod:`meridian_outputs.classify`).
+    """
+    return _compare_content(
+        path_a, path_b, hash_of=hasher, size_of=_stat_size_or_none,
+    )
+
+
 def classify_canonical_archival(
     paths: list[str], *, hasher: Callable[[str], str | None] = _xxh3_file,
+    sizer: Callable[[str], int | None] | None = None,
 ) -> dict[str, ArchivalClassification]:
     """Two-stage canonical-vs-archival classification.  Deterministic output
-    order: keys follow the input ``paths`` list order (caller sorts them)."""
+    order: keys follow the input ``paths`` list order (caller sorts them).
+
+    Stage 2 compares sizes before hashes. When the candidate and its twin
+    have different sizes, the candidate is classified "content DIFFERS"
+    without hashing either file. ``sizer`` supplies those sizes: by default
+    each file is stat-ed, and a failed stat (``None``) falls back to the
+    hash comparison. :meth:`OutputsFtsIndex.rebuild` passes the sizes it
+    already holds so that classification adds no file I/O.
+    """
     path_set = set(paths)
     _hash_cache: dict[str, str | None] = {}
+    size_of = sizer if sizer is not None else _stat_size_or_none
 
     def _h(p: str) -> str | None:
         if p not in _hash_cache:
@@ -1952,6 +2663,17 @@ def classify_canonical_archival(
             out[path] = ArchivalClassification(
                 path=path, is_archival=False,
                 reason="archival name pattern but no canonical twin present",
+            )
+            continue
+        cand_size = size_of(path)
+        twin_size = size_of(twin)
+        if cand_size is not None and twin_size is not None and cand_size != twin_size:
+            out[path] = ArchivalClassification(
+                path=path, is_archival=False, canonical_path=twin,
+                reason=(
+                    "archival name pattern but content DIFFERS from twin "
+                    f"(sizes differ: {cand_size} vs {twin_size} bytes)"
+                ),
             )
             continue
         cand_hash = _h(path)
@@ -2240,6 +2962,14 @@ def _analyse_file(
                 fp = FileFingerprint(path=path, kind=kind, pdf_text=pdf_text,
                                      generating_script=pdf_script)
                 fts_content = _content_for_fts(path, fp, body=pdf_text)
+            elif kind == "npz_content":
+                # Parse the member headers from the bytes already read for
+                # hashing above instead of reopening the file.
+                fp = FileFingerprint(
+                    path=path, kind=kind,
+                    npz_arrays=_npz_array_summary(path, data),
+                )
+                fts_content = _content_for_fts(path, fp)
             elif kind != "text_content":
                 fp = FileFingerprint(path=path, kind=kind)
                 fts_content = _content_for_fts(path, fp)
@@ -3126,6 +3856,21 @@ def _open_tantivy_index_cold_start_safe(
         return fresh_index, warning
 
 
+#: Block size (bytes) DuckDB uses for a NEW index file created by
+#: OutputsFtsIndex when the caller does not pass ``duckdb_block_size``.
+#: DuckDB's own default is 262144. This governs only files created after this
+#: value takes effect: DuckDB records the block size in the file header at
+#: creation and never changes it, so an existing index file keeps the size it
+#: was created with and is never rewritten by changing this constant.
+DUCKDB_NEW_FILE_BLOCK_SIZE = 16384
+#: The block sizes DuckDB accepts for a new database file.
+_DUCKDB_BLOCK_SIZES = (16384, 32768, 65536, 131072, 262144)
+#: Serialises the first creation of an on-disk index file within this process
+#: (see OutputsFtsIndex._duckdb_connect). It is per process only: another OS
+#: process has its own copy of this lock and is not covered by it.
+_DUCKDB_FIRST_OPEN_LOCK = threading.Lock()
+
+
 class OutputsFtsIndex:
     # Adaptive defaults are deliberately bounded: 4k is the safety floor,
     # while 32k was the fastest tested setting in the real SUT benchmark.
@@ -3211,6 +3956,29 @@ class OutputsFtsIndex:
             return cls._WRITE_CHUNK_DEFAULT
         return value
 
+    @classmethod
+    def _resolve_duckdb_block_size(cls, explicit: int | None) -> int:
+        """Validate the ``duckdb_block_size`` constructor argument.
+
+        None selects DUCKDB_NEW_FILE_BLOCK_SIZE. Any value other than one of
+        DuckDB's supported block sizes raises ValueError rather than being
+        silently replaced, so a typo cannot quietly create a file at an
+        unintended size.
+        """
+        if explicit is None:
+            return DUCKDB_NEW_FILE_BLOCK_SIZE
+        if (
+            isinstance(explicit, bool)
+            or not isinstance(explicit, int)
+            or explicit not in _DUCKDB_BLOCK_SIZES
+        ):
+            raise ValueError(
+                f"OutputsFtsIndex: duckdb_block_size={explicit!r} is not a "
+                "supported DuckDB block size; expected one of "
+                + ", ".join(str(size) for size in _DUCKDB_BLOCK_SIZES)
+            )
+        return explicit
+
     def __init__(
         self,
         outputs_dir: str,
@@ -3222,6 +3990,7 @@ class OutputsFtsIndex:
         exclude_patterns: tuple[str, ...] | None = None,
         tantivy_heap_bytes: int | None = None,
         duckdb_memory_limit_bytes: int | None = None,
+        duckdb_block_size: int | None = None,
         max_batch: int | None = None,
         write_chunk: int | None = None,
         walk_cooldown_seconds: float | None = None,
@@ -3284,6 +4053,10 @@ class OutputsFtsIndex:
         # all, so re-resolving on that path is already idempotent -- only an
         # explicit constructor arg needs this guard.
         self._duckdb_memory_limit_overridden = duckdb_memory_limit_bytes is not None
+        # Block size for a NEW db file only (see DUCKDB_NEW_FILE_BLOCK_SIZE).
+        # Validated here, before the write lock or any connection exists, so a
+        # bad value fails at construction and never reaches the file system.
+        self._duckdb_block_size = self._resolve_duckdb_block_size(duckdb_block_size)
         # 3535b9ad -- walk batch cap: explicit param > MERIDIAN_OUTPUTS_MAX_BATCH
         # env var > class default (1bce8c41: an effectively-unbounded default,
         # time-primary -- see _ResumableFileWalk._MAX_BATCH). This value feeds
@@ -3440,6 +4213,21 @@ class OutputsFtsIndex:
         # from scratch, AND doubles as the signal the walk throttle (above)
         # uses to pause further discovery until Phase 1/2 catch up.
         self._pending_stale: dict[str, tuple[float | None, int | None]] = {}
+        # Same-size detection follow-up (see _promote_unhashed_same_size_rows).
+        # _same_size_promoted records the stat signature each promoted path
+        # had when it was queued, so a path whose hash still comes back None
+        # (an unreadable file) is not re-queued on every call while its
+        # signature is unchanged. Entries are dropped once the path gets a
+        # real hash. _same_size_scan_needed forces the promotion scan on a
+        # call with an empty backlog: on the first calls of a new instance
+        # (rehydration from disk happens in Phase 2, after the scan) and
+        # after a scan that could not queue every candidate.
+        self._same_size_promoted: dict[str, tuple[float | None, int | None]] = {}
+        self._same_size_scan_needed: bool = True
+        # Paths queued by _check_content_index_version for a one-time
+        # re-analysis. The new content_index_version marker is written only
+        # once none of them is still pending (see the tail of rebuild()).
+        self._content_reindex_pending: set[str] = set()
         # Planner diagnostics: phase timings and discovery coverage from the
         # most recent rebuild.  These are intentionally lightweight and make
         # large-root bottlenecks measurable instead of inferred from a single
@@ -3593,10 +4381,47 @@ class OutputsFtsIndex:
         self._legacy_migration_calls_since_scan = 0
         self._legacy_migration_found_last_time = True
 
+    def _duckdb_connect(self) -> Any:
+        """Open a DuckDB connection to ``self._db_path``.
+
+        A brand-new on-disk file is created at ``self._duckdb_block_size``. The
+        sizing is applied by a short-lived creating connection that is closed
+        straight away, and every connection is then a plain
+        ``duckdb.connect(path)``: the write connection, the read connection, and
+        any other connection this process opens to the same file. The block
+        size is recorded in the file header, so those plain opens all see it,
+        and the read and write sides can never disagree about a file either
+        one created.
+
+        The existence check, the creating connection and its close, and the
+        plain open all run under one module-level lock
+        (``_DUCKDB_FIRST_OPEN_LOCK``). Without it, a thread in this process
+        could see the file appear while the creating connection was still open,
+        and its plain open would be refused. The lock is per process only and
+        does not coordinate with other OS processes.
+
+        This is deliberate. DuckDB refuses a second connection to the same file
+        in one process whose config differs from one already open (``Can't open
+        a connection to same database file with a different configuration``),
+        so passing the config on a long-lived connection broke the read path
+        whenever the write connection had created the file first. Existing
+        files are opened exactly as before, and ``:memory:`` is never touched
+        (it takes neither the lock nor the creating step).
+        """
+        import duckdb  # noqa: PLC0415
+        if self._db_path == ":memory:":
+            return duckdb.connect(self._db_path)
+        with _DUCKDB_FIRST_OPEN_LOCK:
+            if not os.path.exists(self._db_path):
+                duckdb.connect(
+                    self._db_path,
+                    config={"default_block_size": str(self._duckdb_block_size)},
+                ).close()
+            return duckdb.connect(self._db_path)
+
     def _connect(self) -> Any:
         if self._con is None:
-            import duckdb  # noqa: PLC0415
-            self._con = duckdb.connect(self._db_path)
+            self._con = self._duckdb_connect()
             # task_ecb96ac9 follow-on -- give DuckDB an explicit ceiling to
             # self-manage against (see _default_duckdb_memory_limit_bytes's
             # module comment for why: no ceiling let a real run exhaust
@@ -3746,6 +4571,15 @@ class OutputsFtsIndex:
                     "OutputsFtsIndex._connect: legacy-migration-state "
                     "rehydration failed", exc_info=True,
                 )
+            # Runs after both rehydrations above, so it sees the rows and the
+            # pending backlog restored from disk.
+            try:
+                self._check_content_index_version(self._con)
+            except Exception:  # noqa: BLE001
+                _log.debug(
+                    "OutputsFtsIndex._connect: content-index version check "
+                    "failed", exc_info=True,
+                )
         return self._con
 
     def _maybe_retune_duckdb_memory_limit(self) -> None:
@@ -3846,8 +4680,7 @@ class OutputsFtsIndex:
         if self._db_path == ":memory:":
             return self._connect()
         if self._read_con is None:
-            import duckdb  # noqa: PLC0415
-            self._read_con = duckdb.connect(self._db_path)
+            self._read_con = self._duckdb_connect()
             try:
                 self._ensure_schema(self._read_con)
             except Exception:  # noqa: BLE001
@@ -4467,6 +5300,89 @@ class OutputsFtsIndex:
         self._pending_hash_upgrade = True
         return True
 
+    def _read_meta_version(self, con: Any, key: str) -> int:
+        """Integer value stored under ``key`` in ``outputs_index_meta``, or 0
+        when it is unset or unreadable."""
+        try:
+            row = con.execute(
+                "SELECT value FROM outputs_index_meta WHERE key = ?", [key],
+            ).fetchone()
+        except Exception:  # noqa: BLE001
+            return 0
+        if row is None or row[0] is None:
+            return 0
+        try:
+            return int(row[0])
+        except (TypeError, ValueError):
+            return 0
+
+    def _write_meta_version(self, con: Any, key: str, version: int) -> None:
+        """Delete-then-insert upsert, the same pattern as
+        :meth:`_write_hash_algo_version`."""
+        con.execute("DELETE FROM outputs_index_meta WHERE key = ?", [key])
+        con.execute(
+            "INSERT INTO outputs_index_meta (key, value) VALUES (?, ?)",
+            [key, str(version)],
+        )
+
+    @staticmethod
+    def _needs_content_reindex(path: str, kind: str | None) -> bool:
+        """Rows whose extracted content changed under the current
+        ``_CONTENT_INDEX_VERSION``: PDF and NPZ, matched by kind or by
+        suffix (an .npz row written before this version has kind
+        ``binary_metadata``)."""
+        if kind in ("pdf_content", "npz_content"):
+            return True
+        suffix = os.path.splitext(path)[1].lower()
+        return suffix in _PDF_SUFFIXES or suffix in _NPZ_SUFFIXES
+
+    def _check_content_index_version(self, con: Any) -> int:
+        """Queue a one-time re-analysis of rows whose extracted content is
+        out of date, modelled on :meth:`_check_hash_algo_version`.
+
+        Fast staleness is stat-based, so a row written by older extraction
+        code is never revisited while its file is unchanged. When the stored
+        ``content_index_version`` is below ``_CONTENT_INDEX_VERSION``, every
+        cached PDF/NPZ row is added to ``self._pending_stale`` with its
+        manifest signature and re-analysed through the normal bounded intake
+        (and the backlog persists across restarts with the walk state). The
+        new marker is written by :meth:`rebuild` only once none of the queued
+        paths is still pending, so an interrupted upgrade is re-queued by the
+        next process rather than silently marked done.
+
+        The marker is written at once when nothing needs queueing: a
+        brand-new index, an index with no PDF/NPZ rows, or one whose rows
+        were not rehydrated because a full re-hash is pending (that pass
+        re-analyses every row anyway, and an interrupted re-hash is retried
+        in full because its own marker is not written until it finishes).
+        Returns the number of rows queued.
+        """
+        self._ensure_schema(con)
+        stored = self._read_meta_version(con, _CONTENT_INDEX_VERSION_KEY)
+        if stored >= _CONTENT_INDEX_VERSION:
+            return 0
+        targets = sorted(
+            p for p, row in self._row_cache.items()
+            if self._needs_content_reindex(p, row.kind)
+        )
+        if not targets:
+            self._write_meta_version(
+                con, _CONTENT_INDEX_VERSION_KEY, _CONTENT_INDEX_VERSION,
+            )
+            return 0
+        for p in targets:
+            row = self._row_cache[p]
+            self._pending_stale.setdefault(
+                p, self._manifest.get(p, (row.mtime, row.size)),
+            )
+        self._content_reindex_pending.update(targets)
+        _log.info(
+            "OutputsFtsIndex: content_index_version %d < current %d for %r -- "
+            "re-analysing %d existing PDF/NPZ row(s) once",
+            stored, _CONTENT_INDEX_VERSION, self._db_path, len(targets),
+        )
+        return len(targets)
+
     @staticmethod
     def _tantivy_schema() -> Any:
         import tantivy  # noqa: PLC0415
@@ -4648,11 +5564,18 @@ class OutputsFtsIndex:
             duckdb_count, tantivy_count,
         )
         import tantivy  # noqa: PLC0415
+        # Runs inside rebuild()'s write-lock section and can take far longer
+        # than the lease's stale threshold on a large legacy table: keep the
+        # lease fresh while it runs (never from search()'s lazy build).
+        pacer = _LeaseHeartbeatPacer(self._fts_lease_heartbeat())
         relation = con.execute("SELECT path, content FROM outputs_index")
         for path, content in relation.fetchall():
             writer.delete_documents("path", path)
             writer.add_document(tantivy.Document(path=path, content=content or ""))
+            pacer.tick()
+        pacer.beat()
         writer.commit()
+        pacer.beat()
         index.reload()
 
     def _ensure_schema(self, con: Any) -> None:
@@ -5138,6 +6061,90 @@ class OutputsFtsIndex:
             )
             return None
 
+    def _known_size_counts(
+        self, all_paths: list[str], path_set: set[str],
+    ) -> dict[int, int]:
+        """Return a size -> count map over every path this call knows about.
+
+        A path in ``self._pending_stale`` counts with its freshly stat-ed
+        size, including a path deferred past this call's bounded intake
+        slice. Any other path counts with the size cached in ``_row_cache``.
+        Pending paths outside ``all_paths`` (a backlog restored from disk
+        before the walk revisits them) are counted as well. A path with no
+        known size is not counted. No file is stat-ed here.
+        """
+        counts: dict[int, int] = {}
+        pending = self._pending_stale
+        cache = self._row_cache
+        for p in all_paths:
+            sig = pending.get(p)
+            if sig is not None:
+                sz = sig[1]
+            else:
+                row = cache.get(p)
+                sz = row.size if row is not None else None
+            if sz is not None:
+                counts[sz] = counts.get(sz, 0) + 1
+        for p, sig in pending.items():
+            if p not in path_set and sig[1] is not None:
+                counts[sig[1]] = counts.get(sig[1], 0) + 1
+        return counts
+
+    def _promote_unhashed_same_size_rows(
+        self,
+        all_paths: list[str],
+        size_counts: dict[int, int],
+        analysis_limit: int,
+    ) -> int:
+        """Queue cached rows that were indexed without a hash but now share
+        their size with another known file. Returns the number queued.
+
+        The size prefilter (e1fd4182) skips hashing a file whose size is
+        unique when it is analysed, so its row keeps ``sha256=None``. If a
+        file of the same size appears later, that row is never revisited:
+        its stat signature is unchanged, and archival classification reads
+        the cached ``None`` and reports a byte-identical pair as different.
+        This pass adds each such row back to ``self._pending_stale`` with
+        its manifest signature (the same pattern as strict staleness mode),
+        so ``_needs_hash`` hashes it once and Phase 2 persists the hash.
+
+        Bounded and deterministic: candidates are taken in sorted path
+        order, and at most ``analysis_limit`` minus the current backlog are
+        queued, so promotion never pushes the backlog past one call's
+        intake. When candidates remain, or rehydration from disk has not run
+        yet (``self._con is None``), ``_same_size_scan_needed`` stays set so
+        a later call scans again even with an empty backlog. A path whose
+        hash came back ``None`` is not re-queued while its signature is
+        unchanged (see ``_same_size_promoted``).
+        """
+        pending = self._pending_stale
+        cache = self._row_cache
+        candidates: list[str] = []
+        for p in all_paths:
+            if p in pending:
+                continue
+            row = cache.get(p)
+            if row is None or row.sha256 is not None or row.size is None:
+                continue
+            if size_counts.get(row.size, 0) < 2:
+                continue
+            sig = self._manifest.get(p, (row.mtime, row.size))
+            if self._same_size_promoted.get(p) == sig:
+                continue
+            candidates.append(p)
+        candidates.sort()
+        slots = max(0, analysis_limit - len(pending))
+        queued = candidates[:slots]
+        for p in queued:
+            row = cache[p]
+            sig = self._manifest.get(p, (row.mtime, row.size))
+            pending[p] = sig
+            self._same_size_promoted[p] = sig
+        deferred = len(candidates) - len(queued)
+        self._same_size_scan_needed = deferred > 0 or self._con is None
+        self.last_rebuild_metrics["same_size_promotion_deferred"] = deferred
+        return len(queued)
+
     def rebuild(
         self, *, max_seconds: float | None = DEFAULT_REBUILD_BUDGET_SECONDS,
         staleness_mode: str = "fast", staleness_sample_rate: float = 0.1,
@@ -5500,6 +6507,7 @@ class OutputsFtsIndex:
             # drop it from the backlog so it isn't retried forever.
             for p in removed_paths:
                 self._pending_stale.pop(p, None)
+                self._same_size_promoted.pop(p, None)
             # 6af1518d -- a full pass just completed: this is the new
             # authoritative "expected" total (progress-signal denominator for
             # ConvergenceState), and the scan boundary resets -- the NEXT
@@ -5639,6 +6647,27 @@ class OutputsFtsIndex:
                     # leaving the on-disk row's content untouched.
                     self._pending_stale[p] = self._manifest.get(p, (None, None))
 
+        # Same-size detection: the size -> count map behind _needs_hash below
+        # counts every known path, using the fresh stat signature for any
+        # path in the pending backlog, including paths deferred past this
+        # call's intake slice. Rows indexed while their size was unique carry
+        # sha256=None; once another file of that size appears they are
+        # promoted back into the backlog so they are hashed once and the hash
+        # persists. Both steps cost O(known paths), so they run only when
+        # something is pending (a size count can only rise when a file is new
+        # or changed) or when a scan is still owed (see
+        # _same_size_scan_needed). A call with an empty backlog therefore
+        # adds no work.
+        size_counts: dict[int, int] | None = None
+        same_size_promoted = 0
+        self.last_rebuild_metrics["same_size_promotion_deferred"] = 0
+        if self._pending_stale or self._same_size_scan_needed:
+            size_counts = self._known_size_counts(all_paths, path_set)
+            same_size_promoted = self._promote_unhashed_same_size_rows(
+                all_paths, size_counts, analysis_limit,
+            )
+        self.last_rebuild_metrics["same_size_promoted"] = same_size_promoted
+
         # b85394bd -- BOUNDED ANALYSIS INTAKE: `self._pending_stale` may hold
         # far more than one call should take on at once (discovery capacity
         # is now effectively unbounded per call -- see `walk_batch` above --
@@ -5684,21 +6713,16 @@ class OutputsFtsIndex:
         files_hash_needed = 0
         files_hash_skipped = 0
         if stale:
-            # e1fd4182 (size-prefilter follow-up) -- build a size -> count
-            # map across ALL known paths (stale files use their freshly-
-            # stat'd size from stale_sigs; already-cached files use the size
-            # already sitting in _row_cache from a prior rebuild -- no extra
-            # stat calls either way) so a stale file can be compared against
-            # duplicates that AREN'T themselves stale this call, not just
-            # other members of this batch.
-            size_counts: dict[int, int] = {}
-            for p in all_paths:
-                sz = (
-                    stale_sigs[p][1] if p in stale_sigs
-                    else (self._row_cache[p].size if p in self._row_cache else None)
-                )
-                if sz is not None:
-                    size_counts[sz] = size_counts.get(sz, 0) + 1
+            # e1fd4182 (size-prefilter follow-up) -- a size -> count map
+            # across ALL known paths (pending files use their freshly-stat'd
+            # size, already-cached files the size in _row_cache from a prior
+            # rebuild -- no extra stat calls either way) so a stale file can
+            # be compared against duplicates that AREN'T themselves stale this
+            # call, not just other members of this batch. Built above, before
+            # the intake slice, so deferred paths count too (see
+            # _known_size_counts); a non-empty `stale` implies it was built.
+            if size_counts is None:
+                size_counts = self._known_size_counts(all_paths, path_set)
 
             def _needs_hash(p: str) -> bool:
                 # 49b97a6a -- a pending hash-algo-version upgrade means every
@@ -5781,6 +6805,12 @@ class OutputsFtsIndex:
                 else:
                     pool.shutdown(wait=True)
 
+        if self._same_size_promoted:
+            # A promoted path that now has a real hash needs no retry guard.
+            for p, a in precomputed.items():
+                if a.sha256 is not None:
+                    self._same_size_promoted.pop(p, None)
+
         self.last_rebuild_metrics["analysis_seconds"] = round(
             time.monotonic() - analysis_started, 6,
         )
@@ -5856,8 +6886,21 @@ class OutputsFtsIndex:
                 # its turn in a future Phase 1 comes up.
                 return None
 
+            def _known_size(path: str) -> int | None:
+                # Same-size detection: the sizes this call already holds, so
+                # the size-first check in classify_canonical_archival adds no
+                # stat calls here. None falls back to _cached_hasher.
+                analysis = precomputed.get(path)
+                if analysis is not None:
+                    return analysis.size
+                sig = self._pending_stale.get(path)
+                if sig is not None:
+                    return sig[1]
+                cached_row = self._row_cache.get(path)
+                return cached_row.size if cached_row is not None else None
+
             classifications = classify_canonical_archival(
-                all_paths, hasher=_cached_hasher,
+                all_paths, hasher=_cached_hasher, sizer=_known_size,
             )
         self.last_rebuild_metrics["classification_seconds"] = round(
             time.monotonic() - classify_started, 6,
@@ -6365,7 +7408,9 @@ class OutputsFtsIndex:
                         # below, so a sibling process's staleness check never
                         # mistakes a genuinely-still-working writer for an
                         # abandoned one just because the DB write above alone
-                        # took a while.
+                        # took a while. _rebuild_fts() keeps it fresh from
+                        # there (_LeaseHeartbeatPacer) through the delta and
+                        # the one-time migration, however long they run.
                         self._write_lock.heartbeat()
                         fts_started = time.monotonic()
                         self._rebuild_fts(con)
@@ -6493,6 +7538,29 @@ class OutputsFtsIndex:
                         "OutputsFtsIndex.rebuild: failed to persist "
                         "hash_algo_version", exc_info=True,
                     )
+            # Content-index upgrade (see _check_content_index_version): the
+            # new marker is written only once every queued PDF/NPZ path has
+            # left the backlog (re-analysed and written, or removed from
+            # disk). A path that failed stays pending and keeps it unwritten.
+            if self._content_reindex_pending:
+                self._content_reindex_pending.intersection_update(
+                    self._pending_stale,
+                )
+                if not self._content_reindex_pending:
+                    try:
+                        self._write_meta_version(
+                            self._connect(), _CONTENT_INDEX_VERSION_KEY,
+                            _CONTENT_INDEX_VERSION,
+                        )
+                        _log.info(
+                            "OutputsFtsIndex: PDF/NPZ content re-analysis "
+                            "complete for %r", self._db_path,
+                        )
+                    except Exception:  # noqa: BLE001
+                        _log.debug(
+                            "OutputsFtsIndex.rebuild: failed to persist "
+                            "content_index_version", exc_info=True,
+                        )
             # Durability follow-up to 6af1518d -- persist THIS call's final
             # walk epoch/cursor/pending-backlog/expected-count/last-error,
             # regardless of whether Phase 2's row write above succeeded.
@@ -6763,18 +7831,36 @@ class OutputsFtsIndex:
         deletes, self._pending_tantivy_deletes = self._pending_tantivy_deletes, set()
         upserts, self._pending_tantivy_upserts = self._pending_tantivy_upserts, {}
         if deletes or upserts:
+            # A large (or long-deferred) delta can outlast the lease's stale
+            # threshold: keep the write lock's lease fresh while it runs
+            # (never from search()'s lazy build, see _fts_lease_heartbeat).
+            pacer = _LeaseHeartbeatPacer(self._fts_lease_heartbeat())
             for p in deletes:
                 writer.delete_documents("path", p)
+                pacer.tick()
             for row in upserts.values():
                 writer.add_document(
                     tantivy.Document(path=row.path, content=row.content or "")
                 )
+                pacer.tick()
+            pacer.beat()
             writer.commit()
+            pacer.beat()
             index.reload()
         if not self._tantivy_migration_checked:
             self._tantivy_migration_checked = True
             self._migrate_duckdb_rows_to_tantivy_if_needed(con, index, writer)
         self._fts_built = True
+
+    def _fts_lease_heartbeat(self) -> Callable[[], None]:
+        """The heartbeat for the pacers in :meth:`_rebuild_fts` and the
+        migration it runs: the write lock's, or :func:`_no_lease_heartbeat`
+        while search() runs its lazy build in this thread. search() does not
+        hold the write lock, and :meth:`IndexFileLock.heartbeat` would write
+        the lease of the thread that does (see :data:`_LAZY_FTS_BUILD`)."""
+        if getattr(_LAZY_FTS_BUILD, "active", False):
+            return _no_lease_heartbeat
+        return self._write_lock.heartbeat
 
     def search(
         self, query: str, *, limit: int = 10, include_archival: bool = True,
@@ -6829,8 +7915,15 @@ class OutputsFtsIndex:
                     # but FTS was deferred from a prior rebuild(). Attempt a
                     # lazy build now. An empty pending delta is a no-op
                     # (mirrors the old "FTS over an empty table is harmless").
+                    # This thread does not hold the write lock, so the build
+                    # must not heartbeat its lease (_LAZY_FTS_BUILD).
                     self._fts_pending = False
-                    self._rebuild_fts(con)
+                    lazy_before = getattr(_LAZY_FTS_BUILD, "active", False)
+                    _LAZY_FTS_BUILD.active = True
+                    try:
+                        self._rebuild_fts(con)
+                    finally:
+                        _LAZY_FTS_BUILD.active = lazy_before
                 index, _writer = self._connect_tantivy()
                 # 52cbe5d8 -- a single Searcher snapshot must be used for BOTH
                 # the query (which returns DocAddress values that are only
@@ -7736,6 +8829,12 @@ class OutputsFtsIndex:
         must stay an explicit, out-of-band, caller-scheduled operation --
         e.g. a periodic maintenance window, not a rebuild() side effect.
 
+        The copy is written at this index's own block size
+        (``duckdb_block_size``, or DUCKDB_NEW_FILE_BLOCK_SIZE by default), not
+        DuckDB's 262144 default. If ``new_db_path`` already exists it must have
+        that block size: DuckDB refuses to ATTACH a file whose block size
+        differs, and that error is raised before anything is copied.
+
         Raises ``ValueError`` for ``:memory:`` mode (nothing to compact --
         there is no persistent file) or if ``new_db_path`` resolves to this
         index's own ``db_path``. Raises ``RuntimeError`` if this
@@ -7768,7 +8867,14 @@ class OutputsFtsIndex:
             if new_dir:
                 os.makedirs(new_dir, exist_ok=True)
             target_catalog = "_meridian_outputs_compact_target"
-            con.execute(f'ATTACH \'{new_db_path}\' AS "{target_catalog}"')
+            # Attach the target at this instance's block size. Without the
+            # option, COPY FROM DATABASE writes the copy at DuckDB's 262144
+            # default. _duckdb_block_size is always one of _DUCKDB_BLOCK_SIZES
+            # (validated in __init__), so interpolating it cannot inject SQL.
+            con.execute(
+                f'ATTACH \'{new_db_path}\' AS "{target_catalog}" '
+                f"(BLOCK_SIZE {self._duckdb_block_size})"
+            )
             try:
                 con.execute(f'COPY FROM DATABASE "{source_catalog}" TO "{target_catalog}"')
             finally:

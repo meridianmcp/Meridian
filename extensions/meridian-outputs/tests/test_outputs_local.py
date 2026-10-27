@@ -663,7 +663,7 @@ class TestReadIndexLockOwner:
             assert owner.pid_alive is True
             assert owner.is_stale is False
             assert owner.stale_reason is None
-            assert owner.lock_mode in ("atomic_create", "portalocker")
+            assert owner.lock_mode == "atomic_create"
         finally:
             lock.release()
 
@@ -739,22 +739,27 @@ class TestIndexFileLockCorrectnessFix:
     """a52216e2's core correctness fix: a genuine acquisition failure must
     raise, never be silently swallowed and treated as 'acquired'."""
 
-    def test_unexpected_portalocker_failure_raises_not_silently_succeeds(
+    def test_unexpected_create_failure_raises_not_silently_succeeds(
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
     ) -> None:
         """Regression test for the pre-a52216e2 bug: ANY exception during
-        portalocker acquisition (not just ImportError) used to be caught at
-        DEBUG level and treated as success, letting the caller believe it
-        held exclusive access when it did not."""
-        fake_portalocker = MagicMock()
-        fake_portalocker.LOCK_EX = 2
-        fake_portalocker.lock.side_effect = OSError("simulated permission denied")
-        monkeypatch.setitem(sys.modules, "portalocker", fake_portalocker)
-
+        cross-process acquisition used to be caught at DEBUG level and
+        treated as success, letting the caller believe it held exclusive
+        access when it did not. An unexpected error creating the lock file
+        must raise instead."""
         db_path = str(tmp_path / "index.duckdb")
+        real_open = os.open
+
+        def _read_only(path, flags, *a, **k):  # noqa: ANN001, ANN002, ANN003
+            if str(path).endswith(".lock"):
+                raise OSError("simulated read-only filesystem")
+            return real_open(path, flags, *a, **k)
+
         lock = OL.IndexFileLock(db_path)
-        with pytest.raises(OL.IndexLockAcquireError):
-            lock.acquire()
+        with monkeypatch.context() as m:
+            m.setattr(os, "open", _read_only)
+            with pytest.raises(OL.IndexLockAcquireError):
+                lock.acquire()
         # The in-process thread lock must be released on failure too, so a
         # later legitimate acquire in this same process isn't wedged forever.
         acquired = lock._thread_lock.acquire(blocking=False)
@@ -764,9 +769,8 @@ class TestIndexFileLockCorrectnessFix:
     def test_import_error_is_not_an_error_uses_atomic_fallback(
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
     ) -> None:
-        """portalocker simply being ABSENT is the documented, supported
-        degrade path -- it must never raise, and must still provide real
-        exclusivity via the atomic-create fallback."""
+        """portalocker being ABSENT (the default install) must never raise,
+        and the atomic-create lease file provides real exclusivity."""
         monkeypatch.setitem(sys.modules, "portalocker", None)
         db_path = str(tmp_path / "index.duckdb")
         lock = OL.IndexFileLock(db_path)
@@ -777,6 +781,193 @@ class TestIndexFileLockCorrectnessFix:
         finally:
             lock.release()
         assert not os.path.exists(db_path + ".lock")
+
+
+class _RecordingFakePortalocker:
+    """Stand-in for an importable portalocker (not installed in every test
+    env). IndexFileLock must never call it; it records every call and, like
+    the real OS lock, grants one exclusive holder. A contended call raises
+    instead of blocking, so a regression fails rather than hangs."""
+
+    LOCK_EX = 2
+    LOCK_NB = 4
+
+    def __init__(self) -> None:
+        self.calls: list[str] = []
+        self._held = False
+
+    def lock(self, fh: Any, flags: int) -> None:  # noqa: ARG002
+        self.calls.append("lock")
+        if self._held:
+            raise OSError("simulated: lock is held")
+        self._held = True
+
+    def unlock(self, fh: Any) -> None:  # noqa: ARG002
+        self.calls.append("unlock")
+        self._held = False
+
+
+class TestIndexFileLockIgnoresPortalocker:
+    """Every IndexFileLock acquirer uses the same O_EXCL lease file, whether
+    or not portalocker is importable. A process that took portalocker's OS
+    lock never saw an atomic-create holder's lease file, and an atomic-create
+    process never saw that OS lock, so in an install where only some
+    processes could import portalocker both entered the critical section and
+    a ledger update was lost."""
+
+    @pytest.mark.parametrize(
+        ("holder_sees_portalocker", "contender_sees_portalocker"),
+        [(False, True), (True, False), (True, True)],
+    )
+    def test_acquirers_exclude_each_other_whatever_is_importable(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+        holder_sees_portalocker: bool, contender_sees_portalocker: bool,
+    ) -> None:
+        fake = _RecordingFakePortalocker()
+        db_path = str(tmp_path / "index.duckdb")
+        lock_path = Path(db_path + ".lock")
+
+        monkeypatch.setitem(
+            sys.modules, "portalocker", fake if holder_sees_portalocker else None,
+        )
+        holder = OL.IndexFileLock(db_path, session_id="holder")
+        holder.acquire()
+        try:
+            holder_lease = lock_path.read_bytes()
+            assert json.loads(holder_lease)["lock_mode"] == "atomic_create"
+
+            monkeypatch.setitem(
+                sys.modules, "portalocker",
+                fake if contender_sees_portalocker else None,
+            )
+            contender = OL.IndexFileLock(db_path, session_id="contender", timeout=0.3)
+            # Stands in for a second process: in one process the per-path
+            # thread lock would serialise the two before the file is reached.
+            contender._thread_lock = threading.Lock()
+            with pytest.raises(OL.IndexLockAcquireError) as exc_info:
+                contender.acquire()
+            assert exc_info.value.owner is not None
+            assert exc_info.value.owner.session_id == "holder"
+            assert lock_path.read_bytes() == holder_lease
+            owner = OL.read_index_lock_owner(db_path)
+            assert owner.held is True
+            assert owner.session_id == "holder"
+            assert owner.is_stale is False
+        finally:
+            holder.release()
+        assert not lock_path.exists()
+        assert fake.calls == []
+
+    def test_waiting_contender_leaves_the_holders_lease_intact(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """A contender waiting for the lock never touches the live holder's
+        lease, and takes the lock once the holder releases it."""
+        fake = _RecordingFakePortalocker()
+        monkeypatch.setitem(sys.modules, "portalocker", fake)
+        db_path = str(tmp_path / "index.duckdb")
+        lock_path = Path(db_path + ".lock")
+
+        holder = OL.IndexFileLock(db_path, session_id="holder")
+        holder.acquire()
+        holder_lease = lock_path.read_bytes()
+        assert json.loads(holder_lease)["session_id"] == "holder"
+
+        # The contender inspects the holder's lease each time its create
+        # finds the lock file present, i.e. once it is waiting.
+        waiting = threading.Event()
+        real_inspect = OL._inspect_index_lock
+
+        def _inspect(*args: Any, **kwargs: Any) -> Any:
+            waiting.set()
+            return real_inspect(*args, **kwargs)
+
+        monkeypatch.setattr(OL, "_inspect_index_lock", _inspect)
+        contender = OL.IndexFileLock(db_path, session_id="contender", timeout=10.0)
+        # Stands in for a second process (see the test above).
+        contender._thread_lock = threading.Lock()
+        errors: list[BaseException] = []
+
+        def _contend() -> None:
+            try:
+                contender.acquire()
+            except BaseException as exc:  # noqa: BLE001
+                errors.append(exc)
+
+        waiter = threading.Thread(target=_contend, daemon=True)
+        waiter.start()
+        try:
+            assert waiting.wait(10.0), "contender never waited on the held lock"
+            assert lock_path.read_bytes() == holder_lease
+            owner = OL.read_index_lock_owner(db_path)
+            assert owner.session_id == "holder"
+            assert owner.is_stale is False
+        finally:
+            holder.release()
+            waiter.join(15.0)
+        assert not waiter.is_alive(), "contender never acquired after release"
+        assert errors == []
+        try:
+            lease = json.loads(lock_path.read_text(encoding="utf-8"))
+            assert lease["session_id"] == "contender"
+            assert lease["token"] == contender._token
+            assert lease["lock_mode"] == "atomic_create"
+        finally:
+            contender.release()
+        assert not lock_path.exists()
+        assert fake.calls == []
+
+    def test_lease_write_failure_leaves_no_predecessor_lease(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """A stale predecessor's lock file is removed, not reused, so a
+        failed lease write leaves an empty file of this holder's own rather
+        than a predecessor named as the owner."""
+        fake = _RecordingFakePortalocker()
+        monkeypatch.setitem(sys.modules, "portalocker", fake)
+        db_path = str(tmp_path / "index.duckdb")
+        lock_path = Path(db_path + ".lock")
+        lock_path.write_text(json.dumps({
+            "pid": 4, "hostname": "some-other-host-entirely",
+            "session_id": "predecessor", "started_at": time.time() - 10_000,
+            "heartbeat_at": time.time() - 10_000, "lock_mode": "atomic_create",
+            "token": "predecessor-token",
+        }), encoding="utf-8")
+
+        def _disk_full(*_a: Any, **_k: Any) -> None:
+            raise OSError("disk full")
+
+        monkeypatch.setattr(OL, "_write_lease_to_handle", _disk_full)
+        lock = OL.IndexFileLock(db_path, timeout=5.0)
+        lock.acquire()
+        try:
+            assert lock._lock_mode == "atomic_create"
+            assert lock_path.read_bytes() == b""
+            owner = OL.read_index_lock_owner(db_path)
+            assert owner.held is True
+            assert owner.session_id is None and owner.pid is None
+        finally:
+            lock.release()
+        assert not lock_path.exists()
+        assert fake.calls == []
+
+    def test_reading_the_owner_never_creates_a_lock_file(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """Diagnostics with portalocker importable used to create an empty
+        lock file to probe, which every atomic-create acquirer then waited on
+        as a live owner until it went stale."""
+        fake = _RecordingFakePortalocker()
+        monkeypatch.setitem(sys.modules, "portalocker", fake)
+        db_path = str(tmp_path / "index.duckdb")
+
+        owner = OL.read_index_lock_owner(db_path)
+        assert owner.held is False
+        assert not os.path.exists(db_path + ".lock")
+        lock = OL.IndexFileLock(db_path, timeout=0.3)
+        lock.acquire()
+        lock.release()
+        assert fake.calls == []
 
 
 class TestIndexFileLockAtomicFallback:
@@ -847,7 +1038,17 @@ class TestIndexFileLockAtomicFallback:
             _wait_for_file(ready_path)
             with open(ready_path, encoding="utf-8") as fh:
                 child_pid = int(fh.read().strip())
-            assert child_pid == child.pid
+            # On Windows a venv's python.exe is a launcher: Popen.pid can be the
+            # launcher while the real interpreter (the process that reports
+            # child_pid) is its descendant. Accept either; the owner check below
+            # still pins the exact PID that holds the lock.
+            import psutil
+
+            ancestor_pids = [p.pid for p in psutil.Process(child_pid).parents()]
+            assert child_pid == child.pid or child.pid in ancestor_pids, (
+                f"ready-file pid {child_pid} is neither the spawned process "
+                f"{child.pid} nor one of its descendants"
+            )
 
             owner = OL.read_index_lock_owner(db_path)
             assert owner.held is True
@@ -6953,6 +7154,251 @@ class TestTantivyMigration:
             idx2.close()
         finally:
             pass
+
+
+class _SlowTantivyWriter:
+    """Delegates to a real Tantivy writer but sleeps before every
+    ``add_document``, so the loop around it outlasts a shrunken stale
+    threshold without needing a huge corpus."""
+
+    def __init__(self, inner: Any, delay: float) -> None:
+        self._inner = inner
+        self._delay = delay
+
+    def add_document(self, doc: Any) -> Any:
+        time.sleep(self._delay)
+        return self._inner.add_document(doc)
+
+    def __getattr__(self, name: str) -> Any:
+        return getattr(self._inner, name)
+
+
+class TestFtsLeaseHeartbeat:
+    """rebuild() holds the index write lock through _rebuild_fts(), whose
+    Tantivy delta commit and one-time DuckDB-to-Tantivy migration used to
+    run with no heartbeat at all (rebuild() refreshed the lease once, just
+    before them). One that outlasted the stale threshold left a LIVE holder
+    with an old heartbeat, which a second process judges stale and reclaims,
+    so both ran the critical section. These tests shrink the stale threshold
+    and the heartbeat pacing, run each loop for well over the threshold, and
+    play the second process's acquire loop from a thread: inspect the lock,
+    and reclaim it when judged stale, exactly as _acquire_atomic does."""
+
+    _STALE_SECONDS = 0.75
+    _ROWS = 100
+    _ROW_DELAY = 0.02  # ~2-3 s per loop, several times the stale threshold
+
+    @pytest.fixture(autouse=True)
+    def _fast_lease_clock(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.setenv(
+            "MERIDIAN_OUTPUTS_LOCK_STALE_SECONDS", str(self._STALE_SECONDS),
+        )
+        monkeypatch.setattr(OL, "_FTS_HEARTBEAT_EVERY_SECONDS", 0.1)
+        monkeypatch.setattr(OL.IndexFileLock, "_HEARTBEAT_MIN_INTERVAL_SECONDS", 0.05)
+
+    @staticmethod
+    def _second_acquirer(
+        db_path: str, stop: threading.Event, verdicts: list[str],
+    ) -> None:
+        lock_path = os.path.abspath(db_path) + ".lock"
+        while not stop.is_set():
+            owner, snapshot = OL._inspect_index_lock(db_path)
+            if owner.is_stale:
+                verdicts.append(str(owner.stale_reason))
+                OL._reclaim_stale_lock_file(lock_path, snapshot)
+            time.sleep(0.02)
+
+    def _run_held(self, idx: OL.OutputsFtsIndex, work: Any, what: str) -> None:
+        """Run ``work()`` holding idx's write lock while the simulated second
+        acquirer watches. Asserts it never judged the live holder stale, the
+        lock file still belongs to this holder, and its heartbeat moved on."""
+        verdicts: list[str] = []
+        stop = threading.Event()
+        lock = idx._write_lock
+        lock.acquire()
+        try:
+            started = time.monotonic()
+            watcher = threading.Thread(
+                target=self._second_acquirer, args=(idx._db_path, stop, verdicts),
+                daemon=True,
+            )
+            watcher.start()
+            try:
+                work()
+            finally:
+                stop.set()
+                watcher.join(10.0)
+            elapsed = time.monotonic() - started
+            assert elapsed > 2 * self._STALE_SECONDS, (
+                f"test setup invariant: the loop ran only {elapsed:.2f}s, not "
+                f"longer than the {self._STALE_SECONDS}s stale threshold"
+            )
+            assert verdicts == [], (
+                "a second acquirer judged the lock of a live holder stale "
+                f"(and so tried to reclaim it) during the {what}: {verdicts[:3]}"
+            )
+            lock_path = os.path.abspath(idx._db_path) + ".lock"
+            assert OL._lock_file_is_ours(lock_path, lock._token, lock._file_handle), (
+                "the lock file was reclaimed out from under a live holder"
+            )
+            lease = json.loads(Path(lock_path).read_text(encoding="utf-8"))
+            assert lease["heartbeat_at"] - lease["started_at"] > self._STALE_SECONDS
+        finally:
+            lock.release()
+
+    def test_migration_keeps_lease_fresh_past_stale_threshold(
+        self, tmp_path: Path,
+    ) -> None:
+        db_path = OL._resolve_index_db_path(str(tmp_path))
+        idx = OL.OutputsFtsIndex(str(tmp_path), db_path=db_path)
+        try:
+            con = idx._connect()
+            idx._ensure_schema(con)
+            for i in range(self._ROWS):
+                con.execute(
+                    "INSERT INTO outputs_index VALUES "
+                    "(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                    [
+                        str(tmp_path / f"legacy_{i}.csv"), f"legacyrow{i} content",
+                        time.time(), f"{i:08x}", 10, None, "csv", False, None,
+                        None, None,
+                    ],
+                )
+            index, writer = idx._connect_tantivy()
+            assert index.searcher().num_docs == 0, "test setup: migration must run"
+            slow = _SlowTantivyWriter(writer, self._ROW_DELAY)
+
+            self._run_held(
+                idx,
+                lambda: idx._migrate_duckdb_rows_to_tantivy_if_needed(con, index, slow),
+                "one-time DuckDB-to-Tantivy migration",
+            )
+            assert index.searcher().num_docs == self._ROWS
+        finally:
+            idx.close()
+
+    def test_delta_commit_keeps_lease_fresh_past_stale_threshold(
+        self, tmp_path: Path,
+    ) -> None:
+        from types import SimpleNamespace  # noqa: PLC0415
+
+        db_path = OL._resolve_index_db_path(str(tmp_path))
+        idx = OL.OutputsFtsIndex(str(tmp_path), db_path=db_path)
+        try:
+            con = idx._connect()
+            idx._ensure_schema(con)
+            index, writer = idx._connect_tantivy()
+            idx._tantivy_writer = _SlowTantivyWriter(writer, self._ROW_DELAY)
+            idx._tantivy_migration_checked = True  # delta path only
+            for i in range(self._ROWS):
+                path = str(tmp_path / f"delta_{i}.csv")
+                idx._pending_tantivy_upserts[path] = SimpleNamespace(
+                    path=path, content=f"deltarow{i} content",
+                )
+
+            self._run_held(
+                idx, lambda: idx._rebuild_fts(con), "Tantivy delta commit",
+            )
+            assert index.searcher().num_docs == self._ROWS
+        finally:
+            idx.close()
+
+    def test_lazy_search_build_never_heartbeats_another_threads_lock(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """R6-G: search() runs its lazy _rebuild_fts() holding only its
+        in-process read lock, never the index write lock, yet its pacers
+        used the write lock's heartbeat. With rebuild() holding that lock in
+        another thread, search() rewrote the holder's lease from a thread
+        that does not hold it, unprotected, racing the holder's own lease
+        writes. Neither the lazy delta commit nor the migration it runs may
+        call IndexFileLock.heartbeat."""
+        from types import SimpleNamespace  # noqa: PLC0415
+
+        monkeypatch.setattr(OL, "_FTS_HEARTBEAT_EVERY_ROWS", 1)
+        heartbeats: list[int] = []
+        real_heartbeat = OL.IndexFileLock.heartbeat
+
+        def _spy(lock: Any, *args: Any, **kwargs: Any) -> None:
+            heartbeats.append(threading.get_ident())
+            real_heartbeat(lock, *args, **kwargs)
+
+        monkeypatch.setattr(OL.IndexFileLock, "heartbeat", _spy)
+        db_path = OL._resolve_index_db_path(str(tmp_path))
+        idx = OL.OutputsFtsIndex(str(tmp_path), db_path=db_path)
+        held, done = threading.Event(), threading.Event()
+
+        def _hold_like_rebuild() -> None:
+            idx._write_lock.acquire()
+            try:
+                held.set()
+                done.wait(30.0)
+            finally:
+                idx._write_lock.release()
+
+        holder = threading.Thread(target=_hold_like_rebuild, daemon=True)
+        try:
+            con = idx._connect()
+            idx._ensure_schema(con)
+            # More DuckDB-only rows than pending Tantivy upserts, so the
+            # one-time migration runs after the delta commit too.
+            for i in range(5):
+                con.execute(
+                    "INSERT INTO outputs_index VALUES "
+                    "(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                    [
+                        str(tmp_path / f"legacy_{i}.csv"), f"lazylegacy{i} content",
+                        time.time(), f"{i:08x}", 10, None, "csv", False, None,
+                        None, None,
+                    ],
+                )
+            pending = str(tmp_path / "pending.csv")
+            idx._pending_tantivy_upserts[pending] = SimpleNamespace(
+                path=pending, content="lazypending content",
+            )
+            assert idx._fts_built is False, "test setup: search() must build lazily"
+            holder.start()
+            assert held.wait(10.0), "test setup: the holder never took the lock"
+            lock_path = Path(os.path.abspath(db_path) + ".lock")
+            lease_before = lock_path.read_bytes()
+            try:
+                hits = idx.search("lazylegacy3")
+                lease_after = lock_path.read_bytes()
+            finally:
+                done.set()
+                holder.join(10.0)
+            assert idx._fts_built is True
+            assert idx._last_search_backend == "tantivy"
+            assert [h["path"] for h in hits] == [str(tmp_path / "legacy_3.csv")], (
+                "test setup: the lazy build must run the migration"
+            )
+            assert heartbeats == [], (
+                "search()'s lazy build called heartbeat on the write lock held "
+                f"by another thread ({len(heartbeats)} call(s))"
+            )
+            assert lease_after == lease_before
+        finally:
+            done.set()
+            idx.close()
+
+    def test_pacer_heartbeats_by_row_count_not_every_row(
+        self, monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """The loops must stay cheap: one heartbeat per
+        _FTS_HEARTBEAT_EVERY_ROWS rows (time trigger disabled here), never
+        one per row, plus one per explicit beat() around a commit."""
+        monkeypatch.setattr(OL, "_FTS_HEARTBEAT_EVERY_SECONDS", 3600.0)
+        monkeypatch.setattr(OL, "_FTS_HEARTBEAT_EVERY_ROWS", 1000)
+        calls: list[float] = []
+        pacer = OL._LeaseHeartbeatPacer(lambda: calls.append(time.monotonic()))
+        for _ in range(2500):
+            pacer.tick()
+        assert len(calls) == 2
+        pacer.beat()
+        assert len(calls) == 3
+        for _ in range(999):
+            pacer.tick()
+        assert len(calls) == 3, "beat() must restart the row interval"
 
 
 class TestTantivyDependency:

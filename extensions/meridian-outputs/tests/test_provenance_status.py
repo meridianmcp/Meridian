@@ -439,9 +439,11 @@ class TestRelocated:
     def test_fresh_script_content_hash_relocation_is_verified_and_authoritative(
         self, tmp_path: Path,
     ) -> None:
-        """A content-hash relocation whose generating script is still unchanged
-        keeps the full VERIFIED/0.75 mapping and stays authoritative. The script
-        check must not demote a relocation it has no reason to doubt."""
+        """A content-hash relocation whose generating script is still unchanged,
+        but whose original file has moved away, is not verified: the matched
+        record's tag cannot be tied to the moved bytes, so the script reads
+        unknown and the relocation is AMBIGUOUS, not authoritative. A relocation
+        with no tag at all keeps VERIFIED/0.75 (see the untagged tests)."""
         script = tmp_path / "train.py"
         script.write_text("print('stable')\n", encoding="utf-8")
         old = tmp_path / "run_1" / "metrics.csv"
@@ -458,12 +460,12 @@ class TestRelocated:
         status = PS.get_provenance_status(str(tmp_path), str(new))
         assert status["provenance_type"] == PS.RELOCATED  # sanity
         assert status["relocation_evidence"] == "content_hash"  # sanity
-        assert status["script_staleness"]["is_stale"] is False  # sanity
+        assert status["script_staleness"]["is_stale"] is None  # sanity: moved, unverifiable
         rec = PS.evidence_record_from_provenance_status(status)
-        assert rec.resolver.status is RE.ResolverStatus.VERIFIED
-        assert rec.resolver.confidence == 0.75
+        assert rec.resolver.status is RE.ResolverStatus.AMBIGUOUS
+        assert rec.resolver.confidence == 0.5
         assert rec.partial is False
-        assert rec.is_authoritative is True
+        assert rec.is_authoritative is False
         assert rec.attributes["provenance_type"] == PS.RELOCATED
 
     @duckdb_required
@@ -1024,8 +1026,9 @@ class TestStaleByScript:
         self, tmp_path: Path,
     ) -> None:
         """Counterpart: an unchanged script keeps the RELOCATED verdict. The
-        script lookup must still resolve the matched record's tag (not None),
-        so this also pins that the check reaches the tag at all."""
+        matched record's tag is still read, but its file has moved away, so
+        the tag cannot be tied to these bytes: it reads unknown, never fresh.
+        A changed script would read stale (see the parametrized tests)."""
         script = tmp_path / "stable_train.py"
         script.write_text("print('unchanged')\n", encoding="utf-8")
         old = tmp_path / "run_2" / "predictions.csv"
@@ -1042,8 +1045,8 @@ class TestStaleByScript:
         status = PS.get_provenance_status(str(tmp_path), str(new))
         assert status["provenance_type"] == PS.RELOCATED
         assert status["script_staleness"] is not None
-        assert status["script_staleness"]["is_stale"] is False
-        assert status["staleness_record"]["state"] == "fresh"
+        assert status["script_staleness"]["is_stale"] is None
+        assert status["staleness_record"]["state"] == "unknown"
 
     @duckdb_required
     def test_relocated_query_path_own_stale_tag_wins_over_fresh_matched_tag(
@@ -1085,11 +1088,13 @@ class TestStaleByScript:
 
     @duckdb_required
     @pytest.mark.parametrize(
-        ("old_script_edited", "new_script_edited", "expected_state"),
+        ("old_script_edited", "new_script_edited", "expected_state", "matched_wins"),
         [
-            pytest.param(True, False, "stale", id="matched-stale-query-fresh"),
-            pytest.param(True, True, "stale", id="both-stale"),
-            pytest.param(False, False, "fresh", id="both-fresh"),
+            pytest.param(True, False, "stale", True, id="matched-stale-query-fresh"),
+            pytest.param(True, True, "stale", True, id="both-stale"),
+            # The matched file was moved away, so its fresh reading cannot be
+            # tied to these bytes: only the copy's own tag decides.
+            pytest.param(False, False, "fresh", False, id="both-fresh"),
         ],
     )
     def test_content_hash_relocation_tag_precedence(
@@ -1098,12 +1103,15 @@ class TestStaleByScript:
         old_script_edited: bool,
         new_script_edited: bool,
         expected_state: str,
+        matched_wins: bool,
     ) -> None:
         """Precedence in the content-hash RELOCATED branch: a stale tag on the
         matched record wins. Otherwise a stale tag on the queried path wins.
         Otherwise the matched record's tag is preferred over the queried
         path's tag. script_staleness.path must name the record whose tag won,
-        and here that is the matched record in all three cases. The case where
+        and here that is the matched record when it is stale. When the matched
+        file has moved away and reads fresh, its tag cannot be tied to these
+        bytes, so the queried path's own tag decides. The case where
         only the queried path's tag is stale is covered by
         test_relocated_query_path_own_stale_tag_wins_over_fresh_matched_tag."""
         old_script = tmp_path / "make_old.py"
@@ -1136,8 +1144,11 @@ class TestStaleByScript:
         status = PS.get_provenance_status(str(tmp_path), str(new))
         assert status["provenance_type"] == PS.RELOCATED
         assert status["record"]["path"] == str(old)
-        assert status["script_staleness"]["path"] == str(old)
-        assert status["script_staleness"]["is_stale"] is old_script_edited
+        winner = str(old) if matched_wins else str(new)
+        assert status["script_staleness"]["path"] == winner
+        assert status["script_staleness"]["is_stale"] is (
+            old_script_edited if matched_wins else new_script_edited
+        )
         assert status["staleness_record"]["state"] == expected_state
         assert status["inconclusive"] is False
 
