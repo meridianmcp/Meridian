@@ -4800,6 +4800,7 @@ async def mcp_tools_doc() -> str:
     lines += _render_tool("runpod_list_pods")
     lines += ["## Zotero bridge (local only)\n"]
     lines += _render_tool("zotero_create_collection")
+    lines += _render_tool("zotero_ensure_collection_chain")
     lines += _render_tool("zotero_move_collection")
     lines += _render_tool("zotero_move_item")
     lines += _render_tool("zotero_create_webpage")

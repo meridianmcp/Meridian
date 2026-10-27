@@ -405,6 +405,99 @@ def test_reader_failure_stops_the_attach_before_any_write(tmp_path):
     assert bridge.calls == []
 
 
+@pytest.mark.parametrize("junk_child", ["not an object", 7, None])
+def test_an_unreadable_child_row_stops_the_attach_because_the_pdf_check_cannot_be_trusted(tmp_path, junk_child):
+    # The unreadable row could be the PDF already attached. Skipping it would let a rerun attach a second copy.
+    pdf = write_pdf(tmp_path / "paper.pdf")
+    bridge = FakeBridge()
+    client, _ = make_client(bridge, FakeReader(children={"ITEM0001": [junk_child]}))
+
+    with pytest.raises(ZoteroBridgeError) as info:
+        client.attach_pdf("ITEM0001", str(pdf))
+
+    assert info.value.code == "reader_failed"
+    assert bridge.calls == []
+
+
+@pytest.mark.parametrize("junk_child", ["not an object", 7, None])
+def test_an_unreadable_child_row_stops_the_note_because_the_marker_check_cannot_be_trusted(junk_child):
+    # The unreadable row could be the note already holding the marker. Skipping it would let a rerun add the note twice.
+    bridge = FakeBridge()
+    client, _ = make_client(bridge, FakeReader(children={"ITEM0001": [junk_child]}))
+
+    with pytest.raises(ZoteroBridgeError) as info:
+        client.add_child_note("ITEM0001", "<p>Summary</p>", "meridian-summary-v1")
+
+    assert info.value.code == "reader_failed"
+    assert bridge.calls == []
+
+
+# A dict row is readable only when its data object carries an itemType. Without one, the PDF and note checks cannot tell
+# what the row is, so such a row stops the write as a non-dict row does.
+DICT_CHILDREN_WITHOUT_READABLE_DATA = [
+    {"key": "ATT00001", "version": 1},
+    {"key": "ATT00001", "version": 1, "data": None},
+    {"key": "ATT00001", "version": 1, "data": "attachment"},
+    {"key": "ATT00001", "version": 1, "data": {"key": "ATT00001"}},
+    {"key": "ATT00001", "version": 1, "data": {"key": "ATT00001", "itemType": 7}},
+]
+
+
+@pytest.mark.parametrize("child", DICT_CHILDREN_WITHOUT_READABLE_DATA)
+def test_a_dict_child_without_readable_data_stops_the_attach(tmp_path, child):
+    # Read as not a PDF, this child would let a rerun attach a second copy of a PDF that is already there.
+    pdf = write_pdf(tmp_path / "paper.pdf")
+    bridge = FakeBridge()
+    client, _ = make_client(bridge, FakeReader(children={"ITEM0001": [child]}))
+
+    with pytest.raises(ZoteroBridgeError) as info:
+        client.attach_pdf("ITEM0001", str(pdf))
+
+    assert info.value.code == "reader_failed"
+    assert bridge.calls == []
+
+
+@pytest.mark.parametrize("child", DICT_CHILDREN_WITHOUT_READABLE_DATA)
+def test_a_dict_child_without_readable_data_stops_the_note(child):
+    # Read as not a note, this child would let a rerun add the same note a second time.
+    bridge = FakeBridge()
+    client, _ = make_client(bridge, FakeReader(children={"ITEM0001": [child]}))
+
+    with pytest.raises(ZoteroBridgeError) as info:
+        client.add_child_note("ITEM0001", "<p>Summary</p>", "meridian-summary-v1")
+
+    assert info.value.code == "reader_failed"
+    assert bridge.calls == []
+
+
+def test_a_child_list_past_the_page_limit_stops_the_note_with_no_write(monkeypatch):
+    # The marker note sits on a page the check never reads, so it could already be there. Stopping is the safe answer.
+    monkeypatch.setattr(zbc, "CHILD_PAGE_SIZE", 2)
+    monkeypatch.setattr(zbc, "CHILD_PAGE_LIMIT", 2)
+    children = [note_child(f"NOTE000{index}", "<p>other</p>") for index in range(4)]
+    children.append(note_child("NOTE0009", '<div data-meridian-dedup="meridian-digest-0001">old</div>'))
+    bridge = FakeBridge()
+    client, _ = make_client(bridge, FakeReader(children={"ITEM0001": children}))
+
+    with pytest.raises(ZoteroBridgeError) as info:
+        client.add_child_note("ITEM0001", "<p>Summary</p>", "meridian-digest-0001")
+
+    assert info.value.code == "reader_failed"
+    assert bridge.calls == []
+
+
+def test_a_child_list_of_exactly_the_page_limit_is_read_whole(monkeypatch):
+    monkeypatch.setattr(zbc, "CHILD_PAGE_SIZE", 2)
+    monkeypatch.setattr(zbc, "CHILD_PAGE_LIMIT", 2)
+    children = [note_child(f"NOTE000{index}", "<p>other</p>") for index in range(3)]
+    children.append(note_child("NOTE0009", '<div data-meridian-dedup="meridian-digest-0001">old</div>'))
+    bridge = FakeBridge()
+    client, _ = make_client(bridge, FakeReader(children={"ITEM0001": children}))
+
+    assert client.add_child_note("ITEM0001", "<p>Summary</p>", "meridian-digest-0001") == ALREADY_PRESENT
+    assert bridge.calls == []
+
+
 # ---------------------------------------------------------------------------------------------
 # Webpages and child notes
 # ---------------------------------------------------------------------------------------------
@@ -479,7 +572,6 @@ def test_a_note_that_only_mentions_the_bare_marker_does_not_block_a_write():
 
     assert client.add_child_note("ITEM0001", "<p>Summary</p>", "meridian-summary-v1") == "NOTE0001"
     assert len(writes_of(bridge)) == 1
-
 
 
 # ---------------------------------------------------------------------------------------------

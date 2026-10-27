@@ -24,8 +24,9 @@ which may hold the token, is never kept, and the exception chain is cleared.
 Duplicates. ``attach_pdf`` returns "already_attached", and ``add_child_note`` returns "already_present", without
 writing, when the item already has a PDF or a child note already holds the marker. ``ensure_collection`` and
 ``ensure_collection_chain`` reuse a collection with the same exact name under the same parent, and refuse, with no
-write, when more than one matches. ``create_webpage`` returns "already_present" when the collections it names already
-hold a webpage with the same exact URL. Otherwise each creates and returns the new key.
+write, when more than one matches. ``create_webpage`` returns "already_present" when every collection it names
+already holds a webpage with the same exact URL. When only some do, it raises "partial_match" with no write.
+Otherwise it creates the webpage and returns the new key.
 """
 
 from __future__ import annotations
@@ -255,8 +256,9 @@ def _is_pdf_attachment(child: dict[str, Any]) -> bool:
 def _is_note_with_marker(child: dict[str, Any], marker: str) -> bool:
     """True when the note carries the marker as written by add_child_note: a quoted attribute, not the bare text.
 
-    The bare text would match a longer marker that starts with it (v1 inside v10), and a note that merely quotes the
-    marker in its prose. The quoted attribute matches neither.
+    The bare text would match a longer marker that starts with it (v1 inside v10), and a note that merely mentions the
+    marker in its prose. The quoted attribute avoids both. A note whose text contains that exact attribute still
+    matches, since it cannot be told apart from one add_child_note wrote.
     """
     data = child.get("data")
     if not isinstance(data, dict) or data.get("itemType") != "note":
@@ -289,7 +291,7 @@ def _collection_row(row: Any) -> dict[str, Any]:
         # A missing field is not the same as a top-level collection, so it is refused rather than guessed at.
         raise _unreadable_collection()
     parent = data["parentCollection"]
-    if parent is False or parent is None or parent == "":
+    if parent is False:
         parent_key = None
     elif isinstance(parent, str) and _KEY.fullmatch(parent):
         parent_key = parent
@@ -311,15 +313,45 @@ def _ambiguous_collection() -> ZoteroBridgeError:
     )
 
 
+def _unreadable_webpage() -> ZoteroBridgeError:
+    return ZoteroBridgeError(
+        "reader_failed",
+        "The Zotero local API returned an item this check cannot read, so the duplicate check did not run.",
+    )
+
+
+def _unreadable_child() -> ZoteroBridgeError:
+    return ZoteroBridgeError(
+        "reader_failed",
+        "The Zotero local API returned a child item this check cannot read, so the duplicate check did not run.",
+    )
+
+
+def _readable_child(row: Any) -> bool:
+    """True when a child row has the data object and the itemType that the PDF and note checks read."""
+    data = row.get("data") if isinstance(row, dict) else None
+    return isinstance(data, dict) and isinstance(data.get("itemType"), str)
+
+
 def _webpage_key(row: Any, url: str) -> str | None:
-    """The key of a webpage item in ``row`` whose URL is exactly ``url``, or None for any other row."""
-    if not isinstance(row, dict):
-        return None
-    data = row.get("data")
-    if not isinstance(data, dict) or data.get("itemType") != "webpage" or data.get("url") != url:
+    """The key of a webpage item in ``row`` whose URL is exactly ``url``. None for a readable row of another kind.
+
+    Raises rather than skip a row it cannot read. A skipped webpage could hold the URL, and a rerun would then create a
+    second copy.
+    """
+    data = row.get("data") if isinstance(row, dict) else None
+    if not isinstance(data, dict):
+        raise _unreadable_webpage()
+    item_type = data.get("itemType")
+    if not isinstance(item_type, str):
+        raise _unreadable_webpage()
+    if item_type != "webpage":
         return None
     key = data.get("key") or row.get("key")
-    return key if isinstance(key, str) and _KEY.fullmatch(key) else None
+    page_url = data.get("url")
+    if not isinstance(key, str) or not _KEY.fullmatch(key) or not isinstance(page_url, str):
+        raise _unreadable_webpage()
+    return key if page_url == url else None
 
 
 class CollectionChain(NamedTuple):
@@ -551,7 +583,9 @@ class ZoteroBridgeClient:
         Only the routes in _BATCHABLE_ROUTES are sent. Every operation is checked first, and any other route, method or
         category is refused before anything is sent: grant routes, the status route, a nested batch, attachments, tag
         rename, BibTeX import, and any unlisted method or path. A rollback raises BatchRolledBackError with the failed
-        operation's index. Nothing is applied in part.
+        operation's index. Nothing is applied in part. Item and collection creates are sent as written and are not
+        deduplicated, so a rerun of a batch that creates them writes them again. Use create_webpage or ensure_collection
+        for a create that must not repeat.
         """
         if not isinstance(operations, (list, tuple)):
             raise _invalid("operations", "must be a list")
@@ -681,24 +715,31 @@ class ZoteroBridgeClient:
         return body
 
     def _read_pages(self, base: str, page_size: int, page_limit: int, too_many: str) -> list[Any]:
-        """Every row under ``base``, read a page at a time. Past ``page_limit`` pages it fails with ``too_many``."""
+        """Every row under ``base``, read a page at a time. It fails with ``too_many`` only when a row exists past
+        ``page_limit`` full pages. A list of exactly that many rows is returned whole."""
         found: list[Any] = []
         for page in range(page_limit):
             rows = self._read_list(f"{base}?format=json&limit={page_size}&start={page * page_size}")
             found.extend(rows)
             if len(rows) < page_size:
                 return found
-        raise ZoteroBridgeError("reader_failed", too_many)
+        beyond = self._read_list(f"{base}?format=json&limit={page_size}&start={page_limit * page_size}")
+        if beyond:
+            raise ZoteroBridgeError("reader_failed", too_many)
+        return found
 
     def _children(self, parent_key: str) -> list[dict[str, Any]]:
-        """Every child of an item, read a page at a time. Fails rather than returning a partial list."""
+        """Every child of an item, read a page at a time. Fails rather than returning a partial list, and fails on a
+        child it cannot read, since a skipped child could be the PDF or the note a rerun is checking for."""
         rows = self._read_pages(
             f"/api/users/{_LOCAL_USER_ID}/items/{parent_key}/children",
             CHILD_PAGE_SIZE,
             CHILD_PAGE_LIMIT,
             "The item has more children than the duplicate check reads, so it did not run.",
         )
-        return [row for row in rows if isinstance(row, dict)]
+        if not all(_readable_child(row) for row in rows):
+            raise _unreadable_child()
+        return rows
 
     def _webpage_keys_by_collection(self, collection_keys: list[str], url: str) -> list[list[str]]:
         """For each distinct collection, the keys of its webpage items whose URL is exactly ``url``. Reads only."""

@@ -1327,7 +1327,10 @@ async def _authorize_scoped_mcp_call(
         raise ValueError("project is outside your access scope")
     has_project_ref = has_project_ref or bool(batch_target_ids)
 
-    if resolve_references:
+    # The chain tool's project_name is a Zotero collection name, not a Meridian project. It is neither resolved nor
+    # scope-checked as one, so a scoped caller cannot tell an existing Meridian project name from a missing one.
+    project_name_is_zotero_collection = name in _PROJECT_NAME_IS_A_ZOTERO_COLLECTION_NAME
+    if resolve_references and not project_name_is_zotero_collection:
         try:
             args = await _resolve_project_reference(db, args, scoped_project_ids)
             # Hierarchy tools carry project refs beyond the common
@@ -1350,9 +1353,14 @@ async def _authorize_scoped_mcp_call(
         except Exception as exc:  # noqa: BLE001 — lookup failure is a refusal
             raise member_policy.MemberPolicyUnavailable() from exc
 
+    scope_args = (
+        {key: value for key, value in args.items() if key != "project_name"}
+        if project_name_is_zotero_collection
+        else args
+    )
     try:
         await scope_guard.enforce_scoped_call(
-            name, args, db, scoped_project_ids,
+            name, scope_args, db, scoped_project_ids,
             doc_store_factory=lambda: _resolve_ingest_doc_store(db, data_dir, tenant),
         )
     except (ValueError, member_policy.MemberPolicyDenied):
@@ -7508,7 +7516,7 @@ async def _handle_zotero_bridge_tools(
     tenant: dict[str, Any] | None,
     _mcp_tenant_id: Any,
 ) -> Any:
-    """Dispatch group: the seven local-only Zotero bridge write tools (meridian/mcp/handlers/zotero_bridge_tools.py).
+    """Dispatch group: the eight local-only Zotero bridge write tools (meridian/mcp/handlers/zotero_bridge_tools.py).
     They write to the caller's own Zotero library through the bridge and take no project, so the database, tenant and
     data dir are unused. Hosted Meridian refuses them inside the handlers."""
     from .handlers.zotero_bridge_tools import ZOTERO_BRIDGE_HANDLERS  # noqa: PLC0415
@@ -7711,6 +7719,11 @@ async def _complete_sprint_item_timeout_response(
 _PROJECT_UUID_RE = re.compile(
     r"^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$", re.I
 )
+# Local dispatch resolves a ``project_name`` argument as a Meridian project. The Zotero collection chain's
+# ``project_name`` is a Zotero collection name, so neither the resolver nor the scoped name check may run on it, or a
+# name with no Meridian project is refused before the bridge is reached, and a name that is one is refused differently.
+# The tool itself refuses hosted calls (zotero_bridge_tools._run), so that refusal is the same for every caller.
+_PROJECT_NAME_IS_A_ZOTERO_COLLECTION_NAME = frozenset({"zotero_ensure_collection_chain"})
 
 
 async def _resolve_project_reference(
@@ -7859,7 +7872,8 @@ async def _dispatch_mcp_tool(
     # 3f47cc6e — an explicit project_id is never silently overridden by a
     # project_name that resolves elsewhere: that conflict is rejected.
     if scoped_project_ids is None:
-        args = await _resolve_project_reference(db, args, scoped_project_ids)
+        if name not in _PROJECT_NAME_IS_A_ZOTERO_COLLECTION_NAME:
+            args = await _resolve_project_reference(db, args, scoped_project_ids)
     elif not _authorization_prechecked:
         args = await _authorize_scoped_mcp_call(
             name, args, db, data_dir, tenant, scoped_project_ids,

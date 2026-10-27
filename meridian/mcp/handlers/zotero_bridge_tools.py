@@ -1,6 +1,6 @@
-"""Per-tool handlers for the Zotero bridge write tools: zotero_create_collection, zotero_move_collection,
-zotero_move_item, zotero_create_webpage, zotero_attach_pdf, zotero_add_child_note and zotero_batch. Local only: hosted
-Meridian refuses all seven.
+"""Per-tool handlers for the Zotero bridge write tools: zotero_create_collection, zotero_ensure_collection_chain,
+zotero_move_collection, zotero_move_item, zotero_create_webpage, zotero_attach_pdf, zotero_add_child_note and
+zotero_batch. Local only: hosted Meridian refuses all eight.
 
 Each handler is a thin call into the process-wide ZoteroBridgeClient (meridian/zotero_bridge_transport.py). The client
 validates the input, runs the duplicate checks and the grant flow, and raises ZoteroBridgeError carrying the bridge's
@@ -67,11 +67,12 @@ def _list_arg(args: dict[str, Any], key: str) -> list[Any]:
     return value
 
 
-def _flag_arg(args: dict[str, Any], key: str) -> bool:
-    """An optional true/false argument. Omitted or null is false; anything else that is not a boolean is refused."""
+def _flag_arg(args: dict[str, Any], key: str, default: bool = False) -> bool:
+    """An optional true/false argument. Omitted or null takes ``default``.
+    Anything else that is not a boolean is refused."""
     value = args.get(key)
     if value is None:
-        return False
+        return default
     if not isinstance(value, bool):
         raise ZoteroBridgeError("invalid_input", f"{key} must be true or false.")
     return value
@@ -92,14 +93,31 @@ async def _run(action: Callable[[ZoteroBridgeClient], dict[str, Any]]) -> dict[s
 
 
 async def handle_zotero_create_collection(args: dict[str, Any]) -> dict[str, Any]:
-    """MCP tool: zotero_create_collection. Creates a collection, or with reuse_existing reuses a same-named one."""
+    """MCP tool: zotero_create_collection. Reuses a same-named collection under the same parent unless reuse_existing is
+    false, which always creates one. Reuse is the default, so a rerun does not add a second collection."""
 
     def action(client: ZoteroBridgeClient) -> dict[str, Any]:
-        if _flag_arg(args, "reuse_existing"):
+        if _flag_arg(args, "reuse_existing", default=True):
             status, key = client.ensure_collection(args.get("name"), args.get("parent_key"))
             return {"collection_key": key, "status": status}
         key = client.create_collection(args.get("name"), args.get("parent_key"))
         return {"collection_key": key, "status": CREATED}
+
+    return await _run(action)
+
+
+async def handle_zotero_ensure_collection_chain(args: dict[str, Any]) -> dict[str, Any]:
+    """MCP tool: zotero_ensure_collection_chain. Maps a project to a top-level collection, and an optional subproject
+    to a collection under it. Each level that already exists is reused and not written again."""
+
+    def action(client: ZoteroBridgeClient) -> dict[str, Any]:
+        chain = client.ensure_collection_chain(args.get("project_name"), args.get("subproject_name"))
+        return {
+            "project_key": chain.project_key,
+            "project_status": chain.project_status,
+            "subproject_key": chain.subproject_key,
+            "subproject_status": chain.subproject_status,
+        }
 
     return await _run(action)
 
@@ -171,6 +189,7 @@ async def handle_zotero_batch(args: dict[str, Any]) -> dict[str, Any]:
 
 ZOTERO_BRIDGE_HANDLERS: dict[str, Callable[[dict[str, Any]], Awaitable[dict[str, Any]]]] = {
     "zotero_create_collection": handle_zotero_create_collection,
+    "zotero_ensure_collection_chain": handle_zotero_ensure_collection_chain,
     "zotero_move_collection": handle_zotero_move_collection,
     "zotero_move_item": handle_zotero_move_item,
     "zotero_create_webpage": handle_zotero_create_webpage,

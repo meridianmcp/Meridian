@@ -1,4 +1,4 @@
-"""The seven local-only Zotero bridge write tools (meridian/mcp/handlers/zotero_bridge_tools.py).
+"""The eight local-only Zotero bridge write tools (meridian/mcp/handlers/zotero_bridge_tools.py).
 
 Every test uses a fake client, so nothing reaches Zotero or the bridge. The fake is installed through
 meridian.zotero_bridge_transport.get_client, which the handlers reach at call time. One test runs the real
@@ -16,6 +16,8 @@ from datetime import datetime, timedelta, timezone
 import pytest
 
 import meridian.server  # noqa: F401 - import first to avoid the handler/server import cycle
+from meridian import db as db_module
+from meridian import member_policy
 from meridian import zotero_bridge_transport as transport_mod
 from meridian.mcp import handler as mh
 from meridian.mcp.handlers import zotero_bridge_tools as handlers
@@ -24,13 +26,17 @@ from meridian.zotero_bridge_client import (
     ALREADY_ATTACHED,
     ALREADY_PRESENT,
     BatchRolledBackError,
+    CollectionChain,
     GrantError,
     ZoteroBridgeClient,
     ZoteroBridgeError,
 )
+from zotero_bridge_fakes import URL, FakeLibrary, LibraryReader
+from zotero_bridge_fakes import make as make_library_client
 
 ALL_TOOLS = (
     "zotero_create_collection",
+    "zotero_ensure_collection_chain",
     "zotero_move_collection",
     "zotero_move_item",
     "zotero_create_webpage",
@@ -43,6 +49,7 @@ OPERATION = {"method": "PATCH", "path": "/v1/items/WXYZ5678", "body": {"add_coll
 
 VALID_ARGS = {
     "zotero_create_collection": {"name": "Reading list"},
+    "zotero_ensure_collection_chain": {"project_name": "Project A", "subproject_name": "Methods"},
     "zotero_move_collection": {"key": "ABCD1234", "parent_key": None},
     "zotero_move_item": {"item_key": "WXYZ5678", "add_collections": ["ABCD1234"]},
     "zotero_create_webpage": {"title": "Pricing", "url": "https://example.com/pricing"},
@@ -75,6 +82,9 @@ class FakeClient:
 
     def ensure_collection(self, name, parent_key=None):
         return self._record("ensure_collection", name, parent_key)
+
+    def ensure_collection_chain(self, project_name, subproject_name=None):
+        return self._record("ensure_collection_chain", project_name, subproject_name)
 
     def move_collection(self, key, parent_key):
         return self._record("move_collection", key, parent_key)
@@ -124,10 +134,48 @@ def fake(monkeypatch):
 CASES = [
     (
         "zotero_create_collection",
-        {"name": "Reading list", "parent_key": "ABCD1234"},
+        {"name": "Reading list", "parent_key": "ABCD1234", "reuse_existing": False},
         ("create_collection", ("Reading list", "ABCD1234")),
         "NEWCOLL01",
         {"collection_key": "NEWCOLL01", "status": "created"},
+    ),
+    (
+        "zotero_create_collection",
+        {"name": "Reading list", "parent_key": "ABCD1234"},
+        ("ensure_collection", ("Reading list", "ABCD1234")),
+        ("already_exists", "ABCD1234"),
+        {"collection_key": "ABCD1234", "status": "already_exists"},
+    ),
+    (
+        "zotero_create_collection",
+        {"name": "Top level", "reuse_existing": None},
+        ("ensure_collection", ("Top level", None)),
+        ("created", "NEWCOLL04"),
+        {"collection_key": "NEWCOLL04", "status": "created"},
+    ),
+    (
+        "zotero_ensure_collection_chain",
+        {"project_name": "Project A", "subproject_name": "Methods"},
+        ("ensure_collection_chain", ("Project A", "Methods")),
+        CollectionChain("PROJ0001", "already_exists", "METH0001", "created"),
+        {
+            "project_key": "PROJ0001",
+            "project_status": "already_exists",
+            "subproject_key": "METH0001",
+            "subproject_status": "created",
+        },
+    ),
+    (
+        "zotero_ensure_collection_chain",
+        {"project_name": "Project B"},
+        ("ensure_collection_chain", ("Project B", None)),
+        CollectionChain("PROJ0002", "created", None, None),
+        {
+            "project_key": "PROJ0002",
+            "project_status": "created",
+            "subproject_key": None,
+            "subproject_status": None,
+        },
     ),
     (
         "zotero_create_collection",
@@ -238,14 +286,14 @@ async def test_each_tool_calls_the_client_with_the_right_arguments(
 
 @pytest.mark.asyncio
 async def test_the_mcp_dispatcher_reaches_each_zotero_tool(db, tmp_path, fake):
-    fake.returns["create_collection"] = "NEWCOLL01"
+    fake.returns["ensure_collection"] = ("created", "NEWCOLL01")
 
     payload = await mh._dispatch_mcp_tool(
         "zotero_create_collection", {"name": "Reading list"}, db, str(tmp_path)
     )
 
     assert payload == {"ok": True, "error": None, "collection_key": "NEWCOLL01", "status": "created"}
-    assert fake.calls == [("create_collection", ("Reading list", None))]
+    assert fake.calls == [("ensure_collection", ("Reading list", None))]
 
 
 @pytest.mark.asyncio
@@ -451,6 +499,7 @@ async def test_attach_pdf_imports_a_small_file_as_base64_under_a_grant(monkeypat
 
 REQUIRED = {
     "zotero_create_collection": ["name"],
+    "zotero_ensure_collection_chain": ["project_name"],
     "zotero_move_collection": ["key"],
     "zotero_move_item": ["item_key"],
     "zotero_create_webpage": ["title", "url"],
@@ -512,3 +561,222 @@ async def test_zotero_batch_refuses_an_unlisted_route_through_the_real_client_be
     assert payload["ok"] is False
     assert payload["error"]["code"] == "not_batchable"
     assert sent == []
+
+
+# ---------------------------------------------------------------------------
+# Reruns through the MCP handlers: the real client over the in-memory library from zotero_bridge_fakes.py
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_a_rerun_through_the_mcp_handlers_finds_everything_and_writes_nothing(monkeypatch):
+    library = FakeLibrary()
+    client, _, _ = make_library_client(library)
+    monkeypatch.setattr(transport_mod, "get_client", lambda: client)
+
+    first_collection = await handlers.handle_zotero_create_collection({"name": "Reading list"})
+    first_page = await handlers.handle_zotero_create_webpage(
+        {"title": "Pricing", "url": URL, "collection_keys": [first_collection["collection_key"]]}
+    )
+    assert (first_collection["status"], first_page["status"]) == ("created", "created")
+    assert library.created == ["collection", "item"]
+
+    second_collection = await handlers.handle_zotero_create_collection({"name": "Reading list"})
+    second_page = await handlers.handle_zotero_create_webpage(
+        {"title": "Pricing", "url": URL, "collection_keys": [second_collection["collection_key"]]}
+    )
+
+    assert second_collection == {
+        "ok": True,
+        "error": None,
+        "collection_key": first_collection["collection_key"],
+        "status": "already_exists",
+    }
+    assert second_page == {
+        "ok": True,
+        "error": None,
+        "item_key": first_page["item_key"],
+        "status": "already_present",
+    }
+    assert library.created == ["collection", "item"]
+
+
+@pytest.mark.asyncio
+async def test_an_ambiguous_same_name_comes_back_as_ambiguous_collection_with_no_write(monkeypatch):
+    library = FakeLibrary()
+    library.seed_collection("Methods")
+    library.seed_collection("Methods")
+    client, bridge, _ = make_library_client(library)
+    monkeypatch.setattr(transport_mod, "get_client", lambda: client)
+
+    payload = await handlers.handle_zotero_create_collection({"name": "Methods"})
+
+    assert payload["ok"] is False
+    assert payload["error"]["code"] == "ambiguous_collection"
+    assert library.created == [] and bridge.calls == []
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("handler", "arguments"),
+    [
+        (handlers.handle_zotero_create_collection, {"name": "Reading list"}),
+        (handlers.handle_zotero_ensure_collection_chain, {"project_name": "Project A", "subproject_name": "Methods"}),
+    ],
+)
+async def test_the_default_duplicate_check_stops_with_reader_failed_when_the_local_api_is_off(
+    monkeypatch, handler, arguments
+):
+    library = FakeLibrary()
+    client, bridge, _ = make_library_client(library, reader=LibraryReader(library, fail_status=500))
+    monkeypatch.setattr(transport_mod, "get_client", lambda: client)
+
+    payload = await handler(dict(arguments))
+
+    assert payload["ok"] is False
+    assert payload["error"]["code"] == "reader_failed"
+    assert library.created == [] and bridge.calls == []
+
+
+@pytest.mark.asyncio
+async def test_create_collection_with_reuse_existing_false_does_not_read_so_a_failing_reader_does_not_stop_it(monkeypatch):
+    library = FakeLibrary()
+    reader = LibraryReader(library, fail_status=500)
+    client, _, _ = make_library_client(library, reader=reader)
+    monkeypatch.setattr(transport_mod, "get_client", lambda: client)
+
+    payload = await handlers.handle_zotero_create_collection({"name": "Reading list", "reuse_existing": False})
+
+    assert (payload["ok"], payload["status"]) == (True, "created")
+    assert reader.paths == [] and library.count("collection") == 1
+
+
+@pytest.mark.asyncio
+async def test_the_chain_tool_second_call_creates_nothing_and_reports_already_exists_at_each_level(monkeypatch):
+    library = FakeLibrary()
+    client, bridge, _ = make_library_client(library)
+    monkeypatch.setattr(transport_mod, "get_client", lambda: client)
+    arguments = {"project_name": "Project A", "subproject_name": "Methods"}
+
+    first = await handlers.handle_zotero_ensure_collection_chain(dict(arguments))
+
+    assert first["ok"] is True
+    assert (first["project_status"], first["subproject_status"]) == ("created", "created")
+    assert library.created == ["collection", "collection"]
+    grants_before = [call for call in bridge.calls if call[1] == "/v1/grants"]
+
+    second = await handlers.handle_zotero_ensure_collection_chain(dict(arguments))
+
+    assert second == {
+        "ok": True,
+        "error": None,
+        "project_key": first["project_key"],
+        "project_status": "already_exists",
+        "subproject_key": first["subproject_key"],
+        "subproject_status": "already_exists",
+    }
+    assert library.created == ["collection", "collection"]
+    assert [call for call in bridge.calls if call[1] == "/v1/grants"] == grants_before
+
+
+@pytest.mark.asyncio
+async def test_the_mcp_dispatcher_reaches_the_chain_tool(db, tmp_path, fake):
+    fake.returns["ensure_collection_chain"] = CollectionChain("PROJ0001", "created", None, None)
+
+    payload = await mh._dispatch_mcp_tool(
+        "zotero_ensure_collection_chain", {"project_name": "Project A"}, db, str(tmp_path)
+    )
+
+    assert payload == {
+        "ok": True,
+        "error": None,
+        "project_key": "PROJ0001",
+        "project_status": "created",
+        "subproject_key": None,
+        "subproject_status": None,
+    }
+    assert fake.calls == [("ensure_collection_chain", ("Project A", None))]
+
+
+@pytest.mark.asyncio
+async def test_hosted_refusal_holds_through_the_dispatcher_for_the_chain_tool(db, tmp_path, monkeypatch, fake):
+    monkeypatch.setenv("MERIDIAN_HOSTED", "1")
+
+    payload = await mh._dispatch_mcp_tool(
+        "zotero_ensure_collection_chain", {"project_name": "Project A"}, db, str(tmp_path)
+    )
+
+    assert payload["error"]["code"] == "hosted_refused"
+    assert fake.built == 0
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("project_name", ["Out of scope project", "No such project"])
+async def test_hosted_refusal_holds_for_a_scoped_caller_whether_or_not_the_name_is_a_meridian_project(
+    db, tmp_path, monkeypatch, fake, project_name
+):
+    # A hosted member with no projects in scope, who holds the project-write capability the chain tool is checked
+    # against. The chain tool's project_name is a Zotero collection name, so an existing Meridian project name must not
+    # change the answer: both names come back as hosted_refused, not as a scope error or a no-match error.
+    monkeypatch.setenv("MERIDIAN_HOSTED", "1")
+    await db_module.create_project(db, "Out of scope project")
+    member = member_policy.ScopedProjectIds(
+        (),
+        policy=member_policy.EffectivePolicy(
+            caps=frozenset({member_policy.WRITE_PROJECT}), role=member_policy.ROLE_MEMBER,
+        ),
+    )
+
+    payload = await mh._dispatch_mcp_tool(
+        "zotero_ensure_collection_chain", {"project_name": project_name}, db, str(tmp_path), scoped_project_ids=member,
+    )
+
+    assert payload["ok"] is False
+    assert payload["error"]["code"] == "hosted_refused"
+    assert fake.built == 0
+
+
+@pytest.mark.asyncio
+async def test_the_chain_tool_is_refused_on_hosted_before_any_read_or_write(monkeypatch):
+    monkeypatch.setenv("MERIDIAN_HOSTED", "1")
+    reads: list[str] = []
+    sent: list[tuple[str, str]] = []
+
+    def transport(method, path, headers, body):
+        sent.append((method, path))
+        return 200, {}
+
+    def reader(path):
+        reads.append(path)
+        return 200, []
+
+    real = ZoteroBridgeClient(transport=transport, reader=reader, sleep=lambda seconds: None)
+    monkeypatch.setattr(transport_mod, "get_client", lambda: real)
+
+    payload = await handlers.handle_zotero_ensure_collection_chain(
+        {"project_name": "Project A", "subproject_name": "Methods"}
+    )
+
+    assert payload["ok"] is False
+    assert payload["error"]["code"] == "hosted_refused"
+    assert reads == [] and sent == []
+
+
+def test_reuse_existing_defaults_to_true_in_the_schema_and_the_description():
+    by_name = {tool["name"]: tool for tool in _MCP_TOOLS_LIST}
+    tool = by_name["zotero_create_collection"]
+
+    assert "Defaults to true" in tool["inputSchema"]["properties"]["reuse_existing"]["description"]
+    assert "By default (`reuse_existing` true)" in tool["description"]
+    assert "defaults to false" not in tool["description"].lower()
+    assert "reader_failed and nothing is written" in tool["description"]
+
+
+def test_batch_description_says_creates_are_not_deduplicated_and_documented_not_refused():
+    description = next(t for t in _MCP_TOOLS_LIST if t["name"] == "zotero_batch")["description"]
+
+    assert "POST /v1/items" in description and "POST /v1/collections" in description
+    assert "not deduplicated inside a batch" in description
+    assert "a rerun of the same batch writes them again" in description
+    assert "documented here, not refused" in description
+    assert "zotero_create_collection with `reuse_existing` left at its default of true" in description
