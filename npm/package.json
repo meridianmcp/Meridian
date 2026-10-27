@@ -25,7 +25,7 @@
     "test": "node scripts/bundle-latex.mjs && node scripts/smoke-test-bundle.mjs"
   },
   "dependencies": {
-    "@modelcontextprotocol/sdk": "^1.32.1",
+    "@modelcontextprotocol/sdk": "^1.32.2",
     "@unified-latex/unified-latex-types": "^1.8.4",
     "@unified-latex/unified-latex-util-parse": "^1.8.4",
     "better-sqlite3": "^13.0.3",
