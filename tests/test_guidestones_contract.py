@@ -327,10 +327,10 @@ async def test_creating_a_guidestone_leaves_a_set_goal_and_existing_handoffs_unt
     await guidestone_db.create_guidestone(db, pid, question="Q")
 
     async with db.execute("SELECT pending_goal FROM projects WHERE id = ?", (pid,)) as cur:
-        assert (await cur.fetchone())[0] == "GOAL-TEXT-SENTINEL"
+        assert (await cur.fetchone())["pending_goal"] == "GOAL-TEXT-SENTINEL"
     async with db.execute("SELECT body FROM handoffs WHERE project_id = ?", (pid,)) as cur:
         rows = await cur.fetchall()
-    assert [tuple(r)[0] for r in rows] == ["HANDOFF-BODY-SENTINEL"]
+    assert [r["body"] for r in rows] == ["HANDOFF-BODY-SENTINEL"]
 
 
 @pytest.mark.asyncio
@@ -358,8 +358,8 @@ async def test_deleting_a_project_removes_its_snapshots_even_with_foreign_keys_o
     await guidestone_db.create_guidestone(db, pid, question="Q")
     await db.execute("PRAGMA foreign_keys = OFF")
     await db_module.delete_project(db, pid)
-    async with db.execute("SELECT COUNT(*) FROM guidestones WHERE project_id = ?", (pid,)) as cur:
-        assert (await cur.fetchone())[0] == 0
+    async with db.execute("SELECT COUNT(*) AS n FROM guidestones WHERE project_id = ?", (pid,)) as cur:
+        assert (await cur.fetchone())["n"] == 0
 
 
 @pytest.mark.asyncio
@@ -400,5 +400,5 @@ async def test_an_experiment_from_another_project_is_refused_as_not_found(db):
     foreign = await experiments_db.create_experiment(db, other_pid, other_sid, name="Foreign", hypothesis=None)
     with pytest.raises(ValueError, match="not found in this project"):
         await guidestone_db.create_guidestone(db, pid, question="Q", experiment_id=foreign["id"])
-    async with db.execute("SELECT COUNT(*) FROM guidestones WHERE project_id = ?", (pid,)) as cur:
-        assert (await cur.fetchone())[0] == 0
+    async with db.execute("SELECT COUNT(*) AS n FROM guidestones WHERE project_id = ?", (pid,)) as cur:
+        assert (await cur.fetchone())["n"] == 0
