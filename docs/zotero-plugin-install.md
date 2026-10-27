@@ -93,7 +93,15 @@ What signing does, and what it does not:
 - **One forced kill, for the signing child only.** If Mozilla does not finish within the wait, `sign-plugin` ends the signing child's own process tree, with `taskkill /PID <child> /T /F` on Windows, so that a hung web-ext cannot block the command. This is the only forced kill in the signing path. It touches only the signing child's process tree, and never Zotero or any other process. Zotero's own close step is a plain close request and never forces anything.
 - **Fallback: install the unsigned file yourself.** The install prints the path of the unsigned file. In Zotero, open **Tools > Plugins**, click the gear icon, choose **Install Plugin From File**, and select that file. Zotero may refuse an unsigned add-on in a normal build. The menu names used in this guide and that refusal are unverified on Zotero 10.0.6.
 
-**Status of 0.1.4:** not yet signed, released or installed. The signing step has to run against Mozilla before the release step publishes the signed file, and only then can the install copy it into a profile.
+**Current builds (as of 2026-10-26):**
+
+| Version | Mozilla-signed | On the owner's machine | On the update channel |
+| --- | --- | --- | --- |
+| 0.1.4 | yes (2026-10-22) | earlier build, superseded | yes |
+| 0.1.5 | yes (2026-10-26) | installed briefly, then superseded | no |
+| 0.1.6 | yes (2026-10-26) | installed, and the running bridge reports 0.1.6 | no |
+
+`0.1.5` lacks the request-validation fixes that `0.1.6` has. Publishing a version to the update channel is a separate step from signing and from installing.
 
 ## 5. Verify
 
