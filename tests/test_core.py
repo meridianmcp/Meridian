@@ -8591,10 +8591,13 @@ def test_pg_migration_registry_matches_historical_order():
         # so no production database has run it. It is appended at the tail, not mid-list.
         # Its ADD COLUMN IF NOT EXISTS is idempotent and nothing later depends on it.
         "_migrate_pg_project_use_mode",
+        # Guidestones (impromptu research waypoints) were added after this order was pinned.
+        # Appended at the tail; its CREATE TABLE IF NOT EXISTS is idempotent.
+        "_migrate_pg_guidestones",
     ]
     # No duplicates across the three groups.
     allnames = core + hosted + late
-    assert len(allnames) == len(set(allnames)) == 176
+    assert len(allnames) == len(set(allnames)) == 177
 
 
 def test_core_schema_literals_have_no_inline_tenant_id_indexes():

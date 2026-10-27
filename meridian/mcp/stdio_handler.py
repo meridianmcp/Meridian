@@ -339,6 +339,10 @@ def build_mcp_server():
             # above).
             _shared_tool("list_active_worktrees"),
             _shared_tool("list_worktrees_pending_cleanup"),
+            # Guidestones: the same canonical schemas HTTP MCP advertises.
+            _shared_tool("create_guidestone"),
+            _shared_tool("list_guidestones"),
+            _shared_tool("load_guidestone"),
             Tool(
                 name="idle_until_session_done",
                 description=(
@@ -2690,6 +2694,9 @@ def build_mcp_server():
                 "start_research_run", "complete_research_run",
                 "get_research_run", "list_research_runs",
                 "promote_research_run",
+                # Guidestones -- impromptu research waypoints; same shared dispatch
+                # and schema as HTTP MCP (meridian/mcp/handlers/guidestone_tools.py).
+                "create_guidestone", "list_guidestones", "load_guidestone",
                 "execute_batch",
                 "batch_read", "batch_mutate",
                 "add_workspace_note", "get_workspace_notes",
