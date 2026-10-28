@@ -29,8 +29,9 @@
 // future pass, not silently assumed away.
 
 import { resolveDocIdByPath, type FileTreeFolder } from "./project-tree.js";
+import { scanBraceArguments } from "./latex-scan.js";
 
-const INPUT_RE = /\\(?:input|include)\s*\{([^}]*)\}/g;
+const INPUT_HEAD_RE = /\\(?:input|include)\s*\{/g;
 
 /** Matches the Python port's own `_MAX_INPUT_DEPTH = 20` -- a runaway/cyclic
  * `\input` guard, not a realistic depth for any real paper. */
@@ -95,7 +96,7 @@ export async function expandInputs({
 }: ExpandInputsArgs): Promise<ExpandInputsResult> {
   if (depth > MAX_INPUT_DEPTH) return { source, unexpanded };
 
-  const matches = [...source.matchAll(INPUT_RE)];
+  const matches = scanBraceArguments(source, INPUT_HEAD_RE);
   if (matches.length === 0) return { source, unexpanded };
 
   let result = "";

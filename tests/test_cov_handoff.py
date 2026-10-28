@@ -3463,8 +3463,8 @@ async def test_format_handoff_mcp_content_never_truncates_executable_goal(db):
     assert "<goal_token>" in embedded  # sanity: mint actually worked
     padded = embedded + "\n<sprint_items>" + ("z" * 5000) + "</sprint_items>"
     out = handoff_module.format_handoff_mcp_content(padded, max_bytes=10)
-    banner_match = handoff_module._GOAL_TOKEN_BANNER_RE.search(embedded)
-    assert banner_match is not None
+    banner_span = handoff_module._find_goal_token_banner(embedded)
+    assert banner_span is not None
     assert out == padded
     assert "TRUNCATED" not in out
     assert len(out.encode("utf-8")) > 10

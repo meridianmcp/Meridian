@@ -214,6 +214,11 @@ def _check_value_safety(value: Any, *, path: str, allow_absolute_path: bool) -> 
 #: as the secret-shaped/absolute-path checks above.
 _COMMAND_SHAPED_FIELDS = frozenset({"executor_config.test_cmd", "executor_config.deploy_cmd"})
 
+# ``curl``/``wget``/``dd`` alternatives use a "no further occurrence of the
+# keyword, no pipe/newline" run instead of ``X[^|]*`` / ``.*``. A pattern like
+# ``curl[^|]*\|`` rescanned to the end of the input for every "curl" with no
+# pipe after it (CodeQL py/polynomial-redos). The match set is unchanged: the
+# last keyword before the first pipe (or newline) is the one that can match.
 _UNSAFE_COMMAND_RE = re.compile(
     r"(?i)("
     r"rm\s+-rf\s+[/~]|"
@@ -221,12 +226,12 @@ _UNSAFE_COMMAND_RE = re.compile(
     r"remove-item\s+-recurse\s+-force\s+[a-z]:\\|"
     r"format\s+[a-z]:|"
     r"mkfs\.|"
-    r"dd\s+if=.*of=/dev/|"
+    r"dd\s+if=(?:(?!dd\s+if=)[^\n])*of=/dev/|"
     r">\s*/dev/sd|"
     r"shutdown\b|reboot\b|"
     r"sudo\s+rm\b|"
-    r"curl[^|]*\|\s*(sh|bash)\b|"
-    r"wget[^|]*\|\s*(sh|bash)\b|"
+    r"curl(?:(?!curl)[^|])*\|\s*(sh|bash)\b|"
+    r"wget(?:(?!wget)[^|])*\|\s*(sh|bash)\b|"
     r"drop\s+(database|table)\b|"
     r":\(\)\s*\{\s*:\|\s*:&\s*\}\s*;\s*:|"
     r"git\s+push\s+--force\b"

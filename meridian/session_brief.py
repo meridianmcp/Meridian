@@ -139,8 +139,20 @@ DIRECTIVE_RE = re.compile(
     r"|(?i:\bignore\s+(?:all\s+|any\s+)?(?:previous|prior|above|earlier)\s+(?:instructions|rules|directives)\b)"
     r"|(?i:<\s*/?\s*(?:system|system-reminder|execution_policy|executor_directive|goal_token)\b)"
 )
-# C0 controls (except TAB/LF), DEL, zero-width and bidi-override characters.
-_CTRL_RE = re.compile("[\x00-\x08\x0b-\x1f\x7f\u200b-\u200f\u202a-\u202e\u2066-\u2069\ufeff]")
+# C0 controls (except TAB/LF), DEL, zero-width and bidi-override characters,
+# as a code-point table. A character class with an ``\x0b-\x1f`` span also
+# covers CR, FF and other ``\s`` whitespace, which CodeQL flags as an overly
+# large range (py/overly-large-range); the set itself is unchanged.
+_CTRL_CODEPOINTS = (
+    *range(0x00, 0x09),
+    *range(0x0B, 0x20),
+    0x7F,
+    *range(0x200B, 0x2010),
+    *range(0x202A, 0x202F),
+    *range(0x2066, 0x206A),
+    0xFEFF,
+)
+_CTRL_TRANSLATE = {codepoint: " " for codepoint in _CTRL_CODEPOINTS}
 
 # ---------------------------------------------------------------------------
 # Static text (trusted: authored here, never computed). The fallback briefs
@@ -238,7 +250,7 @@ def sanitize_untrusted(
     """
     if not isinstance(text, str):
         return [], 0
-    t = _CTRL_RE.sub(" ", text.replace("\r\n", "\n").replace("\r", "\n"))
+    t = text.replace("\r\n", "\n").replace("\r", "\n").translate(_CTRL_TRANSLATE)
     out: list[str] = []
     stripped = 0
     for raw in t.split("\n")[:max_scan_lines]:
@@ -264,7 +276,7 @@ def _one_line(value: Any, limit: int) -> str | None:
     """
     if not isinstance(value, str):
         return None
-    t = _CTRL_RE.sub(" ", value.replace("\r\n", "\n").replace("\r", "\n"))
+    t = value.replace("\r\n", "\n").replace("\r", "\n").translate(_CTRL_TRANSLATE)
     for raw in t.split("\n")[:50]:
         line = " ".join(raw.split())
         if line:

@@ -22,6 +22,7 @@
 // references are silently skipped and only inline \bibitem entries surface.
 
 import { matchBraceIndex } from "./range-locate.js";
+import { scanBibitems, scanBraceArguments } from "./latex-scan.js";
 
 /**
  * matchBraceIndex (range-locate.js) returns -1 for an unbalanced/never-
@@ -48,6 +49,35 @@ export interface BibitemEntry {
   raw: string;
 }
 
+const BEGIN_THEBIBLIOGRAPHY = "\\begin{thebibliography}";
+const END_THEBIBLIOGRAPHY = "\\end{thebibliography}";
+
+/**
+ * Body of the first `\begin{thebibliography}...\end{thebibliography}`, or `null`.
+ *
+ * Matches `/\\begin\{thebibliography\}(?:\{[^}]*\})?([\s\S]*?)\\end\{thebibliography\}/`
+ * without its quadratic rescans. The regex first tries the body after an
+ * optional `{...}` argument and then, on failure, the body right after
+ * `\begin{thebibliography}`. A failure there also rules out every later
+ * `\begin{thebibliography}`, since their bodies start further on.
+ */
+function thebibliographyBody(source: string): string | null {
+  const begin = source.indexOf(BEGIN_THEBIBLIOGRAPHY);
+  if (begin === -1) return null;
+  const afterBegin = begin + BEGIN_THEBIBLIOGRAPHY.length;
+  const bodyStarts: number[] = [];
+  if (source[afterBegin] === "{") {
+    const argClose = source.indexOf("}", afterBegin + 1);
+    if (argClose !== -1) bodyStarts.push(argClose + 1);
+  }
+  bodyStarts.push(afterBegin);
+  for (const bodyStart of bodyStarts) {
+    const end = source.indexOf(END_THEBIBLIOGRAPHY, bodyStart);
+    if (end !== -1) return source.slice(bodyStart, end);
+  }
+  return null;
+}
+
 /**
  * Extract `\bibitem{key} text` entries from a thebibliography block.
  *
@@ -61,13 +91,9 @@ export interface BibitemEntry {
  */
 export function parseBibitems(source: string): BibitemEntry[] {
   const entries: BibitemEntry[] = [];
-  const env = source.match(
-    /\\begin\{thebibliography\}(?:\{[^}]*\})?([\s\S]*?)\\end\{thebibliography\}/,
-  );
-  const body = env ? env[1] : source;
+  const body = thebibliographyBody(source) ?? source;
   // Split on \bibitem, keeping the (optional [label]) and mandatory {key}.
-  const pattern = /\\bibitem\s*(?:\[[^\]]*\])?\s*\{([^}]*)\}/g;
-  const matches = [...body.matchAll(pattern)];
+  const matches = scanBibitems(body);
   for (let i = 0; i < matches.length; i++) {
     const m = matches[i];
     const key = m[1].trim();
@@ -236,10 +262,10 @@ export function getBibliography(source: unknown, { resolveBibText }: GetBibliogr
 
     // 2. External .bib via \bibliography{...} or \addbibresource{...}.
     const bibNames: string[] = [];
-    for (const m of source.matchAll(/\\bibliography\s*\{([^}]*)\}/g)) {
+    for (const m of scanBraceArguments(source, /\\bibliography\s*\{/g)) {
       bibNames.push(...m[1].split(",").map((part) => part.trim()));
     }
-    for (const m of source.matchAll(/\\addbibresource\s*\{([^}]*)\}/g)) {
+    for (const m of scanBraceArguments(source, /\\addbibresource\s*\{/g)) {
       bibNames.push(...m[1].split(",").map((part) => part.trim()));
     }
 
