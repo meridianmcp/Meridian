@@ -15,7 +15,7 @@ import {
   type RelationshipProject,
 } from './dashboard-control-plane';
 // 962d4480 -- the settings body keeps an unsent draft across its own repaints.
-import { paintTabBody, setTabBodyMessage } from './dashboard-utils';
+import { escapeQuotedLiteral, paintTabBody, setTabBodyMessage } from './dashboard-utils';
 
 // 02dbd8b4 — runtime configuration generation status (tunnel/executor
 // settings). Pure formatter for the `config_generation` record the server
@@ -2075,7 +2075,7 @@ export async function loadSettingsTab(projectId: any, { force = false } = {}) {
 
 
 
-    const stdioText = `[mcp_servers.meridian]\ntype = "stdio"\ncommand = "pixi"\nargs = ["run", "python", "-m", "meridian", "--mcp"]\ncwd = "${cwd.replace(/"/g, '\\"')}"`;
+    const stdioText = `[mcp_servers.meridian]\ntype = "stdio"\ncommand = "pixi"\nargs = ["run", "python", "-m", "meridian", "--mcp"]\ncwd = "${escapeQuotedLiteral(cwd)}"`;
 
     const httpText = `[mcp_servers.meridian]\ntype = "http"\nurl = "${mcpHttpUrl}"`;
 
@@ -2295,7 +2295,7 @@ export async function loadSettingsTab(projectId: any, { force = false } = {}) {
       if (pathInput) {
         pathInput.addEventListener('input', function() {
           const newCwd = pathInput.value.trim() || '/path/to/your/meridian';
-          const newStdio = '[mcp_servers.meridian]\ntype = "stdio"\ncommand = "pixi"\nargs = ["run", "python", "-m", "meridian", "--mcp"]\ncwd = "' + newCwd.replace(/"/g, '\\"') + '"';
+          const newStdio = '[mcp_servers.meridian]\ntype = "stdio"\ncommand = "pixi"\nargs = ["run", "python", "-m", "meridian", "--mcp"]\ncwd = "' + escapeQuotedLiteral(newCwd) + '"';
           if (stdioEl) stdioEl.textContent = newStdio;
           _codexCopySetup(`codex-copy-stdio-${projectId}`, newStdio);
         });
