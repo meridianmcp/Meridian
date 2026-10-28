@@ -14,7 +14,6 @@ echoed back, and a source URL that carries credentials or a key parameter is dro
 from __future__ import annotations
 
 import asyncio
-import ipaddress
 import re
 from typing import Any
 from urllib.parse import urlsplit
@@ -23,6 +22,7 @@ from fastapi import APIRouter, Depends, HTTPException, Query, Request
 
 from .. import github_search as _github
 from .. import paper_search as _papers
+from ._local_only import is_loopback_host, require_local_request
 
 router = APIRouter()
 
@@ -53,8 +53,6 @@ _ID_FIELDS: dict[str, tuple[str, ...]] = {
     "github_repos": ("repo", "title"),
     "github_code": ("url", "sha"),
 }
-# A request that passed through a proxy or forwarder is not a direct local call.
-_FORWARDED_HEADERS = ("forwarded", "x-forwarded-for", "x-forwarded-host", "x-real-ip")
 _YEAR_RE = re.compile(r"^\s*((?:19|20)\d{2})(?!\d)")
 _SECRET_PARAM_RE = re.compile(
     r"(?i)(?:^|[&;])(?:api[_-]?key|apikey|key|token|access[_-]?token|secret|auth)="
@@ -62,28 +60,18 @@ _SECRET_PARAM_RE = re.compile(
 _URL_RE = re.compile(r"https?://\S+")
 
 
-def _is_loopback_host(host: str) -> bool:
-    try:
-        address = ipaddress.ip_address(host)
-    except ValueError:
-        return False
-    if isinstance(address, ipaddress.IPv6Address) and address.ipv4_mapped is not None:
-        address = address.ipv4_mapped
-    return address.is_loopback
+_is_loopback_host = is_loopback_host  # kept under this name: tests/test_desktop_research_route.py calls it
+
+_REFUSED_MESSAGE = "The desktop research search is only available from this machine."
 
 
 async def _require_loopback(request: Request) -> None:
-    """Refuse anything that did not reach this process directly from the same machine."""
-    client = request.client
-    if (
-        client is None
-        or not _is_loopback_host(client.host)
-        or any(name in request.headers for name in _FORWARDED_HEADERS)
-    ):
-        raise HTTPException(
-            status_code=403,
-            detail="The desktop research search is only available from this machine.",
-        )
+    """Refuse anything that did not reach this process directly from the same machine (spec 6.1).
+
+    The shared check in ``meridian/routes/_local_only.py`` also refuses a foreign ``Host``
+    header, which is what stops DNS rebinding (review B2).
+    """
+    await require_local_request(request, _REFUSED_MESSAGE)
 
 
 def _checked_query(raw: str | None) -> str:

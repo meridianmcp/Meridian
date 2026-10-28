@@ -44,7 +44,7 @@ def _self_hosted(monkeypatch):
 
 @pytest.fixture
 def client():
-    return TestClient(server_module.app, client=LOOPBACK)
+    return TestClient(server_module.app, client=LOOPBACK, base_url="http://localhost")
 
 
 @pytest.fixture
@@ -429,7 +429,7 @@ def test_no_response_carries_a_key_or_a_credential_url(client, upstream, monkeyp
 ])
 def test_non_loopback_callers_are_refused_before_any_search(upstream, client_address):
     answers, calls = upstream
-    outsider = TestClient(server_module.app, client=client_address)
+    outsider = TestClient(server_module.app, client=client_address, base_url="http://localhost")
 
     response = outsider.get(PATH, params={"q": "q", "sources": "openalex"})
 
@@ -439,7 +439,7 @@ def test_non_loopback_callers_are_refused_before_any_search(upstream, client_add
 
 def test_a_forwarded_request_is_refused_even_from_loopback(upstream):
     _, calls = upstream
-    proxied = TestClient(server_module.app, client=LOOPBACK)
+    proxied = TestClient(server_module.app, client=LOOPBACK, base_url="http://localhost")
 
     response = proxied.get(
         PATH, params={"q": "q", "sources": "openalex"},
@@ -450,9 +450,45 @@ def test_a_forwarded_request_is_refused_even_from_loopback(upstream):
     assert calls == []
 
 
+@pytest.mark.parametrize("host_header", ["evil.example", "localhost.evil.example"])
+def test_a_rebinding_host_header_is_refused_before_any_search(upstream, host_header):
+    """D1 (review B2): a DNS-rebinding page reaches the server from loopback but sends its own Host."""
+    _, calls = upstream
+    rebound = TestClient(server_module.app, client=LOOPBACK, base_url="http://localhost")
+
+    response = rebound.get(
+        PATH, params={"q": "q", "sources": "openalex"}, headers={"Host": host_header},
+    )
+
+    assert response.status_code == 403
+    assert calls == []
+
+
+@pytest.mark.parametrize("origin", ["https://evil.example", "null"])
+def test_a_foreign_origin_is_refused_before_any_search(upstream, origin):
+    _, calls = upstream
+    cross_origin = TestClient(server_module.app, client=LOOPBACK, base_url="http://localhost")
+
+    response = cross_origin.get(PATH, params={"q": "q", "sources": "openalex"}, headers={"Origin": origin})
+
+    assert response.status_code == 403
+    assert calls == []
+
+
+def test_a_loopback_request_with_a_localhost_host_is_served(upstream):
+    """D2 (spec 9.1): the existing loopback path still answers once the client names localhost."""
+    _, calls = upstream
+    local_client = TestClient(server_module.app, client=LOOPBACK, base_url="http://localhost")
+
+    response = local_client.get(PATH, params={"q": "q", "sources": "openalex"})
+
+    assert response.status_code == 200
+    assert calls
+
+
 @pytest.mark.parametrize("host", ["127.0.0.1", "127.8.9.10", "::1", "::ffff:127.0.0.1"])
 def test_loopback_addresses_are_accepted(upstream, host):
-    client_for_host = TestClient(server_module.app, client=(host, 50000))
+    client_for_host = TestClient(server_module.app, client=(host, 50000), base_url="http://localhost")
     response = client_for_host.get(PATH, params={"q": "q", "sources": "openalex"})
     assert response.status_code == 200
 

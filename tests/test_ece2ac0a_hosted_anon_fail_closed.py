@@ -81,7 +81,7 @@ EXPECTED_PUBLIC = {
     ("GET", "/install_tunnel.sh"), ("GET", "/install_tunnel.ps1"),
     ("GET", "/install_watcher.sh"), ("GET", "/install_watcher.ps1"),
     ("GET", "/hooks.sh"), ("GET", "/hooks.ps1"), ("GET", "/hooks_install.ps1"),
-    ("GET", "/hooks/diagnostics"), ("POST", "/pkg-guard/check"),
+    ("POST", "/pkg-guard/check"),
     ("GET", "/tunnel/registry"), ("GET", "/tunnel/plugins/check"),
     ("POST", "/tunnel/openai/diagnostics/{tenant_id}"),
     ("GET", "/me"), ("GET", "/me/workspaces"), ("GET", "/tunnel/plugins"),

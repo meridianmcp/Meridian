@@ -30,6 +30,8 @@ export default defineConfig({
         "meridian/static/components/**/*.{ts,tsx}",
         "meridian/static/dashboard-utils.ts",
         "meridian/static/dashboard-mcp.ts",
+        // Local overview: pure grouping and rendering plus the view wiring (workspace-overview-spec-r2, section 8 item 17).
+        "meridian/static/dashboard-workspace.ts",
       ],
       exclude: ["**/*.test.{ts,tsx}", "**/types.ts"],
       thresholds: { lines: 70, functions: 70, branches: 70, statements: 70 },
