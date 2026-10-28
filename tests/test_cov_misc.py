@@ -310,6 +310,25 @@ def test_checkout_redirects_to_login_when_unauthenticated(client):
     assert "/auth/login" in r.headers["location"]
 
 
+def test_checkout_login_redirect_is_constant_per_plan(client):
+    """The unauthenticated /checkout login redirect is a constant per allowlisted plan,
+    byte-identical to the previous interpolated form for standard and pro."""
+    r = client.get("/checkout", params={"plan": "standard"}, follow_redirects=False)
+    assert r.status_code == 302
+    assert r.headers["location"] == "/auth/login?next=/checkout%3Fplan%3Dstandard"
+    r = client.get("/checkout", params={"plan": "pro"}, follow_redirects=False)
+    assert r.status_code == 302
+    assert r.headers["location"] == "/auth/login?next=/checkout%3Fplan%3Dpro"
+
+
+def test_checkout_rejects_plan_outside_allowlist_before_any_redirect(client):
+    """A plan value outside the allowlist gets a 400 and never reaches a Location header."""
+    for bad in ("pro\r\nSet-Cookie: x=1", "pro/../../admin", "pro?next=//evil.example"):
+        r = client.get("/checkout", params={"plan": bad}, follow_redirects=False)
+        assert r.status_code == 400, bad
+        assert "location" not in r.headers, bad
+
+
 def test_checkout_fallback_payment_link_when_stripe_unconfigured(monkeypatch, tmp_path):
     """When Stripe raises RuntimeError, /checkout falls back to STRIPE_PAYMENT_LINK."""
     import meridian.hosted as hosted_module

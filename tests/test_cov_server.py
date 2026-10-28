@@ -1155,6 +1155,55 @@ def test_workspace_accept_unauth_redirects(monkeypatch, tmp_path):
         assert "/auth/login" in r.headers["location"]
 
 
+def test_workspace_accept_valid_token_shape_keeps_login_redirect(monkeypatch, tmp_path):
+    """Tokens minted by secrets.token_urlsafe(32) still take the unauthenticated flow."""
+    import secrets
+
+    token = secrets.token_urlsafe(32)
+    with _make_hosted_client(monkeypatch, tmp_path) as client:
+        r = client.get(f"/workspace/accept?token={token}", follow_redirects=False)
+        assert r.status_code == 302
+        assert "/auth/login" in r.headers["location"]
+        assert r.cookies["pending_invite_token"] == token
+
+
+def test_workspace_accept_rejects_malformed_token_before_redirect(monkeypatch, tmp_path):
+    """A token outside [A-Za-z0-9_-] can never match an invite, so it gets a 400
+    before the login Location or the pending_invite_token cookie is built."""
+    with _make_hosted_client(monkeypatch, tmp_path) as client:
+        for bad in ("bad%3Btoken", "a%20b", "x%0D%0ASet-Cookie%3A%20y%3D1", "a%2Fb%3Fc"):
+            r = client.get(f"/workspace/accept?token={bad}", follow_redirects=False)
+            assert r.status_code == 400, bad
+            assert "location" not in r.headers, bad
+            assert "pending_invite_token" not in r.cookies, bad
+
+
+def test_workspace_accept_rejects_overlong_token(monkeypatch, tmp_path):
+    with _make_hosted_client(monkeypatch, tmp_path) as client:
+        r = client.get("/workspace/accept?token=" + "a" * 257, follow_redirects=False)
+        assert r.status_code == 400
+        assert "location" not in r.headers
+        assert "pending_invite_token" not in r.cookies
+
+
+def test_workspace_accept_malformed_token_never_reaches_invite_lookup(monkeypatch, tmp_path):
+    """Even a signed-in caller with a malformed token gets the 400 without an invite lookup."""
+    import meridian.hosted as hosted_module
+    from meridian import db as db_module
+
+    async def _signed_in(request):
+        return {"id": "tenant-1", "email": "member@example.com"}
+
+    async def _lookup_must_not_run(*args, **kwargs):
+        raise AssertionError("malformed token reached the invite lookup")
+
+    monkeypatch.setattr(hosted_module, "get_current_tenant", _signed_in)
+    monkeypatch.setattr(db_module, "get_workspace_invite_by_token_hash", _lookup_must_not_run)
+    with _make_hosted_client(monkeypatch, tmp_path) as client:
+        r = client.get("/workspace/accept?token=bad%3Btoken", follow_redirects=False)
+        assert r.status_code == 400
+
+
 def test_workspace_connect_db_self_hosted_404(client):
     r = client.post("/workspace/connect-db", json={"url": "postgresql://x"})
     assert r.status_code == 404
