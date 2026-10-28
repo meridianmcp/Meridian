@@ -317,6 +317,19 @@ def _clear_tunnel_mcp_session(
 # correlation id (uuid4), independent of _pending_reqs (HTTP proxy futures).
 _pending_run_cmd_reqs: dict[str, "asyncio.Future[dict]"] = {}
 
+# Which tenant each in-flight request belongs to, keyed by request id. The pending dicts
+# above are shared by every tenant, so a socket drop cancels only its own tenant's requests.
+_pending_owner: dict[str, str] = {}
+
+
+def _cancel_pending_for_tenant(pending: "dict[str, asyncio.Future[dict]]", tenant_id: str) -> None:
+    """Cancel the in-flight requests ``tenant_id`` owns in ``pending``, and leave every other tenant's alone."""
+    for req_id, fut in list(pending.items()):
+        if _pending_owner.get(req_id) == tenant_id and not fut.done():
+            fut.cancel()
+
+
+
 # 8fb69d54 — 4 pre-allocated custom tunnel slots (p0-p3, ports 8814-8817) so
 # custom plugins get real server routes and appear in the claude.ai connector
 # (closes ecf5b8c6). Registries are keyed by slot label, mirroring word/dc.
@@ -938,14 +951,11 @@ async def tunnel_ws(ws: WebSocket, tenant_id: str) -> None:
         clear_tenant_owner_instance(tenant_id, owner_instance)
         if not has_active_tunnel(tenant_id):
             _invalidate_tunnel_manifest(tenant_id)  # 4331f9cd / 49d8244d
-        # Cancel any in-flight proxy requests for this tenant
-        for fut in list(_pending_reqs.values()):
-            if not fut.done():
-                fut.cancel()
-        # 0e973e52 — cancel any in-flight run_cmd requests when FS socket drops
-        for fut_rc in list(_pending_run_cmd_reqs.values()):
-            if not fut_rc.done():
-                fut_rc.cancel()
+        # Cancel only this tenant's in-flight proxy requests. The pending dicts are shared by
+        # every tenant, so cancelling them all would fail other tenants' live calls with 503.
+        _cancel_pending_for_tenant(_pending_reqs, tenant_id)
+        # 0e973e52 — cancel this tenant's in-flight run_cmd requests when FS socket drops
+        _cancel_pending_for_tenant(_pending_run_cmd_reqs, tenant_id)
         try:
             await db_module.update_tenant(auth_db, tenant_id, tunnel_active=0)
         except Exception:
@@ -1040,9 +1050,7 @@ async def tunnel_code_ws(ws: WebSocket, tenant_id: str) -> None:
         _clear_slot_health(tenant_id, "code")
         # af5b5739 / 5f02a21c — release ownership only if still ours.
         clear_tenant_owner_instance(tenant_id, owner_instance)
-        for fut in list(_pending_code_reqs.values()):
-            if not fut.done():
-                fut.cancel()
+        _cancel_pending_for_tenant(_pending_code_reqs, tenant_id)
         _log.info("tunnel-code: tenant %s disconnected", tenant_id[:8])
 
 
@@ -1132,9 +1140,7 @@ async def tunnel_extract_ws(ws: WebSocket, tenant_id: str) -> None:
         _clear_slot_health(tenant_id, "extract")
         # af5b5739 / 5f02a21c — release ownership only if still ours.
         clear_tenant_owner_instance(tenant_id, owner_instance)
-        for fut in list(_pending_extract_reqs.values()):
-            if not fut.done():
-                fut.cancel()
+        _cancel_pending_for_tenant(_pending_extract_reqs, tenant_id)
         _log.info("tunnel-extract: tenant %s disconnected", tenant_id[:8])
 
 
@@ -1245,9 +1251,7 @@ async def _serve_tunnel_ws(
             _invalidate_tunnel_manifest(tenant_id)
         # af5b5739 / 5f02a21c — release ownership only if still ours.
         clear_tenant_owner_instance(tenant_id, owner_instance)
-        for fut in list(pending.values()):
-            if not fut.done():
-                fut.cancel()
+        _cancel_pending_for_tenant(pending, tenant_id)
         _log.info("tunnel-%s: tenant %s disconnected", label, tenant_id[:8])
 
 
@@ -1596,6 +1600,7 @@ async def _do_proxy(
     loop = asyncio.get_event_loop()
     fut: asyncio.Future[dict] = loop.create_future()
     pending[req_id] = fut
+    _pending_owner[req_id] = tenant_id
 
     body_b64: str | None = None
     if body_bytes:
@@ -1664,6 +1669,7 @@ async def _do_proxy(
         )
     finally:
         pending.pop(req_id, None)
+        _pending_owner.pop(req_id, None)
         sem.release()
         _mark_inflight(tenant_id, label, -1)
 
@@ -3613,6 +3619,7 @@ async def send_run_cmd_control(
     loop = asyncio.get_event_loop()
     fut: asyncio.Future[dict] = loop.create_future()
     _pending_run_cmd_reqs[req_id] = fut
+    _pending_owner[req_id] = tenant_id
 
     try:
         await ws.send_json({
@@ -3678,6 +3685,7 @@ async def send_run_cmd_control(
         }
     finally:
         _pending_run_cmd_reqs.pop(req_id, None)
+        _pending_owner.pop(req_id, None)
 
     # The client sends back the structured result directly.
     return result
