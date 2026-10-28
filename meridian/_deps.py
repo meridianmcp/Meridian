@@ -21,6 +21,7 @@ from fastapi.templating import Jinja2Templates
 from . import member_policy
 from .plans import tenant_entitlement_plan
 from .roles import has_perm, PERM_WRITE, PERM_INVITE, PERM_SETTINGS, PERM_MANAGE_POLICY
+from .secret_redaction import redact as _redact_secret_text
 
 
 # ---------------------------------------------------------------------------
@@ -232,7 +233,10 @@ async def _open_tenant_db_by_id(request: Request, tenant_id: str) -> Any:
                 # Dual-read: per-tenant ("v2:") or legacy global key, transparently.
                 url = decrypt_tenant_db_url(tenant_id, tenant["neon_db_url"]) or None
             except Exception:
-                _log.warning("Failed to decrypt neon_db_url for tenant %s", tenant_id)
+                _log.warning(
+                    "Failed to decrypt neon_db_url for tenant %s",
+                    _redact_secret_text(str(tenant_id)),
+                )
                 url = None
         # MERIDIAN_AUTH_DB is the admin's project DB — only admin-plan tenants may use it.
         if not url and tenant.get("plan") == "admin":
@@ -259,7 +263,8 @@ async def _open_tenant_db_by_id(request: Request, tenant_id: str) -> Any:
                 if _attempt == 2:
                     _log.warning(
                         "tenant %s DB init failed after %d attempts: %s",
-                        tenant_id, _attempt + 1, exc,
+                        _redact_secret_text(str(tenant_id)), _attempt + 1,
+                        _redact_secret_text(str(exc)),
                     )
                     raise HTTPException(
                         status_code=503,

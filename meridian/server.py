@@ -28,6 +28,7 @@ from pathlib import Path
 # Shared helpers (templates, _db, _hosted_mode, etc.) live in _deps.py so
 # that routes/ modules can import them without circular-importing server.py.
 # ---------------------------------------------------------------------------
+from .secret_redaction import redact as _redact_secret_text  # noqa: E402 — masks secrets in log/error text
 from ._deps import (
     _VERSION,
     _ASSET_VERSION,
@@ -1172,7 +1173,7 @@ async def _limit_exceeded_handler(request: Request, exc: _limits_module.LimitExc
     return JSONResponse(
         status_code=429,
         content={
-            "detail": str(exc),
+            "detail": _limits_module.limit_429_detail(exc.kind, exc.limit),
             "kind": exc.kind,
             "limit": exc.limit,
             "current": exc.current,
@@ -1300,7 +1301,7 @@ async def _body_size_guard_middleware(request: Request, call_next):
                     return JSONResponse(
                         status_code=429,
                         content={
-                            "detail": str(exc),
+                            "detail": _limits_module.limit_429_detail(exc.kind, exc.limit),
                             "kind": exc.kind,
                             "limit": exc.limit,
                             "current": exc.current,
@@ -7893,11 +7894,12 @@ async def hooks_stop(body: dict[str, Any], request: Request) -> dict[str, Any]:
             }
         except Exception as exc:  # noqa: BLE001
             import logging as _hook_logging
-            _hook_logging.getLogger("meridian.hooks").info(
+            # WARNING, not INFO: server_logs only persists WARNING and above (f0a48685).
+            _hook_logging.getLogger("meridian.hooks").warning(
                 "hooks/stop delta handoff failed for project=%s session=%s: %r",
                 project_id, session_id, exc,
             )
-            return {"ok": True, "handoff": None, "error": str(exc)}
+            return {"ok": True, "handoff": None, "error": "delta handoff failed; see server log"}
     finally:
         _STOP_HOOK_INFLIGHT.discard(session_id)
 
@@ -9401,7 +9403,8 @@ async def _remote_mcp_inner(
                 import logging as _mcp_log
                 _mcp_log.getLogger("meridian.mcp").error(
                     "[mcp] tenant %s DB open failed (%s) — returning %s, NOT falling back to auth DB",
-                    _oa_tenant_id, _db_exc.detail, _db_exc.status_code,
+                    _redact_secret_text(str(_oa_tenant_id)),
+                    _redact_secret_text(str(_db_exc.detail)), _db_exc.status_code,
                 )
                 _oa_method = _body.get("method", "") if isinstance(_body, dict) else ""
                 await _log_connection_event(
@@ -9423,7 +9426,7 @@ async def _remote_mcp_inner(
                 import logging as _mcp_log
                 _mcp_log.getLogger("meridian.mcp").error(
                     "[mcp] tenant %s DB routing error: %s — returning 503, NOT falling back to auth DB",
-                    _oa_tenant_id, _db_err,
+                    _redact_secret_text(str(_oa_tenant_id)), _redact_secret_text(str(_db_err)),
                 )
                 _oa_method = _body.get("method", "") if isinstance(_body, dict) else ""
                 await _log_connection_event(

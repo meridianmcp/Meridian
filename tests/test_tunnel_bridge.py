@@ -1355,7 +1355,9 @@ def test_send_active_repo_control_send_error():
     tn._tunnel_extract_sockets["t1"] = ws
     result = asyncio.run(tn.send_active_repo_control("t1", "/my/repo"))
     assert result["status"] == "error"
-    assert "ws broken" in result["message"]
+    # Fixed message: the exception text is logged server-side, never returned.
+    assert result["message"] == "could not send set_active_repo; see server log"
+    assert "ws broken" not in result["message"]
 
 
 # ---------------------------------------------------------------------------

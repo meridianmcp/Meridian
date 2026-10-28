@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import json
+import logging
 import os
 from typing import Any
 
@@ -316,8 +317,18 @@ async def generate_codebase_map(project_id: str, request: Request) -> dict[str, 
     try:
         render_map(graph, str(out), hotspots_only=bool(body.get("hotspots")))
     except GraphvizMissingError as exc:
+        logging.getLogger(__name__).warning("codebase map needs graphviz: %s", exc)
+        # Fixed install hint, no exception text: the render error is logged above.
         return Response(
-            content=json.dumps({"error": "graphviz_missing", "message": str(exc)}),
+            content=json.dumps({
+                "error": "graphviz_missing",
+                "message": (
+                    "Graphviz 'dot' is not on PATH. Install Graphviz "
+                    "(https://graphviz.org/download/), for example with "
+                    "`winget install graphviz`, `brew install graphviz`, or "
+                    "`apt install graphviz`."
+                ),
+            }),
             status_code=503, media_type="application/json",
         )
     except Exception as exc:  # noqa: BLE001

@@ -8,6 +8,7 @@ import { tmpdir } from "node:os";
 import { basename, delimiter, dirname, isAbsolute, join, relative, resolve } from "node:path";
 import { createHash, randomUUID } from "node:crypto";
 import { compileLocalLatex, getLatestCompileReceiptSummary, getWorkflowStatusPayload, runBoundedCommand, type CommandResult, type CommandRunner, type LatexEngine } from "./overleaf-workflow.js";
+import { ExpectedError } from "./expected-error.js";
 
 const temporaryDirectories: string[] = [];
 let originalPath: string | undefined;
@@ -190,6 +191,28 @@ test("biblatex addbibresource selects Biber and records a local compile receipt 
   assert.equal(payload.localCompile.note.includes("sync is not attested"), true);
   assert.ok(!JSON.stringify(payload).includes("pdf_path"), "workflow API keeps local artifact paths private");
   await assert.rejects(getWorkflowStatusPayload("bad project id", state), /invalid Overleaf project identifier/);
+});
+
+test("caller-input validation throws ExpectedError so the message reaches the caller", async () => {
+  const { root } = await project({ "main.tex": "\\documentclass{article}\\begin{document}x\\end{document}\n" });
+  const rootFile = join(root, "main.tex");
+  await assert.rejects(
+    compileLocalLatex({ rootFile, engine: "tex" as LatexEngine }),
+    (error) => error instanceof ExpectedError && error.message === "unsupported TeX engine: tex",
+  );
+  await assert.rejects(
+    compileLocalLatex({ rootFile, timeoutMs: 0 }),
+    (error) => error instanceof ExpectedError && error.message === "timeoutMs must be between 1 and 1800000",
+  );
+  await assert.rejects(
+    compileLocalLatex({ rootFile, overleafProjectId: "bad id!" }),
+    (error) => error instanceof ExpectedError
+      && error.message === "overleafProjectId must be a simple Overleaf project identifier",
+  );
+  await assert.rejects(
+    getWorkflowStatusPayload("bad project id", join(root, "state")),
+    (error) => error instanceof ExpectedError && error.message === "invalid Overleaf project identifier",
+  );
 });
 
 test("biblatex backend=bibtex selects BibTeX", async () => {

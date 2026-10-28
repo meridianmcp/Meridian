@@ -530,10 +530,38 @@ def _backup_once(path: Path) -> None:
             pass
 
 
-def _write_text_atomic(path: Path, text: str) -> None:
+def _write_text_atomic(path: Path, text: str, *, private: bool = False) -> None:
     """Write via a sibling temp file + rename, so a crash never leaves the user's
-    config half-written. ``newline=""`` keeps the line endings ``text`` carries."""
+    config half-written. ``newline=""`` keeps the line endings ``text`` carries.
+
+    ``private=True`` is for a config that embeds the Meridian token. It uses the
+    same ordering as ``_write_private_file``: the temp file is created empty with
+    ``O_EXCL`` and mode 0600, locked to the current user with ``_restrict_to_owner``,
+    and only then written. No byte of the token therefore lands in a file that is
+    still readable by other principals, on POSIX or on Windows (where the mode bits
+    do nothing and the lock is an icacls ACL). ``os.replace`` keeps that ACL on the
+    final file. If the lock cannot be applied, the temp file is removed, the token
+    is not written, and ``OSError`` is raised (fail closed). This is the one config
+    write that runs a subprocess, and only on Windows. Without ``private`` the write
+    is the same as before (default file mode, no restriction, no subprocess).
+    """
     tmp = path.with_name(path.name + ".meridian-tmp")
+    if private:
+        try:
+            tmp.unlink()  # drop a stale temp file left by an interrupted run
+        except FileNotFoundError:
+            pass
+        # Create empty and owner-only first. Closing the handle before the lock
+        # keeps icacls from competing with an open file on Windows.
+        os.close(os.open(str(tmp), os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600))
+        if not _restrict_to_owner(tmp):
+            try:
+                tmp.unlink()
+            except OSError:
+                pass
+            raise OSError(
+                f"could not restrict {tmp} to your user account; the token was not written"
+            )
     with open(tmp, "w", encoding="utf-8", newline="") as fh:
         fh.write(text)
     os.replace(tmp, path)
@@ -555,11 +583,11 @@ def _configure_codex(config_path: Path, meridian_url: str, token: str, start_cmd
         config_path.parent.mkdir(parents=True, exist_ok=True)
         if existing:
             _backup_once(config_path)
-        _write_text_atomic(config_path, new_text)
+        # A token-bearing write locks its temp file before the token is written
+        # (see _write_text_atomic), so the final file is never exposed.
+        _write_text_atomic(config_path, new_text, private=bool(token))
     except OSError as exc:
         return False, notes + [f"WARNING: could not write {config_path} ({exc})."]
-    if token and not _restrict_to_owner(config_path):
-        notes.append(f"WARNING: could not restrict {config_path} to your user account; it now holds your token.")
     notes.append(f"OK Meridian MCP server merged into {config_path} (your other settings were preserved)")
     return True, notes
 
@@ -606,11 +634,11 @@ def _configure_cursor(meridian_url: str, token: str):
     try:
         path.parent.mkdir(parents=True, exist_ok=True)
         _backup_once(path)
-        _write_text_atomic(path, json.dumps(data, indent=2) + "\n")
+        # A token-bearing write locks its temp file before the token is written
+        # (see _write_text_atomic), so the final file is never exposed.
+        _write_text_atomic(path, json.dumps(data, indent=2) + "\n", private=bool(token))
     except OSError as exc:
         return False, f"WARNING: could not write {path} ({exc})."
-    if token and not _restrict_to_owner(path):
-        return True, f"OK merged into {path} (WARNING: could not restrict it to your user account)"
     return True, f"OK merged into {path} (your other MCP servers were preserved)"
 
 

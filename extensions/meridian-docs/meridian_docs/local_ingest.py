@@ -273,7 +273,10 @@ def _call_mcp_tool_via_curl(
         headers_path = os.path.join(temp_dir, "headers.txt")
         with open(payload_path, "wb") as payload_file:
             payload_file.write(payload)
-        with open(headers_path, "w", encoding="utf-8", newline="\n") as headers_file:
+        # The headers file carries the bearer token, so create it owner-only
+        # (0600 on POSIX; the user-only temp-directory ACL applies on Windows).
+        headers_fd = os.open(headers_path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+        with os.fdopen(headers_fd, "w", encoding="utf-8", newline="\n") as headers_file:
             for name, value in headers.items():
                 headers_file.write(f"{name}: {value}\n")
 

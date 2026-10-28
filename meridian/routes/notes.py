@@ -1,6 +1,7 @@
 """Project notes (per-project wiki) routes — extracted from server.py."""
 from __future__ import annotations
 
+import logging
 import os
 from typing import Any
 
@@ -10,6 +11,7 @@ from fastapi.responses import Response
 from .._deps import _db, _data_dir, validate_input_size, _MANUAL_NOTE_LINT
 from .. import db as db_module
 
+_log = logging.getLogger(__name__)
 router = APIRouter()
 
 
@@ -77,8 +79,9 @@ async def document_structure_endpoint(
         return docs_intel.document_outline(fp)
     except FileNotFoundError:
         return {"error": f"file not found on server: {fp}"}
-    except Exception as exc:  # noqa: BLE001 — surface parse errors inline
-        return {"error": f"could not parse document: {exc}"}
+    except Exception:  # noqa: BLE001 — surface parse errors inline
+        _log.warning("could not parse document %r", fp, exc_info=True)
+        return {"error": "could not parse document"}
 
 
 def _resolve_document_review_builder():
@@ -142,6 +145,26 @@ def _journal_style_presets_path(request: Request) -> str:
     return os.path.join(_data_dir(request), "journal_style_presets.json")
 
 
+def _known_journal_style_preset_names(lister, request: Request) -> list[str]:
+    """Names of every journal style preset the lister reports (built-in and
+    user-saved), for the invalid-preset error text. Best effort: a missing or
+    failing lister yields an empty list instead of a second error."""
+    if lister is None:
+        return []
+    try:
+        catalog = lister(user_presets_path=_journal_style_presets_path(request))
+    except Exception:  # noqa: BLE001 — the name list is a hint; never fail the review over it
+        _log.warning("could not list journal style presets for an error message", exc_info=True)
+        return []
+    presets = catalog.get("presets") if isinstance(catalog, dict) else None
+    if not isinstance(presets, list):
+        return []
+    return [
+        p["name"] for p in presets
+        if isinstance(p, dict) and isinstance(p.get("name"), str)
+    ]
+
+
 @router.get("/journal-style-presets")
 async def list_journal_style_presets_endpoint(request: Request) -> dict[str, Any]:
     """9c1a3fd2 -- catalog for the journal-preset picker on the document
@@ -162,8 +185,9 @@ async def list_journal_style_presets_endpoint(request: Request) -> dict[str, Any
         }
     try:
         return lister(user_presets_path=_journal_style_presets_path(request))
-    except Exception as exc:  # noqa: BLE001 — surface inline, never a 500
-        return {"error": f"could not list journal style presets: {exc}"}
+    except Exception:  # noqa: BLE001 — surface inline, never a 500
+        _log.warning("could not list journal style presets", exc_info=True)
+        return {"error": "could not list journal style presets"}
 
 
 @router.get("/projects/{project_id}/document-review")
@@ -246,15 +270,23 @@ async def document_review_endpoint(
                 journal_name, user_presets_path=_journal_style_presets_path(request)
             )
         except ValueError as exc:
-            return {"error": str(exc)}
+            _log.info("journal style preset %r rejected: %s", journal_name, exc)
+            known = _known_journal_style_preset_names(_lister, request)
+            return {
+                "error": (
+                    f"invalid journal style preset: {journal_name}; "
+                    f"known presets: {known}"
+                ),
+            }
     try:
         result = builder(
             fp, expected_source_fingerprint=fingerprint, style_policy=style_policy
         )
     except FileNotFoundError:
         return {"error": f"file not found on server: {fp}"}
-    except Exception as exc:  # noqa: BLE001 — surface parse errors inline, never a 500
-        return {"error": f"could not build document review: {exc}"}
+    except Exception:  # noqa: BLE001 — surface parse errors inline, never a 500
+        _log.warning("could not build document review %r", fp, exc_info=True)
+        return {"error": "could not build document review"}
     if not isinstance(result, dict):
         return {"error": "document review builder returned an unexpected result"}
     return result

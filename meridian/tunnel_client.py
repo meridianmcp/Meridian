@@ -2833,9 +2833,9 @@ def _note_shell_fallback(reason: str) -> int:
             if count == _SHELL_FALLBACK_PRINT_LIMIT else ""
         )
         print(
-            f"tunnel: shell fallback engaged ({reason}) — occurrence #{count}; "
+            _redact_secret_text(f"tunnel: shell fallback engaged ({reason}) — occurrence #{count}; "
             "this is the platform-required cmd.exe wrapper for a .cmd/.bat "
-            f"launcher, not a bug.{suffix}",
+            f"launcher, not a bug.{suffix}"),
             file=sys.stderr, flush=True,
         )
     return count
@@ -2968,8 +2968,8 @@ def _scoped_cache_clear(cmd: "list[str]", label: str = "?") -> bool:
             # retry proceeds (uvx itself implies uv is present, but if
             # shutil.which can't see it we have nowhere useful to clear from).
             print(
-                f"tunnel:{label}: cannot clear uvx cache for {pkg!r} — "
-                "uv binary not found on PATH; retrying anyway",
+                _redact_secret_text(f"tunnel:{label}: cannot clear uvx cache for {pkg!r} — "
+                "uv binary not found on PATH; retrying anyway"),
                 flush=True,
             )
             return True
@@ -2980,19 +2980,19 @@ def _scoped_cache_clear(cmd: "list[str]", label: str = "?") -> bool:
             )
             if result.returncode == 0:
                 print(
-                    f"tunnel:{label}: cleared uvx cache for {pkg!r} (retry attempt follows)",
+                    _redact_secret_text(f"tunnel:{label}: cleared uvx cache for {pkg!r} (retry attempt follows)"),
                     flush=True,
                 )
             else:
                 _err = (result.stderr or result.stdout or "").strip()[:120]
                 print(
-                    f"tunnel:{label}: uv cache clean {pkg!r} returned "
-                    f"{result.returncode} ({_err}); retrying anyway",
+                    _redact_secret_text(f"tunnel:{label}: uv cache clean {pkg!r} returned "
+                    f"{result.returncode} ({_err}); retrying anyway"),
                     flush=True,
                 )
         except Exception as exc:  # noqa: BLE001 — best-effort, never block the retry
             print(
-                f"tunnel:{label}: uv cache clean {pkg!r} raised {exc}; retrying anyway",
+                _redact_secret_text(f"tunnel:{label}: uv cache clean {pkg!r} raised {exc}; retrying anyway"),
                 flush=True,
             )
         return True
@@ -3006,18 +3006,18 @@ def _scoped_cache_clear(cmd: "list[str]", label: str = "?") -> bool:
         try:
             _shutil.rmtree(npx_cache, ignore_errors=True)
             print(
-                f"tunnel:{label}: cleared npx ephemeral cache at {npx_cache} "
-                f"(retry attempt follows)",
+                _redact_secret_text(f"tunnel:{label}: cleared npx ephemeral cache at {npx_cache} "
+                f"(retry attempt follows)"),
                 flush=True,
             )
         except Exception as exc:  # noqa: BLE001 — best-effort
             print(
-                f"tunnel:{label}: could not remove npx cache {npx_cache}: {exc}; retrying anyway",
+                _redact_secret_text(f"tunnel:{label}: could not remove npx cache {npx_cache}: {exc}; retrying anyway"),
                 flush=True,
             )
     else:
         print(
-            f"tunnel:{label}: npx cache dir {npx_cache} not found — retrying without clear",
+            _redact_secret_text(f"tunnel:{label}: npx cache dir {npx_cache} not found — retrying without clear"),
             flush=True,
         )
     return True
@@ -3090,8 +3090,8 @@ def _scoped_cache_clear_thorough(cmd: "list[str]", label: str = "?") -> None:
     npm = shutil.which("npm")
     if not npm:
         print(
-            f"tunnel:{label}: TAR_ENTRY_ERROR thorough clear: npm not found on PATH; "
-            f"_npx/ already removed — full _cacache wipe skipped (pkg={pkg!r})",
+            _redact_secret_text(f"tunnel:{label}: TAR_ENTRY_ERROR thorough clear: npm not found on PATH; "
+            f"_npx/ already removed — full _cacache wipe skipped (pkg={pkg!r})"),
             flush=True,
         )
         return
@@ -3102,21 +3102,21 @@ def _scoped_cache_clear_thorough(cmd: "list[str]", label: str = "?") -> None:
         )
         if result.returncode == 0:
             print(
-                f"tunnel:{label}: TAR_ENTRY_ERROR thorough clear: npm cache clean --force "
-                f"succeeded (pkg={pkg!r}); retry attempt follows",
+                _redact_secret_text(f"tunnel:{label}: TAR_ENTRY_ERROR thorough clear: npm cache clean --force "
+                f"succeeded (pkg={pkg!r}); retry attempt follows"),
                 flush=True,
             )
         else:
             _err = (result.stderr or result.stdout or "").strip()[:200]
             print(
-                f"tunnel:{label}: TAR_ENTRY_ERROR thorough clear: npm cache clean --force "
-                f"returned {result.returncode} ({_err!r}); retrying anyway",
+                _redact_secret_text(f"tunnel:{label}: TAR_ENTRY_ERROR thorough clear: npm cache clean --force "
+                f"returned {result.returncode} ({_err!r}); retrying anyway"),
                 flush=True,
             )
     except Exception as exc:  # noqa: BLE001 — best-effort, never block the retry
         print(
-            f"tunnel:{label}: TAR_ENTRY_ERROR thorough clear: npm cache clean raised "
-            f"{exc}; retrying anyway",
+            _redact_secret_text(f"tunnel:{label}: TAR_ENTRY_ERROR thorough clear: npm cache clean raised "
+            f"{exc}; retrying anyway"),
             flush=True,
         )
 
@@ -3467,8 +3467,8 @@ def _spawn_with_cache_retry(
     except Exception as first_exc:  # noqa: BLE001
         # First spawn failed (OSError / ENOENT / etc.) — a9d1ef7f generic path.
         print(
-            f"tunnel:{label}: spawn failed ({first_exc}); "
-            "attempting scoped cache-clear + one retry",
+            _redact_secret_text(f"tunnel:{label}: spawn failed ({first_exc}); "
+            "attempting scoped cache-clear + one retry"),
             file=sys.stderr, flush=True,
         )
         _scoped_cache_clear(cmd, label)
@@ -3517,9 +3517,9 @@ def _spawn_with_cache_retry(
         # Run a diagnostic probe with stderr captured to identify the class.
         if _probe_tar_entry_error(cmd, env, label, wait_seconds=5.0):
             print(
-                f"tunnel:{label}: TAR_ENTRY_ERROR detected (corrupted npm extraction "
+                _redact_secret_text(f"tunnel:{label}: TAR_ENTRY_ERROR detected (corrupted npm extraction "
                 "cache, likely AV/Defender file-lock interference); applying thorough "
-                "cache clear + retry",
+                "cache clear + retry"),
                 file=sys.stderr, flush=True,
             )
             _scoped_cache_clear_thorough(cmd, label)
@@ -3538,11 +3538,11 @@ def _spawn_with_cache_retry(
             if _dep_detail is not None:
                 _dep_stderr_final = (_dep_detail.get("stderr") or "")[:500]
                 print(
-                    f"tunnel:{label}: missing dependency file in npm cache "
+                    _redact_secret_text(f"tunnel:{label}: missing dependency file in npm cache "
                     f"(package={_dep_detail['package']!r}, "
                     f"cache_path={_dep_detail['cache_path']!r}, "
                     f"missing_file={_dep_detail['missing_file']!r}); applying "
-                    f"thorough cache clear + retry (final stderr: {_dep_stderr_final!r})",
+                    f"thorough cache clear + retry (final stderr: {_dep_stderr_final!r})"),
                     file=sys.stderr, flush=True,
                 )
                 if diagnostics is not None:
@@ -3571,8 +3571,8 @@ def _spawn_with_cache_retry(
                 # Fast exit but no TAR / dependency-integrity signature — fall
                 # back to the generic scoped clear.
                 print(
-                    f"tunnel:{label}: process exited immediately (code {proc.returncode}); "
-                    "applying scoped cache-clear + one retry",
+                    _redact_secret_text(f"tunnel:{label}: process exited immediately (code {proc.returncode}); "
+                    "applying scoped cache-clear + one retry"),
                     file=sys.stderr, flush=True,
                 )
                 _scoped_cache_clear(cmd, label)
@@ -4459,11 +4459,11 @@ def _report_unknown_port_occupant(port: int, label: str, pid: int) -> None:
         proc_name = ""
     detail = f" ({proc_name})" if proc_name else ""
     print(
-        f"tunnel:{label}: port {port} is already occupied by pid {pid}{detail} "
+        _redact_secret_text(f"tunnel:{label}: port {port} is already occupied by pid {pid}{detail} "
         "with no Meridian slot-claim identity on record — NOT killing it "
         "(unknown occupant). If this is a stale Meridian process, stop it "
         "manually, or clear ~/.meridian/slot_claims and retry; this slot may "
-        "fail to bind until the port is free.",
+        "fail to bind until the port is free."),
         file=sys.stderr, flush=True,
     )
 
@@ -4520,8 +4520,8 @@ def _kill_stale_port_occupant(port: int, label: str, current_client_id: str = ""
     # whose tunnel process is still running, it is NOT a stale orphan — skip.
     if _is_slot_claimed_by_live_client(port, current_client_id):
         print(
-            f"tunnel:{label}: port {port} is claimed by a live client — "
-            "skipping stale-occupant kill",
+            _redact_secret_text(f"tunnel:{label}: port {port} is claimed by a live client — "
+            "skipping stale-occupant kill"),
             flush=True,
         )
         return
@@ -4547,8 +4547,8 @@ def _kill_stale_port_occupant(port: int, label: str, current_client_id: str = ""
                     _report_unknown_port_occupant(port, label, pid)
                     continue
                 print(
-                    f"tunnel:{label}: killing stale prior-generation process "
-                    f"(pid {pid}) still bound to port {port} before spawning fresh",
+                    _redact_secret_text(f"tunnel:{label}: killing stale prior-generation process "
+                    f"(pid {pid}) still bound to port {port} before spawning fresh"),
                     flush=True,
                 )
                 if sys.platform == "win32":
@@ -7200,18 +7200,18 @@ async def _proc_watchdog(
         if failures > max_retries:
             if not gave_up_fast_retry:
                 print(
-                    f"tunnel:{label}: local proxy keeps exiting (code {proc.returncode}); "
+                    _redact_secret_text(f"tunnel:{label}: local proxy keeps exiting (code {proc.returncode}); "
                     f"giving up fast retries after {max_retries} attempts — will keep "
                     f"retrying every {cooldown:.0f}s in case the issue clears; fix the "
-                    f"command to recover sooner.",
+                    f"command to recover sooner."),
                     file=sys.stderr, flush=True,
                 )
                 gave_up_fast_retry = True
             backoff = cooldown
         else:
             print(
-                f"tunnel:{label}: local proxy exited (code {proc.returncode}); relaunching "
-                f"(attempt {failures}/{max_retries})",
+                _redact_secret_text(f"tunnel:{label}: local proxy exited (code {proc.returncode}); relaunching "
+                f"(attempt {failures}/{max_retries})"),
                 file=sys.stderr, flush=True,
             )
             backoff = min(max(backoff, poll_interval) * 2, _MAX_BACKOFF)
@@ -7233,7 +7233,7 @@ async def _proc_watchdog(
             # unbound to anything _kill_stale_port_occupant would ever check.
             _record_spawned_pid(relaunched, label)
         except Exception as exc:  # noqa: BLE001 — count it, back off, may still recover
-            print(f"tunnel:{label}: relaunch failed: {exc}", file=sys.stderr, flush=True)
+            print(_redact_secret_text(f"tunnel:{label}: relaunch failed: {exc}"), file=sys.stderr, flush=True)
 
 
 # ---------------------------------------------------------------------------
@@ -8258,14 +8258,14 @@ async def run_tunnel(
         # here too, right before the Popen below.
         # aaddb273 — pass _client_id for live-client guard.
         _kill_stale_port_occupant(cport, f"custom:{cname}", current_client_id=_client_id)
-        print(f"  custom:{cname:<9}http://127.0.0.1:{cport}", flush=True)
+        print(_redact_secret_text(f"  custom:{cname:<9}http://127.0.0.1:{cport}"), flush=True)
         try:
             # a9d1ef7f — scoped cache-clear + one retry on spawn failure.
             proc_custom = _spawn_with_cache_retry(cmd_custom, spawn_env, f"custom:{cname}")
             proc_holders.append({"proc": proc_custom, "cmd": cmd_custom, "env": spawn_env, "label": f"custom:{cname}"})
             running_custom.append({"name": cname, "port": cport})
         except Exception as exc:
-            print(f"  warning: could not start custom plugin {cname!r}: {exc}", file=sys.stderr)
+            print(_redact_secret_text(f"  warning: could not start custom plugin {cname!r}: {exc}"), file=sys.stderr)
 
     # 5. Print permanent URLs.
     print("", flush=True)
@@ -8342,8 +8342,8 @@ async def run_tunnel(
         _meridian_prefix = "meridian, " if token else ""
         _builtin_conns = _meridian_prefix + ", ".join(TUNNEL_MCP_KEYS)
         print(
-            f"    added connectors: {_builtin_conns}"
-            f"{_custom_conns} (removed on Ctrl+C)",
+            _redact_secret_text(f"    added connectors: {_builtin_conns}"
+            f"{_custom_conns} (removed on Ctrl+C)"),
             flush=True,
         )
         print(
