@@ -3,15 +3,20 @@
 Menu actions and a local write API for Zotero:
 
 - **Import BibTeX here...** on a collection's context menu. Pick one `.bib` file. The entries are checked for
-  duplicates against the whole library, and the new ones are imported into that collection.
+  duplicates against the whole library, and the new ones are imported into that collection. An entry with no title
+  and no DOI is matched by its `BibTeX key`, so importing the same file again no longer adds another untitled copy.
+- **Remove duplicate empty sources here...** on a collection's context menu. It lists the untitled copies that share
+  a `BibTeX key` in that collection, keeps the oldest copy of each, and moves the rest to the Zotero trash only after
+  you approve. A copy with attachments or notes is kept and reported.
 - **Attach PDFs from folder...** on an item's context menu, for the selected items. Pick a folder. For each item
   whose Extra field has a `BibTeX key: <key>` line, the plugin looks for `<key>.pdf` in that folder and attaches it.
 - **Local write API** on `127.0.0.1:23125`, for scripts and agents. It creates, edits, trashes and restores items,
   notes, attachments, relations, collections and tags, and it imports BibTeX. Reads stay on Zotero's own local API.
   See "Local write API" below.
 
-Plugin ID: `meridian-zotero@usemeridian.us`. Version `0.1.4` (source; not yet signed or released).
-Earlier builds: `0.1.3` (released; it had the write API, but accepted any readable file as a linked attachment, which
+Plugin ID: `meridian-zotero@usemeridian.us`. Version `0.1.5` (source; not yet signed or released). `0.1.5` adds the
+untitled-entry BibTeX key match and the duplicate-empty-source cleanup.
+Earlier builds: `0.1.4` (Mozilla-signed and on the update channel), `0.1.3` (released; it had the write API, but accepted any readable file as a linked attachment, which
 0.1.4 closes), `0.1.2` (Mozilla-signed, menus only, no write API), `0.1.1` (on Mozilla, uploaded by the owner, with
 the old placeholder `update_url`, so it does not auto-update from GitHub), `0.1.0` (Mozilla-approved, no
 `strict_max_version`).
@@ -24,6 +29,11 @@ the old placeholder `update_url`, so it does not auto-update from GitHub), `0.1.
   Those checks ran before the limit, collection, restore, linked-file, batch rollback, BibTeX key and creator-role
   changes listed below, so those changes are not live-checked yet. They also predate write grants, so writes in those
   checks would now need a grant key.
+- **Not live-checked yet.** Node tests cover two changes. First, an imported attachment whose base64 body is about
+  4.5 million characters or more (a PDF of about 3.2 MiB and up) returned 500 because the base64 check overflowed the
+  regex engine's stack. The check now uses a pattern without a repeated group. Second, a top-level key the body does not
+  read, or a creator key such as `first_name`, is refused with 422 instead of being dropped. A live check should import a
+  PDF of about 4.5 MB, and create a journal article with `title`, `date`, `DOI`, `url`, `creators` and `collection_keys`.
 - **Write grants, verified live on 2026-10-19 in a throwaway Zotero 10.0.6 profile.** A write without a grant key was
   refused with `grant_required`. The desktop prompt showed the app name and the self-reported warning. Allow for 1 hour
   gave a grant that expired about an hour later, and Allow until Zotero restarts gave one that expired about eight
@@ -42,11 +52,11 @@ the old placeholder `update_url`, so it does not auto-update from GitHub), `0.1.
   Developer Mode), a network drive, and the PDF menu, which needs the Zotero window.
 - **Verified in node.** The unit tests cover the HTTP parser, admission, validation, the link policy against a fake
   resolver, the write logic (against a Zotero-shaped fake) and the design-line checks in `test/static-checks.test.js`.
-- **Not verified in Zotero:** the two menu commands, the preferences pane, and the file pickers. These run only
-  through the Zotero window, which the checks above did not drive. The BibTeX import they share with the API was
-  verified through the API.
-- **Not yet done:** a Mozilla-signed `0.1.4` build, and its release to the update channel. Until that happens,
-  Meridian's install step prints the signing command.
+- **Not verified in Zotero:** the menu commands, the preferences pane, and the file pickers. These run only through
+  the Zotero window, which the checks above did not drive. The BibTeX import they share with the API was verified
+  through the API. In `0.1.5` that includes the new duplicate-empty-source cleanup, which is checked in node only: the
+  pure logic, the key match, and the design-line checks. Its Zotero calls (`getChildItems`, `getNotes`,
+  `Items.trashTx`, `Prompt.confirm`) are not live-checked.
 
 Two bugs were found and fixed while verifying. The BibTeX duplicate check called `Zotero.Items.getAll` with its first
 two arguments swapped, so the import failed before it wrote anything. The menu import and the API import share that
@@ -151,8 +161,8 @@ Collection responses have the same fields except `date_modified`, because Zotero
 | Method and path | Body | Notes |
 | --- | --- | --- |
 | `GET /v1/status` | none | Plugin, API and Zotero versions, and the library id. |
-| `POST /v1/items` | `item_type`, optional `fields`, `creators`, `tags`, `collection_keys`, `relations` | Answers 201. Unknown fields are refused, and the reply lists them. |
-| `PATCH /v1/items/{key}` | `fields`, `creators`, `set_tags`, `add_tags`, `remove_tags`, `set_collections`, `add_collections`, `remove_collections`, `add_relations`, `remove_relations`, and the precondition fields | Only the fields you send change. `item_type` cannot change. |
+| `POST /v1/items` | `item_type`, optional `fields`, `creators`, `tags`, `collection_keys`, `relations` | Answers 201. Unknown fields are refused, and the reply lists them. A top-level key the body does not read, such as `title`, `date` or `collections`, is refused with 422 `invalid_fields`, and the reply names where it belongs (`fields` or `collection_keys`). A creator takes `creatorType` with `firstName` and `lastName`, or with `name`. Other creator keys, such as `first_name`, are refused. |
+| `PATCH /v1/items/{key}` | `fields`, `creators`, `set_tags`, `add_tags`, `remove_tags`, `set_collections`, `add_collections`, `remove_collections`, `add_relations`, `remove_relations`, and the precondition fields | Only the fields you send change. `item_type` cannot change. A top-level key the body does not read, such as `title` or `tags`, is refused with 422 `invalid_fields` and nothing changes. |
 | `POST /v1/items/{key}/trash` | precondition fields, optional | Moves the item to the trash. Works for notes and attachments too. |
 | `POST /v1/items/{key}/restore` | precondition fields, optional | Takes the item out of the trash. |
 | `POST /v1/items/{key}/notes` | `html` | Creates a child note of a regular item. Answers 201. |

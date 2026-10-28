@@ -543,6 +543,157 @@ test('linking is refused on a platform the resolver does not support', async () 
   assert.equal(zotero._calls.links.length, 0);
 });
 
+// Maps each refused key to its reason, so a test can check the key and the place it names.
+function reasonsByField(error) {
+  return Object.fromEntries(error.details.invalid_fields.map((problem) => [problem.field, problem.reason]));
+}
+
+test('createItem refuses top-level keys the body does not read, names where each belongs, and saves nothing', async () => {
+  const { zotero, items } = setup();
+  const collection = zotero._addCollection('Reading');
+  await assert.rejects(
+    items.createItem({
+      item_type: 'journalArticle',
+      title: 'Dropped before',
+      DOI: '10.1/x',
+      date: '2024',
+      url: 'https://example.org/paper',
+      collections: [collection.key],
+    }),
+    (error) => {
+      assert.equal(error.httpStatus, 422);
+      assert.equal(error.code, 'invalid_fields');
+      const reasons = reasonsByField(error);
+      assert.deepEqual(Object.keys(reasons).sort(), ['DOI', 'collections', 'date', 'title', 'url']);
+      assert.match(reasons.title, /fields\.title/);
+      assert.match(reasons.DOI, /fields\.DOI/);
+      assert.match(reasons.url, /fields\.url/);
+      assert.match(reasons.collections, /collection_keys/);
+      return true;
+    }
+  );
+  assert.equal(zotero._state.items.length, 0, 'nothing was saved, not even the parts that were valid');
+});
+
+test('an unknown top-level key is refused even when it sits beside valid ones', async () => {
+  const { zotero, items } = setup();
+  await assert.rejects(
+    items.createItem({ item_type: 'book', fields: { title: 'Valid' }, extra_thing: 'x' }),
+    (error) => {
+      assert.equal(error.code, 'invalid_fields');
+      assert.deepEqual(Object.keys(reasonsByField(error)), ['extra_thing']);
+      assert.match(reasonsByField(error).extra_thing, /not a key of this request/);
+      return true;
+    }
+  );
+  assert.equal(zotero._state.items.length, 0);
+});
+
+test('updateItem refuses a top-level title or tags, which it never read, and changes nothing', async () => {
+  const { zotero, items } = setup();
+  const item = zotero._addItem('book', { title: 'Keep' }, { tags: ['keep'] });
+  const savesBefore = zotero._calls.save;
+  await assert.rejects(items.updateItem(item.key, { title: 'Dropped before', tags: ['new'] }), (error) => {
+    assert.equal(error.httpStatus, 422);
+    assert.equal(error.code, 'invalid_fields');
+    const reasons = reasonsByField(error);
+    assert.match(reasons.title, /fields\.title/);
+    assert.match(reasons.tags, /add_tags/);
+    return true;
+  });
+  assert.equal(item.fields.title, 'Keep');
+  assert.deepEqual(item.tags, [{ tag: 'keep', type: 0 }]);
+  assert.equal(zotero._calls.save, savesBefore);
+});
+
+test('updateItem still accepts every key it reads, including the precondition fields', async () => {
+  const { zotero, items } = setup();
+  const item = zotero._addItem('book', { title: 'Old' });
+  await items.updateItem(item.key, {
+    expected_version: item.version,
+    fields: { title: 'New' },
+    add_tags: ['fresh'],
+    remove_tags: [],
+  });
+  assert.equal(item.fields.title, 'New');
+  assert.deepEqual(item.tags, [{ tag: 'fresh', type: 0 }]);
+});
+
+test('a creator with a snake_case key is refused by name, and nothing is saved as an empty creator', async () => {
+  const { zotero, items } = setup();
+  for (const [key, row] of [
+    ['first_name', { creatorType: 'author', first_name: 'Ada', last_name: 'Lovelace' }],
+    ['creator_type', { creator_type: 'author', lastName: 'Lovelace' }],
+  ]) {
+    await assert.rejects(
+      items.createItem({ item_type: 'book', fields: { title: 'T' }, creators: [row] }),
+      (error) => error.httpStatus === 422 && error.code === 'invalid_value' && new RegExp('creators\\[0\\]\\.' + key + ' is not a creator key').test(error.message),
+      key
+    );
+  }
+  assert.equal(zotero._state.items.length, 0);
+});
+
+test('a creator with snake_case keys is refused on update too, and the item is unchanged', async () => {
+  const { zotero, items } = setup();
+  const item = zotero._addItem('book', { title: 'Keep' });
+  await assert.rejects(
+    items.updateItem(item.key, { fields: { title: 'Changed' }, creators: [{ first_name: 'Ada', last_name: 'L' }] }),
+    apiErrorMatch(422, 'invalid_value')
+  );
+  assert.equal(item.fields.title, 'Keep');
+  assert.deepEqual(item.creators, []);
+});
+
+test('a creator gives either name or firstName and lastName, and at least one name', async () => {
+  const { zotero, items } = setup();
+  await assert.rejects(
+    items.createItem({ item_type: 'book', fields: { title: 'T' }, creators: [{ name: 'Working Group', lastName: 'Ignored' }] }),
+    (error) => error.code === 'invalid_value' && /has name together with firstName or lastName/.test(error.message)
+  );
+  await assert.rejects(
+    items.createItem({ item_type: 'book', fields: { title: 'T' }, creators: [{ creatorType: 'author' }] }),
+    (error) => error.code === 'invalid_value' && /creators\[0\] needs a name/.test(error.message)
+  );
+  await assert.rejects(
+    items.createItem({ item_type: 'book', fields: { title: 'T' }, creators: [{ name: 42 }] }),
+    (error) => error.code === 'invalid_value' && /creators\[0\]\.name must be a string/.test(error.message)
+  );
+  assert.equal(zotero._state.items.length, 0);
+});
+
+test('createItem saves a url field inside fields, with the title beside it', async () => {
+  const { zotero, items } = setup();
+  const result = await items.createItem({
+    item_type: 'journalArticle',
+    fields: { title: 'Linked', url: 'https://example.org/paper' },
+  });
+  const saved = zotero._state.items.find((item) => item.key === result.key);
+  assert.equal(saved.fields.title, 'Linked');
+  assert.equal(saved.fields.url, 'https://example.org/paper');
+});
+
+test('a 4.5 MB imported attachment decodes in full and reaches the importer, where a 3.2 MB one did before', async () => {
+  const { zotero, io, items } = setup();
+  const parent = zotero._addItem('book', { title: 'Book' });
+  const written = [];
+  const write = io.write;
+  io.write = async (path, bytes) => {
+    written.push(bytes.length);
+    return write(path, bytes);
+  };
+  const payload = Buffer.alloc(4500000, 0x41);
+  payload.write('%PDF-1.4', 0, 'latin1');
+  const attachment = await items.createAttachment(parent.key, {
+    mode: 'imported_file',
+    filename: 'big.pdf',
+    data_base64: payload.toString('base64'),
+  });
+  assert.deepEqual(written, [4500000]);
+  assert.equal(zotero._calls.imports.length, 1);
+  assert.equal(attachment.mode, 'imported_file');
+});
+
 test('a write factory built without a link policy refuses linking, and fails closed', async () => {
   const { zotero, items, resolver } = setup({ noPolicy: true });
   const parent = zotero._addItem('book', { title: 'Book' });
