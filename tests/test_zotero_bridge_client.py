@@ -622,3 +622,112 @@ def test_errors_never_carry_the_grant_key_or_a_token():
     assert token not in str(leak_info.value)
     assert leak_info.value.__context__ is None
     assert leak_info.value.__cause__ is None
+
+
+# ---------------------------------------------------------------------------------------------
+# Item bodies in a batch: the keys the bridge reads
+# ---------------------------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    ("method", "path", "body", "key"),
+    [
+        ("POST", "/v1/items", {"item_type": "journalArticle", "title": "T"}, "title"),
+        ("POST", "/v1/items", {"item_type": "book", "date": "2024"}, "date"),
+        ("POST", "/v1/items", {"item_type": "journalArticle", "fields": {"title": "T"}, "collections": ["COLL0001"]}, "collections"),
+        ("PATCH", "/v1/items/ITEM0001", {"title": "T"}, "title"),
+        ("PATCH", "/v1/items/ITEM0001", {"tags": ["x"]}, "tags"),
+    ],
+)
+def test_batch_refuses_a_top_level_item_key_the_bridge_does_not_read(method: str, path: str, body: dict[str, Any], key: str):
+    bridge = FakeBridge()
+    client, _ = make_client(bridge)
+
+    with pytest.raises(ZoteroBridgeError) as info:
+        client.batch([{"method": method, "path": path, "body": body}])
+
+    assert info.value.code == "invalid_input"
+    assert info.value.message.startswith("operations[0].body ")
+    assert f"'{key}'" in info.value.message
+    assert bridge.calls == []
+
+
+def test_batch_refusal_for_a_misplaced_key_names_the_place_it_belongs():
+    bridge = FakeBridge()
+    client, _ = make_client(bridge)
+
+    with pytest.raises(ZoteroBridgeError) as info:
+        client.batch([{"method": "POST", "path": "/v1/items", "body": {"item_type": "book", "title": "T"}}])
+    assert "fields" in info.value.message
+
+    with pytest.raises(ZoteroBridgeError) as info:
+        client.batch([{"method": "PATCH", "path": "/v1/items/ITEM0001", "body": {"tags": ["x"]}}])
+    assert "add_tags" in info.value.message or "set_tags" in info.value.message
+    assert bridge.calls == []
+
+
+def test_batch_refuses_a_creator_key_the_bridge_does_not_read_and_sends_nothing():
+    bridge = FakeBridge()
+    client, _ = make_client(bridge)
+    body = {
+        "item_type": "book",
+        "fields": {"title": "T"},
+        "creators": [{"creatorType": "author", "first_name": "Ada", "last_name": "Lovelace"}],
+    }
+
+    with pytest.raises(ZoteroBridgeError) as info:
+        client.batch([{"method": "POST", "path": "/v1/items", "body": body}])
+
+    assert info.value.code == "invalid_input"
+    assert "creators[0] has the key 'first_name'" in info.value.message
+    assert bridge.calls == []
+
+
+def test_batch_refusal_never_echoes_a_key_that_is_not_a_plain_name():
+    bridge = FakeBridge()
+    client, _ = make_client(bridge)
+    odd_key = "not a plain name " + "x" * 80
+
+    with pytest.raises(ZoteroBridgeError) as info:
+        client.batch([{"method": "POST", "path": "/v1/items", "body": {"item_type": "book", odd_key: "T"}}])
+
+    assert odd_key not in info.value.message
+    assert "(not a plain name)" in info.value.message
+    assert bridge.calls == []
+
+
+def test_batch_sends_a_full_item_create_and_update_in_the_documented_shape():
+    bridge = FakeBridge()
+    client, _ = make_client(bridge)
+    create = {
+        "method": "POST",
+        "path": "/v1/items",
+        "body": {
+            "item_type": "journalArticle",
+            "fields": {"title": "A study", "date": "2024", "DOI": "10.1000/xyz", "url": "https://example.org/a"},
+            "creators": [
+                {"creatorType": "author", "firstName": "Ada", "lastName": "Lovelace"},
+                {"creatorType": "author", "name": "Working Group"},
+            ],
+            "tags": ["alpha"],
+            "collection_keys": ["COLL0001"],
+            "relations": [{"related_key": "ITEM0002"}],
+        },
+    }
+    update = {
+        "method": "PATCH",
+        "path": "/v1/items/ITEM0001",
+        "body": {
+            "fields": {"title": "New"},
+            "expected_version": 3,
+            "add_tags": ["beta"],
+            "set_collections": ["COLL0001"],
+            "add_relations": [{"predicate": "dc:replaces", "object": "zotero://select/items/1_OTHER001"}],
+        },
+    }
+
+    client.batch([create, update])
+
+    sent = writes_of(bridge)
+    assert [(call["method"], call["path"]) for call in sent] == [("POST", "/v1/batch")]
+    assert sent[0]["body"] == {"operations": [create, update]}

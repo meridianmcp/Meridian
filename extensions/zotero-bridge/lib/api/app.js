@@ -140,6 +140,11 @@ function createApp(deps) {
     compileRoute('DELETE', '/v1/grants/:id', false, false, function (params) {
       return grants.revoke(params.id);
     }),
+    // Clears the standing approval, so the next grant request prompts again. Like a grant revoke it takes the token only,
+    // since it takes access away and grants none.
+    compileRoute('DELETE', '/v1/standing', false, false, function () {
+      return grants.revokeStanding();
+    }),
   ];
 
   // The header that carries a write grant key. Header names arrive in lower case.
