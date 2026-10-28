@@ -4319,6 +4319,21 @@ async def _handle_task_tools(
         # a new deterministic revision in this SAME call.
         from .. import handoff as handoff_module_local  # noqa: PLC0415
         _pid = args["project_id"]
+        # CodeQL py/path-injection: an output_dir override that cannot name a
+        # directory is refused before anything is written (correction row,
+        # ai_log event, handoff file). Containment itself is a pending decision.
+        _out_dir = None
+        if args.get("regenerate"):
+            try:
+                _out_dir = handoff_module_local.resolve_output_dir_override(
+                    args.get("output_dir"), data_dir,
+                )
+            except ValueError:
+                return {
+                    "regenerated": False,
+                    "error": "HANDOFF_OUTPUT_DIR_INVALID",
+                    "message": "output_dir must be a string path without NUL bytes",
+                }
         try:
             _correction = await handoff_module_local.record_handoff_correction(
                 db, _pid,
@@ -4361,7 +4376,6 @@ async def _handle_task_tools(
         )
         if not args.get("regenerate"):
             return {"correction": _correction, "regenerated": False}
-        _out_dir = args.get("output_dir") or data_dir
         try:
             _regen_result = await handoff_module_local.regenerate_handoff_correction(
                 db, _pid, _correction["id"], _out_dir,
