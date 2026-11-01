@@ -8103,11 +8103,11 @@ async def create_api_token(request: Request) -> dict[str, Any]:
     if token_type not in ("readwrite", "readonly"):
         token_type = "readwrite"
     db = request.app.state.db
-    # If a label is provided, delete any existing token with the same label first
-    # so the label acts as a unique slot (prevents token accumulation + revocation loops)
-    if label:
-        await db_module.delete_api_tokens_by_label(db, tenant["id"], label)
+    # A label is a slot: a new token with the label replaces the older tokens with it. The new token is created
+    # first and the older ones are removed after, so a failed create never leaves the slot empty.
     raw_token, token_row = await db_module.create_api_token(db, tenant["id"], label, token_type=token_type)
+    if label:
+        await db_module.delete_api_tokens_by_label(db, tenant["id"], label, exclude_id=token_row["id"])
     return {
         "token": raw_token,
         "id": token_row["id"],
@@ -8266,6 +8266,22 @@ import time as _tc_time
 # {device_code: (raw_token, expires_epoch)}
 _tunnel_device_codes: dict[str, tuple[str, float]] = {}
 _TUNNEL_DEVICE_CODE_TTL = 600  # 10 minutes
+_TUNNEL_DEVICE_CODE_MAX = 64
+
+
+def _valid_tunnel_device_code(value: str) -> bool:
+    """A device code is the UUID string the client makes: ASCII letters, digits and hyphens, 8 to 64 characters.
+
+    Anything else is refused before it is stored, shown on the authorize page, or placed in the page's script.
+    """
+    return 8 <= len(value) <= _TUNNEL_DEVICE_CODE_MAX and all(
+        c.isascii() and (c.isalnum() or c == "-") for c in value
+    )
+
+
+def _js_string(value: str) -> str:
+    """A JSON string literal that is safe inside an inline script block: it cannot end the block or break the string."""
+    return json.dumps(value).replace("<", "\\u003c").replace(">", "\\u003e").replace("&", "\\u0026")
 
 
 def _cleanup_tunnel_device_codes() -> None:
@@ -8306,6 +8322,8 @@ async def tunnel_connect_page(request: Request) -> Any:
     device_code = request.query_params.get("device_code", "").strip()
     if not device_code:
         raise HTTPException(status_code=400, detail="device_code required")
+    if not _valid_tunnel_device_code(device_code):
+        raise HTTPException(status_code=400, detail="device_code is not valid")
     # e37187f3 — the connecting machine's hostname, so the token minted below
     # can be scoped per-host instead of per-tenant (see tunnel_connect_authorize).
     # Sanitized to a conservative charset since it round-trips through this
@@ -8325,7 +8343,9 @@ async def tunnel_connect_page(request: Request) -> Any:
             next_path += f"&hostname={_q(hostname, safe='')}"
         return RedirectResponse(url=f"/auth/login?next={_q(next_path, safe='/')}", status_code=302)
 
-    email = tenant.get("email", "")
+    email = html_module.escape(tenant.get("email", ""))
+    js_device_code = _js_string(device_code)
+    js_hostname = _js_string(hostname)
     html = f"""<!DOCTYPE html>
 <html lang="en">
 <head>
@@ -8365,7 +8385,7 @@ async def tunnel_connect_page(request: Request) -> Any:
         const r = await fetch('/auth/tunnel-connect', {{
           method: 'POST',
           headers: {{'Content-Type': 'application/json'}},
-          body: JSON.stringify({{device_code: '{device_code}', hostname: '{hostname}'}})
+          body: JSON.stringify({{device_code: {js_device_code}, hostname: {js_hostname}}})
         }});
         if (r.ok) {{
           btn.style.display = 'none';
@@ -8406,6 +8426,8 @@ async def tunnel_connect_authorize(request: Request) -> dict[str, Any]:
     device_code = (body.get("device_code") or "").strip()
     if not device_code:
         raise HTTPException(status_code=400, detail="device_code required")
+    if not _valid_tunnel_device_code(device_code):
+        raise HTTPException(status_code=400, detail="device_code is not valid")
 
     _cleanup_tunnel_device_codes()
     if device_code in _tunnel_device_codes:
@@ -8424,8 +8446,9 @@ async def tunnel_connect_authorize(request: Request) -> dict[str, Any]:
     hostname = _sanitize_tunnel_hostname(body.get("hostname"))
     label = f"tunnel-cli:{hostname}" if hostname else "tunnel-cli"
     db = request.app.state.db
-    await db_module.delete_api_tokens_by_label(db, tenant["id"], label)
-    raw_token, _ = await db_module.create_api_token(db, tenant["id"], label=label)
+    # Create first, then remove the older tokens for this slot, so a failed create never leaves the slot empty.
+    raw_token, token_row = await db_module.create_api_token(db, tenant["id"], label=label)
+    await db_module.delete_api_tokens_by_label(db, tenant["id"], label, exclude_id=token_row["id"])
 
     _tunnel_device_codes[device_code] = (raw_token, _tc_time.time() + _TUNNEL_DEVICE_CODE_TTL)
     return {"status": "ok"}
