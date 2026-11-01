@@ -34,6 +34,10 @@ from meridian import tunnel_client as tc
 from meridian.routes import oauth as oa
 from meridian.routes import tunnel as tn
 
+# Device codes must be the shape the client makes (server._valid_tunnel_device_code): a UUID string.
+DC1 = "11111111-1111-4111-8111-111111111111"
+DC2 = "22222222-2222-4222-8222-222222222222"
+
 
 # ---------------------------------------------------------------------------
 # 5fe96405 -- _tunnel_mcp_entries: slot entries now carry the bearer token
@@ -422,10 +426,10 @@ def test_tunnel_connect_authorize_scopes_token_per_host(monkeypatch):
         srv._tunnel_device_codes.clear()
 
         r1 = await srv.tunnel_connect_authorize(
-            _fake_tunnel_connect_request(db, {"device_code": "dc-1", "hostname": "laptop-a"})
+            _fake_tunnel_connect_request(db, {"device_code": DC1, "hostname": "laptop-a"})
         )
         r2 = await srv.tunnel_connect_authorize(
-            _fake_tunnel_connect_request(db, {"device_code": "dc-2", "hostname": "desktop-b"})
+            _fake_tunnel_connect_request(db, {"device_code": DC2, "hostname": "desktop-b"})
         )
         tokens = await db_module.list_api_tokens(db, tenant["id"])
         return r1, r2, tokens
@@ -452,10 +456,10 @@ def test_tunnel_connect_authorize_same_host_reinstall_overwrites_only_its_own_to
         srv._tunnel_device_codes.clear()
 
         await srv.tunnel_connect_authorize(
-            _fake_tunnel_connect_request(db, {"device_code": "dc-1", "hostname": "laptop-a"})
+            _fake_tunnel_connect_request(db, {"device_code": DC1, "hostname": "laptop-a"})
         )
         await srv.tunnel_connect_authorize(
-            _fake_tunnel_connect_request(db, {"device_code": "dc-2", "hostname": "laptop-a"})
+            _fake_tunnel_connect_request(db, {"device_code": DC2, "hostname": "laptop-a"})
         )
         return await db_module.list_api_tokens(db, tenant["id"])
 
@@ -477,7 +481,7 @@ def test_tunnel_connect_authorize_without_hostname_falls_back_to_legacy_shared_l
         )
         srv._tunnel_device_codes.clear()
 
-        await srv.tunnel_connect_authorize(_fake_tunnel_connect_request(db, {"device_code": "dc-1"}))
+        await srv.tunnel_connect_authorize(_fake_tunnel_connect_request(db, {"device_code": DC1}))
         return await db_module.list_api_tokens(db, tenant["id"])
 
     tokens = asyncio.run(_run())

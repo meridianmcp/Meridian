@@ -883,7 +883,7 @@ def test_tunnel_connect_missing_device_code(monkeypatch, tmp_path):
 def test_tunnel_connect_unauth_redirects_to_login(monkeypatch, tmp_path):
     with _make_hosted_client(monkeypatch, tmp_path) as client:
         r = client.get(
-            "/auth/tunnel-connect?device_code=dev123",
+            "/auth/tunnel-connect?device_code=11111111-1111-4111-8111-111111111111",
             follow_redirects=False,
         )
         assert r.status_code == 302
