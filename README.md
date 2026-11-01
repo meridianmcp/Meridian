@@ -55,8 +55,9 @@ other's task log, and resume from a compressed handoff when context fills up.
 Prebuilt downloads are attached to every [GitHub release](https://github.com/meridianmcp/Meridian/releases).
 They are **unsigned**; each release includes a `SHA256SUMS` file to check downloads against.
 
+- **Meridian Desktop** (`MeridianDesktop-0.2.0.zip`, Windows): the desktop app, with its own Settings and hosted sign-in. Download it from the [Meridian Desktop releases](https://github.com/ajc3xc/meridian-desktop/releases) and check it against that release's `SHA256SUMS`.
 - **Windows tray app** (`meridian-tray.exe`): a system-tray icon that runs the dashboard server. Choose **Open Dashboard** from the tray menu, which opens **http://127.0.0.1:7878**.
-- **macOS tray app** (`meridian-tray-mac.dmg`): the same tray app. The app is not notarized, so the first launch needs right-click > **Open**.
+- **macOS tray app** (`meridian-tray-mac.zip`): the same tray app. Unzip it. The app is not notarized, so the first launch needs right-click > **Open**.
 - **Linux**: there is no tray app yet. Use the uv install below.
 - `meridian.exe`, `meridian-linux`, `meridian-mac-arm64`: the **tunnel client** only (`meridian --tunnel --repo .`, Pro plan and API token required). They do not serve the dashboard.
 
