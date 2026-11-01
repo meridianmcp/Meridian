@@ -375,7 +375,7 @@ jobs:
   # conclusion that deploy.yml's auto-promote reads. The desktop step runs first
   # so the tray / local-runner result shows even when the full suite fails.
   test-macos:
-    runs-on: macos-14   # Apple Silicon; pinned so macos-latest cannot move under us
+    runs-on: macos-15   # Apple Silicon; pinned so macos-latest cannot move under us
     continue-on-error: true
     timeout-minutes: 30
     steps:
