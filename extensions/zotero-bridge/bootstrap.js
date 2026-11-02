@@ -16,6 +16,8 @@ var MERIDIAN_ADDON_ID = 'meridian-zotero@usemeridian.us';
 var MERIDIAN_PREF_PREFIX = 'extensions.zotero.meridianZoteroBridge.';
 var MERIDIAN_API_PORT_PREF = MERIDIAN_PREF_PREFIX + 'apiPort';
 var MERIDIAN_API_TOKEN_PATH_PREF = MERIDIAN_PREF_PREFIX + 'apiTokenPath';
+var MERIDIAN_STANDING_PREF = MERIDIAN_PREF_PREFIX + 'standingGrantUntil';
+var MERIDIAN_LOCAL_WRITES_OPEN_PREF = MERIDIAN_PREF_PREFIX + 'localWritesOpen';
 var MERIDIAN_BIBTEX_TRANSLATOR_ID = '9cb70025-a888-4a29-a210-93ec52da40d4';
 var MERIDIAN_MENU_COLLECTION = 'meridian-zotero-bridge-collection-menu';
 var MERIDIAN_MENU_ITEM = 'meridian-zotero-bridge-item-menu';
@@ -106,7 +108,7 @@ function meridianLoadLib(rootURI) {
     }
     return loaded[key];
   };
-  ['normalize', 'bibkey', 'pdf', 'collections', 'duplicates'].concat(MERIDIAN_API_MODULES).forEach(function (key) {
+  ['normalize', 'bibkey', 'pdf', 'collections', 'duplicates', 'empty_duplicates'].concat(MERIDIAN_API_MODULES).forEach(function (key) {
     var sandbox = { module: { exports: {} }, require: require };
     Services.scriptloader.loadSubScript(rootURI + 'lib/' + key + '.js', sandbox);
     loaded[key] = sandbox.module.exports;
@@ -152,6 +154,15 @@ function meridianRegisterMenus() {
         onCommand: function (event, context) {
           meridianRun('BibTeX import', function () {
             return meridianImportBibtex(context);
+          });
+        },
+      },
+      {
+        menuType: 'menuitem',
+        label: 'Remove duplicate empty sources here...',
+        onCommand: function (event, context) {
+          meridianRun('Duplicate cleanup', function () {
+            return meridianRemoveEmptyDuplicates(context);
           });
         },
       },
@@ -239,7 +250,7 @@ async function meridianPlanBibtex(text, libraryID) {
   }
 
   var entries = parsed.map(function (json) {
-    return { title: json.title, doi: json.DOI, json: json };
+    return { title: json.title, doi: json.DOI, key: meridianCitationKeyFromJson(json), json: json };
   });
   return { plan: meridianLib.duplicates.planImport(entries, before), parsedCount: parsed.length };
 }
@@ -319,7 +330,11 @@ async function meridianLibraryEntries(libraryID) {
   var entries = [];
   items.forEach(function (item) {
     if (!item.isRegularItem()) return;
-    entries.push({ title: meridianField(item, 'title'), doi: meridianField(item, 'DOI') });
+    entries.push({
+      title: meridianField(item, 'title'),
+      doi: meridianField(item, 'DOI'),
+      key: meridianLib.bibkey.readBibKey(meridianField(item, 'extra')),
+    });
   });
   return entries;
 }
@@ -390,6 +405,60 @@ function meridianImportSummary(collectionName, report) {
     lines.push('', 'Failed to save: ' + report.failed.join('; '));
   }
   return lines.join('\n');
+}
+
+// ---------------------------------------------------------------------------
+// F3: Remove duplicate empty sources from the collection the menu was opened on. Trash only, and only after approval.
+// ---------------------------------------------------------------------------
+
+async function meridianRemoveEmptyDuplicates(context) {
+  var collection = await meridianResolveCollection(context);
+  var items = await Zotero.Items.getAsync(collection.getChildItems(true, false));
+  var candidates = [];
+  items.forEach(function (item) {
+    if (!item || !item.isRegularItem()) return;
+    candidates.push({
+      id: item.id,
+      key: meridianLib.bibkey.readBibKey(meridianField(item, 'extra')),
+      title: meridianField(item, 'title'),
+      doi: meridianField(item, 'DOI'),
+      dateAdded: item.dateAdded,
+      hasChildren: item.getAttachments(false).length + item.getNotes(false).length > 0,
+    });
+  });
+
+  var found = meridianLib.empty_duplicates.findEmptyDuplicates(candidates);
+  if (found.trash.length === 0) {
+    meridianAlert('Collection: ' + collection.name + '\nNo duplicate empty sources were found.');
+    return;
+  }
+
+  var lines = [
+    'Collection: ' + collection.name,
+    'Found ' + found.trash.length + ' duplicate empty source' + (found.trash.length === 1 ? '' : 's') +
+      ' (no title, no DOI, same BibTeX key). The oldest copy of each is kept.',
+  ];
+  if (found.skipped.length) {
+    lines.push(found.skipped.length + ' later copy' + (found.skipped.length === 1 ? '' : 'ies') +
+      ' with attachments or notes will be kept.');
+  }
+  lines.push('', 'Move the ' + found.trash.length + ' copies to the Zotero trash? You can restore them from there.');
+  // Keep is the default and the second button, so Enter and Escape both leave the library as it is.
+  var index = Zotero.Prompt.confirm({
+    title: 'Meridian Zotero Bridge: remove duplicates',
+    text: lines.join('\n'),
+    button0: 'Move to trash',
+    button1: 'Keep',
+    defaultButton: 1,
+  });
+  if (index !== 0) return;
+
+  var ids = found.trash.map(function (entry) {
+    return entry.id;
+  });
+  await Zotero.Items.trashTx(ids);
+  meridianAlert('Collection: ' + collection.name + '\nMoved to trash: ' + ids.length + '.' +
+    (found.skipped.length ? '\nKept, with attachments or notes: ' + found.skipped.length + '.' : ''));
 }
 
 // ---------------------------------------------------------------------------
@@ -524,6 +593,8 @@ async function meridianStartApi() {
   var validate = meridianLib['api/validate'];
   // One tracker serves both write factories and the app, so a rolled-back batch sees every object it touched.
   var tracker = { inBatch: false, touched: [], created: [] };
+  // Open local writes: the owner sets the pref in about:config. Read here, at startup, so a change takes effect after a restart.
+  var openLocalWrites = Services.prefs.getBoolPref(MERIDIAN_LOCAL_WRITES_OPEN_PREF, false);
   // Write grants: a person approves each app at the desktop. The token alone never writes. See lib/api/grants.js.
   var grants = meridianLib['api/grants'].createGrants({
     validate: validate,
@@ -531,6 +602,9 @@ async function meridianStartApi() {
     randomHex: meridianRandomHex,
     ask: meridianAskWriteGrant,
     constantTimeEquals: meridianLib['api/auth'].constantTimeEquals,
+    // Read here, at startup, so a standing approval saved in an earlier run is in force from the first request.
+    standing: meridianStandingStore(),
+    openLocalWrites: openLocalWrites,
   });
   var app = meridianLib['api/app'].createApp({
     zotero: Zotero,
@@ -598,18 +672,41 @@ function meridianAskWriteGrant(appName) {
       text:
         'An app asks to write to your Zotero library:\n\n"' + appName + '"\n\n' +
         'The app name is what the app says it is. Allow only if you started this request yourself. ' +
-        'A session grant ends when Zotero restarts, or after 8 hours.',
-      // Deny is the second button, because Escape comes back as that button's index. Only the two allow buttons
+        'A session grant ends when Zotero restarts, or after 8 hours.\n\n' +
+        'Allow for 30 days: for the next 30 days, any app that asks gets write access at once, with no prompt. ' +
+        'You can end this at any time with DELETE /v1/standing on the write API.',
+      // Deny is the second button, because Escape comes back as that button's index. Only the three allow buttons
       // grant anything, and every other answer, Escape included, refuses.
       button0: 'Allow for 1 hour',
       button1: 'Deny',
       button2: 'Allow until Zotero restarts',
+      button3: 'Allow for 30 days',
       defaultButton: 1,
     });
     if (index === 0) return 'hour';
     if (index === 2) return 'session';
+    if (index === 3) return 'standing';
     return 'deny';
   });
+}
+
+// The saved standing approval: its expiry in ms since the epoch, as a string preference. A string, because a 30-day
+// expiry is larger than an integer preference holds. An empty value means none is saved. The store only reads and
+// writes this one preference, and the grant logic decides what the value means.
+function meridianStandingStore() {
+  return {
+    read: function () {
+      var raw = Services.prefs.getStringPref(MERIDIAN_STANDING_PREF, '');
+      return raw === '' ? null : Number(raw);
+    },
+    write: function (until) {
+      if (until === null) {
+        Services.prefs.clearUserPref(MERIDIAN_STANDING_PREF);
+        return;
+      }
+      Services.prefs.setStringPref(MERIDIAN_STANDING_PREF, String(until));
+    },
+  };
 }
 
 // Random hex from a secure source. Zotero's own keys come from Math.random, which is not enough for a credential,
