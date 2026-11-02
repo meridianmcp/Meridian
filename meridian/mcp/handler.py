@@ -1617,6 +1617,11 @@ async def _handle_mcp_request(
         # native + GitHub names so the merged list has no duplicates.
         if tenant and tenant.get("id"):
             from ..routes import tunnel as _tunnel_mod  # noqa: PLC0415
+            # feat/mcp-tool-groups — per-tenant enable flags for tunnel connector
+            # groups and individual tools (tenants.tunnel_tool_filter). Native and
+            # GitHub tools are never filtered.
+            from .tool_groups import parse_tool_filter as _parse_tool_filter  # noqa: PLC0415
+            _tool_filter = _parse_tool_filter(tenant.get("tunnel_tool_filter"))
             if not _tunnel_mod.has_active_tunnel(tenant["id"]) and \
                     _tunnel_mod.tunnel_cross_instance_miss(tenant):
                 # a19538fe — DB says the tunnel is active but its socket is on a
@@ -1662,7 +1667,9 @@ async def _handle_mcp_request(
                                 "retry, or check the `meridian --tunnel` process."
                             ),
                         }
-                    tools = tools + tunnel_tools
+                    # The degraded checks above use the unfiltered fetch, so a
+                    # tenant who switches tools off never sees a false "0 tools".
+                    tools = tools + _tool_filter.filter_tools(tunnel_tools)
                     if not tunnel_tools and tunnel_health is None:
                         # Tunnel is up but advertised nothing (and it wasn't our new
                         # 5s outer timeout above, which already set its own specific
@@ -1771,6 +1778,14 @@ async def _handle_mcp_request(
                 -32601,
                 f"tool '{name}' is not available on this MCP profile",
             )
+        # feat/mcp-tool-groups — a tunnel tool the tenant has switched off (or whose
+        # group is off) is refused here, before scope checks or tunnel forwarding.
+        # Native and GitHub tools are excluded, so they can never be refused by it.
+        if tenant and name not in _meridian_tool_names() and name not in _server._GITHUB_TOOL_NAMES:
+            from .tool_groups import parse_tool_filter as _parse_tool_filter  # noqa: PLC0415
+            _disabled_reason = _parse_tool_filter(tenant.get("tunnel_tool_filter")).disabled_reason(name)
+            if _disabled_reason:
+                return _server._jsonrpc_err(req_id, -32603, _disabled_reason)
         if token_type == "readonly" and name not in _server._mcp_readonly_tools:
             return _server._jsonrpc_err(req_id, -32603, f"tool '{name}' not allowed for read-only tokens")
         # 95499c3e / decision 6fe5210c — scope and member-capability checks must

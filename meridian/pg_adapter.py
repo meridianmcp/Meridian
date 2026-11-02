@@ -2143,6 +2143,15 @@ async def _migrate_pg_tunnel_plugins_by_host(conn: PostgresConnection) -> None:
     )
 
 
+async def _migrate_pg_tunnel_tool_filter(conn: PostgresConnection) -> None:
+    """tenants.tunnel_tool_filter: per-tenant tunnel tool-group filter (JSON).
+    NULL → every tunnel tool enabled. Mirrors SQLite _migrate_tunnel_tool_filter.
+    Idempotent."""
+    await conn.executescript(
+        "ALTER TABLE tenants ADD COLUMN IF NOT EXISTS tunnel_tool_filter TEXT"
+    )
+
+
 async def _migrate_pg_code_intel(conn: PostgresConnection) -> None:
     """Sprint-2/3 — projects.code_intel_enabled: per-project Code Intelligence toggle."""
     await conn.executescript(
@@ -3464,6 +3473,7 @@ _PG_MIGRATIONS_HOSTED = (
     _migrate_pg_tunnel_active,
     _migrate_pg_tunnel_plugins,
     _migrate_pg_tunnel_plugins_by_host,
+    _migrate_pg_tunnel_tool_filter,
     _migrate_pg_feedback,
     _migrate_pg_registered_hostnames,
     _migrate_pg_redis_overage_fields,

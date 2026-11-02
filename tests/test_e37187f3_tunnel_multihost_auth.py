@@ -40,39 +40,29 @@ DC2 = "22222222-2222-4222-8222-222222222222"
 
 
 # ---------------------------------------------------------------------------
-# 5fe96405 -- _tunnel_mcp_entries: slot entries now carry the bearer token
+# Task 1 (feat/mcp-tool-groups) -- _tunnel_mcp_entries writes only the hosted
+# 'meridian' entry, with no Authorization header (OAuth sign-in). This replaces
+# the earlier 5fe96405 behaviour where per-slot entries carried the bearer token.
 # ---------------------------------------------------------------------------
 
-def test_slot_mcp_entries_carry_auth_header_when_token_provided():
-    entries = tc._tunnel_mcp_entries("https://usemeridian.us", "tid-1", token="sk_meridian_x")
-    for key in ("filesystem", "codebase-memory", "serena"):
-        assert entries[key]["headers"] == {"Authorization": "Bearer sk_meridian_x"}
-    # The pre-existing 'meridian' entry is unaffected.
-    assert entries["meridian"]["headers"] == {"Authorization": "Bearer sk_meridian_x"}
+def test_tunnel_entries_write_only_hosted_meridian_entry_with_no_auth():
+    # Task 1 — the per-slot entries (fs/code/extract) are no longer written, and
+    # the hosted entry carries no Authorization header: sign-in is OAuth.
+    entries = tc._tunnel_mcp_entries("https://usemeridian.us", "tid-1")
+    assert set(entries) == {"meridian"}
+    assert "headers" not in entries["meridian"]
+    assert entries["meridian"]["url"] == "https://usemeridian.us/mcp"
 
 
-def test_slot_mcp_entries_omit_headers_without_token():
-    for tok in (None, ""):
-        entries = tc._tunnel_mcp_entries("https://usemeridian.us", "tid-1", token=tok)
-        for key in ("filesystem", "codebase-memory", "serena"):
-            assert "headers" not in entries[key]
-        assert "meridian" not in entries
 
+def test_slot_relay_urls_still_identify_legacy_entries():
+    # The relay URL shapes are no longer written, but they still mark entries an
+    # older build left in .mcp.json, so migration can recognise and remove them.
+    base, tid = "https://usemeridian.us", "tid-123"
+    assert tc._permanent_url(base, tid) == "https://usemeridian.us/fs/mcp/tid-123/mcp"
+    assert tc._permanent_code_url(base, tid) == "https://usemeridian.us/code/mcp/tid-123/mcp"
+    assert tc._permanent_extract_url(base, tid) == "https://usemeridian.us/extract/mcp/tid-123/mcp"
 
-def test_slot_mcp_entries_headers_are_independent_dicts_per_slot():
-    # Mutating one slot's headers dict must never leak into another's.
-    entries = tc._tunnel_mcp_entries("https://x", "t", token="tok")
-    entries["filesystem"]["headers"]["X-Extra"] = "1"
-    assert "X-Extra" not in entries["codebase-memory"]["headers"]
-    assert "X-Extra" not in entries["serena"]["headers"]
-
-
-def test_slot_mcp_entries_urls_unchanged():
-    # The URL shape itself is untouched by the auth-header fix.
-    entries = tc._tunnel_mcp_entries("https://usemeridian.us", "tid-123", token="tok")
-    assert entries["filesystem"]["url"] == "https://usemeridian.us/fs/mcp/tid-123/mcp"
-    assert entries["codebase-memory"]["url"] == "https://usemeridian.us/code/mcp/tid-123/mcp"
-    assert entries["serena"]["url"] == "https://usemeridian.us/extract/mcp/tid-123/mcp"
 
 
 # ---------------------------------------------------------------------------
