@@ -280,6 +280,15 @@ async def billing_portal_json(request: Request) -> dict[str, str]:
     return {"url": url}
 
 
+# Unauthenticated /checkout login redirects, keyed by the allowlisted plan. The values
+# are constants, so no request text reaches the Location header. Each string is
+# byte-identical to the previous interpolated form for standard and pro.
+_CHECKOUT_LOGIN_REDIRECTS: dict[str, str] = {
+    "standard": "/auth/login?next=/checkout%3Fplan%3Dstandard",
+    "pro": "/auth/login?next=/checkout%3Fplan%3Dpro",
+}
+
+
 @router.get("/checkout")
 async def checkout_redirect(request: Request, plan: str = "standard") -> RedirectResponse:
     """Create a Stripe Checkout Session and redirect to it.
@@ -295,7 +304,7 @@ async def checkout_redirect(request: Request, plan: str = "standard") -> Redirec
     try:
         tenant = await get_current_tenant(request)
     except HTTPException:
-        return RedirectResponse(f"/auth/login?next=/checkout%3Fplan%3D{plan}", status_code=302)
+        return RedirectResponse(_CHECKOUT_LOGIN_REDIRECTS.get(plan, "/auth/login"), status_code=302)
 
     try:
         url = await create_stripe_checkout_session(tenant, plan)

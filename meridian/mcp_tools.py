@@ -4990,6 +4990,24 @@ _MCP_TOOLS_LIST: list[dict[str, Any]] = [
                  "body": {"type": "object", "description": "Optional JSON body for the route."}},
                  "required": ["method", "path"]}}},
          "required": ["operations"]}},
+    {"name": "prose_check", "description":
+        "Flags and questions for a piece of writing, with a preset applied. Works on any "
+        "plain prose, Markdown included. Returns one list, `flags`, sorted by location: "
+        "built-in rule matches (stock phrases, dash marks, three-item lists), owner rules "
+        "from prose_rules.toml, repeated word spans, duplicate sentences, restatement "
+        "candidates, and questions to the author (unsourced figures, quantity claims with "
+        "no number, generic sentences, repeats that may be intended). Also returns plain "
+        "counts (word_count, sentence_count) and two reported values (specificity, "
+        "lexical_diversity), each with its validation status. It never returns a score, a "
+        "grade or a verdict, and it never changes the text. Presets: general (default), "
+        "academic, overleaf (LaTeX source), docx (text from Word). Pure local computation.",
+     "inputSchema": {"type": "object", "properties": {
+         "text": {"type": "string", "description": "The writing to check. Up to 200,000 characters."},
+         "preset": {"type": "string", "enum": ["general", "academic", "overleaf", "docx"],
+                    "description": "general (default) for any plain prose; academic turns off dash and three-item-list flags; overleaf strips LaTeX markup first; docx normalises Word's curly quotes and non-breaking spaces."},
+         "include_custom_rules": {"type": "boolean",
+                    "description": "Apply the owner's rules from prose_rules.toml in the server's data directory (default true)."}},
+         "required": ["text"]}},
 ]
 
 # Publish the distinctive canonical names first so clients that rank the
@@ -5022,6 +5040,7 @@ _READ_ONLY_TOOLS = {
     "list_projects", "get_project_by_name", "get_goal", "get_notes", "read_note",
     "get_pinned_decisions", "get_proposal_gates", "get_tasks", "search_tasks", "search_all", "search_synthesis",
     "paper_search", "social_search", "github_search", "zotero_search",
+    "prose_check",
     "list_watchlist_queries",
     "get_session_brief", "get_context_block", "get_hitl_request",
     "get_external_job", "list_external_jobs",
@@ -5466,6 +5485,7 @@ _TOOL_CATEGORY: dict[str, str] = {
     "paper_search": "research",
     "social_search": "research",
     "github_search": "research",
+    "prose_check": "research",
     "zotero_search": "research",
     "save_watchlist_query": "research",
     "list_watchlist_queries": "research",
@@ -5626,6 +5646,7 @@ _TOOL_ROLE_RELEVANCE: dict[str, str] = {
     "paper_search":              "planner",
     "social_search":             "planner",
     "github_search":             "planner",
+    "prose_check":               "planner",
     "zotero_search":             "planner",
     "save_watchlist_query":      "planner",
     "list_watchlist_queries":    "planner",
@@ -5922,6 +5943,7 @@ _TOOL_WORKFLOW_TIER: dict[str, str] = {
     "paper_search":               "common-support",
     "social_search":              "common-support",
     "github_search":              "common-support",
+    "prose_check":                "common-support",
     "zotero_search":              "common-support",
     "save_watchlist_query":       "common-support",
     "list_watchlist_queries":     "common-support",

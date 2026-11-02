@@ -312,17 +312,22 @@ async def generate_codebase_map(project_id: str, request: Request) -> dict[str, 
     from pathlib import Path as _Path
     from ..codebase_map import GraphvizMissingError, render_map
 
-    out = _Path(tempfile.gettempdir()) / f"meridian_codebase_map_{project_id[:8]}.png"
+    # CodeQL py/path-injection: the temp file name must not embed the URL
+    # project_id. A backslash in that path parameter survives routing and would
+    # escape the temp dir on Windows. mkstemp gives a unique, server-chosen name.
+    _fd, _tmp_name = tempfile.mkstemp(prefix="meridian_codebase_map_", suffix=".png")
+    os.close(_fd)
+    out = _Path(_tmp_name)
     try:
-        render_map(graph, str(out), hotspots_only=bool(body.get("hotspots")))
-    except GraphvizMissingError as exc:
-        return Response(
-            content=json.dumps({"error": "graphviz_missing", "message": str(exc)}),
-            status_code=503, media_type="application/json",
-        )
-    except Exception as exc:  # noqa: BLE001
-        raise HTTPException(status_code=500, detail=f"map render failed: {exc}")
-    try:
+        try:
+            render_map(graph, str(out), hotspots_only=bool(body.get("hotspots")))
+        except GraphvizMissingError as exc:
+            return Response(
+                content=json.dumps({"error": "graphviz_missing", "message": str(exc)}),
+                status_code=503, media_type="application/json",
+            )
+        except Exception as exc:  # noqa: BLE001
+            raise HTTPException(status_code=500, detail=f"map render failed: {exc}")
         png_b64 = base64.b64encode(out.read_bytes()).decode("ascii")
     finally:
         try:

@@ -1132,6 +1132,23 @@ async def update_handoff_correction_status(
     return await get_handoff_correction(db, correction_id)
 
 
+def resolve_output_dir_override(requested: Any, default: str) -> str:
+    """Return the output dir a regenerate call writes to.
+
+    Same rule as before the CodeQL work: a truthy ``requested`` wins, otherwise
+    ``default`` (the server data directory). Only values that cannot name a
+    directory are refused: non-strings and strings with an embedded NUL. The
+    refusal runs before any correction row, ai_log event or handoff file is
+    written. Every other string is returned unchanged, including paths outside
+    ``default``. Confining the override to a root is an open decision, so this
+    helper does not confine it.
+    """
+    value = requested or default
+    if not isinstance(value, str) or "\x00" in value:
+        raise ValueError("output_dir must be a string path without NUL bytes")
+    return value
+
+
 async def regenerate_handoff_correction(
     db: Any,
     project_id: str,
@@ -2440,14 +2457,17 @@ def _prepare_pending_sprint_items(
 
 
 # f628b880 — non-deferential executor framing prepended to the /goal string so an
-# executor session acts immediately instead of defaulting to assistant mode and
-# asking for direction. (ecf69de8 makes this conditional on execution_mode.)
+# executor session acts instead of defaulting to assistant mode and asking for
+# direction. (ecf69de8 makes this conditional on execution_mode.) The
+# no_confirmation default is False, so this text asks for confirmation before
+# claiming or executing unless the execution policy sets no_confirmation.
 # 5abf3e12 — the /goal is now XML-structured; this text is the body of the
 # <executor_directive> tag (trailing space dropped — the tag provides the delimiter).
 _EXECUTOR_GOAL_DIRECTIVE = (
     "You are an executor. Claim and execute the following sprint items "
-    "immediately in order without asking for direction or confirmation. "
-    "Start with the first item now."
+    "in order. Confirm with the human before claiming or executing anything, "
+    "unless the execution policy sets no_confirmation to true; in that case, "
+    "start with the first item now."
 )
 
 # ecf69de8 — deferential framing for execution_mode='interactive' projects. The
@@ -5218,10 +5238,12 @@ def build_item_briefing(
 
     # --- Build each XML section ---
 
-    # <executor_directive> — same directive as the autonomous executor /goal.
+    # <executor_directive> — same gate as the autonomous executor /goal: confirm
+    # first unless the execution policy sets no_confirmation to true.
     role_text = (
-        "You are an executor. Claim and execute the following sprint item "
-        "immediately without asking for direction or confirmation."
+        "You are an executor. Confirm with the human before claiming or "
+        "executing the following sprint item, unless the execution policy "
+        "sets no_confirmation to true; in that case, start immediately."
     )
 
     # <first_step> — always start by reloading the live board.

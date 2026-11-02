@@ -16,7 +16,7 @@ your AI clients over HTTPS in minutes.
 | **Status** | Live | Live | Coming soon · [join waitlist](mailto:hello@usemeridian.us?subject=Pro%20waitlist) |
 | **Compute** | 0.5 CU | 2 CU | 4 CU |
 | **Compute hours/mo** | 10 CU-hrs total | 50 CU-hrs/mo | 300 CU-hrs |
-| **Team members** | 1 | 20 | Unlimited |
+| **Team members** | 1 | 20 | Up to 1,000 |
 
 **BYODB** (Bring Your Own Database): paste your own Neon connection string at signup
 and skip the managed DB — same price, full control of your data.
@@ -216,7 +216,7 @@ A: Email hello@usemeridian.us — we'll migrate you manually.
 A: Your Neon database is deleted 28 days after payment failure. You'll receive warning emails on day 3-7 and day 14.
 
 **Q: Can multiple team members share one account?**
-A: Yes — unlimited members on all plans. Each member signs in with their own Google/GitHub and connects to the same workspace.
+A: Team size depends on your plan (see the pricing table above). Each member signs in with their own Google or GitHub account and connects to the same workspace.
 
 **Q: Is there a rate limit on the MCP endpoint?**
 A: 100 requests per minute per bearer token. Sufficient for all normal usage patterns.

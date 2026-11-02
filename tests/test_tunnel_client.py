@@ -1531,18 +1531,20 @@ def test_resolve_plugins_carries_prefix():
 # ---------------------------------------------------------------------------
 
 def test_tunnel_mcp_entries_urls():
-    # ef162c28 — connectors are keyed by the plugin behind each slot.
+    # Task 1 — the tunnel writes ONE built-in entry: the hosted /mcp server.
+    # The per-slot relay entries (filesystem / codebase-memory / serena) are no
+    # longer written; /mcp aggregates those tools instead.
     entries = tc._tunnel_mcp_entries("https://usemeridian.us", "tid-123")
-    assert set(entries) == {"filesystem", "codebase-memory", "serena"}
-    assert entries["filesystem"]["type"] == "http"
-    assert entries["filesystem"]["url"] == "https://usemeridian.us/fs/mcp/tid-123/mcp"
-    assert entries["codebase-memory"]["url"] == "https://usemeridian.us/code/mcp/tid-123/mcp"
-    assert entries["serena"]["url"] == "https://usemeridian.us/extract/mcp/tid-123/mcp"
-    # The new keys are exactly TUNNEL_MCP_KEYS; the legacy set is distinct.
-    assert set(tc.TUNNEL_MCP_KEYS) == {"filesystem", "codebase-memory", "serena"}
+    assert entries == {"meridian": {"type": "http", "url": "https://usemeridian.us/mcp"}}
+    # The legacy slot-named keys remain the migration set for older installs.
     assert tc._LEGACY_TUNNEL_MCP_KEYS == (
         "meridian-fs", "meridian-code", "meridian-extractor",
     )
+    # The relay URL helpers still exist: they identify entries an older build wrote.
+    assert tc._permanent_url("https://usemeridian.us", "tid-123") == (
+        "https://usemeridian.us/fs/mcp/tid-123/mcp"
+    )
+
 
 
 def test_inject_mcp_entries_into_empty():
@@ -1559,11 +1561,18 @@ def test_inject_mcp_entries_preserves_existing_servers_and_keys():
     entries = tc._tunnel_mcp_entries("https://usemeridian.us", "t1")
     out = tc._inject_mcp_entries(existing, entries, "https://usemeridian.us", "t1")
     data = json.loads(out)
-    # Existing connector and unrelated keys survive; ours are merged in.
+    # The user's own 'meridian' server (no url, so not ours) is untouched; ours
+    # lands under a suffixed key. Unrelated top-level keys survive.
     assert data["mcpServers"]["meridian"]["command"] == "pixi"
     assert data["otherTopLevel"] == 7
-    assert data["mcpServers"]["filesystem"]["url"].endswith("/fs/mcp/t1/mcp")
-    assert "codebase-memory" in data["mcpServers"]
+    assert data["mcpServers"]["meridian-meridian"] == {
+        "type": "http", "url": "https://usemeridian.us/mcp",
+    }
+    # No per-slot relay entries are written.
+    assert "filesystem" not in data["mcpServers"]
+    assert "codebase-memory" not in data["mcpServers"]
+    assert "serena" not in data["mcpServers"]
+
 
 
 def test_inject_mcp_entries_recovers_from_malformed_json():
@@ -1573,59 +1582,57 @@ def test_inject_mcp_entries_recovers_from_malformed_json():
 
 
 def test_inject_mcp_entries_migrates_legacy_slot_named_keys():
-    # ef162c28 — an existing .mcp.json from an OLD tunnel build has the legacy
-    # slot-named keys. Injecting must REMOVE those and write the new plugin
-    # names, leaving no stale duplicates pointing at the same URLs.
+    # ef162c28 / Task 1 — an existing .mcp.json from an OLD tunnel build has the
+    # legacy slot-named keys and the per-slot relay entries (one with a bearer
+    # header). Injecting must REMOVE all of them and write only the hosted entry.
     base, tid = "https://usemeridian.us", "t9"
     existing = json.dumps({"mcpServers": {
         "meridian-fs": {"type": "http", "url": f"{base}/fs/mcp/{tid}/mcp"},
         "meridian-code": {"type": "http", "url": f"{base}/code/mcp/{tid}/mcp"},
         "meridian-extractor": {"type": "http", "url": f"{base}/extract/mcp/{tid}/mcp"},
+        "filesystem": {"type": "http", "url": f"{base}/fs/mcp/{tid}/mcp",
+                       "headers": {"Authorization": "Bearer sk_old"}},
         "user-thing": {"command": "node"},
     }})
     entries = tc._tunnel_mcp_entries(base, tid)
     out = tc._inject_mcp_entries(existing, entries, base, tid)
     servers = json.loads(out)["mcpServers"]
-    # Legacy keys gone, new keys present, exactly once each — no duplicates.
-    assert "meridian-fs" not in servers
-    assert "meridian-code" not in servers
-    assert "meridian-extractor" not in servers
-    assert servers["filesystem"]["url"] == f"{base}/fs/mcp/{tid}/mcp"
-    assert servers["codebase-memory"]["url"] == f"{base}/code/mcp/{tid}/mcp"
-    assert servers["serena"]["url"] == f"{base}/extract/mcp/{tid}/mcp"
+    assert set(servers) == {"meridian", "user-thing"}
+    assert servers["meridian"] == {"type": "http", "url": f"{base}/mcp"}
     # The user's own server is untouched.
     assert servers["user-thing"] == {"command": "node"}
+    # The old bearer token is gone from the file.
+    assert "sk_old" not in out
+
 
 
 def test_inject_mcp_entries_reinject_is_idempotent():
     # ef162c28 — running the tunnel twice must not accumulate duplicate or
-    # suffixed entries: a prior run's new-named entries are ours (by URL/name)
-    # and get rewritten in place.
+    # suffixed entries: a prior run's meridian entry is ours (by URL) and is
+    # rewritten in place.
     base, tid = "https://usemeridian.us", "t7"
     entries = tc._tunnel_mcp_entries(base, tid)
     first = tc._inject_mcp_entries(None, entries, base, tid)
     second = tc._inject_mcp_entries(first, entries, base, tid)
     servers = json.loads(second)["mcpServers"]
-    assert set(servers) == {"filesystem", "codebase-memory", "serena"}
+    assert set(servers) == {"meridian"}
+    assert servers["meridian"] == {"type": "http", "url": f"{base}/mcp"}
+
 
 
 def test_inject_mcp_entries_collision_with_user_server_is_suffixed():
-    # ef162c28 — the user runs their OWN `filesystem` server (different URL).
-    # We must NOT clobber it: write under a suffixed key instead.
+    # ef162c28 — the user runs their OWN `meridian` server at another URL. We must
+    # NOT clobber it: write our entry under a suffixed key instead.
     base, tid = "https://usemeridian.us", "t3"
     existing = json.dumps({"mcpServers": {
-        "filesystem": {"type": "http", "url": "https://example.com/my-fs"},
+        "meridian": {"type": "http", "url": "https://example.com/my-meridian"},
     }})
     entries = tc._tunnel_mcp_entries(base, tid)
     out = tc._inject_mcp_entries(existing, entries, base, tid)
     servers = json.loads(out)["mcpServers"]
-    # The user's server is untouched at its original key.
-    assert servers["filesystem"] == {"type": "http", "url": "https://example.com/my-fs"}
-    # Ours landed under a suffixed key pointing at our relay.
-    assert servers["filesystem-meridian"]["url"] == f"{base}/fs/mcp/{tid}/mcp"
-    # code/extract had no collision → plain names.
-    assert servers["codebase-memory"]["url"] == f"{base}/code/mcp/{tid}/mcp"
-    assert servers["serena"]["url"] == f"{base}/extract/mcp/{tid}/mcp"
+    assert servers["meridian"] == {"type": "http", "url": "https://example.com/my-meridian"}
+    assert servers["meridian-meridian"] == {"type": "http", "url": f"{base}/mcp"}
+
 
 
 def test_unique_mcp_key_suffix_escalation():
@@ -1657,24 +1664,27 @@ def test_install_mcp_json_creates_then_restore_deletes(tmp_path):
     mcp = tmp_path / ".mcp.json"
     assert mcp.exists()
     data = json.loads(mcp.read_text(encoding="utf-8"))
-    assert "serena" in data["mcpServers"]  # ef162c28 — new plugin-derived name
+    assert "meridian" in data["mcpServers"]
     # original was None (we created it) → restore deletes the file
     tc._restore_mcp_json(snaps, "https://usemeridian.us", "tid")
     assert not mcp.exists()
 
 
-def test_install_mcp_json_fresh_file_gets_new_names(tmp_path):
-    # ef162c28 (a) — a brand new .mcp.json gets the plugin-derived names, and
-    # none of the legacy slot names.
+
+def test_install_mcp_json_fresh_file_writes_only_meridian_entry(tmp_path):
+    # Task 1 — a brand new .mcp.json gets the single hosted entry: no per-slot
+    # relay connectors, no legacy names, and no Authorization header.
     tc._install_mcp_json(tmp_path, "https://usemeridian.us", "tid")
-    servers = json.loads((tmp_path / ".mcp.json").read_text(encoding="utf-8"))["mcpServers"]
-    assert set(servers) == {"filesystem", "codebase-memory", "serena"}
-    assert not (set(servers) & set(tc._LEGACY_TUNNEL_MCP_KEYS))
+    text = (tmp_path / ".mcp.json").read_text(encoding="utf-8")
+    servers = json.loads(text)["mcpServers"]
+    assert servers == {"meridian": {"type": "http", "url": "https://usemeridian.us/mcp"}}
+    assert "Authorization" not in text
+
 
 
 def test_install_mcp_json_migrates_existing_legacy_entries(tmp_path):
-    # ef162c28 (b) — an existing .mcp.json with the OLD keys is migrated:
-    # old removed, new present, no duplicates, user's own server preserved.
+    # ef162c28 (b) / Task 1 — an existing .mcp.json with the OLD keys is migrated:
+    # old removed, only the hosted entry written, user's own server preserved.
     base, tid = "https://usemeridian.us", "tid"
     mcp = tmp_path / ".mcp.json"
     mcp.write_text(json.dumps({"mcpServers": {
@@ -1687,11 +1697,11 @@ def test_install_mcp_json_migrates_existing_legacy_entries(tmp_path):
     tc._install_mcp_json(tmp_path, base, tid)
     servers = json.loads(mcp.read_text(encoding="utf-8"))["mcpServers"]
     assert not (set(servers) & set(tc._LEGACY_TUNNEL_MCP_KEYS))
-    assert {"filesystem", "codebase-memory", "serena"} <= set(servers)
+    assert set(servers) == {"meridian", "mine"}
     assert servers["mine"] == {"command": "x"}
-    # No legacy+new duplicate pair for the fs relay URL.
-    fs_url = f"{base}/fs/mcp/{tid}/mcp"
-    assert [k for k, v in servers.items() if v.get("url") == fs_url] == ["filesystem"]
+    # No entry points at a per-slot relay URL any more.
+    assert not [k for k, v in servers.items() if str(v.get("url", "")).startswith(f"{base}/fs/")]
+
 
 
 def test_install_mcp_json_restore_returns_exact_original(tmp_path):
@@ -1700,14 +1710,15 @@ def test_install_mcp_json_restore_returns_exact_original(tmp_path):
     mcp.write_text(original, encoding="utf-8")
 
     snaps = tc._install_mcp_json(tmp_path, "https://usemeridian.us", "tid")
-    # During the session our entries are present alongside the user's.
+    # During the session our entry is present alongside the user's.
     live = json.loads(mcp.read_text(encoding="utf-8"))
-    assert "filesystem" in live["mcpServers"]
     assert live["mcpServers"]["meridian"]["command"] == "pixi"
+    assert live["mcpServers"]["meridian-meridian"]["url"] == "https://usemeridian.us/mcp"
 
     tc._restore_mcp_json(snaps, "https://usemeridian.us", "tid")
     # Restored byte-for-byte to what the user had (they had none of ours).
     assert mcp.read_text(encoding="utf-8") == original
+
 
 
 def test_restore_mcp_json_removes_both_legacy_and_new_keys(tmp_path):
@@ -1739,7 +1750,8 @@ def test_install_mcp_json_updates_existing_cursor_config(tmp_path):
     paths = {p for p, _ in snaps}
     assert cursor in paths
     data = json.loads(cursor.read_text(encoding="utf-8"))
-    assert "filesystem" in data["mcpServers"]
+    assert "meridian" in data["mcpServers"]
+
 
 
 # ---------------------------------------------------------------------------
@@ -1752,52 +1764,24 @@ def test_meridian_server_url():
     assert tc._meridian_server_url("https://usemeridian.us/") == "https://usemeridian.us/mcp"
 
 
-def test_tunnel_mcp_entries_includes_meridian_when_token_provided():
-    # bf31787c — when a token is supplied, the 'meridian' server entry is
-    # injected as the first entry with the correct URL and Authorization header.
-    base, tid = "https://usemeridian.us", "tid-123"
-    tok = "sk_meridian_test"
-    entries = tc._tunnel_mcp_entries(base, tid, token=tok)
-    assert "meridian" in entries
-    assert entries["meridian"]["type"] == "http"
-    assert entries["meridian"]["url"] == "https://usemeridian.us/mcp"
-    assert entries["meridian"]["headers"] == {"Authorization": f"Bearer {tok}"}
-    # Slot connectors still present.
-    assert "filesystem" in entries
-    assert "codebase-memory" in entries
-    assert "serena" in entries
+def test_tunnel_mcp_entries_meridian_entry_carries_no_credential():
+    # Task 1 — sign-in is OAuth, so the hosted entry has NO Authorization header.
+    entries = tc._tunnel_mcp_entries("https://usemeridian.us", "tid-123")
+    assert entries["meridian"] == {"type": "http", "url": "https://usemeridian.us/mcp"}
+    assert "headers" not in entries["meridian"]
 
-
-def test_tunnel_mcp_entries_omits_meridian_without_token():
-    # bf31787c — without a token (or empty token) no 'meridian' entry is injected,
-    # preserving backward-compat for callers that don't have the token handy.
-    base, tid = "https://usemeridian.us", "tid-123"
-    assert "meridian" not in tc._tunnel_mcp_entries(base, tid)
-    assert "meridian" not in tc._tunnel_mcp_entries(base, tid, token=None)
-    assert "meridian" not in tc._tunnel_mcp_entries(base, tid, token="")
 
 
 def test_install_mcp_json_injects_meridian_server_entry(tmp_path):
-    # bf31787c — with a token, _install_mcp_json writes the 'meridian' entry.
-    base, tid, tok = "https://usemeridian.us", "tid-x", "sk_meridian_tok"
-    tc._install_mcp_json(tmp_path, base, tid, token=tok)
+    # Task 1 — the hosted entry is written with no bearer token: OAuth signs in.
+    base, tid = "https://usemeridian.us", "tid-x"
+    tc._install_mcp_json(tmp_path, base, tid)
     servers = json.loads((tmp_path / ".mcp.json").read_text(encoding="utf-8"))["mcpServers"]
-    assert "meridian" in servers
-    assert servers["meridian"]["url"] == f"{base}/mcp"
-    assert servers["meridian"]["headers"]["Authorization"] == f"Bearer {tok}"
-    # Slot connectors still present.
-    assert "filesystem" in servers
-    assert "codebase-memory" in servers
-    assert "serena" in servers
+    assert servers["meridian"] == {"type": "http", "url": f"{base}/mcp"}
+    assert "filesystem" not in servers
+    assert "codebase-memory" not in servers
+    assert "serena" not in servers
 
-
-def test_install_mcp_json_without_token_omits_meridian_entry(tmp_path):
-    # bf31787c — without a token the 'meridian' entry is absent (not a regression
-    # for callers that omit the token parameter).
-    tc._install_mcp_json(tmp_path, "https://usemeridian.us", "tid-x")
-    servers = json.loads((tmp_path / ".mcp.json").read_text(encoding="utf-8"))["mcpServers"]
-    assert "meridian" not in servers
-    assert set(servers) == {"filesystem", "codebase-memory", "serena"}
 
 
 def test_is_our_mcp_entry_recognises_meridian_server_url():
@@ -1811,26 +1795,38 @@ def test_is_our_mcp_entry_recognises_meridian_server_url():
     assert not tc._is_our_mcp_entry("meridian", other, base, tid)
 
 
-def test_inject_mcp_entries_meridian_reinject_is_idempotent(tmp_path):
-    # bf31787c — a second tunnel run should overwrite (not duplicate) the meridian
-    # entry, and should NOT create 'meridian-meridian' due to collision handling.
-    base, tid, tok = "https://usemeridian.us", "tid-y", "sk_meridian_tok"
-    entries = tc._tunnel_mcp_entries(base, tid, token=tok)
+def test_inject_mcp_entries_meridian_reinject_is_idempotent():
+    # bf31787c — a second tunnel run overwrites (not duplicates) the meridian
+    # entry, and does NOT create 'meridian-meridian' due to collision handling.
+    base, tid = "https://usemeridian.us", "tid-y"
+    entries = tc._tunnel_mcp_entries(base, tid)
     first = tc._inject_mcp_entries(None, entries, base, tid)
     second = tc._inject_mcp_entries(first, entries, base, tid)
     servers = json.loads(second)["mcpServers"]
-    # Exactly one 'meridian' key, no 'meridian-meridian'.
-    assert "meridian" in servers
-    assert "meridian-meridian" not in servers
+    assert set(servers) == {"meridian"}
     assert servers["meridian"]["url"] == f"{base}/mcp"
+
+
+def test_inject_mcp_entries_drops_stale_bearer_header_from_old_build():
+    # Task 1 — an entry an older build wrote with an Authorization header is
+    # ours (same URL), so it is rewritten without the header.
+    base, tid = "https://usemeridian.us", "tid-old"
+    stale = json.dumps({"mcpServers": {
+        "meridian": {"type": "http", "url": f"{base}/mcp",
+                     "headers": {"Authorization": "Bearer sk_meridian_stale"}},
+    }})
+    out = tc._inject_mcp_entries(stale, tc._tunnel_mcp_entries(base, tid), base, tid)
+    assert json.loads(out)["mcpServers"]["meridian"] == {"type": "http", "url": f"{base}/mcp"}
+    assert "sk_meridian_stale" not in out
+
 
 
 def test_restore_mcp_json_removes_meridian_server_entry(tmp_path):
     # bf31787c — restore must strip the injected 'meridian' server entry so it
     # doesn't linger after the tunnel stops.
-    base, tid, tok = "https://usemeridian.us", "tid-z", "sk_meridian_tok"
+    base, tid = "https://usemeridian.us", "tid-z"
     mcp = tmp_path / ".mcp.json"
-    snaps = tc._install_mcp_json(tmp_path, base, tid, token=tok)
+    snaps = tc._install_mcp_json(tmp_path, base, tid)
     assert "meridian" in json.loads(mcp.read_text(encoding="utf-8"))["mcpServers"]
 
     tc._restore_mcp_json(snaps, base, tid)
@@ -1838,15 +1834,16 @@ def test_restore_mcp_json_removes_meridian_server_entry(tmp_path):
     assert not mcp.exists()
 
 
+
 def test_restore_mcp_json_strips_meridian_entry_from_existing_file(tmp_path):
     # bf31787c — if the file already existed and we merged in the meridian entry,
     # restore must strip it and leave any user-owned entries intact.
-    base, tid, tok = "https://usemeridian.us", "tid-w", "sk_meridian_tok"
+    base, tid = "https://usemeridian.us", "tid-w"
     mcp = tmp_path / ".mcp.json"
     original_data = {"mcpServers": {"my-server": {"command": "node"}}}
     mcp.write_text(json.dumps(original_data), encoding="utf-8")
 
-    snaps = tc._install_mcp_json(tmp_path, base, tid, token=tok)
+    snaps = tc._install_mcp_json(tmp_path, base, tid)
     # During the session both 'meridian' and 'my-server' are present.
     live = json.loads(mcp.read_text(encoding="utf-8"))["mcpServers"]
     assert "meridian" in live
@@ -1857,6 +1854,7 @@ def test_restore_mcp_json_strips_meridian_entry_from_existing_file(tmp_path):
     assert "meridian" not in restored
     assert "filesystem" not in restored
     assert restored == {"my-server": {"command": "node"}}
+
 
 
 # ---------------------------------------------------------------------------
