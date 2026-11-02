@@ -1132,6 +1132,23 @@ async def update_handoff_correction_status(
     return await get_handoff_correction(db, correction_id)
 
 
+def resolve_output_dir_override(requested: Any, default: str) -> str:
+    """Return the output dir a regenerate call writes to.
+
+    Same rule as before the CodeQL work: a truthy ``requested`` wins, otherwise
+    ``default`` (the server data directory). Only values that cannot name a
+    directory are refused: non-strings and strings with an embedded NUL. The
+    refusal runs before any correction row, ai_log event or handoff file is
+    written. Every other string is returned unchanged, including paths outside
+    ``default``. Confining the override to a root is an open decision, so this
+    helper does not confine it.
+    """
+    value = requested or default
+    if not isinstance(value, str) or "\x00" in value:
+        raise ValueError("output_dir must be a string path without NUL bytes")
+    return value
+
+
 async def regenerate_handoff_correction(
     db: Any,
     project_id: str,
