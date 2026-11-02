@@ -897,9 +897,22 @@ def main() -> int:
     if not is_local and token:
         perm = _http("POST", f"{meridian_url}/auth/tokens", token=token,
                      body={"label": "hooks-installer"})
-        if perm and perm.get("token"):
-            token = perm["token"]
-            print("  Permanent token created.")
+        if not (perm and perm.get("token")):
+            # Fail closed. The token in hand may be the 10-minute browser install
+            # token. Carrying it on would write it into hook_auth.conf and the MCP
+            # registration, and hooks and MCP would then start returning 401 once
+            # it expires, with nothing telling the user why. Nothing has been
+            # written yet at this point.
+            print("Error: could not create a permanent Meridian token (POST /auth/tokens failed).", file=sys.stderr)
+            print(
+                "  Nothing was written. Check the server, then re-run the installer. "
+                "A browser install token expires after 10 minutes, so get a fresh one from "
+                "the install page if yours has expired.",
+                file=sys.stderr,
+            )
+            return 1
+        token = perm["token"]
+        print("  Permanent token created.")
 
     # ---- Step 4: Build hook commands (cwd + hostname read at fire time) ------
     # ba31dedf — the token must NEVER be a literal substring of the hook
