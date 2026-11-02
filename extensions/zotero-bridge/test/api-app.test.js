@@ -325,6 +325,28 @@ test('the import route passes the text, collection and dry-run flag through, and
   assert.equal(badKey.status, 422);
 });
 
+test('a 4.5 MB imported attachment is stored and answers 201, not a 500', async () => {
+  const { app, zotero, errors } = build();
+  const parent = zotero._addItem('book', { title: 'Book' });
+  const payload = Buffer.alloc(4500000, 0x41);
+  payload.write('%PDF-1.4', 0, 'latin1');
+  const out = await call(app, 'POST', '/v1/items/' + parent.key + '/attachments', {
+    json: { mode: 'imported_file', filename: 'paper.pdf', content_type: 'application/pdf', data_base64: payload.toString('base64') },
+  });
+  assert.equal(out.status, 201);
+  assert.equal(zotero._calls.imports.length, 1);
+  assert.equal(errors.length, 0, 'nothing reached the error console');
+});
+
+test('a top-level title on POST /v1/items is a 422 that names fields.title, and no item is written', async () => {
+  const { app, zotero } = build();
+  const out = await call(app, 'POST', '/v1/items', { json: { item_type: 'book', title: 'Top level' } });
+  assert.equal(out.status, 422);
+  assert.equal(out.body.error.code, 'invalid_fields');
+  assert.match(JSON.stringify(out.body.error.details), /fields\.title/);
+  assert.equal(zotero._state.items.length, 0);
+});
+
 test('a parser refusal from the socket layer answers in the same error shape', () => {
   const { app } = build();
   const parsed = parse(app.rejectParse({ httpStatus: 413, code: 'payload_too_large', message: 'Too big.' }));
