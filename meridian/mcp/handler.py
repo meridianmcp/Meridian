@@ -39,6 +39,7 @@ from . import scope_guard
 # defined next to their single use below, unchanged.
 _GITHUB_TOOL_HTTP_TIMEOUT_S = 15.0  # _dispatch_github_tool's httpx client timeout
 _TUNNEL_TOOLS_LIST_TIMEOUT_S = 5.0  # tools/list's outer bound on the tunnel-tools fetch
+_CUSTOM_TOOLS_LIST_TIMEOUT_S = 4.0  # tools/list's outer bound on the owner's custom connectors
 _GIT_DIFF_SUBPROCESS_TIMEOUT_S = 5.0  # `git diff --name-only` (staged + unstaged) in _unclaimed_file_warnings
 _GITHUB_COMMITS_FETCH_TIMEOUT_S = 8.0  # GitHub REST commits fetch in _fetch_recent_commits_uncached
 _GIT_LOG_SUBPROCESS_TIMEOUT_S = 5  # local `git log` fallback in _fetch_recent_commits_uncached
@@ -1701,6 +1702,30 @@ async def _handle_mcp_request(
                         ),
                         "detail": str(exc)[:200],
                     }
+        # The owner's opted-in custom connectors (custom_connectors.py). Listed only
+        # when the owner opted in and the tunnel is up, behind the same tool-group
+        # filter as the tunnel tools. A failure here never breaks native tools/list.
+        if tenant and tenant.get("id"):
+            from ..routes import tunnel as _custom_tunnel_mod  # noqa: PLC0415
+            from .tool_groups import parse_tool_filter as _parse_custom_filter  # noqa: PLC0415
+            import asyncio as _custom_asyncio  # noqa: PLC0415
+            if _custom_tunnel_mod.has_active_tunnel(tenant["id"]):
+                try:
+                    _custom_reserved = {t.get("name") for t in tools} | set(_server._GITHUB_TOOL_NAMES)
+                    _custom_tools = await _custom_asyncio.wait_for(
+                        _custom_tunnel_mod.list_custom_connector_tools(tenant["id"], _custom_reserved),
+                        timeout=_CUSTOM_TOOLS_LIST_TIMEOUT_S,
+                    )
+                    tools = tools + _parse_custom_filter(
+                        tenant.get("tunnel_tool_filter"),
+                    ).filter_tools(_custom_tools)
+                except Exception as exc:  # noqa: BLE001
+                    import sys as _custom_sys  # noqa: PLC0415
+                    print(
+                        f"tools/list: custom connector fetch failed for tenant "
+                        f"{tenant.get('id')}: {type(exc).__name__}",
+                        file=_custom_sys.stderr, flush=True,
+                    )
         from ..tool_manifest import build_tool_manifest  # noqa: PLC0415
         # A named public profile is an actual transport boundary, not merely
         # advisory role metadata.  Filter after native/GitHub/tunnel assembly
@@ -1835,6 +1860,25 @@ async def _handle_mcp_request(
                     f"workspace role '{enforce_role}' is read-only; tool '{name}' denied",
                 )
         try:
+            # The owner's opted-in custom connector tools (custom_connectors.py). Routed
+            # only for a name shaped like one that is not a native or GitHub name, so a
+            # custom tool can never shadow a native one. A disabled custom tool was
+            # already refused above by the tool-group filter.
+            from ..custom_connectors import is_custom_connector_tool_name as _is_custom_name  # noqa: PLC0415
+            if (
+                tenant and tenant.get("id")
+                and name not in _meridian_tool_names()
+                and name not in _server._GITHUB_TOOL_NAMES
+                and _is_custom_name(name)
+            ):
+                from ..routes import tunnel as _custom_call_mod  # noqa: PLC0415
+                try:
+                    _custom_result = await _custom_call_mod.call_custom_connector_tool(
+                        tenant["id"], name, args,
+                    )
+                except _custom_call_mod.CustomConnectorUnavailable as exc:
+                    return _server._jsonrpc_err(req_id, -32603, str(exc))
+                return _server._jsonrpc_ok(req_id, _custom_result)
             _is_github = bool(name in _server._GITHUB_TOOL_NAMES and tenant)
             # Single-connector bridge: a tool that is neither a native Meridian tool
             # nor a GitHub tool may belong to an active tunnel (fs/code/extractor).
