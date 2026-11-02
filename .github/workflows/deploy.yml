@@ -71,6 +71,11 @@ on:
 env:
   FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
 
+# Least privilege (CodeQL actions/missing-workflow-permissions): every job
+# inherits read-only contents unless it declares broader scopes itself.
+permissions:
+  contents: read
+
 jobs:
   # ─── 0. Attest: did the canonical CI already pass on this exact tree? ──────
   # Never fails on purpose (every error path says attested=false); the jobs that
