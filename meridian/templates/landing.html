@@ -786,7 +786,7 @@ irm https://usemeridian.us/hooks.ps1 | iex</pre>
         <li>Connect your own Postgres DB</li>
       </ul>
       <div class="plan-note">Overage: <strong>$0.16/CU-hr</strong> · <strong>$0.50/GB-mo</strong> · auto-billed via Stripe</div>
-      <a class="obf-email plan-cta secondary" data-user="hello" data-domain="usemeridian.us" data-subject="Pro%20waitlist" href="#" rel="nofollow">Join waitlist →</a>
+      <a class="obf-email plan-cta secondary" data-user="hello" data-domain="usemeridian.us" data-subject="Pro waitlist" href="#" rel="nofollow">Join waitlist →</a>
       <div style="font-size:12px;color:var(--muted,#8b9cba);margin-top:6px;text-align:center">Coming soon</div>
     </div>
 
@@ -898,7 +898,7 @@ irm https://usemeridian.us/hooks.ps1 | iex</pre>
 document.querySelectorAll('.obf-email').forEach(function (a) {
   var addr = a.getAttribute('data-user') + '@' + a.getAttribute('data-domain');
   var subj = a.getAttribute('data-subject');
-  a.setAttribute('href', 'mailto:' + addr + (subj ? '?subject=' + subj : ''));
+  a.setAttribute('href', 'mailto:' + addr + (subj ? '?subject=' + encodeURIComponent(subj) : ''));
   if (a.textContent.trim() === 'email') a.textContent = addr;
 });
 </script>
