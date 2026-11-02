@@ -393,9 +393,9 @@ def test_build_quick_start_goal_xml_structure_preserves_constraints():
         "executor_directive", "first_step", "sprint_items", "completion_criteria",
         "not_done_until", "stop_conditions", "sprint_type", "exclusions",
     }
-    # <executor_directive> — executor, act immediately, don't ask.
+    # <executor_directive> — executor; confirm first unless no_confirmation is set.
     assert "You are an executor" in tags["executor_directive"]
-    assert "without asking for direction" in tags["executor_directive"]
+    assert "Confirm with the human before claiming" in tags["executor_directive"]
     # <first_step> — live board query before trusting the snapshot.
     assert 'get_sprint_items(status="pending")' in tags["first_step"]
     # <sprint_items> — the executable ids, MANUAL item excluded.

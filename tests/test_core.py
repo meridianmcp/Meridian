@@ -18761,8 +18761,8 @@ def test_build_quick_start_goal_version_with_no_matches():
 
 
 def test_build_quick_start_goal_autonomous_directive():
-    """ecf69de8 — autonomous (default) prepends the non-deferential executor
-    directive so the session runs immediately."""
+    """ecf69de8 — autonomous (default) prepends the executor directive, which
+    asks the human to confirm before claiming unless no_confirmation is set."""
     from meridian.handoff import (
         _build_quick_start_goal,
         _EXECUTOR_GOAL_DIRECTIVE,
@@ -18775,7 +18775,7 @@ def test_build_quick_start_goal_autonomous_directive():
         _build_quick_start_goal(items),
     ):
         assert _EXECUTOR_GOAL_DIRECTIVE.strip() in goal
-        assert "without asking for direction" in goal
+        assert "Confirm with the human before claiming" in goal
         assert "aaa" in goal and "bbb" in goal
 
 

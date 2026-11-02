@@ -65,13 +65,19 @@ integrity](#token-and-body-integrity) below for why that ordering matters.
 ### The directive block
 
 `<executor_directive>` / `<execution_policy>` tell a cold executor what mode
-it's in — `execution_mode="immediate"`, `no_confirmation="true"`,
+it's in — `execution_mode="immediate"`, `no_confirmation="false"` (the default
+in every mode, so the executor confirms with the human before it starts),
 `claim_before_edit="true"` — and when to escalate
 (`request_hitl` only for a genuine blocker: a missing credential, materially
 ambiguous scope, or an irreversible action — never for routine confirmation).
 `<first_step>` is the literal, copy-pasteable bootstrap call
 (`start_session(...)`) so a receiver with zero prior context has no
 guesswork about how to begin.
+
+`no_confirmation` is a keyword-only argument to
+`executor_config.build_execution_policy` and is never read from
+`executor_config`. An explicit `no_confirmation=True` renders `"true"` only in
+immediate mode; relaxed and planner-downgraded policies always render `"false"`.
 
 ### The item list
 
@@ -329,7 +335,7 @@ described above.
 | Self-start bootstrap | Not included — a human/planner already has context | `<first_step>` gives the literal `start_session(...)` call |
 | Size budget | Unbounded by default (300000 bytes) | Small by construction, backstopped at 12000/16000 bytes |
 | Token/body binding | Same mechanism, same guarantees | Same mechanism, same guarantees |
-| Intended consumer | A planning session deciding what to do next | A cold executor that starts working immediately, no confirmation |
+| Intended consumer | A planning session deciding what to do next | A cold executor that starts working immediately, after confirming with the human unless `no_confirmation` is set |
 
 Both share the exact same token-minting, body-hashing, and (where opted in)
 manifest/evidence machinery described above — there is no separate,
