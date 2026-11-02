@@ -7003,6 +7003,190 @@ async def _fetch_me_with_retry(
     raise last_exc
 
 
+# ---------------------------------------------------------------------------
+# The owner's custom connectors (meridian/custom_connectors.py), opt-in only.
+# ---------------------------------------------------------------------------
+# One WebSocket (/tunnel-cx) carries every opted-in connector. The server names the
+# connector in the ``x-meridian-custom-connector`` header of each request. A stdio
+# connector runs under mcp-proxy on loopback and is reached at /mcp. An http
+# connector is reached at the owner's URL. No auth header is ever added here.
+
+_CUSTOM_CONNECTOR_HEADER = "x-meridian-custom-connector"
+_CUSTOM_FORWARD_HEADERS = frozenset({"content-type", "accept", "mcp-session-id"})
+_CUSTOM_RESPONSE_HEADERS = frozenset({"content-type", "mcp-session-id"})
+
+
+@dataclass(frozen=True)
+class _CustomEndpoint:
+    """Where one opted-in connector is reached. URLs stay out of repr so they never log."""
+
+    name: str
+    transport: str
+    local_url: str = field(default="", repr=False)
+    remote_url: str = field(default="", repr=False)
+
+
+def _free_loopback_port() -> int:
+    """A loopback port that is free right now. mcp-proxy binds it straight after."""
+    import socket  # noqa: PLC0415
+
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as probe:
+        probe.bind(("127.0.0.1", 0))
+        return int(probe.getsockname()[1])
+
+
+def _spawn_custom_connector_processes(npx: str, proc_holders: list[dict]) -> "dict[str, _CustomEndpoint]":
+    """Start the owner's opted-in stdio connectors and return the endpoints to relay to.
+
+    Nothing starts unless ``custom_tunnel_opt_in`` is literally true in the desktop
+    settings file. Only a connector's name is printed. A command, an argument or a
+    URL is never printed, since any of them can carry a secret.
+    """
+    from . import custom_connectors as _cc  # noqa: PLC0415
+
+    config = _cc.load_config()
+    for note in config.notes:
+        print(f"  custom connectors: {note}", file=sys.stderr, flush=True)
+    if not config.opt_in:
+        return {}
+    endpoints: dict[str, _CustomEndpoint] = {}
+    for connector in config.connectors:
+        if connector.transport == _cc.TRANSPORT_HTTP:
+            endpoints[connector.name] = _CustomEndpoint(
+                connector.name, _cc.TRANSPORT_HTTP, remote_url=connector.url,
+            )
+            print(f"  custom:{connector.name:<9}tunnel (http)", flush=True)
+            continue
+        port = _free_loopback_port()
+        cmd = _build_proxy_for_inner(npx, [connector.command, *connector.args], port)
+        label = f"cx:{connector.name}"
+        try:
+            proc = _spawn_with_cache_retry(cmd, None, label)
+        except Exception as exc:  # noqa: BLE001
+            print(
+                f"  warning: could not start custom connector {connector.name!r}: {type(exc).__name__}",
+                file=sys.stderr, flush=True,
+            )
+            continue
+        # Same holder shape as the custom plugins, so the watchdog relaunches it and
+        # the shutdown path terminates it.
+        proc_holders.append({"proc": proc, "cmd": cmd, "env": None, "label": label})
+        endpoints[connector.name] = _CustomEndpoint(
+            connector.name, _cc.TRANSPORT_STDIO, local_url=f"http://127.0.0.1:{port}/mcp",
+        )
+        print(f"  custom:{connector.name:<9}tunnel (stdio)", flush=True)
+    return endpoints
+
+
+def _ws_custom_connectors_url(base_url: str, tenant_id: str, token: str) -> str:
+    """The WebSocket URL for the owner's custom connectors (routes/tunnel.py /tunnel-cx)."""
+    return _ws_office_url(base_url, tenant_id, token, "cx")
+
+
+def _custom_error_response(req_id: object, status: int, message: str) -> dict:
+    body = json.dumps({"error": message}).encode()
+    return {
+        "type": "response",
+        "id": req_id,
+        "status": status,
+        "headers": {"content-type": "application/json"},
+        "body": base64.b64encode(body).decode(),
+    }
+
+
+async def _relay_custom_connector_request(http_client, endpoints: "dict[str, _CustomEndpoint]", msg: dict) -> dict:
+    """Relay one server request to the connector its header names.
+
+    The request path is never used, and only the three headers in
+    ``_CUSTOM_FORWARD_HEADERS`` are forwarded, so nothing the server sends can
+    reach a connector beyond a JSON-RPC body. A failure returns a generic error
+    body that names the connector and never its URL or command.
+    """
+    req_id = msg.get("id")
+    headers_in = msg.get("headers") if isinstance(msg.get("headers"), dict) else {}
+    name = ""
+    for key, value in headers_in.items():
+        if isinstance(key, str) and key.lower() == _CUSTOM_CONNECTOR_HEADER and isinstance(value, str):
+            name = value
+    endpoint = endpoints.get(name)
+    if endpoint is None:
+        return _custom_error_response(req_id, 404, "unknown custom connector")
+    if (msg.get("method") or "POST").upper() != "POST":
+        return _custom_error_response(req_id, 405, "custom connectors take POST only")
+    target = endpoint.remote_url if endpoint.transport == "http" else endpoint.local_url
+    forward = {
+        key: value for key, value in headers_in.items()
+        if isinstance(key, str) and key.lower() in _CUSTOM_FORWARD_HEADERS and isinstance(value, str)
+    }
+    try:
+        body = base64.b64decode(msg["body"]) if msg.get("body") else None
+    except Exception:  # noqa: BLE001
+        return _custom_error_response(req_id, 400, "request body is not valid base64")
+    try:
+        resp = await http_client.request(
+            "POST", target, headers=forward, content=body,
+            timeout=_LOCAL_REQUEST_TIMEOUT, follow_redirects=False,
+        )
+    except Exception as exc:  # noqa: BLE001
+        print(f"tunnel:cx:{name}: request failed ({type(exc).__name__})", file=sys.stderr, flush=True)
+        return _custom_error_response(req_id, 502, f"custom connector '{name}' is unavailable")
+    resp_body = resp.content or b""
+    return {
+        "type": "response",
+        "id": req_id,
+        "status": resp.status_code,
+        "headers": {k: v for k, v in resp.headers.items() if k.lower() in _CUSTOM_RESPONSE_HEADERS},
+        "body": base64.b64encode(resp_body).decode() if resp_body else "",
+    }
+
+
+async def _run_custom_connectors_connection(ws_url: str, endpoints: "dict[str, _CustomEndpoint]") -> None:
+    """Hold the cx socket open, announce the opted-in names, and relay requests."""
+    import httpx  # noqa: PLC0415
+    import websockets  # noqa: PLC0415
+
+    announcement = {
+        "type": "custom_connectors",
+        "opt_in": True,
+        "connectors": [{"name": e.name, "transport": e.transport} for e in endpoints.values()],
+    }
+    async with websockets.connect(
+        ws_url, max_size=None, ping_interval=20, ping_timeout=_WS_PING_TIMEOUT,
+        open_timeout=_tunnel_connect_timeout(),
+    ) as ws:
+        await ws.send(json.dumps(announcement))
+        print(f"tunnel:cx: {len(endpoints)} custom connector(s) announced", flush=True)
+        async with httpx.AsyncClient() as http_client:
+            async for raw in ws:
+                try:
+                    msg = json.loads(raw)
+                except (ValueError, TypeError):
+                    continue
+                if not isinstance(msg, dict) or msg.get("type") != "request":
+                    continue
+                resp = await _relay_custom_connector_request(http_client, endpoints, msg)
+                await ws.send(json.dumps(resp))
+
+
+async def _reconnect_custom_connectors_loop(ws_url: str, endpoints: "dict[str, _CustomEndpoint]") -> None:
+    """Keep the cx socket up with a backoff capped at 60s. Logs the exception class only,
+    since the socket URL carries the tunnel token."""
+    delay = 1.0
+    while True:
+        try:
+            await _run_custom_connectors_connection(ws_url, endpoints)
+            delay = 1.0
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:  # noqa: BLE001
+            print(
+                f"tunnel:cx: connection ended ({type(exc).__name__}); retrying in {delay:.0f}s",
+                file=sys.stderr, flush=True,
+            )
+        await asyncio.sleep(delay)
+        delay = min(delay * 2, 60.0)
+
+
 async def _run_connection(
     ws_url: str, port: int, label: str = "fs", tool_prefix: str | None = None,
     lifecycle: "_tunnel_lifecycle.TunnelLifecycle | None" = None,
@@ -8215,6 +8399,10 @@ async def run_tunnel(
         except Exception as exc:
             print(f"  warning: could not start custom plugin {cname!r}: {exc}", file=sys.stderr)
 
+    # 4d. The owner's custom connectors (custom_connectors.py). Off unless the desktop
+    #     opt-in is literally true, and only tunnel_exposed, enabled entries start.
+    custom_endpoints = _spawn_custom_connector_processes(npx, proc_holders)
+
     # 5. Print permanent URLs.
     print("", flush=True)
     # Best-effort update nudge: the server reports its version in /me (already
@@ -8381,6 +8569,14 @@ async def run_tunnel(
     # Custom plugins (eager) still use the regular reconnect + watchdog.
     for holder in proc_holders:
         tasks.append(asyncio.ensure_future(_proc_watchdog(holder)))
+    # The owner's opted-in custom connectors share one cx socket. Only started when
+    # the opt-in is on and at least one connector is usable.
+    if custom_endpoints:
+        tasks.append(asyncio.ensure_future(
+            _reconnect_custom_connectors_loop(
+                _ws_custom_connectors_url(base_url, tenant_id, token), custom_endpoints,
+            )
+        ))
     if not tasks and not running_custom:
         print("error: no tunnel plugins enabled — nothing to serve.", file=sys.stderr)
         return 1

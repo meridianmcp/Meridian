@@ -23,6 +23,7 @@ Connector groups, keyed by the tunnel slot label (``routes/tunnel.py``)::
     desktop     dc                 -> desktop-commander__*
     zotero      zotero             -> zotero-mcp__*
     custom      p0..p3             -> custom-p0__* .. custom-p3__*
+    custom      owner's connectors -> custom-<name>__*     (custom_connectors.py, opt-in)
 
 Settings value: ``tenants.tunnel_tool_filter`` (JSON text, NULL = all enabled)::
 
@@ -40,6 +41,8 @@ import json
 from dataclasses import dataclass
 from functools import lru_cache
 from typing import Any, Iterable
+
+from ..custom_connectors import is_custom_connector_prefix
 
 # Tunnel slot label -> group. Every slot in routes/tunnel._TUNNEL_LABELS must
 # appear here; tests enforce that so no tunnel tool is ungrouped.
@@ -83,11 +86,22 @@ def _connector_groups() -> dict[str, str]:
 
 
 def group_of_tool(name: str) -> str | None:
-    """The group a tunnel tool belongs to, or ``None`` if it is not a tunnel tool."""
+    """The group a tunnel tool belongs to, or ``None`` if it is not a tunnel tool.
+
+    The owner's custom connectors (``custom-<name>__<tool>``) are in the ``custom``
+    group, whether or not they are currently announced. A name that is never
+    announced is never listed or callable, so the group only ever narrows what is
+    already on offer.
+    """
     prefix, sep, _rest = name.partition("__")
     if not sep:
         return None
-    return _connector_groups().get(prefix)
+    group = _connector_groups().get(prefix)
+    if group is not None:
+        return group
+    if is_custom_connector_prefix(prefix):
+        return "custom"
+    return None
 
 
 def _flag_map(raw: Any) -> dict[str, bool]:
