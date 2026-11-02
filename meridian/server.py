@@ -265,9 +265,17 @@ button:hover{{background:#6d28d9}}
 # refreshes last_seen for connected sessions every minute, for as long as they
 # stay within SESSION_KEEPALIVE_TTL_S of their last call. Sessions idle past
 # the TTL are forgotten so genuinely-dead ones still expire on schedule.
+#
+# Cost: every refresh is a database write, and on a scale-to-zero Neon endpoint
+# each write keeps the compute awake. The TTL is therefore the length of the
+# awake tail after each tool call, so it defaults to 5 minutes rather than 10.
+# A session quiet for longer than the TTL stops being refreshed, and its claims
+# expire 10 minutes after its last refresh (db/locks.py). Keep
+# TTL + interval <= 10 minutes; test_keepalive_window_fits_the_claim_window
+# enforces it.
 # ---------------------------------------------------------------------------
 SESSION_KEEPALIVE_INTERVAL_S = int(os.environ.get("MERIDIAN_KEEPALIVE_INTERVAL_S", "60"))
-SESSION_KEEPALIVE_TTL_S = int(os.environ.get("MERIDIAN_KEEPALIVE_TTL_S", "600"))
+SESSION_KEEPALIVE_TTL_S = int(os.environ.get("MERIDIAN_KEEPALIVE_TTL_S", "300"))
 
 # session_id -> monotonic timestamp of the last activity that proved liveness.
 _CONNECTED_SESSIONS: dict[str, float] = {}
