@@ -285,7 +285,7 @@ The two backstops above bound content as it is *built*. `format_handoff_mcp_cont
 at the *wire* layer via `max_bytes` (cb00889c). For ordinary narrative content
 that still exceeds the budget after the two backstops above, truncation is
 integrity-first: it never cuts through or before the end of an embedded
-`<goal_token>...</goal_token>` + SECURITY banner (`_GOAL_TOKEN_BANNER_RE`), and
+`<goal_token>...</goal_token>` + SECURITY banner (`_find_goal_token_banner`), and
 appends an explicit machine-readable marker naming how many bytes were omitted
 — never a silent drop.
 
