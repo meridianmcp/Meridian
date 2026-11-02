@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import asyncio
+import logging
 import os
 import signal
 from pathlib import Path
@@ -14,6 +15,7 @@ from fastapi.responses import JSONResponse, Response
 from .._deps import _db, _hosted_mode, _is_demo_request, _require_hosted_operator
 from .. import db as db_module
 
+_log = logging.getLogger(__name__)
 router = APIRouter()
 
 
@@ -213,8 +215,9 @@ async def git_status(request: Request) -> dict[str, Any]:
             "up_to_date": behind == 0,
             "warning": f"{behind} commit(s) behind origin/{branch}" if behind > 0 else None,
         }
-    except Exception as e:
-        return {"ok": False, "error": str(e), "behind": 0, "ahead": 0}
+    except Exception:
+        _log.warning("git status check failed", exc_info=True)
+        return {"ok": False, "error": "could not read git status; see server log", "behind": 0, "ahead": 0}
 
 
 @router.post("/admin/shutdown")

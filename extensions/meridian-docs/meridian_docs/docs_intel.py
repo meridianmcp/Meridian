@@ -42,6 +42,7 @@ import difflib
 import hashlib
 import io
 import json
+import logging
 import os
 import re
 import shutil
@@ -58,6 +59,8 @@ from pathlib import Path
 from typing import Any
 
 from . import ooxml_integrity, render_gate
+
+_log = logging.getLogger(__name__)
 
 # OOXML namespaces.
 _W = "http://schemas.openxmlformats.org/wordprocessingml/2006/main"
@@ -10045,7 +10048,8 @@ def list_journal_style_presets(user_presets_path: str | None = None) -> dict[str
             else {}
         )
     except ValueError as exc:
-        return {"error": str(exc)}
+        _log.warning("user journal style presets file is invalid: %s", exc)
+        return {"error": "user journal style presets file is invalid; see server log"}
 
     builtin_lower = {n.lower() for n in JOURNAL_STYLE_PRESETS}
     entries = [

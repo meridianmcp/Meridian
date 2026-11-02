@@ -62,6 +62,7 @@ import { recordEdit, listProvenance, markSynced } from "./provenance.js";
 import { lookupCitationKey } from "./zotero.js";
 import { launchOverleafBrowser, type LaunchedChromeLike } from "./browser.js";
 import { getWorkflowStatusPayload } from "./overleaf-workflow.js";
+import { ExpectedError } from "./expected-error.js";
 
 // One shared connection for the lifetime of this process -- matches the
 // spec's "one local Node process on one machine" framing (no pooling, no
@@ -153,7 +154,7 @@ function readBody(req: IncomingMessage): Promise<string> {
         // "body too large" JSON error through the still-intact `res`. The
         // client saw a connection reset instead of a clean error response.
         // Just reject and let the caller respond normally.
-        reject(new Error("body too large"));
+        reject(new ExpectedError("body too large"));
       }
     });
     req.on("end", () => {
@@ -161,6 +162,18 @@ function readBody(req: IncomingMessage): Promise<string> {
     });
     req.on("error", reject);
   });
+}
+
+// Client-facing body for a failed request. The real error (message, stack, file
+// paths) always goes to this process's stderr. Only an ExpectedError keeps its
+// message in the response, because that message was written for the caller (for
+// example "body too large"). Any other error gets the generic message, so internal
+// detail does not reach the extension.
+function sendServerError(res: ServerResponse, err: unknown): void {
+  console.error("[meridian-latex] request failed:", err);
+  const message = err instanceof ExpectedError ? err.message : "internal server error";
+  res.writeHead(500, { "Content-Type": "application/json" });
+  res.end(JSON.stringify({ error: message }));
 }
 
 const server = createServer(async (req: IncomingMessage, res: ServerResponse) => {
@@ -191,8 +204,7 @@ const server = createServer(async (req: IncomingMessage, res: ServerResponse) =>
       res.writeHead(200, { "Content-Type": "application/json" });
       res.end(JSON.stringify(workflowStatus));
     } catch (err) {
-      res.writeHead(500, { "Content-Type": "application/json" });
-      res.end(JSON.stringify({ error: String((err && (err as Error).message) || err) }));
+      sendServerError(res, err);
     }
     return;
   }
@@ -203,8 +215,7 @@ const server = createServer(async (req: IncomingMessage, res: ServerResponse) =>
       res.writeHead(200, { "Content-Type": "application/json" });
       res.end(JSON.stringify({ hash }));
     } catch (err) {
-      res.writeHead(500, { "Content-Type": "application/json" });
-      res.end(JSON.stringify({ error: String((err && (err as Error).message) || err) }));
+      sendServerError(res, err);
     }
     return;
   }
@@ -239,8 +250,7 @@ const server = createServer(async (req: IncomingMessage, res: ServerResponse) =>
         res.end(JSON.stringify({ nodes }));
       }
     } catch (err) {
-      res.writeHead(500, { "Content-Type": "application/json" });
-      res.end(JSON.stringify({ error: String((err && (err as Error).message) || err) }));
+      sendServerError(res, err);
     }
     return;
   }
@@ -257,8 +267,7 @@ const server = createServer(async (req: IncomingMessage, res: ServerResponse) =>
       res.writeHead(200, { "Content-Type": "application/json" });
       res.end(JSON.stringify(result));
     } catch (err) {
-      res.writeHead(500, { "Content-Type": "application/json" });
-      res.end(JSON.stringify({ error: String((err && (err as Error).message) || err) }));
+      sendServerError(res, err);
     }
     return;
   }
@@ -271,8 +280,7 @@ const server = createServer(async (req: IncomingMessage, res: ServerResponse) =>
       res.writeHead(200, { "Content-Type": "application/json" });
       res.end(JSON.stringify(result));
     } catch (err) {
-      res.writeHead(500, { "Content-Type": "application/json" });
-      res.end(JSON.stringify({ error: String((err && (err as Error).message) || err) }));
+      sendServerError(res, err);
     }
     return;
   }
@@ -289,8 +297,7 @@ const server = createServer(async (req: IncomingMessage, res: ServerResponse) =>
       res.writeHead(200, { "Content-Type": "application/json" });
       res.end(JSON.stringify(result));
     } catch (err) {
-      res.writeHead(500, { "Content-Type": "application/json" });
-      res.end(JSON.stringify({ error: String((err && (err as Error).message) || err) }));
+      sendServerError(res, err);
     }
     return;
   }
@@ -311,8 +318,7 @@ const server = createServer(async (req: IncomingMessage, res: ServerResponse) =>
       res.writeHead(200, { "Content-Type": "application/json" });
       res.end(JSON.stringify(result));
     } catch (err) {
-      res.writeHead(500, { "Content-Type": "application/json" });
-      res.end(JSON.stringify({ error: String((err && (err as Error).message) || err) }));
+      sendServerError(res, err);
     }
     return;
   }
@@ -325,8 +331,7 @@ const server = createServer(async (req: IncomingMessage, res: ServerResponse) =>
       res.writeHead(200, { "Content-Type": "application/json" });
       res.end(JSON.stringify(result));
     } catch (err) {
-      res.writeHead(500, { "Content-Type": "application/json" });
-      res.end(JSON.stringify({ error: String((err && (err as Error).message) || err) }));
+      sendServerError(res, err);
     }
     return;
   }
@@ -345,8 +350,7 @@ const server = createServer(async (req: IncomingMessage, res: ServerResponse) =>
       res.writeHead(200, { "Content-Type": "application/json" });
       res.end(JSON.stringify({ provenance }));
     } catch (err) {
-      res.writeHead(500, { "Content-Type": "application/json" });
-      res.end(JSON.stringify({ error: String((err && (err as Error).message) || err) }));
+      sendServerError(res, err);
     }
     return;
   }
@@ -369,8 +373,7 @@ const server = createServer(async (req: IncomingMessage, res: ServerResponse) =>
       res.writeHead(200, { "Content-Type": "application/json" });
       res.end(JSON.stringify(result));
     } catch (err) {
-      res.writeHead(500, { "Content-Type": "application/json" });
-      res.end(JSON.stringify({ error: String((err && (err as Error).message) || err) }));
+      sendServerError(res, err);
     }
     return;
   }
@@ -422,8 +425,7 @@ const server = createServer(async (req: IncomingMessage, res: ServerResponse) =>
       res.writeHead(200, { "Content-Type": "application/json" });
       res.end(JSON.stringify({ launched: true }));
     } catch (err) {
-      res.writeHead(500, { "Content-Type": "application/json" });
-      res.end(JSON.stringify({ error: String((err && (err as Error).message) || err) }));
+      sendServerError(res, err);
     }
     return;
   }
@@ -441,8 +443,7 @@ const server = createServer(async (req: IncomingMessage, res: ServerResponse) =>
       res.writeHead(200, { "Content-Type": "application/json" });
       res.end(JSON.stringify({ claims }));
     } catch (err) {
-      res.writeHead(500, { "Content-Type": "application/json" });
-      res.end(JSON.stringify({ error: String((err && (err as Error).message) || err) }));
+      sendServerError(res, err);
     }
     return;
   }

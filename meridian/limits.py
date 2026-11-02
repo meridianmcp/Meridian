@@ -48,6 +48,11 @@ LIMIT_429_MESSAGE: Final[str] = (
 )
 
 
+def limit_429_detail(kind: str, limit: int) -> str:
+    """The 429 ``detail`` text: the canonical message plus the limit that tripped."""
+    return f"{LIMIT_429_MESSAGE} (limit: {kind}={limit})"
+
+
 class LimitExceeded(Exception):
     """Raised when a create-side guard trips. Carries enough context for the
     HTTP layer to render a useful 429 message."""
@@ -56,8 +61,7 @@ class LimitExceeded(Exception):
         self.kind = kind
         self.limit = limit
         self.current = current
-        detail = f"{LIMIT_429_MESSAGE} (limit: {kind}={limit})"
-        super().__init__(detail)
+        super().__init__(limit_429_detail(kind, limit))
 
 
 def _current_limit(name: str) -> int:

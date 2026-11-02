@@ -486,7 +486,9 @@ def test_send_add_fs_roots_error():
     tn._tunnel_sockets["t-addrooterr"] = ws
     result = asyncio.run(tn.send_add_fs_roots_control("t-addrooterr", ["/path"]))
     assert result["status"] == "error"
-    assert "socket gone" in result["message"]
+    # Fixed message: the exception text is logged server-side, never returned.
+    assert result["message"] == "could not send add_fs_roots; see server log"
+    assert "socket gone" not in result["message"]
 
 
 def test_send_set_fs_roots_not_connected():

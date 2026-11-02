@@ -1415,8 +1415,9 @@ async def send_active_repo_control(tenant_id: str, repo_path: str) -> dict[str, 
     try:
         await ws.send_json({"type": "set_active_repo", "repo_path": repo_path})
         return {"status": "ok", "repo_path": repo_path}
-    except Exception as exc:  # noqa: BLE001
-        return {"status": "error", "message": str(exc)}
+    except Exception:  # noqa: BLE001
+        _log.warning("set_active_repo send to the extract tunnel failed", exc_info=True)
+        return {"status": "error", "message": "could not send set_active_repo; see server log"}
 
 
 # ---------------------------------------------------------------------------
@@ -2248,7 +2249,8 @@ async def openai_tunnel_diagnostics(tenant_id: str, request: Request) -> Respons
             meridian_tunnel_active=meridian_active,
         )
     except OpenAITunnelAdapterError as exc:
-        return _json_response({"error": str(exc)}, status_code=400)
+        _log.warning("OpenAI tunnel adapter error: %s", exc)
+        return _json_response({"error": "OpenAI tunnel adapter error; see server log"}, status_code=400)
     return _json_response(diagnostics)
 
 
@@ -3260,7 +3262,8 @@ async def install_plugin(request: Request) -> Response:
     except asyncio.TimeoutError:
         return _json_response({"ok": False, "output": "install timed out (60s)"})
     except Exception as exc:  # noqa: BLE001
-        return _json_response({"ok": False, "output": str(exc)})
+        _log.warning("tunnel install command failed: %s", exc)
+        return _json_response({"ok": False, "output": "install failed; see server log"})
 
 
 # ---------------------------------------------------------------------------
@@ -3351,7 +3354,7 @@ async def get_mcp_registry(request: Request) -> Response:
             return _json_response({**cached[0], "cached": True})
         # No cache — 503 so api() throws and the client falls back to curated list.
         return _json_response(
-            {"error": f"registry unavailable: {exc}", "servers": [], "next_cursor": None},
+            {"error": "registry unavailable", "servers": [], "next_cursor": None},
             status_code=503,
         )
 
@@ -3530,8 +3533,9 @@ async def send_add_fs_roots_control(tenant_id: str, roots: list[str]) -> dict[st
     try:
         await ws.send_json({"type": "add_fs_roots", "roots": roots})
         return {"status": "ok", "roots": roots}
-    except Exception as exc:  # noqa: BLE001
-        return {"status": "error", "message": str(exc)}
+    except Exception:  # noqa: BLE001
+        _log.warning("add_fs_roots send to the fs tunnel failed", exc_info=True)
+        return {"status": "error", "message": "could not send add_fs_roots; see server log"}
 
 
 # live-fs-roots — full-list REPLACE control for the fs slot. add_fs_roots only
@@ -3553,8 +3557,9 @@ async def send_set_fs_roots_control(tenant_id: str, roots: list[str]) -> dict[st
     try:
         await ws.send_json({"type": "set_fs_roots", "roots": roots})
         return {"status": "ok", "roots": roots}
-    except Exception as exc:  # noqa: BLE001
-        return {"status": "error", "message": str(exc)}
+    except Exception:  # noqa: BLE001
+        _log.warning("set_fs_roots send to the fs tunnel failed", exc_info=True)
+        return {"status": "error", "message": "could not send set_fs_roots; see server log"}
 
 
 # 0e973e52 — run_verification: timeout for waiting on the client's run_cmd_result.
@@ -3665,11 +3670,12 @@ async def send_run_cmd_control(
             "stdout_tail": "",
             "stderr_tail": "",
         }
-    except Exception as exc:  # noqa: BLE001
+    except Exception:  # noqa: BLE001
         _pending_run_cmd_reqs.pop(req_id, None)
+        _log.warning("run_cmd request to the tunnel client failed", exc_info=True)
         return {
             "status": "error",
-            "message": str(exc),
+            "message": "run_cmd request failed; see server log",
             "exit_code": None,
             "passed": None,
             "failed": None,
@@ -3813,7 +3819,8 @@ async def add_tunnel_filesystem_root(request: Request) -> Response:
             status_code=exc.status_code,
         )
     except Exception as exc:  # noqa: BLE001
-        return _json_response({"error": f"could not persist root: {exc}"}, status_code=500)
+        _log.exception("could not persist fs root: %s", exc)
+        return _json_response({"error": "could not persist root"}, status_code=500)
     live = await send_add_fs_roots_control(tenant["id"], [path])
     return _json_response({"roots": roots, "live": live})
 
@@ -3864,7 +3871,8 @@ async def remove_tunnel_filesystem_root(request: Request) -> Response:
             status_code=exc.status_code,
         )
     except Exception as exc:  # noqa: BLE001
-        return _json_response({"error": f"could not persist removal: {exc}"}, status_code=500)
+        _log.exception("could not persist fs root removal: %s", exc)
+        return _json_response({"error": "could not persist removal"}, status_code=500)
     live = await send_set_fs_roots_control(tenant["id"], roots)
     return _json_response({"roots": roots, "live": live})
 

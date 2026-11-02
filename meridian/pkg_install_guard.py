@@ -30,10 +30,13 @@ but if you ever import this from .ps1 you need pure ASCII. Keep this file ASCII 
 """
 from __future__ import annotations
 
+import logging
 import re
 import unicodedata
 from dataclasses import dataclass, field
 from typing import Any
+
+_log = logging.getLogger(__name__)
 
 # ---------------------------------------------------------------------------
 # Known-good allowlist
@@ -241,9 +244,10 @@ def verify_pypi(package: str, *, timeout: float = 8.0) -> VerificationResult:
                 f"Proceeding with caution -- verify the package name manually."
             )
         return result
-    except Exception as exc:
+    except Exception:
+        _log.warning("PyPI lookup for %r could not complete", package, exc_info=True)
         result.error = (
-            f"PyPI lookup for '{package}' could not complete ({type(exc).__name__}: {exc}). "
+            f"PyPI lookup for '{package}' could not complete (see server log). "
             f"Network may be unavailable -- failing open. Verify the package name manually."
         )
         return result
@@ -337,10 +341,11 @@ def verify_npm(package: str, *, timeout: float = 8.0) -> VerificationResult:
                 f"Proceeding with caution -- verify the package name manually."
             )
         return result
-    except Exception as exc:
+    except Exception:
+        _log.warning("npm registry lookup for %r could not complete", package, exc_info=True)
         result.error = (
             f"npm registry lookup for '{package}' could not complete "
-            f"({type(exc).__name__}: {exc}). "
+            f"(see server log). "
             f"Network may be unavailable -- failing open. Verify the package name manually."
         )
         return result

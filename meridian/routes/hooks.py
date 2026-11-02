@@ -1,6 +1,7 @@
 """Hooks, connections, and script-serving routes."""
 from __future__ import annotations
 
+import logging
 import os
 from pathlib import Path
 from typing import Any
@@ -16,6 +17,7 @@ from .. import hook_paths as hook_paths_module
 from .. import session_brief as session_brief_module
 from ..session_brief import build_server_section
 
+_log = logging.getLogger(__name__)
 router = APIRouter()
 
 
@@ -472,11 +474,12 @@ async def pkg_guard_check(body: _PkgGuardRequest) -> dict[str, Any]:
 
     try:
         result = gate_command(body.command)
-    except Exception as exc:
+    except Exception:
         # Fail open -- never let a bug in the guard block legitimate work.
+        _log.warning("pkg-guard internal error (failing open)", exc_info=True)
         return {
             "action": "allow",
-            "message": f"pkg-guard internal error (failing open): {exc}",
+            "message": "pkg-guard internal error (failing open); see server log",
             "packages": [],
             "results": [],
             "allowlisted_all": True,

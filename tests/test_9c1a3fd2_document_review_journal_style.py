@@ -108,6 +108,10 @@ def test_document_review_journal_param_reaches_style_policy(client, monkeypatch,
     assert r2.status_code == 200
     assert "error" in r2.json()
     assert "not-a-real-journal" in r2.json()["error"]
+    # The error names the known presets (restored after the 6a629929 change
+    # dropped them), built from the lister, never from the raw exception text.
+    assert "known presets: ['jcshm']" in r2.json()["error"]
+    assert "unknown journal style preset" not in r2.json()["error"]
     assert _style_policy_calls[-1] == expected_presets_path
 
 
