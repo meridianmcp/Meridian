@@ -5261,6 +5261,7 @@ async def _handle_session_tools(
         handle_get_session_brief,
         handle_get_project_state_milestones,
     )
+    from .handlers.prose_tools import handle_prose_check  # noqa: PLC0415
     from .handlers.research_tools import (  # noqa: PLC0415
         handle_github_search,
         # a5343387 — bounded ephemeral research runs, siblings of
@@ -5320,6 +5321,8 @@ async def _handle_session_tools(
         "social_search": handle_social_search,
         "zotero_search": handle_zotero_search,
         "github_search": handle_github_search,
+        # prose_check — local flags for a text, owner-scoped presets and rule file.
+        "prose_check": handle_prose_check,
         # a5343387 — bounded ephemeral research runs.
         "start_research_run": handle_start_research_run,
         "complete_research_run": handle_complete_research_run,
