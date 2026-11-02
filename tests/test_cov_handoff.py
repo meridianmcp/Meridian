@@ -598,7 +598,7 @@ def test_execution_policy_from_settings():
     assert default["execution_mode"] == "immediate"
     assert default["required_first_action"] == "claim_sprint_item"
     assert default["max_planning_turns"] == 1
-    assert default["no_confirmation"] is True
+    assert default["no_confirmation"] is False
     assert default["permitted_parallel_wave"] is True
     assert default["claim_before_edit"] is True
 
@@ -890,7 +890,7 @@ def test_build_quick_start_goal_execution_policy_default_immediate():
         assert "</executor_directive>\n<execution_policy " in goal
         assert 'execution_mode="immediate"' in goal
         assert 'required_first_action="claim_sprint_item"' in goal
-        assert 'no_confirmation="true"' in goal
+        assert 'no_confirmation="false"' in goal
         assert 'claim_before_edit="true"' in goal
         tags, _ = _parse_goal_xml(goal)
         assert "execution_policy" in tags

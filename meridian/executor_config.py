@@ -56,7 +56,10 @@ EXECUTOR_CREDENTIALS_RULE = (
 #
 # Every field except ``max_planning_turns`` is fully determined by the mode —
 # not independently configurable — so the contract can't be silently
-# weakened by a partial/malicious executor_config. ``max_planning_turns`` is
+# weakened by a partial/malicious executor_config. ``no_confirmation`` is the
+# one exception to "fully determined": it defaults to False and is settable
+# only by an explicit code-level argument (never read from executor_config).
+# ``max_planning_turns`` is
 # the one override accepted from executor_config, and it is clamped/rejected
 # with the SAME fail-safe convention normalize_executor_config already uses
 # (an invalid value falls back to the mode default rather than raising).
@@ -143,6 +146,7 @@ def build_execution_policy(
     execution_mode: str | None = None,
     role: str | None = None,
     pinned_decisions: "list[dict[str, Any]] | None" = None,
+    no_confirmation: bool = False,
 ) -> dict[str, Any]:
     """Build the canonical, machine-readable execution policy contract.
 
@@ -163,8 +167,11 @@ def build_execution_policy(
       must happen. executor_config-overridable within a hard ceiling.
     * ``required_first_action`` — the literal tool name a receiver must call
       first: 'claim_sprint_item' (immediate) or 'get_sprint_items' (relaxed).
-    * ``no_confirmation`` — True in immediate mode: do not wait for human
-      confirmation before starting. False in relaxed mode.
+    * ``no_confirmation`` — False by default, in every mode. An explicit
+      ``no_confirmation=True`` argument sets it, but only in immediate mode:
+      a relaxed or downgraded policy always stays False. It is never read
+      from executor_config. When True: do not wait for human confirmation
+      before starting.
     * ``permitted_parallel_wave`` — True in immediate mode: resource-
       conflict-free batches may be fanned out per the existing
       get_parallelizable_groups()/wave logic. False in relaxed mode:
@@ -221,7 +228,7 @@ def build_execution_policy(
         "required_first_action": (
             REQUIRED_FIRST_ACTION_IMMEDIATE if is_immediate else REQUIRED_FIRST_ACTION_RELAXED
         ),
-        "no_confirmation": is_immediate,
+        "no_confirmation": bool(no_confirmation) and is_immediate,
         "permitted_parallel_wave": is_immediate,
         "claim_before_edit": True,
         "genuine_blocker_escalation": GENUINE_BLOCKER_ESCALATION_RULE,

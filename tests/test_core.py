@@ -18959,7 +18959,7 @@ def test_mcp_start_session_includes_execution_policy(client):
     assert policy is not None
     assert policy["execution_mode"] == "immediate"
     assert policy["required_first_action"] == "claim_sprint_item"
-    assert policy["no_confirmation"] is True
+    assert policy["no_confirmation"] is False
     assert policy["permitted_parallel_wave"] is True
     assert policy["claim_before_edit"] is True
     assert isinstance(policy["max_planning_turns"], int) and policy["max_planning_turns"] >= 1
@@ -19033,7 +19033,7 @@ def test_mcp_generate_handoff_embeds_execution_policy_tag_all_modes(client, mode
     body = result.get("content") or ""
     assert 'execution_mode="immediate"' in body
     assert 'required_first_action="claim_sprint_item"' in body
-    assert 'no_confirmation="true"' in body
+    assert 'no_confirmation="false"' in body
     assert 'claim_before_edit="true"' in body
 
 
