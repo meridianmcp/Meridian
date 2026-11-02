@@ -2,7 +2,7 @@
 
 `GET /desktop/research/search` runs one query across the research sources and returns each source's answer on its own. The desktop Search tab is its consumer.
 
-- **Local only.** Served on the local server (`http://127.0.0.1:7878` by default). A caller that is not on loopback, or a request carrying a `Forwarded`, `X-Forwarded-For`, `X-Forwarded-Host` or `X-Real-IP` header, gets `403`. On the hosted service, anonymous callers get `401` from the app-wide gate.
+- **Local only.** Served on the local server (`http://127.0.0.1:7878` by default). The shared check in `meridian/routes/_local_only.py` gives `403` unless the caller is on loopback, no `Forwarded`, `X-Forwarded-For`, `X-Forwarded-Host` or `X-Real-IP` header is sent, the `Host` header names `localhost`, `127.0.0.1` or `[::1]` (with an optional port, which stops DNS rebinding), `Sec-Fetch-Site` is `none` or `same-origin` when sent, and `Origin` is an http(s) loopback origin when sent. On the hosted service, anonymous callers get `401` from the app-wide gate.
 - **Read-only.** Nothing is written to the database and nothing is captured. No token or header value is returned.
 
 ## Request

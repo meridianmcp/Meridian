@@ -154,7 +154,6 @@ HOSTED_PUBLIC_ROUTES: frozenset[RouteKey] = frozenset({
     ("GET", "/hooks.sh"),
     ("GET", "/hooks.ps1"),
     ("GET", "/hooks_install.ps1"),
-    ("GET", "/hooks/diagnostics"),
     ("POST", "/pkg-guard/check"),
     # --- Tunnel utilities with no tenant data --------------------------------
     ("GET", "/tunnel/registry"),

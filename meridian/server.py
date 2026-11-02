@@ -960,6 +960,7 @@ from .routes.export import router as _export_router          # noqa: E402
 from .routes.github import router as _github_router          # noqa: E402
 from .routes.billing import router as _billing_router        # noqa: E402
 from .routes.hooks import router as _hooks_router            # noqa: E402
+from .routes.workspace_overview import router as _workspace_overview_router  # noqa: E402
 from .routes.projects import router as _projects_router      # noqa: E402
 from .routes.blog import router as _blog_router              # noqa: E402
 from .routes.marketplace import router as _marketplace_router  # noqa: E402
@@ -987,6 +988,7 @@ app.include_router(_export_router)
 app.include_router(_github_router)
 app.include_router(_billing_router)
 app.include_router(_hooks_router)
+app.include_router(_workspace_overview_router)
 app.include_router(_projects_router)
 app.include_router(_blog_router)
 app.include_router(_marketplace_router)
