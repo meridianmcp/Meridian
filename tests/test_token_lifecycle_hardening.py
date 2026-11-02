@@ -7,14 +7,14 @@ value placed in the script must be a JSON string that cannot end the script bloc
 from __future__ import annotations
 
 import json
-import uuid
 
 import pytest
 
 import meridian.server as srv  # import first -- avoids handler/server import cycle
 
 
-@pytest.mark.parametrize("value", [str(uuid.uuid4()), "abcdefgh", "a" * 64, "A1-b2-C3-d4"])
+# A fixed UUID, not uuid.uuid4(): pytest-xdist needs every worker to collect the same test IDs.
+@pytest.mark.parametrize("value", ["3f2c9a4e-6b1d-4c7a-9e8f-1a2b3c4d5e6f", "abcdefgh", "a" * 64, "A1-b2-C3-d4"])
 def test_device_codes_in_the_client_shape_are_accepted(value):
     assert srv._valid_tunnel_device_code(value) is True
 
