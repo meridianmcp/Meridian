@@ -187,7 +187,7 @@ protobuf==6.33.6
 psutil==7.2.2
 pure_eval==0.2.4
 pyarrow==23.0.1
-pyasn1==0.6.4
+pyasn1==0.6.5
 pyasn1_modules==0.4.2
 pycparser==3.0
 pydantic-settings==2.15.0
