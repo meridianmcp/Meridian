@@ -8,6 +8,7 @@ const v = require('../lib/api/validate.js');
 const { createApp } = require('../lib/api/app.js');
 const { createItemWrites } = require('../lib/api/items.js');
 const { createCollectionWrites } = require('../lib/api/collections.js');
+const { createGrants } = require('../lib/api/grants.js');
 const { createFakeZotero, createFakeIO } = require('./support/fake-zotero.js');
 
 const HOST = '127.0.0.1:23125';
@@ -31,6 +32,10 @@ function fakeGrants() {
       calls.push(['revoke', id]);
       return { grant_id: id, status: 'revoked' };
     },
+    revokeStanding: () => {
+      calls.push(['revokeStanding']);
+      return { standing: 'none' };
+    },
     checkKey: (key) => key === WRITE_KEY,
   };
 }
@@ -43,7 +48,7 @@ function build(overrides) {
   const tracker = { inBatch: false, touched: [], created: [] };
   const deps = {
     zotero,
-    version: '0.1.4',
+    version: '0.1.5',
     host: HOST,
     token: TOKEN,
     validate: v,
@@ -113,7 +118,7 @@ test('GET /v1/status answers with the versions, for an admitted caller', async (
   const { app } = build();
   const out = await call(app, 'GET', '/v1/status');
   assert.equal(out.status, 200);
-  assert.deepEqual(out.body, { plugin_version: '0.1.4', api_version: 1, zotero_version: '10.0.6', library_id: 1 });
+  assert.deepEqual(out.body, { plugin_version: '0.1.5', api_version: 1, zotero_version: '10.0.6', library_id: 1 });
 });
 
 test('no token is a 401 that says how to send one', async () => {
@@ -325,6 +330,28 @@ test('the import route passes the text, collection and dry-run flag through, and
   assert.equal(badKey.status, 422);
 });
 
+test('a 4.5 MB imported attachment is stored and answers 201, not a 500', async () => {
+  const { app, zotero, errors } = build();
+  const parent = zotero._addItem('book', { title: 'Book' });
+  const payload = Buffer.alloc(4500000, 0x41);
+  payload.write('%PDF-1.4', 0, 'latin1');
+  const out = await call(app, 'POST', '/v1/items/' + parent.key + '/attachments', {
+    json: { mode: 'imported_file', filename: 'paper.pdf', content_type: 'application/pdf', data_base64: payload.toString('base64') },
+  });
+  assert.equal(out.status, 201);
+  assert.equal(zotero._calls.imports.length, 1);
+  assert.equal(errors.length, 0, 'nothing reached the error console');
+});
+
+test('a top-level title on POST /v1/items is a 422 that names fields.title, and no item is written', async () => {
+  const { app, zotero } = build();
+  const out = await call(app, 'POST', '/v1/items', { json: { item_type: 'book', title: 'Top level' } });
+  assert.equal(out.status, 422);
+  assert.equal(out.body.error.code, 'invalid_fields');
+  assert.match(JSON.stringify(out.body.error.details), /fields\.title/);
+  assert.equal(zotero._state.items.length, 0);
+});
+
 test('a parser refusal from the socket layer answers in the same error shape', () => {
   const { app } = build();
   const parsed = parse(app.rejectParse({ httpStatus: 413, code: 'payload_too_large', message: 'Too big.' }));
@@ -397,4 +424,103 @@ test('createApp refuses to start without the grant store', () => {
     () => createApp({ zotero, validate: v, http, auth, host: HOST, token: TOKEN, items: {}, collections: {}, tracker }),
     /needs deps\.grants/
   );
+});
+
+test('DELETE /v1/standing clears the standing approval with the token alone, and answers 200', async () => {
+  const grants = fakeGrants();
+  const { app } = build({ grants });
+  const out = await call(app, 'DELETE', '/v1/standing', { noGrant: true });
+  assert.equal(out.status, 200);
+  assert.deepEqual(out.body, { standing: 'none' });
+  assert.deepEqual(grants.calls, [['revokeStanding']]);
+});
+
+test('the standing route still needs the token, and other methods on it are refused', async () => {
+  const { app } = build();
+  assert.equal((await call(app, 'DELETE', '/v1/standing', { noAuth: true, noGrant: true })).status, 401);
+  const wrong = await call(app, 'GET', '/v1/standing');
+  assert.equal(wrong.status, 405);
+  assert.deepEqual(wrong.body.error.details.allow, ['DELETE']);
+});
+
+// The real grant store, with open local writes as given. Any dialog it shows is recorded in `asked`.
+function realGrants(openLocalWrites) {
+  const clock = { t: 1_000_000 };
+  let counter = 0;
+  const asked = [];
+  const standing = {
+    value: null,
+    writes: [],
+    read: () => standing.value,
+    write: (value) => {
+      standing.writes.push(value);
+      standing.value = value;
+    },
+  };
+  const grants = createGrants({
+    validate: v,
+    now: () => clock.t,
+    randomHex: (bytes) => {
+      counter += 1;
+      return counter.toString(16).padStart(bytes * 2, '0');
+    },
+    ask: async (appName) => {
+      asked.push(appName);
+      return 'deny';
+    },
+    constantTimeEquals: auth.constantTimeEquals,
+    standing,
+    openLocalWrites,
+  });
+  return { grants, asked, standing };
+}
+
+test('open local writes: a grant is granted at once, its key writes, and the token is still required', async () => {
+  const { grants, asked } = realGrants(true);
+  const { app } = build({ grants });
+  const refused = await call(app, 'POST', '/v1/grants', { json: { app_name: 'Claude Code' }, noAuth: true, noGrant: true });
+  assert.equal(refused.status, 401, 'a grant request without the token is refused');
+  const asking = await call(app, 'POST', '/v1/grants', { json: { app_name: 'Claude Code' }, noGrant: true });
+  assert.equal(asking.status, 202);
+  assert.equal(asking.body.status, 'granted', 'granted at once');
+  const polled = await call(app, 'GET', '/v1/grants/' + asking.body.grant_id, { noGrant: true });
+  assert.equal(polled.body.status, 'granted');
+  const key = polled.body.write_key;
+  const wrote = await call(app, 'POST', '/v1/items', {
+    json: { item_type: 'book', fields: { title: 'Open mode' } },
+    headers: { 'meridian-write-grant': key },
+  });
+  assert.equal(wrote.status, 201, 'the key writes');
+  const noKey = await call(app, 'POST', '/v1/items', { json: { item_type: 'book', fields: { title: 'No key' } }, noGrant: true });
+  assert.equal(noKey.status, 403, 'a write without a grant key is still refused');
+  assert.equal(noKey.body.error.code, 'grant_required');
+  const noToken = await call(app, 'POST', '/v1/items', {
+    json: { item_type: 'book', fields: { title: 'No token' } },
+    noAuth: true,
+    headers: { 'meridian-write-grant': key },
+  });
+  assert.equal(noToken.status, 401, 'a write without the token is refused even with the key');
+  assert.deepEqual(asked, [], 'no dialog was shown');
+});
+
+test('open local writes stays on after DELETE /v1/standing', async () => {
+  const { grants, asked } = realGrants(true);
+  const { app } = build({ grants });
+  const cleared = await call(app, 'DELETE', '/v1/standing', { noGrant: true });
+  assert.equal(cleared.status, 200);
+  const asking = await call(app, 'POST', '/v1/grants', { json: { app_name: 'Claude Code' }, noGrant: true });
+  assert.equal(asking.body.status, 'granted', 'the next request is still granted at once');
+  assert.deepEqual(asked, []);
+});
+
+test('a grant request body cannot turn open local writes on, at the HTTP layer either', async () => {
+  const { grants, asked } = realGrants(false);
+  const { app } = build({ grants });
+  const out = await call(app, 'POST', '/v1/grants', {
+    json: { app_name: 'Claude Code', open_local_writes: true, openLocalWrites: true, standing: true },
+    noGrant: true,
+  });
+  assert.equal(out.body.status, 'pending', 'the request waits for the dialog');
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.deepEqual(asked, ['Claude Code'], 'the dialog was shown');
 });

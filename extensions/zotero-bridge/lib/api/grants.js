@@ -3,13 +3,23 @@
 // Write grants. A write to the library needs a key that a person granted at the desktop. The bearer token admits a
 // request, but it does not grant writes, so a process that holds the token cannot write until someone at the desktop
 // answers a prompt. Zotero's local API works the same way: it asks the user before it issues a key. Three things differ:
-// the default answer is Deny; a grant is never remembered across a restart; and the key goes back once, to the
-// request that asked for it.
+// the default answer is Deny; a grant is never remembered across a restart, except a standing approval (below); and
+// the key goes back once, to the request that asked for it.
 //
-// This module is pure logic. The clock, the random source and the prompt are injected, so the node tests run the
-// whole state machine without a timer or a dialog.
+// A standing approval is one exception. The desktop's "Allow for 30 days" answer saves it, and while it is in
+// force a request is granted at once, with no dialog. Only that answer makes one. A request body cannot make or extend
+// one, and a revoke clears it.
+//
+// Open local writes is the other. The owner turns it on in about:config, never in a request. While it is on, a request
+// is granted at once, with no dialog, and each key is a one-hour key as before. It has no expiry and saves nothing, so
+// turning it off leaves nothing behind. The token is still required, and the write gate does not change.
+//
+// This module is pure logic. The clock, the random source, the prompt and the saved standing approval are injected, so
+// the node tests run the whole state machine without a timer, a dialog or a preference.
 
 var HOUR_MS = 60 * 60 * 1000;
+// A standing approval lasts this long from the moment the desktop saves it. Each request it grants still gets a one-hour key.
+var STANDING_MS = 30 * 24 * HOUR_MS;
 // A session grant runs until Zotero restarts. Zotero's restart clears it. This cap also ends it after this long.
 var SESSION_MAX_MS = 8 * HOUR_MS;
 var DENY_COOLDOWN_MS = 5 * 60 * 1000;
@@ -26,19 +36,83 @@ function createGrants(deps) {
   var randomHex = deps.randomHex;
   var ask = deps.ask;
   var constantTimeEquals = deps.constantTimeEquals;
+  // Only a literal true turns open local writes on, so a damaged or non-boolean value leaves it off. Read once, here.
+  var openLocalWrites = deps.openLocalWrites === true;
 
   if (typeof now !== 'function') throw new Error('createGrants needs deps.now');
   if (typeof randomHex !== 'function') throw new Error('createGrants needs deps.randomHex');
   if (typeof ask !== 'function') throw new Error('createGrants needs deps.ask');
   if (typeof constantTimeEquals !== 'function') throw new Error('createGrants needs deps.constantTimeEquals');
+  if (!deps.standing || typeof deps.standing.read !== 'function' || typeof deps.standing.write !== 'function') {
+    throw new Error('createGrants needs deps.standing');
+  }
 
   var records = new Map();
   var pendingId = null;
   var cooldowns = new Map();
   var requestTimes = [];
+  // The standing approval's expiry in ms since the epoch, or null when none is saved. Read once, at startup.
+  var standingUntil = readStanding();
 
   function refused(status, code, message) {
     return v.apiError(status, code, message);
+  }
+
+  // Anything that is not a positive, finite number counts as no standing approval, so a damaged value grants nothing.
+  // A standing approval starts no more than STANDING_MS from now, so a saved expiry further off was not written by one.
+  function readStanding() {
+    var value;
+    try {
+      value = deps.standing.read();
+    } catch (error) {
+      return null;
+    }
+    var valid = typeof value === 'number' && isFinite(value) && value > 0 && value <= now() + STANDING_MS;
+    return valid ? value : null;
+  }
+
+  // Saves the expiry, or clears it with null. False means the store refused, so no standing approval is kept.
+  function saveStanding(value) {
+    try {
+      deps.standing.write(value);
+      return true;
+    } catch (error) {
+      return false;
+    }
+  }
+
+  // True while a standing approval is in force. One that has run out is forgotten, and its saved expiry is cleared.
+  function standingInForce() {
+    if (standingUntil === null) return false;
+    if (now() < standingUntil) return true;
+    standingUntil = null;
+    saveStanding(null);
+    return false;
+  }
+
+  // Only the desktop's "Allow for 30 days" answer calls this, after the one-hour key exists. If the save is refused,
+  // no standing approval is kept, and the request still has its one-hour key.
+  function rememberStanding() {
+    var until = now() + STANDING_MS;
+    if (!saveStanding(until)) return;
+    standingUntil = until;
+  }
+
+  // True while open local writes is on. Nothing is saved for it and it has no expiry, so there is nothing to clear.
+  function openInForce() {
+    return openLocalWrites;
+  }
+
+  // Grants a request at once, with no dialog. The key is made before the record is stored, so a failure here leaves no
+  // pending record behind. Nothing waits for an answer, so the one-request-at-a-time rule does not apply.
+  function grantAtOnce(record, choice) {
+    record.key = randomHex(KEY_HEX_LENGTH / 2);
+    record.status = 'granted';
+    record.expiresAt = now() + HOUR_MS;
+    record.choice = choice;
+    records.set(record.id, record);
+    prune();
+    return { grant_id: record.id, status: 'granted' };
   }
 
   // A grant that has run out is marked expired and loses its key. Nothing else depends on the clock.
@@ -64,7 +138,7 @@ function createGrants(deps) {
   function settle(record, choice) {
     if (pendingId === record.id) pendingId = null;
     if (record.status !== 'pending') return;
-    if (choice === 'hour' || choice === 'session') {
+    if (choice === 'hour' || choice === 'session' || choice === 'standing') {
       try {
         record.key = randomHex(KEY_HEX_LENGTH / 2);
       } catch (error) {
@@ -72,8 +146,9 @@ function createGrants(deps) {
         return;
       }
       record.status = 'granted';
-      record.expiresAt = now() + (choice === 'hour' ? HOUR_MS : SESSION_MAX_MS);
+      record.expiresAt = now() + (choice === 'session' ? SESSION_MAX_MS : HOUR_MS);
       record.choice = choice;
+      if (choice === 'standing') rememberStanding();
       return;
     }
     record.status = 'denied';
@@ -114,6 +189,10 @@ function createGrants(deps) {
       choice: null,
       delivered: false,
     };
+    // Open local writes and a standing approval both grant at once. Open mode is checked first. It never expires and
+    // saves nothing, so it does not read the stored expiry at all.
+    if (openInForce()) return grantAtOnce(record, 'open');
+    if (standingInForce()) return grantAtOnce(record, 'standing');
     records.set(record.id, record);
     pendingId = record.id;
     prune();
@@ -183,17 +262,28 @@ function createGrants(deps) {
     return { grant_id: record.id, status: record.status };
   }
 
+  // Clears the standing approval, so the next request prompts again. Grants already made are not touched. The saved
+  // expiry is cleared first: if the store refuses, the error reaches the caller and the approval stays in force.
+  // Open local writes is not touched here. Only the owner's preference turns it off.
+  function revokeStanding() {
+    deps.standing.write(null);
+    standingUntil = null;
+    return { standing: 'none' };
+  }
+
   return {
     request: request,
     status: status,
     checkKey: checkKey,
     revoke: revoke,
+    revokeStanding: revokeStanding,
   };
 }
 
 module.exports = {
   createGrants: createGrants,
   HOUR_MS: HOUR_MS,
+  STANDING_MS: STANDING_MS,
   SESSION_MAX_MS: SESSION_MAX_MS,
   DENY_COOLDOWN_MS: DENY_COOLDOWN_MS,
   REQUEST_LIMIT: REQUEST_LIMIT,

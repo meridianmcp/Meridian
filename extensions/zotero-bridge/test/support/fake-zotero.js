@@ -14,6 +14,8 @@ var FIELDS = {
   extra: { id: 5, types: [2, 7, 1, 14] },
   publicationTitle: { id: 4, types: [2] },
   bookTitle: { id: 6, types: [7] },
+  // url is a base field in Zotero. A fake without it refused a URL as an invalid field, so no test could save one.
+  url: { id: 7, types: [2, 7] },
 };
 var CREATOR_TYPES = { author: 1, editor: 2 };
 

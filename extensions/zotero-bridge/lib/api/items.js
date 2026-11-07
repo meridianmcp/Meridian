@@ -12,6 +12,20 @@
 // deps.tracker is shared with app.js and collections.js. While a batch runs, every object this file
 // saves or trashes is recorded there, so a rolled-back batch can bring the cached objects back in line.
 
+// The top-level keys each item body reads. Any other key is refused with the place its value belongs. Before this check a key
+// such as title or collections was dropped without a word, and the caller got a success reply and an empty item.
+var CREATE_BODY_KEYS = ['item_type', 'fields', 'creators', 'tags', 'collection_keys', 'relations'];
+var UPDATE_BODY_KEYS = [
+  'item_type', 'fields', 'creators', 'expected_modified', 'expected_version', 'set_tags', 'add_tags', 'remove_tags',
+  'set_collections', 'add_collections', 'remove_collections', 'add_relations', 'remove_relations',
+];
+// The keys a creator row reads. A snake_case key such as first_name was dropped, and the creator was saved empty.
+var CREATOR_KEYS = ['creatorType', 'firstName', 'lastName', 'name'];
+
+function present(value) {
+  return value !== undefined && value !== null;
+}
+
 function createItemWrites(deps) {
   var zotero = deps.zotero;
   var v = deps.validate;
@@ -114,32 +128,87 @@ function createItemWrites(deps) {
     return { entries: entries, problems: problems };
   }
 
+  // Refuses every key a creator row does not read, the same way refuseUnknownKeys does for the top level: each one is
+  // listed under creators[i].<key> with the place its value belongs, in one 422 invalid_fields reply. Before this check a
+  // snake_case key such as first_name was dropped, and the creator was saved empty.
+  function refuseUnknownCreatorKeys(rows) {
+    var problems = [];
+    rows.forEach(function (row, index) {
+      Object.keys(row).forEach(function (key) {
+        if (CREATOR_KEYS.indexOf(key) === -1) {
+          problems.push({
+            field: 'creators[' + index + '].' + key,
+            reason: 'is not a creator key. Use creatorType, firstName and lastName for a person, or name for an institution',
+          });
+        }
+      });
+    });
+    throwIfProblems(problems, 'Some keys are not valid in a creator. A creator takes creatorType, firstName, lastName or name.');
+  }
+
   // Zotero's setCreators() quietly swaps a role the item type does not allow for the primary role.
   // Each role is checked here, before anything is mutated, so the caller hears about it.
   function planCreators(list, itemType, itemTypeID) {
-    return v.optionalList(list, 'creators', v.LIMITS.creators).map(function (row, index) {
+    var rows = v.optionalList(list, 'creators', v.LIMITS.creators);
+    rows.forEach(function (row, index) {
+      v.requireObject(row, 'creators[' + index + ']');
+    });
+    refuseUnknownCreatorKeys(rows);
+    return rows.map(function (row, index) {
       var label = 'creators[' + index + ']';
-      v.requireObject(row, label);
       var type = v.requireString(row.creatorType === undefined ? 'author' : row.creatorType, label + '.creatorType', 64);
       var typeID = zotero.CreatorTypes.getID(type);
       if (!typeID) throw invalid(label + '.creatorType', 'is not a known creator type');
       if (!zotero.CreatorTypes.isValidForItemType(typeID, itemTypeID)) {
         throw invalid(label + '.creatorType', 'is "' + type + '", which is not a valid creator role for item type ' + itemType);
       }
-      if (typeof row.name === 'string' && row.firstName === undefined && row.lastName === undefined) {
+      if (present(row.name)) {
+        if (present(row.firstName) || present(row.lastName)) {
+          throw invalid(label, 'has name together with firstName or lastName. Send either name, or firstName and lastName');
+        }
         return {
           creatorType: type,
           lastName: v.requireString(row.name, label + '.name', v.LIMITS.name),
           fieldMode: 1,
         };
       }
+      var firstName = v.optionalString(row.firstName, label + '.firstName', v.LIMITS.name) || '';
+      var lastName = v.optionalString(row.lastName, label + '.lastName', v.LIMITS.name) || '';
+      if (!firstName && !lastName) {
+        throw invalid(label, 'needs a name. Send firstName and lastName for a person, or name for an institution');
+      }
       return {
         creatorType: type,
-        firstName: v.optionalString(row.firstName, label + '.firstName', v.LIMITS.name) || '',
-        lastName: v.optionalString(row.lastName, label + '.lastName', v.LIMITS.name) || '',
+        firstName: firstName,
+        lastName: lastName,
         fieldMode: 0,
       };
     });
+  }
+
+  // Where a top-level key belongs, for the refusal. A Zotero field name is named as a field, and a collection key is named as collection_keys.
+  function misplacedKeyReason(key, create) {
+    if (['collections', 'collection', 'collection_key', 'collectionKeys', 'collectionKey'].indexOf(key) !== -1) {
+      return create
+        ? 'belongs in collection_keys, a list of collection keys'
+        : 'belongs in set_collections, add_collections or remove_collections, a list of collection keys';
+    }
+    if (!create && (key === 'tags' || key === 'tag')) return 'belongs in set_tags, add_tags or remove_tags';
+    if (!create && (key === 'relations' || key === 'relation')) return 'belongs in add_relations or remove_relations';
+    if (key === 'creator') return 'belongs in creators, a list of creator objects';
+    if (zotero.ItemFields.getID(key)) return 'is a Zotero field. Put it in fields, as fields.' + key;
+    return create
+      ? 'is not a key of this request. Zotero fields go in fields, creators in creators and collections in collection_keys'
+      : 'is not a key of this request. Zotero fields go in fields, creators in creators and collection changes in set_collections, add_collections or remove_collections';
+  }
+
+  // Refuses every top-level key the body does not read. Each one is listed with the place it belongs.
+  function refuseUnknownKeys(body, allowed, create) {
+    var problems = [];
+    Object.keys(body).forEach(function (key) {
+      if (allowed.indexOf(key) === -1) problems.push({ field: key, reason: misplacedKeyReason(key, create) });
+    });
+    throwIfProblems(problems, 'Some keys are not valid at the top level of this request.');
   }
 
   function tagText(value, label) {
@@ -206,18 +275,19 @@ function createItemWrites(deps) {
   }
 
   // Lists at most MAX_LISTED_PROBLEMS fields. The total and the truncated flag appear only when the list is cut.
-  function throwIfProblems(problems) {
+  function throwIfProblems(problems, message) {
     if (!problems.length) return;
     var details = { invalid_fields: problems.slice(0, MAX_LISTED_PROBLEMS) };
     if (problems.length > MAX_LISTED_PROBLEMS) {
       details.total = problems.length;
       details.truncated = true;
     }
-    throw apiError(422, 'invalid_fields', 'Some fields are not valid for this item type.', details);
+    throw apiError(422, 'invalid_fields', message || 'Some fields are not valid for this item type.', details);
   }
 
   async function createItem(body) {
     v.requireObject(body, 'body');
+    refuseUnknownKeys(body, CREATE_BODY_KEYS, true);
     var itemType = v.requireString(body.item_type, 'item_type', 64);
     if (itemType === 'note' || itemType === 'attachment') {
       throw invalid('item_type', 'must not be ' + itemType + '; use the notes or attachments endpoint');
@@ -253,6 +323,7 @@ function createItemWrites(deps) {
 
   async function updateItem(key, body) {
     v.requireObject(body, 'body');
+    refuseUnknownKeys(body, UPDATE_BODY_KEYS, false);
     var item = loadItem(key);
     checkVersion(item, body);
     if (body.item_type !== undefined) throw invalid('item_type', 'cannot change on an existing item');
