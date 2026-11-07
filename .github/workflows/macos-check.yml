@@ -1,7 +1,7 @@
 name: macOS check
 
 # On-demand macOS test run for one branch. A push to this branch runs it, and workflow_dispatch reruns it once the
-# file is on the default branch. It runs the same steps as test-macos in test.yml, on macos-15, so a branch can be
+# file is on the default branch. It runs the same steps as test-macos in test-platforms.yml, on macos-15, so a branch can be
 # checked on a real Apple Silicon runner before it merges. It is not a promotion gate.
 on:
   push:
@@ -13,8 +13,8 @@ jobs:
     runs-on: macos-15   # Apple Silicon; pinned so macos-latest cannot move under us
     timeout-minutes: 60
     steps:
-      - uses: actions/checkout@v4
-      - uses: prefix-dev/setup-pixi@v0.8.1
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: prefix-dev/setup-pixi@ad1da6449d9e506fd127fd67ab2d054a769f6a94 # v0.11.2
         with:
           pixi-version: v0.79.0
           cache: false

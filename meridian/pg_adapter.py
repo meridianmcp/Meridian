@@ -3473,10 +3473,10 @@ _PG_MIGRATIONS_HOSTED = (
     _migrate_pg_tunnel_active,
     _migrate_pg_tunnel_plugins,
     _migrate_pg_tunnel_plugins_by_host,
-    _migrate_pg_tunnel_tool_filter,
     _migrate_pg_feedback,
     _migrate_pg_registered_hostnames,
     _migrate_pg_redis_overage_fields,
+    _migrate_pg_tunnel_tool_filter,
 )
 
 async def _migrate_pg_decision_code_anchor(conn: PostgresConnection) -> None:

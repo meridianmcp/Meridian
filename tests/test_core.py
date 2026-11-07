@@ -1344,7 +1344,10 @@ def test_tunnel_device_code_expires(monkeypatch, tmp_path):
 def test_tunnel_connect_page_redirects_unauthenticated(monkeypatch, tmp_path):
     """GET /auth/tunnel-connect without session redirects to login."""
     hclient, _ = _make_tunnel_hosted_client(monkeypatch, tmp_path)
-    r = hclient.get("/auth/tunnel-connect?device_code=abc", follow_redirects=False)
+    r = hclient.get(
+        "/auth/tunnel-connect?device_code=11111111-1111-4111-8111-111111111111",
+        follow_redirects=False,
+    )
     assert r.status_code == 302
     assert "/auth/login" in r.headers["location"]
     assert "device_code" in r.headers["location"]
@@ -8446,6 +8449,8 @@ def test_pg_migration_registry_matches_historical_order():
         "_migrate_pg_feedback",
         "_migrate_pg_registered_hostnames",
         "_migrate_pg_redis_overage_fields",
+        # tunnel_tool_filter (1984adc0) is unshipped, so it is appended at the tail, not mid-list.
+        "_migrate_pg_tunnel_tool_filter",
     ]
     assert late == [
         "_migrate_pg_workspace_tenant_isolation",
@@ -8597,7 +8602,7 @@ def test_pg_migration_registry_matches_historical_order():
     ]
     # No duplicates across the three groups.
     allnames = core + hosted + late
-    assert len(allnames) == len(set(allnames)) == 177
+    assert len(allnames) == len(set(allnames)) == 178
 
 
 def test_core_schema_literals_have_no_inline_tenant_id_indexes():
