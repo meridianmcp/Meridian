@@ -1,0 +1,17 @@
+{
+  "_comment": "Shared session-liveness parity vectors for the Workspace overview. Python (tests/test_workspace_overview.py) and TypeScript (meridian/static/dashboard-workspace.test.ts) both load this file. A vector is live when status is 'active' and last_seen is within 600 seconds of now. age_s is now minus last_seen in seconds, or null when last_seen does not parse.",
+  "now": "2026-10-27T12:00:00Z",
+  "live_window_s": 600,
+  "vectors": [
+    { "name": "boundary_600_0", "last_seen": "2026-10-27T11:50:00Z", "status": "active", "expected_live": true, "expected_age_s": 600.0 },
+    { "name": "over_600_5", "last_seen": "2026-10-27T11:49:59.5Z", "status": "active", "expected_live": false, "expected_age_s": 600.5 },
+    { "name": "fractional_600_001", "last_seen": "2026-10-27T11:49:59.999Z", "status": "active", "expected_live": false, "expected_age_s": 600.0 },
+    { "name": "inside", "last_seen": "2026-10-27T11:55:00Z", "status": "active", "expected_live": true, "expected_age_s": 300.0 },
+    { "name": "space_form_utc", "last_seen": "2026-10-27 11:50:00", "status": "active", "expected_live": true, "expected_age_s": 600.0 },
+    { "name": "offset_form", "last_seen": "2026-10-27T13:50:00+02:00", "status": "active", "expected_live": true, "expected_age_s": 600.0 },
+    { "name": "future_skew", "last_seen": "2026-10-27T12:00:05Z", "status": "active", "expected_live": false, "expected_age_s": -5.0 },
+    { "name": "idle_status", "last_seen": "2026-10-27 11:59:00", "status": "idle", "expected_live": false, "expected_age_s": 60.0 },
+    { "name": "closed_status", "last_seen": "2026-10-27 11:59:00", "status": "closed", "expected_live": false, "expected_age_s": 60.0 },
+    { "name": "garbage", "last_seen": "not a time", "status": "active", "expected_live": false, "expected_age_s": null }
+  ]
+}

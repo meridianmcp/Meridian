@@ -1249,3 +1249,85 @@ select option {
   .sidebar { top: var(--demo-banner-h, 0px); }
   #sidebar-toggle { top: calc(var(--demo-banner-h, 0px) + 10px); }
 }
+
+/* Local overview (dashboard-workspace.ts). Colours come only from the theme variables.
+   The view replaces #tab-bodies while open; #topbar stays visible above it. */
+.ws-sidebar-btn {
+  display: flex; justify-content: space-between; align-items: center;
+  width: calc(100% - 16px); margin: 0 8px 6px; padding: 8px 10px;
+  border: 1px solid var(--border); border-radius: 4px;
+  background: var(--surface-2); color: var(--text); cursor: pointer;
+  font-family: 'IBM Plex Mono', monospace; font-size: 11px; text-align: left;
+}
+.ws-sidebar-btn[hidden] { display: none; }
+.ws-sidebar-btn:hover, .ws-sidebar-btn.active { border-color: var(--accent); color: var(--accent); }
+.ws-overview-view {
+  flex: 1; min-width: 0; min-height: 0; overflow-y: auto; overflow-x: hidden;
+  padding: 0 16px; background: var(--bg); color: var(--text);
+}
+.ws-overview-view[hidden] { display: none; }
+.ws-overview { min-width: 0; max-width: 100%; }
+.ws-view-bar {
+  display: flex; flex-wrap: wrap; justify-content: space-between; align-items: center; gap: 8px;
+  padding: 12px 0; border-bottom: 1px solid var(--border);
+}
+.ws-view-title {
+  margin: 0; font-family: 'IBM Plex Mono', monospace; font-size: 14px; font-weight: 600; color: var(--accent);
+}
+.ws-view-actions { display: flex; gap: 6px; }
+.ws-overview-body { padding: 8px 0 24px; min-width: 0; }
+.ws-btn {
+  padding: 5px 10px; border: 1px solid var(--border); border-radius: 4px;
+  background: var(--surface-2); color: var(--text); cursor: pointer;
+  font-family: 'IBM Plex Mono', monospace; font-size: 11px;
+}
+.ws-btn:hover { border-color: var(--accent); }
+.ws-btn:disabled { opacity: 0.5; cursor: default; border-color: var(--border); }
+.ws-section { margin-bottom: 18px; min-width: 0; }
+.ws-heading {
+  margin: 12px 0 6px; font-family: 'IBM Plex Mono', monospace; font-size: 11px; font-weight: 600;
+  letter-spacing: 0.06em; text-transform: uppercase; color: var(--muted);
+}
+.ws-chips { display: flex; flex-wrap: wrap; gap: 6px; margin: 4px 0; min-width: 0; }
+.ws-chip {
+  display: inline-block; max-width: 100%; padding: 2px 8px; border: 1px solid var(--border);
+  border-radius: 999px; background: var(--surface-1); color: var(--text);
+  font-family: 'IBM Plex Mono', monospace; font-size: 11px; overflow-wrap: anywhere;
+}
+.ws-chip--unknown { color: var(--muted); border-style: dashed; }
+.ws-list { list-style: none; margin: 0; padding: 0; min-width: 0; }
+.ws-row {
+  margin: 0 0 8px; padding: 8px 10px; border: 1px solid var(--border); border-radius: 4px;
+  background: var(--surface); min-width: 0; overflow-wrap: anywhere;
+}
+.ws-row-head { font-size: 12px; overflow-wrap: anywhere; }
+.ws-group { margin: 6px 0; min-width: 0; }
+.ws-group > summary {
+  cursor: pointer; padding: 6px 0; font-family: 'IBM Plex Mono', monospace; font-size: 12px; color: var(--text);
+}
+.ws-count { margin-left: 6px; color: var(--muted); }
+.ws-path { color: var(--muted); font-family: 'IBM Plex Mono', monospace; font-size: 11px; overflow-wrap: anywhere; }
+.ws-activity { margin: 4px 0; padding-left: 16px; color: var(--muted); font-size: 11px; overflow-wrap: anywhere; }
+.ws-reason { margin-top: 4px; font-size: 12px; overflow-wrap: anywhere; }
+.ws-problems { margin-left: 6px; color: var(--status-failed); font-size: 11px; overflow-wrap: anywhere; }
+.ws-meta { margin: 2px 0; color: var(--muted); font-size: 11px; overflow-wrap: anywhere; }
+.ws-muted { margin: 4px 0; color: var(--muted); font-size: 12px; overflow-wrap: anywhere; }
+.ws-note { margin: 4px 0; color: var(--muted); font-size: 12px; overflow-wrap: anywhere; }
+.ws-banner {
+  margin: 8px 0; padding: 8px 10px; border: 1px solid var(--status-hitl); border-radius: 4px;
+  background: var(--surface-2); color: var(--text); font-size: 12px; overflow-wrap: anywhere;
+}
+.ws-banner p { margin: 0 0 6px; }
+.ws-banner--error { border-color: var(--status-failed); }
+.ws-gaps code { color: var(--accent); font-family: 'IBM Plex Mono', monospace; font-size: 11px; overflow-wrap: anywhere; }
+@media (max-width: 640px) {
+  .ws-overview-view { padding: 0 16px; }
+  .ws-view-actions { width: 100%; }
+  .ws-view-actions .ws-btn { flex: 1 1 0; }
+  .ws-chips { gap: 4px; }
+  /* Phone width: each repo or session row is one column. Chips and long paths wrap inside it. */
+  .ws-row { display: flex; flex-direction: column; gap: 4px; }
+  .ws-row > * { min-width: 0; max-width: 100%; }
+  .ws-chip { max-width: 100%; }
+  .ws-activity { padding-left: 14px; }
+}
