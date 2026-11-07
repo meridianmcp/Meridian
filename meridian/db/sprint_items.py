@@ -6905,7 +6905,7 @@ async def get_sprint_items_page(
     offset = max(0, int(offset))
     async with db.execute(
         f"SELECT * FROM sprint_items WHERE {where} "
-        "ORDER BY added_at ASC, rowid ASC LIMIT ? OFFSET ?",
+        f"ORDER BY {_sprint_priority_order_sql()} ASC, added_at ASC, rowid ASC LIMIT ? OFFSET ?",
         (*params_list, limit, offset),
     ) as cur:
         rows = await cur.fetchall()

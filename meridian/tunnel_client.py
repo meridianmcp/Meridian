@@ -7003,6 +7003,190 @@ async def _fetch_me_with_retry(
     raise last_exc
 
 
+# ---------------------------------------------------------------------------
+# The owner's custom connectors (meridian/custom_connectors.py), opt-in only.
+# ---------------------------------------------------------------------------
+# One WebSocket (/tunnel-cx) carries every opted-in connector. The server names the
+# connector in the ``x-meridian-custom-connector`` header of each request. A stdio
+# connector runs under mcp-proxy on loopback and is reached at /mcp. An http
+# connector is reached at the owner's URL. No auth header is ever added here.
+
+_CUSTOM_CONNECTOR_HEADER = "x-meridian-custom-connector"
+_CUSTOM_FORWARD_HEADERS = frozenset({"content-type", "accept", "mcp-session-id"})
+_CUSTOM_RESPONSE_HEADERS = frozenset({"content-type", "mcp-session-id"})
+
+
+@dataclass(frozen=True)
+class _CustomEndpoint:
+    """Where one opted-in connector is reached. URLs stay out of repr so they never log."""
+
+    name: str
+    transport: str
+    local_url: str = field(default="", repr=False)
+    remote_url: str = field(default="", repr=False)
+
+
+def _free_loopback_port() -> int:
+    """A loopback port that is free right now. mcp-proxy binds it straight after."""
+    import socket  # noqa: PLC0415
+
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as probe:
+        probe.bind(("127.0.0.1", 0))
+        return int(probe.getsockname()[1])
+
+
+def _spawn_custom_connector_processes(npx: str, proc_holders: list[dict]) -> "dict[str, _CustomEndpoint]":
+    """Start the owner's opted-in stdio connectors and return the endpoints to relay to.
+
+    Nothing starts unless ``custom_tunnel_opt_in`` is literally true in the desktop
+    settings file. Only a connector's name is printed. A command, an argument or a
+    URL is never printed, since any of them can carry a secret.
+    """
+    from . import custom_connectors as _cc  # noqa: PLC0415
+
+    config = _cc.load_config()
+    for note in config.notes:
+        print(f"  custom connectors: {note}", file=sys.stderr, flush=True)
+    if not config.opt_in:
+        return {}
+    endpoints: dict[str, _CustomEndpoint] = {}
+    for connector in config.connectors:
+        if connector.transport == _cc.TRANSPORT_HTTP:
+            endpoints[connector.name] = _CustomEndpoint(
+                connector.name, _cc.TRANSPORT_HTTP, remote_url=connector.url,
+            )
+            print(f"  custom:{connector.name:<9}tunnel (http)", flush=True)
+            continue
+        port = _free_loopback_port()
+        cmd = _build_proxy_for_inner(npx, [connector.command, *connector.args], port)
+        label = f"cx:{connector.name}"
+        try:
+            proc = _spawn_with_cache_retry(cmd, None, label)
+        except Exception as exc:  # noqa: BLE001
+            print(
+                f"  warning: could not start custom connector {connector.name!r}: {type(exc).__name__}",
+                file=sys.stderr, flush=True,
+            )
+            continue
+        # Same holder shape as the custom plugins, so the watchdog relaunches it and
+        # the shutdown path terminates it.
+        proc_holders.append({"proc": proc, "cmd": cmd, "env": None, "label": label})
+        endpoints[connector.name] = _CustomEndpoint(
+            connector.name, _cc.TRANSPORT_STDIO, local_url=f"http://127.0.0.1:{port}/mcp",
+        )
+        print(f"  custom:{connector.name:<9}tunnel (stdio)", flush=True)
+    return endpoints
+
+
+def _ws_custom_connectors_url(base_url: str, tenant_id: str, token: str) -> str:
+    """The WebSocket URL for the owner's custom connectors (routes/tunnel.py /tunnel-cx)."""
+    return _ws_office_url(base_url, tenant_id, token, "cx")
+
+
+def _custom_error_response(req_id: object, status: int, message: str) -> dict:
+    body = json.dumps({"error": message}).encode()
+    return {
+        "type": "response",
+        "id": req_id,
+        "status": status,
+        "headers": {"content-type": "application/json"},
+        "body": base64.b64encode(body).decode(),
+    }
+
+
+async def _relay_custom_connector_request(http_client, endpoints: "dict[str, _CustomEndpoint]", msg: dict) -> dict:
+    """Relay one server request to the connector its header names.
+
+    The request path is never used, and only the three headers in
+    ``_CUSTOM_FORWARD_HEADERS`` are forwarded, so nothing the server sends can
+    reach a connector beyond a JSON-RPC body. A failure returns a generic error
+    body that names the connector and never its URL or command.
+    """
+    req_id = msg.get("id")
+    headers_in = msg.get("headers") if isinstance(msg.get("headers"), dict) else {}
+    name = ""
+    for key, value in headers_in.items():
+        if isinstance(key, str) and key.lower() == _CUSTOM_CONNECTOR_HEADER and isinstance(value, str):
+            name = value
+    endpoint = endpoints.get(name)
+    if endpoint is None:
+        return _custom_error_response(req_id, 404, "unknown custom connector")
+    if (msg.get("method") or "POST").upper() != "POST":
+        return _custom_error_response(req_id, 405, "custom connectors take POST only")
+    target = endpoint.remote_url if endpoint.transport == "http" else endpoint.local_url
+    forward = {
+        key: value for key, value in headers_in.items()
+        if isinstance(key, str) and key.lower() in _CUSTOM_FORWARD_HEADERS and isinstance(value, str)
+    }
+    try:
+        body = base64.b64decode(msg["body"]) if msg.get("body") else None
+    except Exception:  # noqa: BLE001
+        return _custom_error_response(req_id, 400, "request body is not valid base64")
+    try:
+        resp = await http_client.request(
+            "POST", target, headers=forward, content=body,
+            timeout=_LOCAL_REQUEST_TIMEOUT, follow_redirects=False,
+        )
+    except Exception as exc:  # noqa: BLE001
+        print(f"tunnel:cx:{name}: request failed ({type(exc).__name__})", file=sys.stderr, flush=True)
+        return _custom_error_response(req_id, 502, f"custom connector '{name}' is unavailable")
+    resp_body = resp.content or b""
+    return {
+        "type": "response",
+        "id": req_id,
+        "status": resp.status_code,
+        "headers": {k: v for k, v in resp.headers.items() if k.lower() in _CUSTOM_RESPONSE_HEADERS},
+        "body": base64.b64encode(resp_body).decode() if resp_body else "",
+    }
+
+
+async def _run_custom_connectors_connection(ws_url: str, endpoints: "dict[str, _CustomEndpoint]") -> None:
+    """Hold the cx socket open, announce the opted-in names, and relay requests."""
+    import httpx  # noqa: PLC0415
+    import websockets  # noqa: PLC0415
+
+    announcement = {
+        "type": "custom_connectors",
+        "opt_in": True,
+        "connectors": [{"name": e.name, "transport": e.transport} for e in endpoints.values()],
+    }
+    async with websockets.connect(
+        ws_url, max_size=None, ping_interval=20, ping_timeout=_WS_PING_TIMEOUT,
+        open_timeout=_tunnel_connect_timeout(),
+    ) as ws:
+        await ws.send(json.dumps(announcement))
+        print(f"tunnel:cx: {len(endpoints)} custom connector(s) announced", flush=True)
+        async with httpx.AsyncClient() as http_client:
+            async for raw in ws:
+                try:
+                    msg = json.loads(raw)
+                except (ValueError, TypeError):
+                    continue
+                if not isinstance(msg, dict) or msg.get("type") != "request":
+                    continue
+                resp = await _relay_custom_connector_request(http_client, endpoints, msg)
+                await ws.send(json.dumps(resp))
+
+
+async def _reconnect_custom_connectors_loop(ws_url: str, endpoints: "dict[str, _CustomEndpoint]") -> None:
+    """Keep the cx socket up with a backoff capped at 60s. Logs the exception class only,
+    since the socket URL carries the tunnel token."""
+    delay = 1.0
+    while True:
+        try:
+            await _run_custom_connectors_connection(ws_url, endpoints)
+            delay = 1.0
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:  # noqa: BLE001
+            print(
+                f"tunnel:cx: connection ended ({type(exc).__name__}); retrying in {delay:.0f}s",
+                file=sys.stderr, flush=True,
+            )
+        await asyncio.sleep(delay)
+        delay = min(delay * 2, 60.0)
+
+
 async def _run_connection(
     ws_url: str, port: int, label: str = "fs", tool_prefix: str | None = None,
     lifecycle: "_tunnel_lifecycle.TunnelLifecycle | None" = None,
@@ -7240,27 +7424,12 @@ async def _proc_watchdog(
 # Local MCP config auto-update (.mcp.json / .cursor/mcp.json) — pure, unit tested
 # ---------------------------------------------------------------------------
 
-# ef162c28 — Connector keys were historically named by transport SLOT
-# (meridian-fs / meridian-code / meridian-extractor). They now derive from the
-# PLUGIN behind each slot so the .mcp.json names read as what the connector
-# actually is: filesystem / codebase-memory / serena. The static slot→name map
-# below is the canonical source. We deliberately do NOT derive these from the
-# resolved plugin's ``name`` field: the plugin names are "filesystem" /
-# "code-intel" / "code-extractor", which would give the wrong labels for the
-# code and extract slots (codebase-memory-mcp rides "code"; Serena rides
-# "extract"). A hardcoded slot→name map is therefore the cleanest option and
-# avoids threading the plugin registry through these pure helpers. Known
-# limitation: a tenant who overrides the extract slot's command (e.g. back to
-# mcp-server-code-extractor) still gets the connector name "serena" — the name
-# tracks the slot's default implementation, not the live override.
-_TUNNEL_MCP_SLOT_NAMES = {
-    "fs": "filesystem",
-    "code": "codebase-memory",
-    "extract": "serena",
-}
-
-# The connector keys the CURRENT code injects (new, plugin-derived names).
-TUNNEL_MCP_KEYS = tuple(_TUNNEL_MCP_SLOT_NAMES.values())
+# The tunnel no longer writes per-slot connector entries (filesystem /
+# codebase-memory / serena) into local MCP config. The hosted ``meridian``
+# endpoint (``{base_url}/mcp``) aggregates every slot's tools instead, and the
+# bridge filters them by group (see meridian/mcp/tool_groups.py). Entries that
+# older builds wrote under those names are still recognised as ours by URL (see
+# _is_our_mcp_entry) so they are removed on the next write or restore.
 
 # ef162c28 — the legacy slot-named keys older tunnel builds wrote. Kept so the
 # migration on inject (drop stale duplicates) and the restore/cleanup path
@@ -7327,10 +7496,10 @@ def generate_credential_free_mcp_config(
     """Build a CREDENTIAL-FREE local MCP client config (ba31dedf).
 
     Unlike :func:`_tunnel_mcp_entries` / :func:`_install_mcp_json` below
-    (which inject the CALLER'S OWN already-authenticated bearer token into
-    their OWN local, gitignored ``.mcp.json``/``.cursor/mcp.json`` so
-    ``meridian --tunnel`` actually authenticates on this machine), this
-    generator NEVER embeds a real credential. It exists for surfaces where the
+    (which write the hosted ``meridian`` connector into the caller's OWN local,
+    gitignored ``.mcp.json``/``.cursor/mcp.json``; that connector carries no
+    credential because the hosted endpoint signs the client in through OAuth),
+    this generator NEVER embeds a real credential. It exists for surfaces where the
     output might be shared, screenshotted, pasted into docs/chat, or committed
     before a human fills in their own token: onboarding docs, a dashboard
     "copy config" action for a machine that hasn't authenticated yet, or a
@@ -7379,66 +7548,33 @@ def generate_credential_free_mcp_config(
 def _tunnel_mcp_entries(
     base_url: str, tenant_id: str,
     custom: "list[dict] | None" = None,
-    token: "str | None" = None,
 ) -> dict[str, dict]:
-    """The HTTP MCP connector entries pointing at this tenant's tunnel.
+    """The MCP connector entries this tunnel writes into local MCP config.
 
-    ef162c28 — the three built-in slots are keyed by the plugin behind each slot
-    (``filesystem`` / ``codebase-memory`` / ``serena``, see
-    :data:`_TUNNEL_MCP_SLOT_NAMES`), pointing at the hosted relay URLs
-    (claude.ai-reachable). *custom* is the list of running user-defined plugins
-    (``{"name", "port"}``); each gets an entry keyed ``meridian-custom-<name>``
-    pointing at its LOCAL mcp-proxy (``http://127.0.0.1:<port>/mcp``) — they are
-    LOCAL-ONLY and have no server route, so a co-located client reaches them
-    directly, not via the relay.
+    The hosted tier gets exactly ONE built-in entry, ``meridian``, pointing at the
+    hosted Streamable HTTP server ``{base_url}/mcp``. It carries NO Authorization
+    header: that endpoint authenticates through OAuth, so the client signs in
+    itself and no bearer token is written to disk. The ``/mcp`` endpoint already
+    aggregates the tunnel's filesystem / codebase-memory / serena tools, so the
+    per-slot relay entries (``/fs/mcp/...``, ``/code/mcp/...``,
+    ``/extract/mcp/...``) are no longer written.
 
-    bf31787c — when *token* is provided the main ``meridian`` server entry is
-    also injected, pointing at ``{base_url}/mcp`` with an ``Authorization``
-    header. Without this entry Claude Code has no Meridian tools at all
-    (start_session, get_sprint_items, generate_handoff, …) even though the three
-    tool-slot connectors are present.
+    *custom* is the list of running user-defined plugins (``{"name", "port"}``);
+    each gets an entry keyed ``meridian-custom-<name>`` pointing at its LOCAL
+    mcp-proxy (``http://127.0.0.1:<port>/mcp``). They are LOCAL-ONLY and have no
+    server route, so a co-located client reaches them directly.
 
-    5fe96405 — the three slot entries (fs/code/extract) now carry the SAME
-    ``Authorization: Bearer <token>`` header as the ``meridian`` entry above
-    when *token* is provided. Before this fix these entries had no credential
-    at all: the slot routes (``_authorize_tunnel_proxy_caller`` in
-    routes/tunnel.py) started hard-requiring a matching tenant credential
-    (4cbb1cea) and every generated slot entry 401'd immediately —
-    "invalid or mismatched tenant credential" — regardless of whether the
-    caller had a valid token, because none was ever attached. Adding the
-    header here (rather than dropping the per-slot entries in favour of the
-    tools that ``/mcp`` now aggregates) is the smaller, additive fix: it
-    mirrors the already-working ``meridian`` entry exactly, and a client that
-    still wants a direct per-slot connector (bypassing the aggregated-tools
-    routing) keeps working. See ``_authorize_tunnel_proxy_caller``'s
-    WWW-Authenticate header (same commit) for the discovery-side half of this
-    fix, kept for any OAuth-capable client that still hits a slot URL with no
-    credential at all.
+    *tenant_id* is accepted so every caller shares one signature; the hosted
+    ``meridian`` entry is tenant-agnostic.
 
     Collision handling and legacy-key migration happen in
     :func:`_inject_mcp_entries`, which sees the existing config; this function is
-    a pure name→url map and stays trivially unit-testable.
+    a pure name→entry map and stays trivially unit-testable.
     """
-    entries: dict[str, dict] = {}
-    # bf31787c — the main Meridian server entry MUST come first so it is the
-    # first thing an agent sees in the merged mcpServers dict. The three slot
-    # connectors follow.
-    _auth_headers = {"Authorization": f"Bearer {token}"} if token else None
-    if token:
-        entries["meridian"] = {
-            "type": "http",
-            "url": _meridian_server_url(base_url),
-            "headers": _auth_headers,
-        }
-    for _slot_key, _slot_url in (
-        ("fs", _permanent_url(base_url, tenant_id)),
-        ("code", _permanent_code_url(base_url, tenant_id)),
-        ("extract", _permanent_extract_url(base_url, tenant_id)),
-    ):
-        _entry: dict[str, Any] = {"type": "http", "url": _slot_url}
-        if _auth_headers:
-            _entry["headers"] = dict(_auth_headers)
-        entries[_TUNNEL_MCP_SLOT_NAMES[_slot_key]] = _entry
+    del tenant_id  # the hosted /mcp endpoint is shared across tenants
+    entries: dict[str, dict] = {
+        "meridian": {"type": "http", "url": _meridian_server_url(base_url)},
+    }
     for cp in custom or []:
         name = cp.get("name")
         port = cp.get("port")
@@ -7541,23 +7677,19 @@ def _inject_mcp_entries(
 def _install_mcp_json(
     cwd: "str | Path", base_url: str, tenant_id: str,
     custom: "list[dict] | None" = None,
-    token: "str | None" = None,
 ) -> list[tuple["Path", "str | None"]]:
     """Inject tunnel connector entries into local MCP config files.
 
     *custom* is the list of running user-defined plugins (``{"name", "port"}``);
     each gets a LOCAL ``http://127.0.0.1:<port>/mcp`` connector entry alongside the
-    built-in relay entries (see :func:`_tunnel_mcp_entries`).
-
-    bf31787c — *token* is the tenant's bearer token.  When provided the main
-    ``meridian`` server entry is also injected so Claude Code has access to all
-    Meridian tools (start_session, get_sprint_items, generate_handoff, …).
+    hosted ``meridian`` entry (see :func:`_tunnel_mcp_entries`). No bearer token is
+    written: the hosted endpoint signs the client in through OAuth.
 
     Returns a list of ``(path, original_text_or_None)`` snapshots for restore.
     ``original_text_or_None`` is ``None`` when we created the file. Failures on
     any single file are reported and skipped — never fatal to the tunnel.
     """
-    entries = _tunnel_mcp_entries(base_url, tenant_id, custom, token=token)
+    entries = _tunnel_mcp_entries(base_url, tenant_id, custom)
     snapshots: list[tuple[Path, str | None]] = []
     for path in _mcp_json_paths(cwd):
         existed = path.exists()
@@ -8267,6 +8399,10 @@ async def run_tunnel(
         except Exception as exc:
             print(f"  warning: could not start custom plugin {cname!r}: {exc}", file=sys.stderr)
 
+    # 4d. The owner's custom connectors (custom_connectors.py). Off unless the desktop
+    #     opt-in is literally true, and only tunnel_exposed, enabled entries start.
+    custom_endpoints = _spawn_custom_connector_processes(npx, proc_holders)
+
     # 5. Print permanent URLs.
     print("", flush=True)
     # Best-effort update nudge: the server reports its version in /me (already
@@ -8319,14 +8455,13 @@ async def run_tunnel(
         pass
     print("", flush=True)
 
-    # 5b. Auto-update local MCP client config.
-    # bf31787c — pass the bearer token so _install_mcp_json can inject the main
-    # 'meridian' server entry (start_session / generate_handoff / …) alongside
-    # the three tunnel-slot connectors. Without the token the entry was silently
-    # omitted and Claude Code had no Meridian tools at all.
+    # 5b. Auto-update local MCP client config. Only the single hosted 'meridian'
+    # entry is written (OAuth sign-in, no bearer token) plus any local custom
+    # plugin entries; the filesystem / codebase-memory / serena tools reach the
+    # client through that one endpoint.
     mcp_snapshots: list[tuple[Path, str | None]] = []
     try:
-        mcp_snapshots = _install_mcp_json(Path.cwd(), base_url, tenant_id, running_custom, token=token)
+        mcp_snapshots = _install_mcp_json(Path.cwd(), base_url, tenant_id, running_custom)
     except Exception as exc:  # noqa: BLE001
         print(f"  warning: could not update local MCP config: {exc}", file=sys.stderr, flush=True)
     if mcp_snapshots:
@@ -8335,15 +8470,8 @@ async def run_tunnel(
         _custom_conns = "".join(
             f", meridian-custom-{cp['name']}" for cp in running_custom
         )
-        # ef162c28 — connectors are now named by the plugin behind each slot
-        # (filesystem / codebase-memory / serena) rather than by transport slot.
-        # bf31787c — the main 'meridian' server entry (start_session / …) is
-        # always injected first when a token is available.
-        _meridian_prefix = "meridian, " if token else ""
-        _builtin_conns = _meridian_prefix + ", ".join(TUNNEL_MCP_KEYS)
         print(
-            f"    added connectors: {_builtin_conns}"
-            f"{_custom_conns} (removed on Ctrl+C)",
+            f"    added connectors: meridian{_custom_conns} (removed on Ctrl+C)",
             flush=True,
         )
         print(
@@ -8441,6 +8569,14 @@ async def run_tunnel(
     # Custom plugins (eager) still use the regular reconnect + watchdog.
     for holder in proc_holders:
         tasks.append(asyncio.ensure_future(_proc_watchdog(holder)))
+    # The owner's opted-in custom connectors share one cx socket. Only started when
+    # the opt-in is on and at least one connector is usable.
+    if custom_endpoints:
+        tasks.append(asyncio.ensure_future(
+            _reconnect_custom_connectors_loop(
+                _ws_custom_connectors_url(base_url, tenant_id, token), custom_endpoints,
+            )
+        ))
     if not tasks and not running_custom:
         print("error: no tunnel plugins enabled — nothing to serve.", file=sys.stderr)
         return 1

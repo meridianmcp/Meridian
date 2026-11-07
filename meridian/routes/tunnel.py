@@ -324,6 +324,27 @@ _CUSTOM_SLOTS = ("p0", "p1", "p2", "p3")
 _tunnel_custom_sockets: dict[str, dict[str, WebSocket]] = {s: {} for s in _CUSTOM_SLOTS}
 _pending_custom_reqs: dict[str, dict[str, "asyncio.Future[dict]"]] = {s: {} for s in _CUSTOM_SLOTS}
 
+# Owner's custom connectors (meridian/custom_connectors.py). One WebSocket,
+# /tunnel-cx/{tenant}, carries every connector the owner opted in to. A request
+# names its connector in the ``x-meridian-custom-connector`` header, and the
+# per-connector session label is ``cx:<name>``. The client announces the names
+# over this socket, and only an opted-in announcement is recorded.
+_CUSTOM_CX_LABEL = "cx"
+_CUSTOM_CX_PREFIX = "cx:"
+_CUSTOM_CONNECTOR_HEADER = "x-meridian-custom-connector"
+_CUSTOM_LIST_BUDGET_S = 4.0
+_tunnel_cx_sockets: dict[str, WebSocket] = {}
+_pending_cx_reqs: dict[str, "asyncio.Future[dict]"] = {}
+# tenant -> {"socket": id of the announcing WebSocket, "names": tuple[str, ...]}
+_tenant_custom_connectors: dict[str, dict] = {}
+# tenant -> {advertised tool name: (connector name, tool name)}
+_tunnel_custom_tool_routes: dict[str, dict[str, tuple[str, str]]] = {}
+
+
+class CustomConnectorUnavailable(RuntimeError):
+    """A custom connector tool cannot be used. The text is safe to show the caller."""
+
+
 # d71ba2e7 — per-tenant core-slot health: tenant_id → {slot_label: healthy}.
 # Absent ⇒ assumed healthy. The client sends a
 # ``{"type":"plugin_status","slot":...,"healthy":false}`` message over a slot's
@@ -1225,6 +1246,9 @@ async def _serve_tunnel_ws(
                     quarantine_reason=msg.get("quarantine_reason"),
                 )
                 continue
+            if msg_type == "custom_connectors" and label == _CUSTOM_CX_LABEL:
+                _record_custom_connector_announcement(tenant_id, ws, msg)
+                continue
             if msg_type == "response":
                 req_id = msg.get("id")
                 fut = pending.get(req_id)
@@ -1239,6 +1263,8 @@ async def _serve_tunnel_ws(
         _unregister_tunnel_socket_multi_host(tenant_id, label, host_id, ws, sockets)
         _clear_tunnel_mcp_session(tenant_id, label, socket=ws)
         _clear_slot_health(tenant_id, label)
+        if label == _CUSTOM_CX_LABEL:
+            _clear_custom_connector_announcement(tenant_id, ws)
         # 4331f9cd / 49d8244d — slot dropped; if no tunnel remains, drop cached
         # routes (+ manifest timestamp) so the next tools/list rebuilds cleanly.
         if not has_active_tunnel(tenant_id):
@@ -1312,6 +1338,12 @@ def _make_custom_slot_ws(_slot: str):
 
 for _cs in _CUSTOM_SLOTS:
     router.websocket(f"/tunnel-{_cs}/{{tenant_id}}")(_make_custom_slot_ws(_cs))
+
+
+@router.websocket("/tunnel-cx/{tenant_id}")
+async def tunnel_cx_ws(ws: WebSocket, tenant_id: str) -> None:
+    """Hold open the WebSocket that carries the owner's opted-in custom connectors."""
+    await _serve_tunnel_ws(ws, tenant_id, _tunnel_cx_sockets, _pending_cx_reqs, _CUSTOM_CX_LABEL)
 
 
 # ---------------------------------------------------------------------------
@@ -4112,6 +4144,8 @@ def _label_maps(label: str) -> "tuple[dict[str, WebSocket], dict[str, asyncio.Fu
         return _tunnel_latex_sockets, _pending_latex_reqs
     if label in _tunnel_custom_sockets:  # 8fb69d54 — custom slots p0-p3
         return _tunnel_custom_sockets[label], _pending_custom_reqs[label]
+    if label == _CUSTOM_CX_LABEL or label.startswith(_CUSTOM_CX_PREFIX):  # owner's custom connectors
+        return _tunnel_cx_sockets, _pending_cx_reqs
     return _tunnel_extract_sockets, _pending_extract_reqs
 
 
@@ -4476,6 +4510,10 @@ async def _tunnel_jsonrpc(
         }
         if repo_path:
             headers["x-meridian-repo-path"] = repo_path
+        if label.startswith(_CUSTOM_CX_PREFIX):
+            # The client multiplexes every custom connector over one socket, so the
+            # connector name travels as a header. The name is validated on announce.
+            headers[_CUSTOM_CONNECTOR_HEADER] = label[len(_CUSTOM_CX_PREFIX):]
         if session_id:
             headers["Mcp-Session-Id"] = session_id
         proxy_kwargs: dict[str, float] = {}
@@ -4713,6 +4751,125 @@ async def list_tunnel_tools(
     # the caller is observing the recovered tools. Drain it so it fires only once.
     _tools_list_changed_pending.discard(tenant_id)
     return aggregated
+
+
+def _record_custom_connector_announcement(tenant_id: str, ws: object, msg: dict) -> None:
+    """Record the owner's opted-in connector names announced over the cx socket.
+
+    A message without a literal ``opt_in: true`` clears whatever was recorded, so
+    an opt-out never leaves a connector listed or callable.
+    """
+    from ..custom_connectors import announced_names  # noqa: PLC0415
+
+    names = announced_names(msg)
+    _tunnel_custom_tool_routes.pop(tenant_id, None)
+    if not names:
+        _tenant_custom_connectors.pop(tenant_id, None)
+        return
+    _tenant_custom_connectors[tenant_id] = {"socket": id(ws), "names": names}
+    _log.info("custom connectors announced for tenant %s: %d", tenant_id[:8], len(names))
+
+
+def _clear_custom_connector_announcement(tenant_id: str, ws: object) -> None:
+    """Forget the announcement only when it came from this socket."""
+    entry = _tenant_custom_connectors.get(tenant_id)
+    if entry is not None and entry.get("socket") == id(ws):
+        _tenant_custom_connectors.pop(tenant_id, None)
+        _tunnel_custom_tool_routes.pop(tenant_id, None)
+
+
+def _custom_connector_names(tenant_id: str) -> tuple[str, ...]:
+    """Connector names this tenant may list and call now. Empty unless the tunnel is
+    up, the cx socket is connected, and an opted-in announcement is recorded."""
+    entry = _tenant_custom_connectors.get(tenant_id)
+    if entry is None or tenant_id not in _tunnel_cx_sockets or not has_active_tunnel(tenant_id):
+        return ()
+    return tuple(entry.get("names") or ())
+
+
+async def _fetch_custom_connector_tools(tenant_id: str, connector: str) -> list[dict]:
+    """tools/list for one connector, bounded. Any failure means no tools from it."""
+    try:
+        resp = await asyncio.wait_for(
+            _tunnel_jsonrpc(tenant_id, f"{_CUSTOM_CX_PREFIX}{connector}", "tools/list", {}),
+            timeout=_CUSTOM_LIST_BUDGET_S,
+        )
+    except Exception as exc:  # noqa: BLE001
+        _log.debug("custom connector tools/list failed for %s: %s", tenant_id[:8], type(exc).__name__)
+        return []
+    if not isinstance(resp, dict) or "error" in resp:
+        return []
+    tools = (resp.get("result") or {}).get("tools") or []
+    return [tool for tool in tools if isinstance(tool, dict)]
+
+
+async def list_custom_connector_tools(
+    tenant_id: str, reserved_names: "frozenset[str] | set[str]" = frozenset(),
+) -> list[dict]:
+    """The owner's opted-in custom connector tools for this tenant, named
+    ``custom-<connector>__<tool>``. Empty unless the owner opted in and announced.
+    A name in *reserved_names* is never advertised, so a custom tool cannot shadow
+    a native one."""
+    from ..custom_connectors import custom_tool_name  # noqa: PLC0415
+
+    names = _custom_connector_names(tenant_id)
+    if not names:
+        _tunnel_custom_tool_routes.pop(tenant_id, None)
+        return []
+    fetched = await asyncio.gather(*(_fetch_custom_connector_tools(tenant_id, n) for n in names))
+    aggregated: list[dict] = []
+    routes: dict[str, tuple[str, str]] = {}
+    for connector, tools in zip(names, fetched):
+        for tool in tools:
+            tool_name = tool.get("name")
+            if not isinstance(tool_name, str) or not tool_name:
+                continue
+            advertised = custom_tool_name(connector, tool_name)
+            if advertised is None or advertised in reserved_names or advertised in routes:
+                continue
+            entry = dict(tool)
+            entry["name"] = advertised
+            routes[advertised] = (connector, tool_name)
+            aggregated.append(entry)
+    _tunnel_custom_tool_routes[tenant_id] = routes
+    return aggregated
+
+
+async def call_custom_connector_tool(tenant_id: str, name: str, arguments: dict | None) -> dict:
+    """Forward a tools/call for one of the owner's custom connector tools.
+
+    Returns the connector's MCP result. Raises CustomConnectorUnavailable when the
+    name is not an opted-in, connected tool, or when the connector cannot answer.
+    The error text never carries a command, an argument, a URL or the connector's
+    own error text.
+    """
+    target = (_tunnel_custom_tool_routes.get(tenant_id) or {}).get(name)
+    if target is None:
+        await list_custom_connector_tools(tenant_id)
+        target = (_tunnel_custom_tool_routes.get(tenant_id) or {}).get(name)
+    if target is None:
+        raise CustomConnectorUnavailable(
+            f"custom tool '{name}' is not available: its connector is off, not exposed "
+            "to the tunnel, or not connected"
+        )
+    connector, tool = target
+    try:
+        resp = await _tunnel_jsonrpc(
+            tenant_id, f"{_CUSTOM_CX_PREFIX}{connector}", "tools/call",
+            {"name": tool, "arguments": arguments or {}},
+        )
+    except Exception as exc:  # noqa: BLE001
+        _log.debug("custom connector call failed for %s: %s", tenant_id[:8], type(exc).__name__)
+        raise CustomConnectorUnavailable(
+            f"custom connector '{connector}' did not answer; retry shortly"
+        ) from None
+    if resp is None:
+        raise CustomConnectorUnavailable(f"custom connector '{connector}' is not connected")
+    if "error" in resp:
+        raise CustomConnectorUnavailable(
+            f"custom connector '{connector}' returned an error for tool '{tool}'"
+        )
+    return resp.get("result") or {}
 
 
 async def refresh_tunnel_manifest(

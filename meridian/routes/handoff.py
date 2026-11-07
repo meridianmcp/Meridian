@@ -471,6 +471,20 @@ async def record_handoff_correction_endpoint(
             status_code=422,
             detail="source_handoff_id and blocker_classification are required",
         )
+    # CodeQL py/path-injection: an output_dir override that cannot name a
+    # directory is refused before anything is written (correction row, ai_log
+    # event, handoff file). Containment itself is a pending decision.
+    out_dir = None
+    if body.get("regenerate"):
+        try:
+            out_dir = handoff_module.resolve_output_dir_override(
+                body.get("output_dir"), _data_dir(request),
+            )
+        except ValueError as exc:
+            raise HTTPException(
+                status_code=400,
+                detail="output_dir must be a string path without NUL bytes",
+            ) from exc
     try:
         correction = await handoff_module.record_handoff_correction(
             db, project_id,
@@ -507,10 +521,9 @@ async def record_handoff_correction_endpoint(
     )
     if not body.get("regenerate"):
         return {"correction": correction, "regenerated": False}
-    data_dir = _data_dir(request)
     try:
         result = await handoff_module.regenerate_handoff_correction(
-            db, project_id, correction["id"], body.get("output_dir") or data_dir,
+            db, project_id, correction["id"], out_dir,
             session_id=body.get("session_id"),
             # 0b0b24d8 — omitted mode resolves by intent, never a silent 'full'.
             mode=body.get("mode") or None,

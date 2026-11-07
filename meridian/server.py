@@ -265,9 +265,17 @@ button:hover{{background:#6d28d9}}
 # refreshes last_seen for connected sessions every minute, for as long as they
 # stay within SESSION_KEEPALIVE_TTL_S of their last call. Sessions idle past
 # the TTL are forgotten so genuinely-dead ones still expire on schedule.
+#
+# Cost: every refresh is a database write, and on a scale-to-zero Neon endpoint
+# each write keeps the compute awake. The TTL is therefore the length of the
+# awake tail after each tool call, so it defaults to 5 minutes rather than 10.
+# A session quiet for longer than the TTL stops being refreshed, and its claims
+# expire 10 minutes after its last refresh (db/locks.py). Keep
+# TTL + interval <= 10 minutes; test_keepalive_window_fits_the_claim_window
+# enforces it.
 # ---------------------------------------------------------------------------
 SESSION_KEEPALIVE_INTERVAL_S = int(os.environ.get("MERIDIAN_KEEPALIVE_INTERVAL_S", "60"))
-SESSION_KEEPALIVE_TTL_S = int(os.environ.get("MERIDIAN_KEEPALIVE_TTL_S", "600"))
+SESSION_KEEPALIVE_TTL_S = int(os.environ.get("MERIDIAN_KEEPALIVE_TTL_S", "300"))
 
 # session_id -> monotonic timestamp of the last activity that proved liveness.
 _CONNECTED_SESSIONS: dict[str, float] = {}
@@ -4130,16 +4138,21 @@ async def get_notification_prefs(request: Request) -> dict[str, Any]:
     return {"prefs": prefs}
 
 
-_WORKSPACE_MEMBER_LIMITS: dict[str, int] = {"standard": 25, "pro": 50}
+# Team-size cap on POST /workspace/invite, by entitlement plan. It counts the
+# invited workspace_members rows (pending and accepted), never the owner. It only
+# blocks new invites: a workspace over its cap keeps every member it has. Pro's
+# 1000 is a safeguard ceiling, not an unlimited allowance.
+_WORKSPACE_MEMBER_LIMITS: dict[str, int] = {"free": 1, "standard": 20, "pro": 1000}
 
 
 def _workspace_member_limit(tenant: dict[str, Any]) -> int:
     """Team-size cap for the entitlement in force on ``tenant`` (a playtester has
-    Pro's; a plan the table does not know gets the Standard-sized default)."""
+    Pro's; a plan the table does not know gets Standard's cap, not Free's)."""
     from .plans import tenant_entitlement_plan  # noqa: PLC0415
 
     return _WORKSPACE_MEMBER_LIMITS.get(
-        tenant_entitlement_plan(tenant, default="standard"), 25
+        tenant_entitlement_plan(tenant, default="standard"),
+        _WORKSPACE_MEMBER_LIMITS["standard"],
     )
 
 
@@ -4235,12 +4248,19 @@ async def workspace_invite_resend(request: Request, member_id: str) -> dict[str,
     return {"id": member_id, "email": member["email"], "resent": True}
 
 
+# Invite tokens are minted with secrets.token_urlsafe(32) (the invite and resend
+# handlers), so every real token matches this shape. Anything else can never match
+# an invite, so it is refused before the token is echoed into the login ``next=``
+# Location or the pending_invite_token cookie.
+_INVITE_TOKEN_RE = re.compile(r"[A-Za-z0-9_-]{1,256}")
+
+
 @app.get("/workspace/accept")
 async def workspace_accept(request: Request, token: str = "") -> HTMLResponse:
     """Accept a workspace invite. Marks joined_at and redirects to dashboard."""
     if not _hosted_mode():
         raise HTTPException(status_code=404)
-    if not token:
+    if not _INVITE_TOKEN_RE.fullmatch(token):
         return HTMLResponse("<h2>Invalid invite link.</h2><p><a href='/auth/login'>Sign in</a></p>", status_code=400)
     import hashlib
     from fastapi.responses import RedirectResponse as _Redir
@@ -8103,11 +8123,11 @@ async def create_api_token(request: Request) -> dict[str, Any]:
     if token_type not in ("readwrite", "readonly"):
         token_type = "readwrite"
     db = request.app.state.db
-    # If a label is provided, delete any existing token with the same label first
-    # so the label acts as a unique slot (prevents token accumulation + revocation loops)
-    if label:
-        await db_module.delete_api_tokens_by_label(db, tenant["id"], label)
+    # A label is a slot: a new token with the label replaces the older tokens with it. The new token is created
+    # first and the older ones are removed after, so a failed create never leaves the slot empty.
     raw_token, token_row = await db_module.create_api_token(db, tenant["id"], label, token_type=token_type)
+    if label:
+        await db_module.delete_api_tokens_by_label(db, tenant["id"], label, exclude_id=token_row["id"])
     return {
         "token": raw_token,
         "id": token_row["id"],
@@ -8266,6 +8286,22 @@ import time as _tc_time
 # {device_code: (raw_token, expires_epoch)}
 _tunnel_device_codes: dict[str, tuple[str, float]] = {}
 _TUNNEL_DEVICE_CODE_TTL = 600  # 10 minutes
+_TUNNEL_DEVICE_CODE_MAX = 64
+
+
+def _valid_tunnel_device_code(value: str) -> bool:
+    """A device code is the UUID string the client makes: ASCII letters, digits and hyphens, 8 to 64 characters.
+
+    Anything else is refused before it is stored, shown on the authorize page, or placed in the page's script.
+    """
+    return 8 <= len(value) <= _TUNNEL_DEVICE_CODE_MAX and all(
+        c.isascii() and (c.isalnum() or c == "-") for c in value
+    )
+
+
+def _js_string(value: str) -> str:
+    """A JSON string literal that is safe inside an inline script block: it cannot end the block or break the string."""
+    return json.dumps(value).replace("<", "\\u003c").replace(">", "\\u003e").replace("&", "\\u0026")
 
 
 def _cleanup_tunnel_device_codes() -> None:
@@ -8306,6 +8342,8 @@ async def tunnel_connect_page(request: Request) -> Any:
     device_code = request.query_params.get("device_code", "").strip()
     if not device_code:
         raise HTTPException(status_code=400, detail="device_code required")
+    if not _valid_tunnel_device_code(device_code):
+        raise HTTPException(status_code=400, detail="device_code is not valid")
     # e37187f3 — the connecting machine's hostname, so the token minted below
     # can be scoped per-host instead of per-tenant (see tunnel_connect_authorize).
     # Sanitized to a conservative charset since it round-trips through this
@@ -8325,7 +8363,9 @@ async def tunnel_connect_page(request: Request) -> Any:
             next_path += f"&hostname={_q(hostname, safe='')}"
         return RedirectResponse(url=f"/auth/login?next={_q(next_path, safe='/')}", status_code=302)
 
-    email = tenant.get("email", "")
+    email = html_module.escape(tenant.get("email", ""))
+    js_device_code = _js_string(device_code)
+    js_hostname = _js_string(hostname)
     html = f"""<!DOCTYPE html>
 <html lang="en">
 <head>
@@ -8365,7 +8405,7 @@ async def tunnel_connect_page(request: Request) -> Any:
         const r = await fetch('/auth/tunnel-connect', {{
           method: 'POST',
           headers: {{'Content-Type': 'application/json'}},
-          body: JSON.stringify({{device_code: '{device_code}', hostname: '{hostname}'}})
+          body: JSON.stringify({{device_code: {js_device_code}, hostname: {js_hostname}}})
         }});
         if (r.ok) {{
           btn.style.display = 'none';
@@ -8406,6 +8446,8 @@ async def tunnel_connect_authorize(request: Request) -> dict[str, Any]:
     device_code = (body.get("device_code") or "").strip()
     if not device_code:
         raise HTTPException(status_code=400, detail="device_code required")
+    if not _valid_tunnel_device_code(device_code):
+        raise HTTPException(status_code=400, detail="device_code is not valid")
 
     _cleanup_tunnel_device_codes()
     if device_code in _tunnel_device_codes:
@@ -8424,8 +8466,9 @@ async def tunnel_connect_authorize(request: Request) -> dict[str, Any]:
     hostname = _sanitize_tunnel_hostname(body.get("hostname"))
     label = f"tunnel-cli:{hostname}" if hostname else "tunnel-cli"
     db = request.app.state.db
-    await db_module.delete_api_tokens_by_label(db, tenant["id"], label)
-    raw_token, _ = await db_module.create_api_token(db, tenant["id"], label=label)
+    # Create first, then remove the older tokens for this slot, so a failed create never leaves the slot empty.
+    raw_token, token_row = await db_module.create_api_token(db, tenant["id"], label=label)
+    await db_module.delete_api_tokens_by_label(db, tenant["id"], label, exclude_id=token_row["id"])
 
     _tunnel_device_codes[device_code] = (raw_token, _tc_time.time() + _TUNNEL_DEVICE_CODE_TTL)
     return {"status": "ok"}

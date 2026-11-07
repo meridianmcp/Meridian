@@ -368,3 +368,7 @@ jobs:
             echo "ERROR: docs/api-reference.md is out of date. Run 'pixi run python scripts/gen_docs.py' and commit the result."
             exit 1
           fi
+
+  # test-macos and test-windows moved to test-platforms.yml (f4ab2787). They are a
+  # non-gating cross-platform signal in their own workflow, so this canonical gate
+  # keeps every job blocking.

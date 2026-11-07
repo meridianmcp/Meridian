@@ -105,7 +105,7 @@ def test_build_execution_policy_immediate_default_shape():
         "execution_mode": "immediate",
         "max_planning_turns": ec.DEFAULT_MAX_PLANNING_TURNS_IMMEDIATE,
         "required_first_action": ec.REQUIRED_FIRST_ACTION_IMMEDIATE,
-        "no_confirmation": True,
+        "no_confirmation": False,
         "permitted_parallel_wave": True,
         "claim_before_edit": True,
         "genuine_blocker_escalation": ec.GENUINE_BLOCKER_ESCALATION_RULE,
@@ -137,7 +137,38 @@ def test_build_execution_policy_honors_max_planning_turns_override():
     assert policy["max_planning_turns"] == 5
     # Other fields stay deterministic — not user-configurable.
     assert policy["execution_mode"] == "immediate"
-    assert policy["no_confirmation"] is True
+    assert policy["no_confirmation"] is False
+
+
+def test_no_confirmation_defaults_false_in_immediate_and_explicit_true_still_works():
+    # Default: immediate mode no longer implies no_confirmation.
+    default = ec.build_execution_policy(None, execution_mode="autonomous")
+    assert default["execution_mode"] == "immediate"
+    assert default["no_confirmation"] is False
+    assert 'no_confirmation="false"' in _render_policy(default)
+
+    # An explicit code-level True is still honored in immediate mode...
+    explicit = ec.build_execution_policy(
+        None, execution_mode="autonomous", no_confirmation=True,
+    )
+    assert explicit["no_confirmation"] is True
+    assert 'no_confirmation="true"' in _render_policy(explicit)
+
+    # ...but never in relaxed mode or a planner-downgraded policy.
+    relaxed = ec.build_execution_policy(
+        None, execution_mode="interactive", no_confirmation=True,
+    )
+    assert relaxed["no_confirmation"] is False
+    planner = ec.build_execution_policy(
+        None, execution_mode="autonomous", role="planner", no_confirmation=True,
+    )
+    assert planner["no_confirmation"] is False
+
+
+def _render_policy(policy):
+    from meridian.handoff import _build_execution_policy_clause
+
+    return _build_execution_policy_clause(policy)
 
 
 def test_build_execution_policy_rejects_unsafe_max_planning_turns():

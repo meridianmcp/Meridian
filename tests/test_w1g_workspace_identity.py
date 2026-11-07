@@ -139,7 +139,7 @@ class TestBuildExecutionPolicyScopeOverride:
             "execution_mode": "immediate",
             "max_planning_turns": ec.DEFAULT_MAX_PLANNING_TURNS_IMMEDIATE,
             "required_first_action": ec.REQUIRED_FIRST_ACTION_IMMEDIATE,
-            "no_confirmation": True,
+            "no_confirmation": False,
             "permitted_parallel_wave": True,
             "claim_before_edit": True,
             "genuine_blocker_escalation": ec.GENUINE_BLOCKER_ESCALATION_RULE,

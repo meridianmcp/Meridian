@@ -1,0 +1,34 @@
+# Tool-routing rules for this repo (e5a7ce7f). Owner rules approved 2026-11-02.
+#
+# meridian/tool_routing.py reads this file with load_routing_config(). It
+# validates the whole file and fails closed on any schema error. Unknown rule
+# fields are rejected, and the schema has no enabled flag, so a disabled rule
+# is a commented-out [[rules]] block. It stays inert until someone uncomments it.
+#
+# Each rule's reason goes in `notes`, the only free-text field the schema
+# accepts. Do not put absolute local paths or secrets in this file.
+#
+# Defaults apply to [routing]: mode = "shadow", confidence_threshold = 0.6.
+
+# ENABLED. Database questions go to Neon, the hosted Postgres.
+[[rules]]
+id = "neon-database"
+priority = 40
+match_keywords = ["neon", "postgres", "postgresql", "sql", "database"]
+category = "database"
+tool = "neon"
+notes = "Owner rule (2026-11-02): Neon answers database questions. Keywords are substring matches, so a code question that names Postgres also matches this rule. Code-read rules outrank it when both match."
+
+# DISABLED. The owner must pick ONE code-read tool before this rule is enabled.
+# That choice is deliberately not made here. The two candidates are:
+#   - Serena find_symbol (AGENTS.md, "Code intelligence" section)
+#   - codebase-memory get_code_snippet (the session hook text)
+# Replace the placeholder tool value with the chosen tool's name, then uncomment the block.
+#
+# [[rules]]
+# id = "code-reads"
+# priority = 60
+# match_keywords = ["read the code", "show the code", "show me the function", "function body", "class definition"]
+# category = "code-intel"
+# tool = "OWNER_TO_CHOOSE_SERENA_FIND_SYMBOL_OR_CODEBASE_MEMORY_GET_CODE_SNIPPET"
+# notes = "Owner decision pending: choose one code-read tool (see the comment above). Priority 60 keeps code reads ahead of the database rule."

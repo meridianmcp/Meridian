@@ -59,7 +59,7 @@ jobs:
   # has zero platform-specific code -- see meridian-tray.spec's own darwin
   # branch for where platform actually matters: hiddenimports and the
   # onedir+COLLECT+BUNDLE packaging pystray's macOS menu-bar icon needs).
-  # macos-14 mirrors build-mac-arm64's runner choice -- only Apple Silicon is
+  # macos-15 mirrors build-mac-arm64's runner choice -- only Apple Silicon is
   # realistic here (macos-13/Intel is effectively unavailable, same
   # constraint already accepted for the slim client per decision 80f1d4bc).
   # No UPX install step, matching build-mac-arm64's existing precedent for
@@ -71,7 +71,7 @@ jobs:
   # (see meridian-tray.spec's module docstring for the macOS Gatekeeper
   # caveat this implies).
   build-tray-mac:
-    runs-on: macos-14
+    runs-on: macos-15
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
       - uses: prefix-dev/setup-pixi@ad1da6449d9e506fd127fd67ab2d054a769f6a94 # v0.11.2
@@ -123,7 +123,7 @@ jobs:
           path: dist/meridian-linux
 
   build-mac-arm64:
-    runs-on: macos-14
+    runs-on: macos-15
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
       - uses: prefix-dev/setup-pixi@ad1da6449d9e506fd127fd67ab2d054a769f6a94 # v0.11.2
@@ -161,7 +161,7 @@ jobs:
           #    a lock re-solve.
           - os: ubuntu-22.04
             artifact: meridian-connect-x86_64-unknown-linux
-          - os: macos-14
+          - os: macos-15
             artifact: meridian-connect-aarch64-apple-darwin
           - os: windows-latest
             artifact: meridian-connect-x86_64-windows.exe
