@@ -159,11 +159,13 @@ const sleep = (ms: number) => new Promise((res) => setTimeout(res, ms));
 
 function installPage(): void {
   const html = readFileSync(resolve(__dirname, "../templates/dashboard.html"), "utf8")
-    .replace(/<script[\s\S]*?<\/script>/g, "")
     .replace(/\{\{[\s\S]*?\}\}/g, "")
     .replace(/\{%[\s\S]*?%\}/g, "");
-  const body = html.match(/<body[^>]*>([\s\S]*)<\/body>/i);
-  document.body.innerHTML = body ? body[1] : html;
+  // Drop <script> elements with the DOM parser, not a regex: a case-sensitive tag
+  // regex misses <SCRIPT> (CodeQL js/bad-tag-filter, js/incomplete-multi-character-sanitization).
+  const parsed = new DOMParser().parseFromString(html, "text/html");
+  parsed.querySelectorAll("script").forEach((s) => s.remove());
+  document.body.innerHTML = parsed.body.innerHTML;
   (globalThis as any).fetch = async (url: unknown, init?: RequestInit) => {
     const isGoalGet = String(url).split("?")[0] === `/projects/${PROJECT.id}/goal` && (init?.method || "GET") === "GET";
     if (isGoalGet && server.gate) await server.gate;
