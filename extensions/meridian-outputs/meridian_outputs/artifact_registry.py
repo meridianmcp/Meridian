@@ -468,7 +468,9 @@ def register_artifact(
         - :func:`compute_artifact_id` cannot anchor an id (see its own
           docstring).
         - ``expected_sha256`` is given and contradicts the freshly-computed
-          hash of ``canonical_path`` (when readable), OR contradicts a hash
+          hash of ``canonical_path`` (when readable), OR is given while no
+          local hash can be computed at all (no path, missing, not a file, or
+          unreadable), OR contradicts a hash
           already on file for this id from a prior registration. Either way
           the write is refused rather than silently accepted or silently
           overwriting a conflicting prior hash.
@@ -494,6 +496,16 @@ def register_artifact(
     computed_hash: str | None = None
     if canonical_path and os.path.isfile(canonical_path):
         computed_hash = fingerprint.script_content_hash(canonical_path)
+
+    # Fail closed: a caller-asserted hash may never mint an identity or be
+    # stored as content_hash unless this machine could actually hash the file.
+    if expected_sha256 and not computed_hash:
+        raise RegistryError(
+            "register_artifact: expected_sha256 was supplied but no local content "
+            f"hash could be computed for canonical_path={canonical_path!r} (no path, "
+            "missing, not a file, or unreadable) -- refusing to register an "
+            "identity from an unverified caller-asserted hash"
+        )
 
     if expected_sha256 and computed_hash and str(expected_sha256) != str(computed_hash):
         raise RegistryError(
@@ -1026,9 +1038,18 @@ def reconcile_legacy_outputs(
             ambiguous.append({"entry": entry, "candidates": existing["candidates"]})
             continue
 
-        content_hash = expected_sha256
+        local_hash = None
         if canonical_path and os.path.isfile(canonical_path):
-            content_hash = fingerprint.script_content_hash(canonical_path) or expected_sha256
+            local_hash = fingerprint.script_content_hash(canonical_path)
+        if expected_sha256 and not local_hash:
+            # Same refusal register_artifact makes, so the dry run previews
+            # exactly what the real run would do.
+            errors.append({"entry": entry, "reason": (
+                "expected_sha256 was supplied but no local content hash could "
+                f"be computed for canonical_path={canonical_path!r}"
+            )})
+            continue
+        content_hash = local_hash or expected_sha256
         try:
             would_be_id = compute_artifact_id(
                 kind, content_hash=content_hash, generator=generator,

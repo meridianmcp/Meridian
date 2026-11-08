@@ -169,6 +169,55 @@ class TestRegisterArtifact:
                 expected_sha256="0" * 64, generator="plot.py",
             )
 
+    def test_expected_sha256_without_path_refuses(self, tmp_path: Path) -> None:
+        # A bare caller-asserted hash must never mint an identity.
+        with pytest.raises(AR.RegistryError):
+            AR.register_artifact(
+                str(tmp_path), "figure", expected_sha256="a" * 64, generator="plot.py",
+            )
+        assert AR.list_artifacts(str(tmp_path)) == []
+
+    def test_expected_sha256_with_missing_path_refuses(self, tmp_path: Path) -> None:
+        with pytest.raises(AR.RegistryError):
+            AR.register_artifact(
+                str(tmp_path), "figure", canonical_path=str(tmp_path / "nope.png"),
+                expected_sha256="a" * 64, generator="plot.py",
+            )
+        assert AR.list_artifacts(str(tmp_path)) == []
+
+    def test_expected_sha256_with_directory_path_refuses(self, tmp_path: Path) -> None:
+        sub = tmp_path / "a_directory"
+        sub.mkdir()
+        with pytest.raises(AR.RegistryError):
+            AR.register_artifact(
+                str(tmp_path), "figure", canonical_path=str(sub),
+                expected_sha256="a" * 64, generator="plot.py",
+            )
+        assert AR.list_artifacts(str(tmp_path)) == []
+
+    def test_expected_sha256_unhashable_file_refuses(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        # The file exists, but the hash helper cannot read it.
+        fig = _write(tmp_path / "fig1.png", "content")
+        monkeypatch.setattr(AR.fingerprint, "script_content_hash", lambda _p: None)
+        with pytest.raises(AR.RegistryError):
+            AR.register_artifact(
+                str(tmp_path), "figure", canonical_path=fig,
+                expected_sha256="a" * 64, generator="plot.py",
+            )
+        assert AR.list_artifacts(str(tmp_path)) == []
+
+    def test_expected_sha256_matching_real_file_still_registers(self, tmp_path: Path) -> None:
+        fig = _write(tmp_path / "fig1.png", "content")
+        real = AR.fingerprint.script_content_hash(fig)
+        rec = AR.register_artifact(
+            str(tmp_path), "figure", canonical_path=fig,
+            expected_sha256=real, generator="plot.py",
+        )
+        assert rec["hash_verified"] is True
+        assert rec["content_hash"] == real
+
     def test_mutated_content_at_same_path_mints_a_new_identity(self, tmp_path: Path) -> None:
         # Because content_hash is itself baked into the artifact_id seed,
         # editing a file in place produces a NEW id on re-registration rather
@@ -455,6 +504,22 @@ class TestReconcileLegacyOutputs:
         report = AR.reconcile_legacy_outputs(str(tmp_path), entries, dry_run=False)
         assert len(report["ambiguous"]) == 1
         assert report["registered"] == []
+
+    def test_expected_hash_without_local_file_is_an_error_in_both_modes(self, tmp_path: Path) -> None:
+        # Preview and real run must agree: both report an error, neither registers.
+        entries = [{
+            "kind": "figure",
+            "canonical_path": str(tmp_path / "moved_away.png"),
+            "expected_sha256": "a" * 64,
+            "generator": "old_script.py",
+        }]
+        preview = AR.reconcile_legacy_outputs(str(tmp_path), entries, dry_run=True)
+        assert preview["would_register"] == []
+        assert len(preview["errors"]) == 1
+        real = AR.reconcile_legacy_outputs(str(tmp_path), entries, dry_run=False)
+        assert real["registered"] == []
+        assert len(real["errors"]) == 1
+        assert AR.list_artifacts(str(tmp_path)) == []
 
     def test_defaults_to_provenance_ledger_when_no_entries_given(self, tmp_path: Path) -> None:
         fig = _write(tmp_path / "legacy.png", "legacy-bytes")
