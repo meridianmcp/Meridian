@@ -1,4 +1,4 @@
-"""6d1abc98 — GitHub search submodule, keyless (GitHub's public REST search API).
+"""6d1abc98 — GitHub search submodule (GitHub's public REST search API).
 
 811881c6/f65f6111/d58000c6 (see :mod:`meridian.paper_search` / :mod:`meridian.social_search`)
 established a per-source function pattern for the Research Module: a
@@ -16,8 +16,10 @@ paper_search's two-source shape:
 - ``github_repo_search`` — GitHub's Repository Search API (``/search/repositories``):
   finds competitor/prior-art repositories by topic/description/stars.
 
-Both are keyless (no PAT required for public-repo search) — matching the exact
-keyless constraint paper_search.py/social_search.py are built around.
+Both need a GitHub token, read from the server-side ``GITHUB_TOKEN`` environment
+variable. GitHub answers anonymous search with HTTP 401, so when the variable is unset
+each call returns a ``GitHub token not configured`` error without making a request. The
+token is sent only as a Bearer ``Authorization`` header and is never returned or logged.
 
 2e51a41a — adds an in-memory result cache (TTL 5 min, keyed by query+limit) and
 exponential backoff on HTTP 429/503 responses (max 3 attempts, delays 0.5s and 1.5s
@@ -29,12 +31,15 @@ the keyless-family convention of degrading to ``{error}`` rather than hanging.
 from __future__ import annotations
 
 import asyncio
+import os
 import time
 from typing import Any
 
 _GITHUB_CODE_API = "https://api.github.com/search/code"
 _GITHUB_REPO_API = "https://api.github.com/search/repositories"
 _ACCEPT_HEADER = "application/vnd.github+json"
+_GITHUB_TOKEN_ENV = "GITHUB_TOKEN"
+_TOKEN_NOT_CONFIGURED = "GitHub token not configured"
 
 # 2e51a41a — in-memory result cache shared by both search functions.
 # Key: ("code"|"repo", query, limit); value: (result_dict, monotonic_timestamp).
@@ -58,6 +63,51 @@ def _cache_get(key: tuple) -> Any | None:
 def _cache_set(key: tuple, result: Any) -> None:
     """Store result in cache with current monotonic timestamp."""
     _CACHE[key] = (result, time.monotonic())
+
+
+def _github_token() -> str | None:
+    """Return the server-side GitHub token from ``GITHUB_TOKEN``, or None if unset or blank.
+
+    Read on every call so the value follows the environment. It is only ever placed in
+    the Authorization header; it is never returned, logged or echoed in an error.
+    """
+    token = os.environ.get(_GITHUB_TOKEN_ENV, "").strip()
+    return token or None
+
+
+def _github_headers(token: str | None) -> dict[str, str]:
+    """Request headers for a GitHub search call. Authorization is sent only with a token."""
+    headers = {
+        "User-Agent": "Meridian/github_search (research routing)",
+        "Accept": _ACCEPT_HEADER,
+    }
+    if token:
+        headers["Authorization"] = f"Bearer {token}"
+    return headers
+
+
+def _token_missing_error(query: str) -> dict[str, Any]:
+    return {
+        "error": _TOKEN_NOT_CONFIGURED,
+        "query": query,
+        "hint": (
+            "Set the GITHUB_TOKEN environment variable on the Meridian server. "
+            "GitHub search answers 401 without a token."
+        ),
+    }
+
+
+def _token_rejected_error(query: str) -> dict[str, Any]:
+    return {
+        "error": "GitHub rejected the configured GITHUB_TOKEN (HTTP 401); check that the token is valid.",
+        "query": query,
+    }
+
+
+def _is_unauthorized(exc: Exception) -> bool:
+    """True when ``exc`` is an HTTP 401 from GitHub (httpx.HTTPStatusError carries ``response``)."""
+    response = getattr(exc, "response", None)
+    return getattr(response, "status_code", None) == 401
 
 
 async def _fetch_with_backoff(
@@ -215,6 +265,9 @@ async def github_code_search(
     if not q:
         return {"error": "query is required"}
     n = max(1, min(int(limit or 10), 50))
+    token = _github_token()
+    if token is None:
+        return _token_missing_error(q)
     cache_key = ("code", q, n)
     cached = _cache_get(cache_key)
     if cached is not None:
@@ -228,13 +281,12 @@ async def github_code_search(
         async with _httpx.AsyncClient(timeout=15.0) as http:
             resp = await _fetch_with_backoff(
                 http, _GITHUB_CODE_API, params=params,
-                headers={
-                    "User-Agent": "Meridian/github_search (research routing)",
-                    "Accept": _ACCEPT_HEADER,
-                },
+                headers=_github_headers(token),
             )
             results = parse_github_code_items(resp.json(), n)
     except Exception as exc:  # noqa: BLE001 — degrade, never crash the tool call
+        if _is_unauthorized(exc):
+            return _token_rejected_error(q)
         return {"error": f"github code search failed: {exc}", "query": q}
     out = {"query": q, "count": len(results), "results": results}
     _cache_set(cache_key, out)
@@ -259,6 +311,9 @@ async def github_repo_search(
     if not q:
         return {"error": "query is required"}
     n = max(1, min(int(limit or 10), 50))
+    token = _github_token()
+    if token is None:
+        return _token_missing_error(q)
     cache_key = ("repo", q, n)
     cached = _cache_get(cache_key)
     if cached is not None:
@@ -272,13 +327,12 @@ async def github_repo_search(
         async with _httpx.AsyncClient(timeout=15.0) as http:
             resp = await _fetch_with_backoff(
                 http, _GITHUB_REPO_API, params=params,
-                headers={
-                    "User-Agent": "Meridian/github_search (research routing)",
-                    "Accept": _ACCEPT_HEADER,
-                },
+                headers=_github_headers(token),
             )
             results = parse_github_repo_items(resp.json(), n)
     except Exception as exc:  # noqa: BLE001 — degrade, never crash the tool call
+        if _is_unauthorized(exc):
+            return _token_rejected_error(q)
         return {"error": f"github repo search failed: {exc}", "query": q}
     out = {"query": q, "count": len(results), "results": results}
     _cache_set(cache_key, out)

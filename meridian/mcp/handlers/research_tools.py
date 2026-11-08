@@ -147,6 +147,7 @@ async def handle_list_research_runs(
     """MCP tool: list_research_runs (a5343387). Read-only. By default
     terminal runs (completed/failed/abandoned/expired) are omitted so a
     fresh session sees only runs that may still be live."""
+    from meridian.db import get_project as _get_project  # noqa: PLC0415
     from meridian.db import research_runs as run_db  # noqa: PLC0415
 
     project_id = args["project_id"]
@@ -156,7 +157,25 @@ async def handle_list_research_runs(
         status=args.get("status"),
         limit=args.get("limit", 100),
     )
-    return {"runs": runs, "count": len(runs)}
+    if runs:
+        return {"runs": runs, "count": len(runs)}
+    # An empty list is ambiguous on its own: it could mean a wrong project id.
+    if await _get_project(db, project_id) is None:
+        return {"error": "project not found", "project_id": project_id}
+    any_runs = await run_db.list_research_runs(
+        db, project_id, include_terminal=True, status=None, limit=1,
+    )
+    if any_runs:
+        hint = (
+            "No runs match these filters. Pass include_terminal=true and clear "
+            "status to see completed runs."
+        )
+    else:
+        hint = (
+            "Nothing has been captured yet: no research runs have been started in "
+            "this project. Start one with start_research_run."
+        )
+    return {"runs": [], "count": 0, "hint": hint}
 
 
 async def handle_promote_research_run(

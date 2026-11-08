@@ -16,6 +16,13 @@ import pytest
 # Fixtures
 # ---------------------------------------------------------------------------
 
+
+@pytest.fixture(autouse=True)
+def _github_token_for_search(monkeypatch):
+    """github_search refuses to run without GITHUB_TOKEN. These tests cover caching and
+    backoff, not authentication, so a dummy value is set (no request reaches GitHub)."""
+    monkeypatch.setenv("GITHUB_TOKEN", "test-token-not-real")
+
 _SAMPLE_S2_PAYLOAD = {
     "total": 2,
     "offset": 0,

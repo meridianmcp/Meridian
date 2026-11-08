@@ -152,12 +152,29 @@ def _parse_arxiv_feed(xml_text: str, limit: int = 10) -> list[dict[str, Any]] | 
     return out
 
 
+def _arxiv_search_query(q: str, *, raw_query: bool = False) -> str:
+    """Build arXiv's ``search_query`` value for a free-text query.
+
+    A multi-word query is sent as a quoted phrase (``all:"graph neural networks"``).
+    Unquoted, arXiv ANDs the bare words across the whole record, so a single rare
+    word matches far too much and the ranking is poor. A single word is sent
+    unchanged, and a query the caller already quoted is passed through as-is.
+    ``raw_query=True`` keeps the old unquoted form (``all:<query>``) for callers that
+    want arXiv's own boolean syntax such as ``ti:foo AND au:bar``.
+    """
+    if raw_query or '"' in q or len(q.split()) < 2:
+        return f"all:{q}"
+    return f'all:"{q}"'
+
+
 async def arxiv_search(
-    query: str, limit: int = 10, sort_by: str = "relevance"
+    query: str, limit: int = 10, sort_by: str = "relevance", *, raw_query: bool = False
 ) -> dict[str, Any]:
     """Search arXiv and return ``{query, count, results:[...]}``.
 
     ``sort_by``: ``'relevance'`` (default) or ``'date'`` (most-recently-updated first).
+    A multi-word query is searched as an exact phrase; pass ``raw_query=True`` to send
+    the query unquoted (see :func:`_arxiv_search_query`).
     Never raises — an empty query returns ``{error}`` and any network/parse failure
     degrades to ``{error, query}`` so a research call can't crash the MCP handler.
 
@@ -176,7 +193,7 @@ async def arxiv_search(
     n = max(1, min(int(limit or 10), 50))
     sort = "lastUpdatedDate" if _wants_date_sort(sort_by) else "relevance"
     params = {
-        "search_query": f"all:{q}",
+        "search_query": _arxiv_search_query(q, raw_query=raw_query),
         "start": "0",
         "max_results": str(n),
         "sortBy": sort,

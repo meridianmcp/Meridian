@@ -5348,6 +5348,54 @@ def _multiword_or_ranked_clause(
     return where_sql, score_sql, where_params, score_params
 
 
+_SEARCH_ALL_BODY_CAP = 500  # characters of body text returned per search_all hit
+
+
+def _cap_search_body(row: dict[str, Any], field: str) -> None:
+    """Clip ``row[field]`` to ``_SEARCH_ALL_BODY_CAP`` characters, in place.
+
+    Sets ``row["body_truncated"]`` so a caller can tell the stored text is longer.
+    Use the hit's ``snippet`` to see the matching part of a long body.
+    """
+    text = row.get(field)
+    if isinstance(text, str) and len(text) > _SEARCH_ALL_BODY_CAP:
+        row[field] = text[:_SEARCH_ALL_BODY_CAP].rstrip() + "..."
+        row["body_truncated"] = True
+    else:
+        row["body_truncated"] = False
+
+
+def _multiword_and_ranked_clause(
+    columns: "list[str]", query: str, *, op: str = "LIKE"
+) -> "tuple[str, str, list[str], list[str]]":
+    """Match and score fragment for search_all's SQLite path, with AND across terms.
+
+    A row matches only when EVERY term appears in at least one of ``columns``
+    (AND across terms, OR across columns). Returns the same
+    ``(where_sql, score_sql, where_params, score_params)`` shape, with the same
+    ESCAPE handling, as :func:`_multiword_or_ranked_clause`. The score counts matched
+    terms, so with AND every returned row carries the full term count; it keeps the
+    ORDER BY stable and is not a relevance signal.
+    """
+    terms = _search_terms(query)
+    if not terms:
+        return "(1 = 0)", "0", [], []
+    where_parts: list[str] = []
+    score_parts: list[str] = []
+    where_params: list[str] = []
+    score_params: list[str] = []
+    for term in terms:
+        col_or = " OR ".join(f"{c} {op} ? ESCAPE '!'" for c in columns)
+        like = f"%{_like_escape(term)}%"
+        where_parts.append(f"({col_or})")
+        where_params.extend([like] * len(columns))
+        score_parts.append(f"(CASE WHEN ({col_or}) THEN 1 ELSE 0 END)")
+        score_params.extend([like] * len(columns))
+    where_sql = "(" + " AND ".join(where_parts) + ")"
+    score_sql = "(" + " + ".join(score_parts) + ")"
+    return where_sql, score_sql, where_params, score_params
+
+
 def _or_tsquery_source(query: str) -> str:
     """25155e91 — rewrite a free-text query into an OR form for websearch_to_tsquery.
 
@@ -6158,17 +6206,18 @@ async def search_all(
     category already exhausted at a higher offset simply returns an empty
     page for it; callers only need the single combined cursor.
 
-    SQLite (25155e91): keyword match — a row matches if ANY whitespace-separated
-    query term appears (as a substring) in one of its text fields, ranked by how
-    many terms matched (see _multiword_or_ranked_clause). A long multi-word
-    natural-language query degrades gracefully to the most-relevant rows instead
-    of returning zero the moment one rare token is absent.
-    Postgres (82e0b887, 25155e91): on-the-fly tsvector full-text search via
-    websearch_to_tsquery, ordered by ts_rank. The query terms are OR-combined
-    (a | b | c) so any term can match, with ts_rank surfacing the best rows
-    first. Stemming/word-form tolerance means "authenticating users" matches
-    "authentication for the user" — which the SQLite substring path cannot. Zero
-    schema / zero index (evaluated per query).
+    SQLite: keyword match. A row matches only if EVERY whitespace-separated query
+    term appears (as a substring) in one of its text fields (see
+    _multiword_and_ranked_clause). A multi-word query therefore returns rows that
+    contain all of its words.
+    Postgres (82e0b887): on-the-fly tsvector full-text search via
+    websearch_to_tsquery, ordered by ts_rank. The terms are AND-ed, and a quoted
+    "phrase" matches exactly. Stemming/word-form tolerance means "authenticating
+    users" matches "authentication for the user", which the SQLite substring path
+    cannot. Zero schema / zero index (evaluated per query).
+    Each hit's body field (description, body or notes) is capped to 500
+    characters; ``body_truncated`` is true when the stored text was clipped, and
+    ``snippet`` shows the matching part.
 
     Returns grouped results: {tasks, notes, decisions, sprint_items, total,
     cursor, limit, has_more, next_cursor}. Each item includes a
@@ -6250,16 +6299,11 @@ async def search_all(
             "added_at DESC LIMIT ? OFFSET ?"
         )
 
-        # 25155e91 — OR the query terms instead of ANDing them. Plain
-        # websearch_to_tsquery('a b c') builds 'a & b & c', so one rare/absent
-        # token in a long natural-language query ("... BFS x=768 x=1511") zeroed
-        # the whole result. websearch reads the bare word 'or' as the OR
-        # operator, so feeding it "a or b or c" builds 'a | b | c' — match ANY
-        # term. ts_rank still orders by how many/how well terms matched, so the
-        # result degrades gracefully to the most-relevant rows rather than to
-        # nothing. A single-term query is passed through unchanged (still
-        # stemmed). The SQL is untouched — only the bound tsquery source changes.
-        tsq = _or_tsquery_source(query)
+        # AND the query terms (websearch_to_tsquery's default), so a multi-word
+        # query matches rows containing all of its words, and a quoted "phrase"
+        # matches the phrase exactly. The earlier OR rewrite (25155e91) matched any
+        # single common word, which flooded results. ts_rank still orders the rows.
+        tsq = query
         tasks = await _search(tasks_sql, (project_id, tsq, tsq, fetch_limit, cursor))
         notes = await _search(notes_sql, (project_id, tsq, tsq, fetch_limit, cursor))
         decisions = await _search(decisions_sql, (project_id, tsq, tsq, fetch_limit, cursor))
@@ -6288,24 +6332,17 @@ async def search_all(
             tasks, notes, decisions, sprint_items,
         )
     else:
-        # 25155e91 — SQLite keyword path: OR the query terms and rank by how many
-        # matched, instead of ANDing them. The old AND-of-all-terms
-        # (_multiword_match_clause) meant one rare/absent token in a long
-        # natural-language query ("... single-path BFS x=768 x=1511") zeroed the
-        # whole result even when several terms clearly matched a row. Now a row
-        # matches if ANY term appears (OR across terms, OR across the row's
-        # fields), and a _match_score column counts matched terms so the most
-        # complete matches sort first — graceful degradation to relevant results
-        # rather than to nothing. A single-term query is identical to the old
-        # contiguous-substring match; a wholly unrelated query still matches no
-        # rows. created_at is the tiebreak within an equal score.
-        w_task, sc_task, wp_task, sp_task = _multiword_or_ranked_clause(
+        # SQLite keyword path: a row matches only when EVERY query term appears
+        # (as a substring) in one of its fields, so a multi-word query finds rows
+        # containing all of its words. Terms are AND-ed; each row's fields are
+        # OR-ed. created_at is the tiebreak order within the result.
+        w_task, sc_task, wp_task, sp_task = _multiword_and_ranked_clause(
             ["description"], query, op=op)
-        w_note, sc_note, wp_note, sp_note = _multiword_or_ranked_clause(
+        w_note, sc_note, wp_note, sp_note = _multiword_and_ranked_clause(
             ["title", "body"], query, op=op)
-        w_dec, sc_dec, wp_dec, sp_dec = _multiword_or_ranked_clause(
+        w_dec, sc_dec, wp_dec, sp_dec = _multiword_and_ranked_clause(
             ["title", "body"], query, op=op)
-        w_sprint, sc_sprint, wp_sprint, sp_sprint = _multiword_or_ranked_clause(
+        w_sprint, sc_sprint, wp_sprint, sp_sprint = _multiword_and_ranked_clause(
             ["title", "notes"], query, op=op)
 
         tasks_sql = (
@@ -6367,6 +6404,17 @@ async def search_all(
         d["snippet"] = _search_snippet(d.get("body"), query)
     for s in sprint_items:
         s["snippet"] = _search_snippet(s.get("notes"), query)
+
+    # Cap each hit's body text. This runs after the snippets above, which are
+    # built from the full text, so a match past the cap still appears in the snippet.
+    for t in tasks:
+        _cap_search_body(t, "description")
+    for n in notes:
+        _cap_search_body(n, "body")
+    for d in decisions:
+        _cap_search_body(d, "body")
+    for s in sprint_items:
+        _cap_search_body(s, "notes")
 
     # 9d8e858c — default-collapse sprint_items sharing a parent_id/item_group
     # (2+ items) into one summary row each; expand=True keeps every match.
@@ -9543,7 +9591,14 @@ async def get_findings(
     limit: int = 50,
 ) -> list[dict[str, Any]]:
     """c35370cc — read stored findings for a project (newest first), optionally
-    scoped by ``key`` and/or ``session_id``."""
+    scoped by ``key`` and/or ``session_id``.
+
+    Reads ``session_findings`` only. That table is written by :func:`store_finding`
+    (per-task intermediate results). It does NOT contain research findings captured
+    with capture_research_finding or save_finding. Those are project notes with
+    kind 'finding' and the 'finding' tag, so read them back with
+    ``get_project_notes(tag='finding')``.
+    """
     sql = "SELECT * FROM session_findings WHERE project_id = ?"
     params: list[Any] = [project_id]
     if key is not None:

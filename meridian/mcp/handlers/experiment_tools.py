@@ -66,6 +66,7 @@ async def handle_list_experiments(
 ) -> Any:
     """MCP tool: list_experiments (3f6b8715). Read-only."""
     from meridian.db import experiments as exp_db  # noqa: PLC0415
+    from meridian.db import get_project as _get_project  # noqa: PLC0415
 
     project_id = args["project_id"]
     try:
@@ -74,7 +75,20 @@ async def handle_list_experiments(
         )
     except ValueError as exc:
         return {"error": str(exc)}
-    return {"experiments": experiments, "count": len(experiments)}
+    if experiments:
+        return {"experiments": experiments, "count": len(experiments)}
+    # An empty list is ambiguous on its own: it could mean a wrong project id.
+    if await _get_project(db, project_id) is None:
+        return {"error": "project not found", "project_id": project_id}
+    any_experiments = await exp_db.list_experiments(db, project_id, status=None, limit=1)
+    if any_experiments:
+        hint = "No experiments match this status filter. Clear status to see all experiments."
+    else:
+        hint = (
+            "Nothing has been captured yet: no experiments have been created in this "
+            "project. Create one with create_experiment."
+        )
+    return {"experiments": [], "count": 0, "hint": hint}
 
 
 async def handle_start_experiment_run(

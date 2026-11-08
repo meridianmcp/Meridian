@@ -30,13 +30,12 @@ _LONG_QUERY = "img127 coverage gap single-path BFS x=768 x=1511"
 
 
 @pytest.mark.asyncio
-async def test_search_all_multiword_nl_query_degrades_gracefully(anydb):
-    """25155e91 — the item's exact failing query.
+async def test_search_all_multiword_nl_requires_all_terms(anydb):
+    """Multi-word queries match only rows that contain every term (AND).
 
-    A record whose text contains several of the query's terms (img127, coverage,
-    gap, single-path, BFS) but not the punctuation-heavy coordinate tokens
-    (x=768, x=1511) must still be FOUND. Before the fix the AND semantics
-    required every term, so this returned zero.
+    The record has img127, coverage, gap, single-path and BFS, but not x=768 or
+    x=1511. The full query therefore must NOT match it. A query made only of the
+    terms the record has must still find it.
     """
     db = anydb
     p = await db_module.create_project(db, "sa-nl-degrade")
@@ -49,11 +48,12 @@ async def test_search_all_multiword_nl_query_degrades_gracefully(anydb):
     single = await db_module.search_all(db, p["id"], "img127")
     assert any(i["title"] == "img127 coverage gap" for i in single["sprint_items"])
 
-    # The full multi-word NL query now ALSO finds the record (was 0 before).
+    # The full query has terms (x=768, x=1511) the record lacks, so AND excludes it.
     result = await db_module.search_all(db, p["id"], _LONG_QUERY)
-    assert any(i["title"] == "img127 coverage gap" for i in result["sprint_items"]), (
-        "multi-word NL query must degrade gracefully to the relevant record, "
-        "not return zero because 'x=768'/'x=1511' are absent")
+    assert not any(i["title"] == "img127 coverage gap" for i in result["sprint_items"])
+    # A query of only the terms the record has matches it.
+    present = await db_module.search_all(db, p["id"], "img127 coverage single-path BFS")
+    assert any(i["title"] == "img127 coverage gap" for i in present["sprint_items"])
 
 
 @pytest.mark.asyncio
@@ -69,14 +69,14 @@ async def test_search_all_multiword_unrelated_still_empty(anydb):
 
 @pytest.mark.asyncio
 async def test_search_all_partial_match_beats_none(anydb):
-    """A record matching SOME terms surfaces; a decoy matching NONE does not."""
+    """A record containing every query term surfaces; a decoy containing none does not."""
     db = anydb
     p = await db_module.create_project(db, "sa-partial")
     await db_module.add_project_note(
         db, p["id"], "Relevant", "img127 coverage gap single-path notes")
     await db_module.add_project_note(
         db, p["id"], "Decoy", "completely unrelated content about billing")
-    result = await db_module.search_all(db, p["id"], _LONG_QUERY)
+    result = await db_module.search_all(db, p["id"], "img127 coverage single-path")
     titles = [n["title"] for n in result["notes"]]
     assert "Relevant" in titles
     assert "Decoy" not in titles
@@ -84,7 +84,7 @@ async def test_search_all_partial_match_beats_none(anydb):
 
 @pytest.mark.asyncio
 async def test_search_all_ranks_more_complete_matches_first(anydb):
-    """Rows matching more query terms rank ahead of rows matching fewer."""
+    """A row missing any query term is excluded, even when it matches the others."""
     db = anydb
     p = await db_module.create_project(db, "sa-rank")
     # 'more' matches 3 terms; 'fewer' matches 1. Distinct enough that ts_rank
@@ -95,8 +95,7 @@ async def test_search_all_ranks_more_complete_matches_first(anydb):
         db, p["id"], "fewer", "alpha appears but not the others at all")
     result = await db_module.search_all(db, p["id"], "alpha beta gamma")
     titles = [n["title"] for n in result["notes"]]
-    assert titles[:2] == ["more", "fewer"], (
-        f"expected the 3-term match ranked first, got {titles}")
+    assert titles == ["more"], f"only the row with all three terms should match, got {titles}"
 
 
 @pytest.mark.asyncio
@@ -374,7 +373,7 @@ def test_search_all_takes_pg_path_for_postgres_shaped_db():
     This static test reads the search_all source via AST/inspect and asserts that:
     1. The function dialect-splits on hasattr(db, '_pool').
     2. The Postgres branch contains websearch_to_tsquery (the good ranking path).
-    3. The SQLite branch contains _multiword_or_ranked_clause (the cruder path).
+    3. The SQLite branch contains _multiword_and_ranked_clause (AND across terms).
 
     No live DB required — the claim is structural.
     """
@@ -396,9 +395,9 @@ def test_search_all_takes_pg_path_for_postgres_shaped_db():
         "search_all Postgres path must use ts_rank for result ordering"
     )
 
-    # The SQLite branch must use the cruder _multiword_or_ranked_clause.
-    assert "_multiword_or_ranked_clause" in src, (
-        "search_all SQLite path must use _multiword_or_ranked_clause for OR/ranked search"
+    # The SQLite branch must require every term via _multiword_and_ranked_clause.
+    assert "_multiword_and_ranked_clause" in src, (
+        "search_all SQLite path must use _multiword_and_ranked_clause for AND/ranked search"
     )
 
     # Confirm the two paths are separated by an if/else on is_pg, not both active.
@@ -424,16 +423,16 @@ def test_search_all_takes_pg_path_for_postgres_shaped_db():
     assert "is_pg" in code_src, "is_pg discriminator must appear in search_all executable body"
     assert "websearch_to_tsquery" in code_src, "ts_rank/websearch path must appear in executable body"
     assert "ts_rank" in code_src, "ts_rank ordering must appear in executable body"
-    assert "_multiword_or_ranked_clause" in code_src, (
-        "_multiword_or_ranked_clause SQLite path must appear in executable body"
+    assert "_multiword_and_ranked_clause" in code_src, (
+        "_multiword_and_ranked_clause SQLite path must appear in executable body"
     )
 
     # is_pg must appear before both branch bodies in the executable code.
     is_pg_pos = code_src.index("is_pg")
     ts_rank_pos = code_src.index("ts_rank")
-    multi_pos = code_src.index("_multiword_or_ranked_clause")
+    multi_pos = code_src.index("_multiword_and_ranked_clause")
     assert is_pg_pos < ts_rank_pos, "is_pg guard must precede the ts_rank branch"
-    assert is_pg_pos < multi_pos, "is_pg guard must precede the _multiword_or_ranked_clause branch"
+    assert is_pg_pos < multi_pos, "is_pg guard must precede the _multiword_and_ranked_clause branch"
 
 
 # ---------------------------------------------------------------------------
@@ -456,7 +455,7 @@ async def test_search_all_unchanged_by_planning_search_addition(anydb):
     assert hasattr(db_module, "planning_search")
     await db_module.planning_search(db, p["id"], "img127 coverage")
 
-    result = await db_module.search_all(db, p["id"], _LONG_QUERY)
+    result = await db_module.search_all(db, p["id"], "img127 coverage gap")
     assert set(result.keys()) == {
         "query", "tasks", "notes", "decisions", "sprint_items", "total",
         # W1-A additive pagination fields (search_all cursor/limit).
@@ -464,7 +463,7 @@ async def test_search_all_unchanged_by_planning_search_addition(anydb):
     }
     assert any(
         i["title"] == "img127 coverage gap" for i in result["sprint_items"]
-    ), "search_all's own graceful-degradation behavior must be unaffected"
+    ), "search_all's own matching must be unaffected"
 
 
 def test_search_synthesis_handler_still_calls_search_all():

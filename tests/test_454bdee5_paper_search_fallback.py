@@ -335,7 +335,8 @@ async def test_arxiv_happy_path_is_unchanged_and_never_touches_a_fallback(net, n
     assert out["results"][0]["arxiv_id"] == "2404.14082v3"
     assert net.urls() == [ps._ARXIV_API]
     call = net.calls[0]
-    assert call["params"]["search_query"] == "all:mechanistic interpretability"
+    # A multi-word query is sent as an exact phrase (see test_arxiv_query_quoting).
+    assert call["params"]["search_query"] == 'all:"mechanistic interpretability"'
     assert call["headers"] == {"User-Agent": "Meridian/paper_search (research routing)"}
     assert net.clients[0]["follow_redirects"] is True
     assert no_sleep == []
