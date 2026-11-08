@@ -197,7 +197,7 @@ def _ensure_event_loop() -> "asyncio.AbstractEventLoop":
         return loop
 
 
-_SUBCOMMANDS = ("artifacts", "doctor", "hooks", "memory", "recovery", "setup", "zotero")
+_SUBCOMMANDS = ("artifacts", "doctor", "hooks", "memory", "recovery", "setup", "ssh-bootstrap", "zotero")
 
 
 def _dispatch_subcommand(raw_argv: list[str]) -> int | None:
@@ -219,6 +219,10 @@ def _dispatch_subcommand(raw_argv: list[str]) -> int | None:
       write a selected-session context pack into host-local application data.
     * ``artifacts configure|capture|restore|export|purge`` -- manage opted-in,
       local-only provider output capture and verification.
+    * ``ssh-bootstrap --host H [--user U] [--port P] [--identity-file PATH]
+      [--os linux|darwin] [--arch amd64|arm64] [--repo P] [--plan] [--json]`` --
+      install Serena and codebase-memory-mcp on an SSH host, bound to 127.0.0.1.
+      ``--plan`` prints the steps and runs nothing (see ``meridian.ssh_bootstrap``).
     * ``zotero sync`` -- run one bounded workstation sync of hosted citation
       markers through authenticated MCP calls; no background loop is started.
     * ``zotero install-plugin [--profile DIR] [--dry-run] [--keep-zotero-open]`` -- install the
@@ -253,6 +257,10 @@ def _dispatch_subcommand(raw_argv: list[str]) -> int | None:
         from .artifact_capture import cli_main as _artifact_cli
 
         return _artifact_cli(raw_argv[1:])
+    if raw_argv[0] == "ssh-bootstrap":
+        from .ssh_bootstrap import cli_main as _ssh_bootstrap_cli
+
+        return _ssh_bootstrap_cli(raw_argv[1:])
     if raw_argv[0] == "zotero":
         if len(raw_argv) > 1 and raw_argv[1] == "install-plugin":
             from .zotero_plugin_install import cli_main as _plugin_cli
