@@ -8,8 +8,11 @@ when the playwright package or chromium is absent.
 
 from __future__ import annotations
 
+import asyncio
+import contextlib
 import json
 import socket
+import sys
 import threading
 import time
 import pytest
@@ -241,6 +244,62 @@ except ImportError:
 pytestmark_playwright = pytest.mark.skipif(
     not _PLAYWRIGHT_AVAILABLE, reason="playwright not installed — run pixi run install-browsers"
 )
+
+
+@contextlib.contextmanager
+def _proactor_loop_policy():
+    """Pin the Windows Proactor event-loop policy for the duration of the block.
+
+    Playwright's sync API builds its driver loop with ``asyncio.new_event_loop()``
+    and spawns the driver with ``asyncio.create_subprocess_exec``, which needs a
+    ProactorEventLoop on Windows. ``meridian/__main__.py`` sets the process-wide
+    policy to WindowsSelectorEventLoopPolicy at import time, and any test module
+    that imports it leaves that policy installed for the rest of the process. The
+    Playwright tests then fail with a bare NotImplementedError, but only when such a
+    module was collected first (order-dependent). The previous policy is restored on
+    exit so other modules see no change. No-op off Windows.
+    """
+    if sys.platform != "win32":
+        yield
+        return
+    previous = asyncio.get_event_loop_policy()
+    asyncio.set_event_loop_policy(asyncio.WindowsProactorEventLoopPolicy())
+    try:
+        yield
+    finally:
+        asyncio.set_event_loop_policy(previous)
+
+
+@pytest.fixture(autouse=True)
+def _playwright_loop_policy():
+    """Run every test in this module under the Proactor policy (see above)."""
+    with _proactor_loop_policy():
+        yield
+
+
+def test_proactor_loop_policy_restores_previous_policy():
+    """Regression guard for the order-dependent NotImplementedError above.
+
+    Inside the block a new loop is a ProactorEventLoop even when the process-wide
+    policy is Selector (as left behind by ``meridian.__main__``), and the Selector
+    policy is restored on exit.
+    """
+    if sys.platform != "win32":
+        pytest.skip("Proactor/Selector loop distinction is Windows-only")
+    original = asyncio.get_event_loop_policy()
+    asyncio.set_event_loop_policy(asyncio.WindowsSelectorEventLoopPolicy())
+    try:
+        with _proactor_loop_policy():
+            loop = asyncio.new_event_loop()
+            try:
+                assert isinstance(loop, asyncio.ProactorEventLoop)
+            finally:
+                loop.close()
+        assert isinstance(
+            asyncio.get_event_loop_policy(), asyncio.WindowsSelectorEventLoopPolicy
+        )
+    finally:
+        asyncio.set_event_loop_policy(original)
 
 
 @pytestmark_playwright
