@@ -12,3 +12,4 @@ docs/mcp-tools.md text eol=lf
 /tests/test_code_index.py text eol=lf
 /meridian/code_index.py text eol=lf
 /.claude/settings.json text eol=lf
+.claude/hooks/*.sh text eol=lf
