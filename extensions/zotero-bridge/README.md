@@ -40,6 +40,9 @@ the old placeholder `update_url`, so it does not auto-update from GitHub), `0.1.
   must not allow the drive. A linked file's path was also read back through Zotero's local API, which answered with a
   redirect to the path, not the bytes. Not covered live: a symbolic link (creating one needs an administrator or
   Developer Mode), a network drive, and the PDF menu, which needs the Zotero window.
+- **Remembered apps, verified in node only.** The node tests cover the remembered list, the remembered grant that needs
+  no prompt, forgetting an app (which ends its grants), and Deny, which still refuses and remembers nothing. The fourth
+  prompt button, the preferences pane and the preference itself have not run in Zotero. See "Verify before first real use".
 - **Verified in node.** The unit tests cover the HTTP parser, admission, validation, the link policy against a fake
   resolver, the write logic (against a Zotero-shaped fake) and the design-line checks in `test/static-checks.test.js`.
 - **Not verified in Zotero:** the two menu commands, the preferences pane, and the file pickers. These run only
@@ -61,7 +64,8 @@ Zotero's own restore does. That restore is API-only.
   compared in constant time. A write also needs a grant key that a person approved at the desktop (see Write grants).
 - **Local trust.** The token admits a request, but it does not grant a write. A write needs a grant that a person
   approves at the desktop. The API cannot tell that person from another process of the same user, so the desktop
-  prompt is the protection, and it shows the app name as self-reported. The processes share one connection limit of
+  prompt is the protection, and it shows the app name as self-reported. A remembered app name is granted without a
+  prompt (see Write grants). The processes share one connection limit of
   eight. A connection that sends no complete request is closed after ten seconds, so one process can hold a slot for
   up to ten seconds that way. After an answer, the socket stays open for up to five more
   seconds. This affects local availability only: a local process can keep other callers from connecting.
@@ -121,8 +125,8 @@ A write needs a grant key, and a person at the desktop has to approve the grant.
 cannot write on its own.
 
 - `POST /v1/grants` with `{"app_name": "..."}` asks for a grant. The answer is `202` and a `grant_id`. Zotero shows a
-  prompt that names the app. Its buttons are **Allow for 1 hour**, **Allow until Zotero restarts** and **Deny**. Deny is
-  the default, so Enter and Escape both refuse.
+  prompt that names the app. Its buttons are **Allow for 1 hour**, **Allow until Zotero restarts**,
+  **Allow for this app, remembered** and **Deny**. Deny is the default, so Enter and Escape both refuse.
 - `GET /v1/grants/<grant_id>` reports `pending`, `granted`, `denied`, `expired` or `revoked`. When a grant is first seen
   as granted, the reply carries `write_key` once. A later request does not return it again.
 - Send the key as `Meridian-Write-Grant: <write_key>` on every write. A write without a live key is refused with
@@ -130,13 +134,29 @@ cannot write on its own.
 - `DELETE /v1/grants/<grant_id>` ends a grant at once.
 - An hour grant ends after one hour. A session grant ends when Zotero restarts, or after eight hours at most. Nothing is
   written to disk, so a restart clears every grant.
-- Limits: one request can wait for an answer at a time (a second is refused with `grant_busy`). An app name that was
-  refused waits five minutes before it can ask again (`grant_cooldown`). Six requests in ten minutes is the most
+- Limits: one request can wait for an answer at a time (a second is refused with `grant_busy`). A remembered name is
+  granted at once, so it is not refused for that. An app name that was refused waits five minutes before it can ask
+  again (`grant_cooldown`). Six requests in ten minutes is the most
   (`grant_rate_limited`). If Zotero cannot show the prompt, the request is refused. An error never grants anything.
 - The app name is what the requester says it is, and the prompt says so.
 - **What this does not stop.** A grant key goes back to whichever process asked, so approving a request also gives that
   process its key. The prompt cannot tell the desktop app from another process of the same user, and it cannot see
   which process asked. Read the app name, and approve only a request you made yourself.
+- **Remembered apps.** **Allow for this app, remembered** grants the request and adds the app name to a list. The list
+  is kept in the preference `extensions.zotero.meridianZoteroBridge.rememberedApps`, as JSON with each name and the time
+  it was approved. A later request from a name on the list is granted at once, with no prompt, for one hour. The name
+  is matched without regard to letter case or surrounding spaces, the same way as the refusal cooldown. A remembered
+  name does not wait behind a prompt for another app. Its grant is one hour long, whatever the first approval was, and
+  each of its requests still counts toward the six-in-ten-minutes limit. The list holds 50 names at most. A
+  preference that cannot be read, or holds text that is not a valid list, reads as an empty list, so those apps prompt
+  again. A new app name still prompts, even while others are remembered.
+- **Forgetting an app.** The preferences pane lists each remembered name with a **Revoke** button. Revoking removes the
+  name from the list and ends every live grant that app holds, including a request still waiting for an answer. The
+  app's next request prompts again. A prompt that is already open cannot be closed from here, but its answer is then
+  ignored, so an **Allow for this app, remembered** answer after a revoke remembers nothing.
+- **Known tradeoff, accepted by the owner and not fixed in this build.** The app name is self-reported. A local program
+  that sends a remembered name gets a grant with no prompt, for as long as that name stays on the list. The prompt
+  cannot stop this, and the list does not check who is asking. Revoke any name you no longer trust.
 
 Reads: use Zotero's own local API (`http://127.0.0.1:23119/api/users/0/...`), which Zotero serves when
 "Allow other applications on this computer to communicate with Zotero" is on. The write API does not serve reads.
@@ -168,7 +188,7 @@ Collection responses have the same fields except `date_modified`, because Zotero
 | `POST /v1/tags/rename` | `from`, `to` | Renames a tag across the user library. Not allowed inside a batch. |
 | `POST /v1/import/bibtex` | `bibtex`, optional `collection_key`, optional `dry_run` | Returns the plan: what would import, the exact duplicates, and the conflicts. `dry_run: true` writes nothing. A file whose library changes during the parse is refused with 409 `library_changed`, and nothing is imported. Not allowed inside a batch. |
 | `POST /v1/batch` | `operations`: a list of `{method, path, body}` | Runs the operations in one transaction. Any failure rolls the whole batch back and reports `failed_index`. Needs a write grant key. |
-| `POST /v1/grants` | `app_name` | Asks a person at the desktop for a write grant. Answers 202 with a `grant_id`. The token is enough here. |
+| `POST /v1/grants` | `app_name` | Asks a person at the desktop for a write grant. Answers 202 with a `grant_id`. A remembered app name is granted at once, with no prompt. The token is enough here. |
 | `GET /v1/grants/{id}` | none | Reports the grant's status. Returns `write_key` once, when the grant is first granted. The token is enough here. |
 | `DELETE /v1/grants/{id}` | none | Ends the grant at once. The token is enough here. |
 
@@ -352,6 +372,8 @@ the run goes on, so the summary always shows every item.
   linked files may come from, separated by vertical bars (`|`). Shown in the preferences pane. The write API cannot set it.
 - `extensions.zotero.meridianZoteroBridge.apiPort`, default `23125`. Set by the install.
 - `extensions.zotero.meridianZoteroBridge.apiTokenPath`, default empty, which keeps the API off. Set by the install.
+- `extensions.zotero.meridianZoteroBridge.rememberedApps`, default `[]`. The app names approved with **Allow for this
+  app, remembered**, as JSON. Shown in the preferences pane, where each can be revoked. Written only by the add-on.
 
 ## Compatibility
 
@@ -395,6 +417,12 @@ Not verified yet:
    it, or swap in its current picker helper.
 7. **Citation key on imported items.** The BibTeX import reads the key from the translator's itemID field and writes a BibTeX key: <key> line into Extra, which the PDF step reads. Verified live on 2026-10-17: an imported entry's Extra holds BibTeX key: <key>.
 
+8. **Remembered apps and the four-button prompt.** The node tests cover the list and the grant logic. The prompt's
+   fourth button, the preferences pane and the Zotero preference have not run in Zotero. The prompt uses
+   `Zotero.Prompt.confirm` with four buttons, which has not been checked in Zotero 10. If Zotero shows only three
+   buttons, the remember choice is missing and nothing is remembered, while the other grants still work. If it refuses
+   the fourth button, every prompt refuses, which is the fail-closed outcome. Check this first in the disposable profile.
+
 ## Disposable-profile test checklist
 
 Use a fresh profile that is not your working profile, with its own data folder, and a test library with a few items.
@@ -417,6 +445,11 @@ Do not use your real library.
 9. Disable and re-enable the plugin, then restart Zotero. Menus, the pane and the API still work once, with no duplicate
    menu entries.
 10. Remove the plugin. Menus and the pane are gone, the API stops, and no plugin errors appear.
+11. Remembered apps: `POST /v1/grants` with a new app name, and choose **Allow for this app, remembered**. Poll the grant
+    until it is granted and write with its key. Then request the same name again, in a different letter case. Expect
+    `granted` at once, with no dialog. Open the preferences pane, the name is listed, and click **Revoke**. Expect the
+    earlier key to be refused at once, and the next request for that name to show the dialog again. Check also that
+    the four buttons show, that Enter and Escape refuse, and that the preference holds a JSON list.
 
 ## Tests
 
@@ -437,6 +470,8 @@ Files:
 - `lib/api/items.js`, `lib/api/collections.js`: the write logic. `test/api-items.test.js` and
   `test/api-collections.test.js`, both run against `test/support/fake-zotero.js`, which is not Zotero.
 - `lib/api/app.js`: routes, JSON bodies, the write queue, and batches. `test/api-app.test.js`.
+- `lib/api/grants.js`, `lib/api/remembered.js`: the write grants, the desktop answer mapping, and the remembered apps list.
+  `test/grants.test.js` and `test/api-remembered.test.js`.
 - `api/listener.js`: the socket. Covered by the live checks, not by node.
 - `bootstrap.js`: Zotero glue (install, startup, shutdown, menus, pane, translator, attachments, the API).
 - `test/static-checks.test.js`: the design line.

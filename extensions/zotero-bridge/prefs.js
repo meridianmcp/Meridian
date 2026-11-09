@@ -15,5 +15,10 @@ pref("extensions.zotero.meridianZoteroBridge.linkFolders", "");
 // apiPort: the loopback port for the local write API. The Meridian install sets the same value.
 // apiTokenPath: the file that holds the bearer token. The Meridian install writes it into the
 //               profile's user.js. Empty means the API stays off.
+// rememberedApps: the apps a person chose to remember at the write prompt, as a JSON list of
+//                 {"name": ..., "approved_at": ...}. A request from a listed name is granted without a prompt.
+//                 The pane lists them and can forget each one. Written only by the add-on, never by the API.
+pref("extensions.zotero.meridianZoteroBridge.rememberedApps", "[]");
+
 pref("extensions.zotero.meridianZoteroBridge.apiPort", 23125);
 pref("extensions.zotero.meridianZoteroBridge.apiTokenPath", "");

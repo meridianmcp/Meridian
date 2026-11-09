@@ -26,6 +26,13 @@
     folder. Zotero's local API tells local programs the path of every linked file, so list only folders you are
     willing to have pointed at.
   </description>
+  <label value="Remembered apps"/>
+  <description>
+    Apps you chose to allow and remember at the write prompt. A request from a remembered name is granted without a
+    prompt, for one hour each time. Revoke an app to end its live grant and make it prompt again. The name is
+    self-reported, so a local program that uses a remembered name gets through without a prompt.
+  </description>
+  <vbox id="meridian-remembered-list"/>
   <description>
     Duplicate policy for BibTeX import, applied before anything is written.
     An entry is skipped as an exact duplicate when its DOI matches an item already
