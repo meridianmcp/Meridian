@@ -1,4 +1,4 @@
-"""Tests for the local secrets broker, slice 1.
+"""Tests for the local secrets broker, slices 1 and 2.
 
 Every credential here is a fake value. Each test injects InMemoryCredentialStore,
 so the OS credential store is never touched.
@@ -7,6 +7,7 @@ so the OS credential store is never touched.
 from __future__ import annotations
 
 import base64
+import dataclasses
 import hashlib
 import json
 import os
@@ -60,7 +61,7 @@ def _put(
     name: str = NAME,
     value: str = VALUE,
     group: str = GROUP,
-    sensitivity: str | None = None,
+    sensitivity: str = "SECRET",
     allowed: list[str] | None = None,
 ) -> None:
     broker.put_secret(
@@ -386,11 +387,11 @@ def test_secret_item_runs_without_approval(broker):
     assert broker.run_with_secret(NAME, [PY, "-c", "pass"]).exit_code == 0
 
 
-def test_unset_class_defaults_to_secret_and_runs(broker):
+def test_put_without_a_class_is_a_type_error(broker):
     broker.initialize(PASSPHRASE)
-    broker.put_secret(NAME, VALUE, group=GROUP, purpose=PURPOSE, allowed_commands=[PY])
-    assert broker.list_names()[0]["class"] == "SECRET"
-    assert broker.run_with_secret(NAME, [PY, "-c", "pass"]).status == "completed"
+    with pytest.raises(TypeError):
+        broker.put_secret(NAME, VALUE, group=GROUP, purpose=PURPOSE, allowed_commands=[PY])
+    assert broker.list_names() == []
 
 
 def test_plain_item_runs_with_its_value_and_the_output_is_redacted(broker):
@@ -435,6 +436,197 @@ def test_missing_executable_raises_broker_error_without_the_value(broker, vault_
     with pytest.raises(sb.BrokerError) as info:
         broker.run_with_secret(NAME, [missing])
     assert VALUE not in str(info.value)
+
+
+# -- approver for SENSITIVE items (slice 2) ---------------------------------
+
+
+class _RecordingApprover:
+    """Approver stand-in: records each request and returns (or raises) a fixed answer."""
+
+    def __init__(self, answer: object) -> None:
+        self.answer = answer
+        self.requests: list[sb.ApprovalRequest] = []
+
+    def __call__(self, request: sb.ApprovalRequest) -> object:
+        self.requests.append(request)
+        if isinstance(self.answer, BaseException):
+            raise self.answer
+        return self.answer
+
+
+def _audit_entries(vault_dir: Path) -> tuple[str, list[dict]]:
+    text = (vault_dir / sb.AUDIT_FILE_NAME).read_text(encoding="utf-8")
+    return text, [json.loads(line) for line in text.splitlines()]
+
+
+def _marker_code(marker: Path) -> str:
+    return f"open({str(marker)!r}, 'w').close()"
+
+
+def test_without_an_approver_a_sensitive_run_is_unchanged(broker, vault_dir, tmp_path):
+    broker.initialize(PASSPHRASE)
+    _put(broker, sensitivity="SENSITIVE")
+    marker = tmp_path / "ran.txt"
+    result = broker.run_with_secret(NAME, [PY, "-c", _marker_code(marker)], approver=None)
+    assert result.status == "approval_required"
+    assert not marker.exists()
+    _, entries = _audit_entries(vault_dir)
+    assert [entry["outcome"] for entry in entries] == ["approval_required"]
+
+
+def test_approved_sensitive_run_executes_once_and_logs_approved_then_run(broker, vault_dir, tmp_path):
+    broker.initialize(PASSPHRASE)
+    _put(broker, sensitivity="SENSITIVE", value=SPECIAL_VALUE)
+    marker = tmp_path / "ran.txt"
+    argv = [PY, "-c", _marker_code(marker)]
+    approver = _RecordingApprover(True)
+    result = broker.run_with_secret(NAME, argv, approver=approver, client="fake client")
+    assert result.status == "completed"
+    assert result.exit_code == 0
+    assert marker.exists()
+    assert approver.requests == [
+        sb.ApprovalRequest(
+            name=NAME,
+            purpose=PURPOSE,
+            group=GROUP,
+            command=PY,
+            argv=tuple(argv),
+            client="fake client",
+        )
+    ]
+    text, entries = _audit_entries(vault_dir)
+    assert [entry["outcome"] for entry in entries] == ["approved", "started", "completed"]
+    assert entries[0]["client"] == "fake client"
+    assert "client" not in entries[1]
+    for leaked in (SPECIAL_VALUE, base64.b64encode(SPECIAL_VALUE.encode("utf-8")).decode("ascii")):
+        assert leaked not in text
+
+
+def test_denied_sensitive_run_does_not_run_and_logs_one_denied_line(broker, vault_dir, tmp_path):
+    broker.initialize(PASSPHRASE)
+    _put(broker, sensitivity="SENSITIVE")
+    marker = tmp_path / "ran.txt"
+    approver = _RecordingApprover(False)
+    result = broker.run_with_secret(
+        NAME, [PY, "-c", _marker_code(marker)], approver=approver, client="fake client"
+    )
+    assert result.status == "denied"
+    assert result.exit_code is None
+    assert result.stdout == "" and result.stderr == ""
+    assert not marker.exists()
+    assert len(approver.requests) == 1
+    _, entries = _audit_entries(vault_dir)
+    assert [entry["outcome"] for entry in entries] == ["denied"]
+    assert entries[0]["secret"] == NAME
+    assert entries[0]["client"] == "fake client"
+
+
+@pytest.mark.parametrize(
+    "answer",
+    ["yes", 1, None, RuntimeError("FAKE prompt failure")],
+    ids=["string", "integer", "none", "raises"],
+)
+def test_anything_but_an_exact_true_denies(broker, vault_dir, tmp_path, answer):
+    broker.initialize(PASSPHRASE)
+    _put(broker, sensitivity="SENSITIVE")
+    marker = tmp_path / "ran.txt"
+    result = broker.run_with_secret(NAME, [PY, "-c", _marker_code(marker)], approver=_RecordingApprover(answer))
+    assert result.status == "denied"
+    assert not marker.exists()
+    _, entries = _audit_entries(vault_dir)
+    assert [entry["outcome"] for entry in entries] == ["denied"]
+
+
+def test_approved_sensitive_output_is_still_redacted(broker):
+    broker.initialize(PASSPHRASE)
+    _put(broker, value=SPECIAL_VALUE, sensitivity="SENSITIVE")
+    code = f"import os; print(os.environ[{NAME!r}])"
+    result = broker.run_with_secret(NAME, [PY, "-c", code], approver=_RecordingApprover(True))
+    assert result.status == "completed"
+    assert result.stdout.strip() == "[REDACTED]"
+
+
+def test_approver_is_not_asked_when_an_earlier_check_refuses(broker, tmp_path):
+    broker.initialize(PASSPHRASE)
+    _put(broker, sensitivity="SENSITIVE")
+    approver = _RecordingApprover(True)
+    with pytest.raises(sb.CommandNotAllowed):
+        broker.run_with_secret(NAME, ["python", "-c", "pass"], approver=approver)
+    broker.set_enabled(False, name=NAME)
+    with pytest.raises(sb.SecretDisabled):
+        broker.run_with_secret(NAME, [PY, "-c", "pass"], approver=approver)
+    assert approver.requests == []
+
+
+def test_approver_is_not_asked_about_secret_or_plain_items(broker):
+    broker.initialize(PASSPHRASE)
+    _put(broker, name="FAKE_SECRET_ITEM", sensitivity="SECRET")
+    _put(broker, name="FAKE_PLAIN_ITEM2", value=PUBLIC_VALUE, sensitivity="PUBLIC")
+    approver = _RecordingApprover(False)
+    assert broker.run_with_secret("FAKE_SECRET_ITEM", [PY, "-c", "pass"], approver=approver).status == "completed"
+    assert broker.run_with_secret("FAKE_PLAIN_ITEM2", [PY, "-c", "pass"], approver=approver).status == "completed"
+    assert approver.requests == []
+
+
+def test_the_value_is_used_only_after_approval(broker, monkeypatch):
+    """The integrity pass decrypts and discards before any approval; the value is used after one.
+
+    Events are recorded in order. Before the approver, the only decrypt is the integrity
+    pass. After a denial nothing else is decrypted. After an approval the value is
+    decrypted once more, for use in the child's environment.
+    """
+    broker.initialize(PASSPHRASE)
+    _put(broker, sensitivity="SENSITIVE")
+    events: list[str] = []
+    real_decrypt = sb._decrypt_record
+
+    def spy(master: bytes, name: str, record: dict) -> bytes:
+        events.append(f"decrypt:{name}")
+        return real_decrypt(master, name, record)
+
+    def approver_answering(answer: bool):
+        def ask(request: sb.ApprovalRequest) -> bool:
+            events.append("approver")
+            return answer
+
+        return ask
+
+    monkeypatch.setattr(sb, "_decrypt_record", spy)
+    denied = broker.run_with_secret(NAME, [PY, "-c", "pass"], approver=approver_answering(False))
+    assert denied.status == "denied"
+    assert events == [f"decrypt:{NAME}", "approver"]
+    events.clear()
+    approved = broker.run_with_secret(NAME, [PY, "-c", "pass"], approver=approver_answering(True))
+    assert approved.status == "completed"
+    assert events == [f"decrypt:{NAME}", "approver", f"decrypt:{NAME}"]
+
+
+def test_approval_audit_failure_blocks_the_run(broker, tmp_path, monkeypatch):
+    broker.initialize(PASSPHRASE)
+    _put(broker, sensitivity="SENSITIVE")
+    marker = tmp_path / "ran.txt"
+
+    def failing_append(path, line):
+        raise OSError("disk full")
+
+    monkeypatch.setattr(sb, "_append_audit_line", failing_append)
+    with pytest.raises(sb.AuditUnavailable):
+        broker.run_with_secret(NAME, [PY, "-c", _marker_code(marker)], approver=_RecordingApprover(True))
+    assert not marker.exists()
+
+
+@pytest.mark.parametrize("client", ["", "   ", "x" * 201, "bad\x00client", 7])
+def test_client_label_is_validated(broker, client):
+    broker.initialize(PASSPHRASE)
+    _put(broker, sensitivity="SENSITIVE")
+    with pytest.raises(sb.InvalidInput):
+        broker.run_with_secret(NAME, [PY, "-c", "pass"], approver=_RecordingApprover(True), client=client)
+
+
+def test_the_approval_request_has_metadata_fields_only():
+    fields = {field.name for field in dataclasses.fields(sb.ApprovalRequest)}
+    assert fields == {"name", "purpose", "group", "command", "argv", "client"}
 
 
 # -- redaction --------------------------------------------------------------
@@ -563,15 +755,82 @@ def test_reserved_loader_variable_names_are_rejected(broker, reserved):
 def test_allowed_commands_must_be_absolute_paths(broker):
     broker.initialize(PASSPHRASE)
     with pytest.raises(sb.InvalidInput):
-        broker.put_secret(NAME, VALUE, group=GROUP, purpose=PURPOSE, allowed_commands=["python"])
+        broker.put_secret(
+            NAME, VALUE, group=GROUP, purpose=PURPOSE, allowed_commands=["python"], sensitivity="SECRET"
+        )
     with pytest.raises(sb.InvalidInput):
-        broker.put_secret(NAME, VALUE, group=GROUP, purpose=PURPOSE, allowed_commands=[])
+        broker.put_secret(
+            NAME, VALUE, group=GROUP, purpose=PURPOSE, allowed_commands=[], sensitivity="SECRET"
+        )
 
 
 def test_values_must_be_at_least_eight_bytes(broker):
     broker.initialize(PASSPHRASE)
     with pytest.raises(sb.InvalidInput):
         _put(broker, value="short")
+
+
+# -- value floor: 8 bytes for every class ------------------------------------
+#
+# Slice 2 proposed a 1-byte floor for PUBLIC and INTERNAL. It is not adopted: the
+# 8-byte floor holds for every class, because a 1-byte value would redact ordinary output.
+
+
+@pytest.mark.parametrize("cls", ["PUBLIC", "INTERNAL", "SECRET", "SENSITIVE"])
+def test_a_one_byte_value_is_refused_for_every_class(broker, cls):
+    broker.initialize(PASSPHRASE)
+    with pytest.raises(sb.InvalidInput):
+        _put(broker, name="FAKE_ONE_BYTE", value="x", sensitivity=cls)
+    assert broker.list_names() == []
+
+
+@pytest.mark.parametrize("cls", ["PUBLIC", "INTERNAL"])
+def test_an_empty_plain_value_is_still_refused(broker, cls):
+    broker.initialize(PASSPHRASE)
+    with pytest.raises(sb.InvalidInput):
+        _put(broker, name="FAKE_EMPTY_ITEM", value="", sensitivity=cls)
+    assert broker.list_names() == []
+
+
+@pytest.mark.parametrize("cls", ["PUBLIC", "INTERNAL", "SECRET", "SENSITIVE"])
+def test_a_seven_byte_value_is_refused_for_every_class(broker, cls):
+    broker.initialize(PASSPHRASE)
+    with pytest.raises(sb.InvalidInput):
+        _put(broker, name="FAKE_SHORT_ITEM", value="1234567", sensitivity=cls)  # 7 bytes
+    assert broker.list_names() == []
+
+
+@pytest.mark.parametrize("cls", ["PUBLIC", "INTERNAL", "SECRET", "SENSITIVE"])
+def test_an_eight_byte_value_is_accepted_for_every_class(broker, cls):
+    broker.initialize(PASSPHRASE)
+    _put(broker, name="FAKE_EIGHT_ITEM", value="12345678", sensitivity=cls)
+    assert [row["name"] for row in broker.list_names()] == ["FAKE_EIGHT_ITEM"]
+
+
+def test_the_floor_counts_utf8_bytes_not_characters(broker):
+    broker.initialize(PASSPHRASE)
+    with pytest.raises(sb.InvalidInput):
+        _put(broker, name="FAKE_UTF8_SHORT", value="ééé", sensitivity="SECRET")  # 3 chars, 6 bytes
+    _put(broker, name="FAKE_UTF8_OK", value="éééé", sensitivity="SECRET")  # 4 chars, 8 bytes
+    assert [row["name"] for row in broker.list_names()] == ["FAKE_UTF8_OK"]
+
+
+@pytest.mark.parametrize("cls", ["PUBLIC", "INTERNAL", "SECRET", "SENSITIVE"])
+def test_the_maximum_stays_8192_bytes_for_every_class(broker, cls):
+    broker.initialize(PASSPHRASE)
+    _put(broker, name="FAKE_MAX_ITEM", value="a" * sb.MAX_VALUE_BYTES, sensitivity=cls)
+    with pytest.raises(sb.InvalidInput):
+        _put(broker, name="FAKE_OVER_ITEM", value="a" * (sb.MAX_VALUE_BYTES + 1), sensitivity=cls)
+
+
+def test_encode_value_has_one_floor_for_every_class():
+    assert sb._encode_value("12345678") == b"12345678"
+    with pytest.raises(sb.InvalidInput):
+        sb._encode_value("1234567")
+    with pytest.raises(sb.InvalidInput):
+        sb._encode_value("1234567\x00")  # 8 bytes, but a NUL is refused
+    with pytest.raises(sb.InvalidInput):
+        sb._encode_value(123)
 
 
 @pytest.mark.parametrize(
@@ -630,18 +889,12 @@ def test_secret_and_sensitive_values_are_encrypted(broker, vault_dir, cls):
 
 
 @pytest.mark.parametrize("unset", [None, "", "bogus", "public", "Sensitive"])
-def test_unknown_or_unset_class_fails_closed_to_secret(broker, vault_dir, unset):
+def test_unknown_or_unset_class_is_refused_and_writes_nothing(broker, vault_dir, unset):
     broker.initialize(PASSPHRASE)
-    _put(broker, name="FAKE_UNSET_ITEM", value=SPECIAL_VALUE, sensitivity=unset)
-    record = _record(vault_dir, "FAKE_UNSET_ITEM")
-    assert record["class"] == "SECRET"
-    assert "value" not in record
-    listed = {row["name"]: row["class"] for row in broker.list_names()}
-    assert listed["FAKE_UNSET_ITEM"] == "SECRET"
-    result = broker.run_with_secret(
-        "FAKE_UNSET_ITEM", [PY, "-c", _match_code("FAKE_UNSET_ITEM", SPECIAL_VALUE)]
-    )
-    assert result.stdout == "match"
+    with pytest.raises(sb.InvalidInput):
+        _put(broker, name="FAKE_UNSET_ITEM", value=SPECIAL_VALUE, sensitivity=unset)
+    assert not (vault_dir / sb.VAULT_FILE_NAME).exists()
+    assert broker.list_names() == []
 
 
 def test_plain_entry_with_an_unknown_class_is_refused(broker, vault_dir):
@@ -668,7 +921,7 @@ def test_plain_entry_with_an_unknown_class_is_refused(broker, vault_dir):
     [
         ("SECRET", "SENSITIVE", sb.IntegrityError),
         ("SENSITIVE", "SECRET", sb.IntegrityError),
-        ("SECRET", "bogus", sb.IntegrityError),
+        ("SECRET", "bogus", sb.BrokerError),
         ("SECRET", "INTERNAL", sb.BrokerError),
         ("SECRET", "PUBLIC", sb.BrokerError),
     ],
@@ -687,6 +940,108 @@ def test_changing_a_class_fails_verification(vault_dir, store, old_class, new_cl
         second.unlock(PASSPHRASE)
     assert VALUE not in str(info.value)
     assert not second.is_unlocked()
+
+
+# -- index tag: plain items and the record set -------------------------------
+
+
+def _edit_vault(vault_dir: Path, mutate) -> None:
+    path = vault_dir / sb.VAULT_FILE_NAME
+    doc = json.loads(path.read_text(encoding="utf-8"))
+    mutate(doc)
+    path.write_text(json.dumps(doc), encoding="utf-8")
+
+
+def _plain_setup(vault_dir: Path, store: InMemoryCredentialStore) -> None:
+    first = sb.SecretsBroker(vault_dir, store)
+    first.initialize(PASSPHRASE)
+    _put(first, name="FAKE_PUBLIC_ITEM", value=PUBLIC_VALUE, sensitivity="PUBLIC")
+    _put(first, name=NAME, value=VALUE, sensitivity="SECRET")
+    first.close()
+
+
+def test_editing_a_plain_value_fails_the_index_check_at_unlock(vault_dir, store):
+    _plain_setup(vault_dir, store)
+    _edit_vault(
+        vault_dir,
+        lambda doc: doc["secrets"]["FAKE_PUBLIC_ITEM"].__setitem__("value", "FAKE-public-9.9.9"),
+    )
+    second = sb.SecretsBroker(vault_dir, store)
+    with pytest.raises(sb.IntegrityError) as info:
+        second.unlock(PASSPHRASE)
+    assert "FAKE-public-9.9.9" not in str(info.value)
+    assert not second.is_unlocked()
+
+
+def test_an_item_added_by_hand_fails_the_index_check_at_unlock(vault_dir, store):
+    _plain_setup(vault_dir, store)
+    injected = {
+        "group": GROUP,
+        "purpose": PURPOSE,
+        "allowed_commands": [PY],
+        "class": "PUBLIC",
+        "value": "FAKE-injected",
+    }
+    _edit_vault(vault_dir, lambda doc: doc["secrets"].__setitem__("FAKE_INJECTED", injected))
+    second = sb.SecretsBroker(vault_dir, store)
+    with pytest.raises(sb.IntegrityError):
+        second.unlock(PASSPHRASE)
+    assert not second.is_unlocked()
+
+
+def test_an_item_removed_by_hand_fails_the_index_check_at_unlock(vault_dir, store):
+    _plain_setup(vault_dir, store)
+    _edit_vault(vault_dir, lambda doc: doc["secrets"].pop("FAKE_PUBLIC_ITEM"))
+    second = sb.SecretsBroker(vault_dir, store)
+    with pytest.raises(sb.IntegrityError):
+        second.unlock(PASSPHRASE)
+    assert not second.is_unlocked()
+
+
+def test_a_vault_without_an_index_tag_is_refused(vault_dir, store):
+    _plain_setup(vault_dir, store)
+    _edit_vault(vault_dir, lambda doc: doc.pop("index_tag"))
+    second = sb.SecretsBroker(vault_dir, store)
+    with pytest.raises(sb.IntegrityError):
+        second.unlock(PASSPHRASE)
+    assert not second.is_unlocked()
+
+
+def test_put_refuses_to_re_tag_a_vault_edited_after_unlock(vault_dir, store):
+    _plain_setup(vault_dir, store)
+    broker = sb.SecretsBroker(vault_dir, store)
+    broker.unlock(PASSPHRASE)
+    try:
+        _edit_vault(
+            vault_dir,
+            lambda doc: doc["secrets"]["FAKE_PUBLIC_ITEM"].__setitem__("value", "FAKE-public-9.9.9"),
+        )
+        path = vault_dir / sb.VAULT_FILE_NAME
+        edited = path.read_bytes()
+        with pytest.raises(sb.IntegrityError):
+            _put(broker, name="FAKE_NEW_ITEM", value=VALUE, sensitivity="SECRET")
+        assert path.read_bytes() == edited  # nothing was written
+    finally:
+        broker.close()
+
+
+def test_run_refuses_a_plain_item_edited_after_unlock(vault_dir, store, tmp_path):
+    _plain_setup(vault_dir, store)
+    broker = sb.SecretsBroker(vault_dir, store)
+    broker.unlock(PASSPHRASE)
+    marker = tmp_path / "ran.txt"
+    try:
+        _edit_vault(
+            vault_dir,
+            lambda doc: doc["secrets"]["FAKE_PUBLIC_ITEM"].__setitem__("value", "FAKE-public-9.9.9"),
+        )
+        with pytest.raises(sb.IntegrityError):
+            broker.run_with_secret(
+                "FAKE_PUBLIC_ITEM", [PY, "-c", f"open({str(marker)!r}, 'w').close()"]
+            )
+        assert not marker.exists()
+    finally:
+        broker.close()
 
 
 def test_recovery_wrap_covers_the_encrypted_vault_only(vault_dir, store):

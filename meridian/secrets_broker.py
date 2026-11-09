@@ -7,8 +7,11 @@ What this slice does:
   file. SECRET and SENSITIVE values are AES-256-GCM encrypted under a random
   32-byte master key. Names, groups, purposes, allowed commands and classes are
   plaintext metadata. For encrypted items they are bound into the AEAD
-  associated data, so editing them on disk fails the integrity check at unlock.
-  An unknown or unset class is treated as SECRET.
+  associated data. Every item, plain or encrypted, is also covered by an index
+  tag: an HMAC-SHA256 under a key derived from the master key. Editing a value,
+  adding or removing an item, or changing a class fails the integrity check at
+  unlock. A class that is not one of the four names is refused with an error;
+  it is never stored as a default.
 * Wraps the master key twice: once under a passphrase and once under a one-time
   recovery code. Each wrapping key comes from hashlib.scrypt and each wrap is
   AES-256-GCM. Both wraps live in an OS credential store behind a small adapter
@@ -22,10 +25,16 @@ What this slice does:
 * Appends JSON lines to an audit log that records names, commands and outcomes,
   never values.
 
-SENSITIVE is the high-risk approval tier: a call on a SENSITIVE item returns
-``approval_required`` and does not run. Not in this slice: the desktop approval
-prompt, the desktop UI, and a Linux credential store (the adapter is a stub that
-raises NotImplementedError).
+SENSITIVE is the high-risk approval tier. A call on a SENSITIVE item with no
+approver returns ``approval_required`` and does not run. With an approver (slice 2:
+the Windows dialog in ``secrets_prompt``), the approver's answer decides: an exact
+``True`` runs the command once and anything else returns ``denied``. The approver
+gets metadata only, never the value. The integrity check decrypts each encrypted
+record in memory to authenticate it, before any approval, and discards that
+plaintext. The value enters the child's environment only after an approval. Each
+answer writes one audit line (``approved`` or ``denied``). Not in this slice: the
+desktop UI, and a Linux credential store (the adapter is a stub that raises
+NotImplementedError).
 
 Handling rule: no code path here formats or logs a secret value. Exception
 messages never contain a value or a passphrase. ``RunResult`` output is redacted
@@ -34,7 +43,8 @@ before it is returned.
 Limits: Python cannot reliably zero memory, so clearing the in-memory key is best
 effort. Redaction covers only the listed encodings; a child that transforms the
 value another way can still leak it. Once a command is allowed to run with a
-secret, that command is trusted with the secret.
+secret, that command is trusted with the secret. Replacing the whole vault file
+with an older copy is not detected: the index tag proves integrity, not freshness.
 """
 
 from __future__ import annotations
@@ -53,6 +63,7 @@ import subprocess
 import sys
 import tempfile
 import urllib.parse
+from collections.abc import Callable
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
@@ -94,6 +105,7 @@ REDACTED_TOKEN = b"[REDACTED]"
 MIN_VALUE_BYTES = 8
 MAX_VALUE_BYTES = 8192
 MAX_PURPOSE_CHARS = 200
+MAX_CLIENT_CHARS = 200
 DEFAULT_TIMEOUT_SECONDS = 300.0
 UNLOCK_FAILED_MESSAGE = (
     "could not unwrap the master key: wrong passphrase or recovery code, "
@@ -128,15 +140,15 @@ _RESERVED_ENV_NAMES = frozenset(
     }
 )
 
+def _check_class(value: object) -> str:
+    """Return the class unchanged, or refuse it. There is no default class."""
+    if not isinstance(value, str) or value not in SENSITIVITY_CLASSES:
+        raise InvalidInput("sensitivity must be one of PUBLIC, INTERNAL, SECRET, SENSITIVE")
+    return value
+
+
 # Common passphrases are checked by SHA-256 digest against a bundled file. The file
 # holds digests only, never plaintext. See the header of that file for its source.
-def effective_sensitivity(value: object) -> str:
-    """Return the class to apply. An unknown or unset class is treated as SECRET."""
-    if isinstance(value, str) and value in SENSITIVITY_CLASSES:
-        return value
-    return SENSITIVITY_SECRET
-
-
 @functools.lru_cache(maxsize=1)
 def _common_passphrase_digests() -> frozenset[str]:
     """SHA-256 digests of the common-passphrase list, read once from the bundled file.
@@ -450,6 +462,17 @@ def _check_purpose(purpose: object) -> str:
     return purpose.strip()
 
 
+def _check_client(client: object) -> str:
+    if (
+        not isinstance(client, str)
+        or not client.strip()
+        or len(client) > MAX_CLIENT_CHARS
+        or "\x00" in client
+    ):
+        raise InvalidInput(f"client must be 1-{MAX_CLIENT_CHARS} characters with no NUL")
+    return client
+
+
 def _encode_value(value: object) -> bytes:
     if not isinstance(value, str):
         raise InvalidInput("value must be a string")
@@ -519,13 +542,43 @@ def _decrypt_record(master: bytes, name: str, record: dict) -> bytes:
         raise IntegrityError(f"secret '{name}' failed its integrity check") from None
 
 
+def _index_tag(master: bytes, records: dict[str, dict]) -> str:
+    """Base64 HMAC-SHA256 over every record, under a key derived from the master key.
+
+    Covers names, every field of every record (plain values included) and the set
+    of records, so a plain value edit, an added item or a deleted item all fail.
+    """
+    subkey = hmac.new(master, b"meridian-secrets-broker/index-key/v1", hashlib.sha256).digest()
+    body = json.dumps(records, sort_keys=True, separators=(",", ":")).encode("utf-8")
+    return _b64(hmac.new(subkey, b"meridian-secrets-broker/index/v1\n" + body, hashlib.sha256).digest())
+
+
+def _verify_vault(master: bytes, records: dict[str, dict], tag: str | None) -> None:
+    """Check every encrypted record, then the index tag. Raises IntegrityError.
+
+    Encrypted records are checked first, so a damaged encrypted item is named in the
+    error. The index tag then covers the plain items and the record set.
+    """
+    for name, record in records.items():
+        if record["class"] in ENCRYPTED_CLASSES:
+            _decrypt_record(master, name, record)
+    if tag is None:
+        raise IntegrityError("vault index has no integrity tag")
+    try:
+        stored = _unb64(tag)
+    except (ValueError, TypeError):
+        raise IntegrityError("vault index failed its integrity check") from None
+    if not hmac.compare_digest(stored, _unb64(_index_tag(master, records))):
+        raise IntegrityError("vault index failed its integrity check")
+
+
 def _check_record_shape(name: str, record: object) -> None:
-    """Fail closed on any record whose fields do not match its effective class.
+    """Fail closed on any record whose fields do not match its class.
 
     PUBLIC and INTERNAL records carry a plaintext ``value`` and no ciphertext.
-    Every other record, including one with an unknown class, must carry
-    ciphertext and no ``value``, so a plaintext value can never sit under a
-    class that should be encrypted.
+    SECRET and SENSITIVE records carry ciphertext and no ``value``, so a plaintext
+    value can never sit under a class that should be encrypted. Any other class is
+    malformed.
     """
     ok = isinstance(record, dict)
     if ok:
@@ -533,12 +586,15 @@ def _check_record_shape(name: str, record: object) -> None:
         ok = ok and isinstance(record.get("allowed_commands"), list)
         ok = ok and all(isinstance(item, str) for item in record["allowed_commands"])
     if ok:
-        if effective_sensitivity(record["class"]) in PLAIN_CLASSES:
-            ok = record["class"] in PLAIN_CLASSES and isinstance(record.get("value"), str)
+        cls = record["class"]
+        if cls in PLAIN_CLASSES:
+            ok = isinstance(record.get("value"), str)
             ok = ok and "nonce" not in record and "ct" not in record
-        else:
+        elif cls in ENCRYPTED_CLASSES:
             ok = isinstance(record.get("nonce"), str) and isinstance(record.get("ct"), str)
             ok = ok and "value" not in record
+        else:
+            ok = False  # unknown class: refused, never defaulted
     if not ok:
         raise BrokerError(f"vault record '{name}' is malformed")
 
@@ -581,12 +637,35 @@ def _append_audit_line(path: Path, line: str) -> None:
 
 @dataclass(frozen=True)
 class RunResult:
-    """status is 'completed', 'timed_out' or 'approval_required'."""
+    """status is 'completed', 'timed_out', 'approval_required' or 'denied'."""
 
     status: str
     exit_code: int | None
     stdout: str
     stderr: str
+
+
+@dataclass(frozen=True)
+class ApprovalRequest:
+    """What an approver is asked about. Metadata only: no field can carry a value."""
+
+    name: str
+    purpose: str
+    group: str
+    command: str
+    argv: tuple[str, ...]
+    client: str
+
+
+Approver = Callable[[ApprovalRequest], bool]
+
+
+def _approver_said_yes(approver: Approver, request: ApprovalRequest) -> bool:
+    """Only an exact True approves. A raising approver is a denial, never a run."""
+    try:
+        return approver(request) is True
+    except Exception:  # any failure at the prompt means the command does not run
+        return False
 
 
 class SecretsBroker:
@@ -665,9 +744,9 @@ class SecretsBroker:
         self._off_groups.clear()
 
     def _open(self, master: bytes) -> None:
-        for name, record in self._load_vault().items():
-            if effective_sensitivity(record["class"]) in ENCRYPTED_CLASSES:
-                _decrypt_record(master, name, record)  # IntegrityError on any mismatch
+        loaded = self._read_vault_file()
+        if loaded is not None:
+            _verify_vault(master, *loaded)  # IntegrityError on any mismatch
         self.close()
         self._key = bytearray(master)
 
@@ -686,15 +765,16 @@ class SecretsBroker:
         group: str,
         purpose: str,
         allowed_commands: list[str],
-        sensitivity: str | None = None,
+        sensitivity: str,
     ) -> None:
-        """Create or replace an item. An unknown or unset class is stored as SECRET.
+        """Create or replace an item. ``sensitivity`` is required: one of the four classes.
 
         Needs an unlocked broker for every class, so the write path has one rule.
+        The vault is verified before it changes, so a tampered file is never re-tagged.
         """
         key = self._require_unlocked()
         _check_name(name)
-        cls = effective_sensitivity(sensitivity)
+        cls = _check_class(sensitivity)
         core = {
             "group": _check_group(group),
             "purpose": _check_purpose(purpose),
@@ -702,28 +782,28 @@ class SecretsBroker:
             "class": cls,
         }
         encoded = _encode_value(value)
-        records = self._load_vault()
+        records = self._load_verified(bytes(key))
         if cls in PLAIN_CLASSES:
             records[name] = {**core, "value": value}
         else:
             nonce = secrets.token_bytes(12)
             ciphertext = AESGCM(bytes(key)).encrypt(nonce, encoded, _record_aad(name, core))
             records[name] = {**core, "nonce": _b64(nonce), "ct": _b64(ciphertext)}
-        self._save_vault(records)
+        self._save_vault(records, bytes(key))
 
     def list_names(self) -> list[dict[str, str]]:
         """Name, group, purpose and class for every item. Never a value.
 
-        Works while locked. Encrypted items' class is verified at unlock (it is
-        bound into their AEAD data). PUBLIC and INTERNAL items have no AEAD, so
-        their metadata is not integrity-checked.
+        Works while locked and reads without the master key. Every field is checked
+        at unlock (encrypted items by their AEAD data, all items by the index tag),
+        so until then these values are unverified.
         """
         return [
             {
                 "name": name,
                 "group": record["group"],
                 "purpose": record["purpose"],
-                "class": effective_sensitivity(record["class"]),
+                "class": record["class"],
             }
             for name, record in sorted(self._load_vault().items())
         ]
@@ -731,10 +811,10 @@ class SecretsBroker:
     def set_enabled(
         self, enabled: bool, *, name: str | None = None, group: str | None = None
     ) -> None:
-        self._require_unlocked()
+        key = self._require_unlocked()
         if (name is None) == (group is None):
             raise InvalidInput("pass exactly one of name or group")
-        records = self._load_vault()
+        records = self._load_verified(bytes(key))
         if name is not None:
             _check_name(name)
             if name not in records:
@@ -770,15 +850,23 @@ class SecretsBroker:
         argv: list[str] | tuple[str, ...],
         *,
         timeout: float = DEFAULT_TIMEOUT_SECONDS,
+        approver: Approver | None = None,
+        client: str = "unspecified",
     ) -> RunResult:
+        """Run one allowed command with the item's value in its environment only.
+
+        ``approver`` is asked only about a SENSITIVE item that has passed every other
+        check. Without one, that call returns ``approval_required`` and does not run.
+        """
         if not isinstance(argv, (list, tuple)) or not argv or not all(isinstance(a, str) for a in argv):
             raise InvalidInput("argv must be a non-empty list of strings")
         _check_name(name)
+        _check_client(client)
         command = argv[0]
         if self._key is None:
             self._audit(name, command, "refused_locked")
             raise BrokerLocked("broker is locked; unlock it first")
-        record = self._load_vault().get(name)
+        record = self._load_verified(bytes(self._key)).get(name)
         if record is None:
             self._audit(name, command, "refused_unknown_secret")
             raise UnknownSecret(f"no secret named '{name}'")
@@ -788,10 +876,24 @@ class SecretsBroker:
         if not _command_allowed(command, record["allowed_commands"]):
             self._audit(name, command, "refused_command_not_allowed")
             raise CommandNotAllowed(f"command is not allowed for secret '{name}'")
-        cls = effective_sensitivity(record["class"])
+        cls = record["class"]
         if cls == SENSITIVITY_SENSITIVE:
-            self._audit(name, command, "approval_required")
-            return RunResult(status="approval_required", exit_code=None, stdout="", stderr="")
+            if approver is None:
+                self._audit(name, command, "approval_required")
+                return RunResult(status="approval_required", exit_code=None, stdout="", stderr="")
+            request = ApprovalRequest(
+                name=name,
+                purpose=record["purpose"],
+                group=record["group"],
+                command=command,
+                argv=tuple(argv),
+                client=client,
+            )
+            approved = _approver_said_yes(approver, request)
+            # One audit line per answer, written before anything runs (fail closed).
+            self._audit(name, command, "approved" if approved else "denied", client=client)
+            if not approved:
+                return RunResult(status="denied", exit_code=None, stdout="", stderr="")
 
         if cls in PLAIN_CLASSES:
             value_text = record["value"]
@@ -831,11 +933,12 @@ class SecretsBroker:
 
     # -- storage -----------------------------------------------------------
 
-    def _load_vault(self) -> dict[str, dict]:
+    def _read_vault_file(self) -> tuple[dict[str, dict], str | None] | None:
+        """Parse the vault file. None when it does not exist. Records are shape-checked."""
         try:
             raw = (self._dir / VAULT_FILE_NAME).read_text(encoding="utf-8")
         except FileNotFoundError:
-            return {}
+            return None
         try:
             doc = json.loads(raw)
         except ValueError:
@@ -846,13 +949,31 @@ class SecretsBroker:
             or not isinstance(doc.get("secrets"), dict)
         ):
             raise BrokerError("vault file has an unexpected format")
+        tag = doc.get("index_tag")
+        if tag is not None and not isinstance(tag, str):
+            raise BrokerError("vault file has an unexpected format")
         for name, record in doc["secrets"].items():
             _check_record_shape(name, record)
-        return doc["secrets"]
+        return doc["secrets"], tag
 
-    def _save_vault(self, records: dict[str, dict]) -> None:
+    def _load_vault(self) -> dict[str, dict]:
+        """Records as stored. Not verified: use _load_verified before trusting or changing them."""
+        loaded = self._read_vault_file()
+        return {} if loaded is None else loaded[0]
+
+    def _load_verified(self, master: bytes) -> dict[str, dict]:
+        """Records after the integrity check. A missing vault file means no records."""
+        loaded = self._read_vault_file()
+        if loaded is None:
+            return {}
+        records, tag = loaded
+        _verify_vault(master, records, tag)
+        return records
+
+    def _save_vault(self, records: dict[str, dict], master: bytes) -> None:
         self._dir.mkdir(parents=True, exist_ok=True)
-        text = json.dumps({"v": FORMAT_VERSION, "secrets": records}, sort_keys=True, indent=2) + "\n"
+        doc = {"v": FORMAT_VERSION, "index_tag": _index_tag(master, records), "secrets": records}
+        text = json.dumps(doc, sort_keys=True, indent=2) + "\n"
         fd, tmp_name = tempfile.mkstemp(dir=self._dir, prefix=".vault-", suffix=".tmp")
         try:
             with os.fdopen(fd, "w", encoding="utf-8", newline="\n") as handle:
@@ -866,7 +987,13 @@ class SecretsBroker:
             raise
 
     def _audit(
-        self, secret: str, command: str, outcome: str, *, exit_code: int | None = None
+        self,
+        secret: str,
+        command: str,
+        outcome: str,
+        *,
+        exit_code: int | None = None,
+        client: str | None = None,
     ) -> None:
         entry: dict[str, object] = {
             "ts": datetime.now(timezone.utc).isoformat(timespec="seconds"),
@@ -876,6 +1003,8 @@ class SecretsBroker:
         }
         if exit_code is not None:
             entry["exit_code"] = exit_code
+        if client is not None:
+            entry["client"] = client
         try:
             _append_audit_line(self._dir / AUDIT_FILE_NAME, json.dumps(entry, sort_keys=True) + "\n")
         except OSError:
