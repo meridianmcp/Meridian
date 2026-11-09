@@ -197,7 +197,7 @@ def _ensure_event_loop() -> "asyncio.AbstractEventLoop":
         return loop
 
 
-_SUBCOMMANDS = ("artifacts", "doctor", "hooks", "memory", "recovery", "setup", "zotero")
+_SUBCOMMANDS = ("artifacts", "doctor", "hooks", "memory", "recovery", "secrets", "setup", "zotero")
 
 
 def _dispatch_subcommand(raw_argv: list[str]) -> int | None:
@@ -219,6 +219,9 @@ def _dispatch_subcommand(raw_argv: list[str]) -> int | None:
       write a selected-session context pack into host-local application data.
     * ``artifacts configure|capture|restore|export|purge`` -- manage opted-in,
       local-only provider output capture and verification.
+    * ``secrets init|list|run NAME -- ARGV`` -- local secrets broker: create the
+      vault, list items without values, or run one allowed command with an item's
+      value in its environment (SENSITIVE items ask in an Approve once / Deny window).
     * ``zotero sync`` -- run one bounded workstation sync of hosted citation
       markers through authenticated MCP calls; no background loop is started.
     * ``zotero install-plugin [--profile DIR] [--dry-run] [--keep-zotero-open]`` -- install the
@@ -253,6 +256,10 @@ def _dispatch_subcommand(raw_argv: list[str]) -> int | None:
         from .artifact_capture import cli_main as _artifact_cli
 
         return _artifact_cli(raw_argv[1:])
+    if raw_argv[0] == "secrets":
+        from .secrets_cli import cli_main as _secrets_cli
+
+        return _secrets_cli(raw_argv[1:])
     if raw_argv[0] == "zotero":
         if len(raw_argv) > 1 and raw_argv[1] == "install-plugin":
             from .zotero_plugin_install import cli_main as _plugin_cli
@@ -272,7 +279,7 @@ def _dispatch_subcommand(raw_argv: list[str]) -> int | None:
 
 def main(argv: list[str] | None = None) -> int:
     """CLI dispatch: HTTP server by default, MCP stdio with ``--mcp``,
-    offline ``artifacts`` / ``doctor`` / ``hooks`` / ``memory`` / ``recovery`` / ``setup`` subcommands (see
+    offline ``artifacts`` / ``doctor`` / ``hooks`` / ``memory`` / ``recovery`` / ``secrets`` / ``setup`` subcommands (see
     ``_dispatch_subcommand``).
 
     Frozen-aware: when running as the downloadable binary (``sys.frozen``) with
