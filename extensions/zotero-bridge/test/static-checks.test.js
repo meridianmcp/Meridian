@@ -34,7 +34,7 @@ function runtimeFiles() {
   assert.ok(fs.existsSync(path.join(PLUGIN_ROOT, 'bootstrap.js')), 'bootstrap.js must exist');
   assert.ok(fs.existsSync(LISTENER), 'api/listener.js must exist');
   const libs = walk(path.join(PLUGIN_ROOT, 'lib'), []).filter((f) => f.endsWith('.js'));
-  const pane = walk(path.join(PLUGIN_ROOT, 'content'), []).filter((f) => f.endsWith('.xhtml'));
+  const pane = walk(path.join(PLUGIN_ROOT, 'content'), []).filter((f) => f.endsWith('.xhtml') || f.endsWith('.js'));
   return [path.join(PLUGIN_ROOT, 'bootstrap.js'), path.join(PLUGIN_ROOT, 'prefs.js'), LISTENER, ...libs, ...pane];
 }
 
@@ -113,6 +113,21 @@ test('no code path can permanently delete a library item or collection', () => {
       assert.equal(pattern.test(text), false, `${relative} contains ${label}`);
     }
   }
+});
+
+test('the desktop prompt keeps Deny as the second button and the default, and maps the answer through promptChoice', () => {
+  const text = fs.readFileSync(path.join(PLUGIN_ROOT, 'bootstrap.js'), 'utf8');
+  assert.match(text, /button1:\s*'Deny'/, 'Deny must stay the second button, the one Escape returns');
+  assert.match(text, /defaultButton:\s*1,/, 'Deny must stay the default button');
+  assert.match(text, /button3:\s*'Allow for this app, remembered'/, 'the remembered choice is the fourth button');
+  assert.match(text, /return meridianLib\['api\/grants'\]\.promptChoice\(index\);/, 'the answer goes through promptChoice');
+  assert.equal(/return 'hour';|return 'session';/.test(text), false, 'bootstrap must not map answers itself');
+});
+
+test('the preferences script builds the remembered list without markup from a name', () => {
+  const text = fs.readFileSync(path.join(PLUGIN_ROOT, 'content', 'preferences.js'), 'utf8');
+  assert.equal(/innerHTML|outerHTML|insertAdjacentHTML|document\.write/.test(text), false, 'names are set as attribute values only');
+  assert.match(text, /setAttribute\('value', entry\.name\)/);
 });
 
 test('no email address other than the plugin id appears anywhere in the plugin folder', () => {

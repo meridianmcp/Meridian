@@ -16,6 +16,7 @@ var MERIDIAN_ADDON_ID = 'meridian-zotero@usemeridian.us';
 var MERIDIAN_PREF_PREFIX = 'extensions.zotero.meridianZoteroBridge.';
 var MERIDIAN_API_PORT_PREF = MERIDIAN_PREF_PREFIX + 'apiPort';
 var MERIDIAN_API_TOKEN_PATH_PREF = MERIDIAN_PREF_PREFIX + 'apiTokenPath';
+var MERIDIAN_REMEMBERED_PREF = MERIDIAN_PREF_PREFIX + 'rememberedApps';
 var MERIDIAN_BIBTEX_TRANSLATOR_ID = '9cb70025-a888-4a29-a210-93ec52da40d4';
 var MERIDIAN_MENU_COLLECTION = 'meridian-zotero-bridge-collection-menu';
 var MERIDIAN_MENU_ITEM = 'meridian-zotero-bridge-item-menu';
@@ -27,11 +28,14 @@ var meridianLib = null;
 var meridianPaneID = null;
 var meridianApi = null;
 var meridianVersion = null;
+var meridianRemembered = null;
+var meridianGrants = null;
 
 var MERIDIAN_API_MODULES = [
   'api/http',
   'api/auth',
   'api/validate',
+  'api/remembered',
   'api/grants',
   'api/link_policy',
   'api/items',
@@ -50,10 +54,12 @@ async function startup(data, reason) {
   meridianVersion = data && data.version;
   meridianLib = meridianLoadLib(rootURI);
   meridianSetDefaultPrefs(rootURI);
+  meridianStartGrants();
   meridianRegisterMenus();
   meridianPaneID = await Zotero.PreferencePanes.register({
     pluginID: MERIDIAN_ADDON_ID,
     src: rootURI + 'content/preferences.xhtml',
+    scripts: [rootURI + 'content/preferences.js'],
     label: 'Meridian Zotero Bridge',
   });
   try {
@@ -90,6 +96,7 @@ function shutdown(data, reason) {
   } catch (error) {
     Zotero.logError(error);
   }
+  meridianStopGrants();
   meridianPaneID = null;
   meridianLib = null;
   meridianRootURI = null;
@@ -508,6 +515,51 @@ async function meridianHasPdfAttachment(item) {
 // Local write API. Routes and checks live in lib/api/; the socket lives in api/listener.js.
 // ---------------------------------------------------------------------------
 
+// Write grants and the remembered apps list are made at startup, not with the API, so the preferences pane can list and
+// forget remembered apps even while the API is off. The pane reaches them through Zotero.MeridianZoteroBridge, which
+// exists only while the add-on runs. See lib/api/grants.js and lib/api/remembered.js.
+function meridianStartGrants() {
+  var remembered = meridianLib['api/remembered'].createRemembered({
+    read: function () {
+      return Services.prefs.getStringPref(MERIDIAN_REMEMBERED_PREF, '[]');
+    },
+    write: function (text) {
+      Services.prefs.setStringPref(MERIDIAN_REMEMBERED_PREF, text);
+    },
+    now: Date.now,
+  });
+  meridianRemembered = remembered;
+  meridianGrants = meridianLib['api/grants'].createGrants({
+    validate: meridianLib['api/validate'],
+    now: Date.now,
+    randomHex: meridianRandomHex,
+    ask: meridianAskWriteGrant,
+    constantTimeEquals: meridianLib['api/auth'].constantTimeEquals,
+    remembered: remembered,
+    log: function (error) {
+      Zotero.logError(error);
+    },
+  });
+  Zotero.MeridianZoteroBridge = {
+    listRemembered: function () {
+      return meridianRemembered ? meridianRemembered.list() : [];
+    },
+    forgetRemembered: function (name) {
+      return meridianGrants ? meridianGrants.forgetApp(name) : { removed: 0, ended: 0 };
+    },
+  };
+}
+
+function meridianStopGrants() {
+  try {
+    delete Zotero.MeridianZoteroBridge;
+  } catch (error) {
+    Zotero.logError(error);
+  }
+  meridianGrants = null;
+  meridianRemembered = null;
+}
+
 async function meridianStartApi() {
   var tokenPath = Services.prefs.getStringPref(MERIDIAN_API_TOKEN_PATH_PREF, '');
   if (!tokenPath) {
@@ -524,17 +576,11 @@ async function meridianStartApi() {
   var validate = meridianLib['api/validate'];
   // One tracker serves both write factories and the app, so a rolled-back batch sees every object it touched.
   var tracker = { inBatch: false, touched: [], created: [] };
-  // Write grants: a person approves each app at the desktop. The token alone never writes. See lib/api/grants.js.
-  var grants = meridianLib['api/grants'].createGrants({
-    validate: validate,
-    now: Date.now,
-    randomHex: meridianRandomHex,
-    ask: meridianAskWriteGrant,
-    constantTimeEquals: meridianLib['api/auth'].constantTimeEquals,
-  });
+  // Write grants are made at startup (meridianStartGrants). The token alone never writes. See lib/api/grants.js.
+  if (!meridianGrants) throw new Error('Write grants are not set up.');
   var app = meridianLib['api/app'].createApp({
     zotero: Zotero,
-    grants: grants,
+    grants: meridianGrants,
     version: meridianVersion,
     host: listenerModule.LOOPBACK_HOST + ':' + port,
     token: token,
@@ -598,17 +644,18 @@ function meridianAskWriteGrant(appName) {
       text:
         'An app asks to write to your Zotero library:\n\n"' + appName + '"\n\n' +
         'The app name is what the app says it is. Allow only if you started this request yourself. ' +
-        'A session grant ends when Zotero restarts, or after 8 hours.',
-      // Deny is the second button, because Escape comes back as that button's index. Only the two allow buttons
-      // grant anything, and every other answer, Escape included, refuses.
+        'A session grant ends when Zotero restarts, or after 8 hours. "Allow for this app, remembered" adds the name ' +
+        'to a list. Later requests from that name are then granted without asking, for one hour each, until you ' +
+        'forget the name in the Meridian Zotero Bridge preferences.',
+      // Deny is the second button, because Escape comes back as that button's index. Only the three allow buttons
+      // grant anything, and every other answer, Escape included, refuses. promptChoice maps the index to a choice.
       button0: 'Allow for 1 hour',
       button1: 'Deny',
       button2: 'Allow until Zotero restarts',
+      button3: 'Allow for this app, remembered',
       defaultButton: 1,
     });
-    if (index === 0) return 'hour';
-    if (index === 2) return 'session';
-    return 'deny';
+    return meridianLib['api/grants'].promptChoice(index);
   });
 }
 
