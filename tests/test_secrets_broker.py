@@ -7,6 +7,7 @@ so the OS credential store is never touched.
 from __future__ import annotations
 
 import base64
+import hashlib
 import json
 import os
 import sys
@@ -26,6 +27,10 @@ NAME = "FAKE_API_KEY"
 GROUP = "fake-group"
 PURPOSE = "fake test key"
 PY = sys.executable
+PUBLIC_VALUE = "FAKE-public-1.2.3"
+INTERNAL_VALUE = "FAKE-internal-port-8080"
+# Replaced at authoring time with one bundled common-list entry (see test body).
+COMMON_LIST_CANDIDATE = "000000000000"
 
 
 class InMemoryCredentialStore:
@@ -55,7 +60,7 @@ def _put(
     name: str = NAME,
     value: str = VALUE,
     group: str = GROUP,
-    risk: str = "routine",
+    sensitivity: str | None = None,
     allowed: list[str] | None = None,
 ) -> None:
     broker.put_secret(
@@ -64,8 +69,12 @@ def _put(
         group=group,
         purpose=PURPOSE,
         allowed_commands=allowed if allowed is not None else [PY],
-        risk=risk,
+        sensitivity=sensitivity,
     )
+
+
+def _record(vault_dir: Path, name: str) -> dict:
+    return json.loads((vault_dir / sb.VAULT_FILE_NAME).read_text(encoding="utf-8"))["secrets"][name]
 
 
 def _flip_first_byte(b64_text: str) -> str:
@@ -189,21 +198,51 @@ def test_change_passphrase_requires_the_current_passphrase(broker, store):
     assert store.items[sb.TARGET_PASSPHRASE_WRAP] == before
 
 
-def test_passphrase_minimum_length_and_common_list_are_enforced(broker, store):
+def test_passphrase_of_eleven_characters_is_rejected(broker, store):
+    assert len("FAKE-tiny-1") == 11
     with pytest.raises(sb.PassphraseRejected):
-        broker.initialize("FAKE-tiny-1")  # 11 characters
-    with pytest.raises(sb.PassphraseRejected):
-        broker.initialize("password1234")  # 12 characters, on the common list
-    with pytest.raises(sb.PassphraseRejected):
-        broker.initialize("  PassWord1234 ")  # 12 once stripped, on the common list
+        broker.initialize("FAKE-tiny-1")
     assert not broker.is_initialized()
     assert store.items == {}
-    broker.initialize("FAKE-pass-12")  # exactly 12 characters is accepted
+
+
+def test_passphrase_of_twelve_characters_is_accepted(broker):
+    broker.initialize("FAKE-pass-12")  # exactly 12 characters
     assert broker.is_initialized()
 
 
-def test_common_passphrase_list_entries_meet_the_minimum_length():
-    assert all(len(entry) >= sb.PASSPHRASE_MIN_LENGTH for entry in sb._COMMON_PASSPHRASES)
+def test_passphrase_on_the_common_list_is_rejected_without_echoing_it(broker, store):
+    digest = hashlib.sha256(COMMON_LIST_CANDIDATE.encode("utf-8")).hexdigest()
+    assert digest in sb._common_passphrase_digests()  # the candidate is a bundled list entry
+    with pytest.raises(sb.PassphraseRejected) as info:
+        broker.initialize(COMMON_LIST_CANDIDATE)
+    assert COMMON_LIST_CANDIDATE not in str(info.value)
+    with pytest.raises(sb.PassphraseRejected):
+        broker.initialize("  " + COMMON_LIST_CANDIDATE.upper() + "  ")  # normalised before the check
+    assert not broker.is_initialized()
+    assert store.items == {}
+
+
+def test_common_passphrase_file_holds_digests_only():
+    lines = [
+        line
+        for line in sb.COMMON_PASSPHRASE_FILE.read_text(encoding="ascii").splitlines()
+        if line and not line.startswith("#")
+    ]
+    assert all(sb._DIGEST_RE.fullmatch(line) for line in lines)
+    assert len(lines) == len(set(lines))
+    assert len(sb._common_passphrase_digests()) == len(lines) >= sb.COMMON_PASSPHRASE_MIN_DIGESTS
+
+
+def test_missing_common_list_refuses_passphrases_instead_of_allowing_them(broker, store, monkeypatch, tmp_path):
+    monkeypatch.setattr(sb, "COMMON_PASSPHRASE_FILE", tmp_path / "absent.txt")
+    sb._common_passphrase_digests.cache_clear()
+    try:
+        with pytest.raises(sb.BrokerError):
+            broker.initialize(PASSPHRASE)
+        assert store.items == {}
+    finally:
+        sb._common_passphrase_digests.cache_clear()
 
 
 def test_change_passphrase_rejects_a_short_new_passphrase(broker, store):
@@ -331,9 +370,9 @@ def test_run_rejects_malformed_argv(broker):
         broker.run_with_secret(NAME, PY)  # a bare string, not a list
 
 
-def test_high_risk_secret_needs_approval_and_does_not_run(broker, tmp_path):
+def test_sensitive_item_needs_approval_and_does_not_run(broker, tmp_path):
     broker.initialize(PASSPHRASE)
-    _put(broker, risk="high")
+    _put(broker, sensitivity="SENSITIVE")
     marker = tmp_path / "ran.txt"
     result = broker.run_with_secret(NAME, [PY, "-c", f"open({str(marker)!r}, 'w').close()"])
     assert result.status == "approval_required"
@@ -341,16 +380,33 @@ def test_high_risk_secret_needs_approval_and_does_not_run(broker, tmp_path):
     assert not marker.exists()
 
 
-def test_put_secret_defaults_to_high_risk(broker):
+def test_secret_item_runs_without_approval(broker):
+    broker.initialize(PASSPHRASE)
+    _put(broker, sensitivity="SECRET")
+    assert broker.run_with_secret(NAME, [PY, "-c", "pass"]).exit_code == 0
+
+
+def test_unset_class_defaults_to_secret_and_runs(broker):
     broker.initialize(PASSPHRASE)
     broker.put_secret(NAME, VALUE, group=GROUP, purpose=PURPOSE, allowed_commands=[PY])
-    assert broker.run_with_secret(NAME, [PY, "-c", "pass"]).status == "approval_required"
+    assert broker.list_names()[0]["class"] == "SECRET"
+    assert broker.run_with_secret(NAME, [PY, "-c", "pass"]).status == "completed"
 
 
-def test_put_secret_rejects_an_unknown_risk_tier(broker):
+def test_plain_item_runs_with_its_value_and_the_output_is_redacted(broker):
     broker.initialize(PASSPHRASE)
-    with pytest.raises(sb.InvalidInput):
-        _put(broker, risk="medium")
+    _put(broker, name="FAKE_PUBLIC_ITEM", value=PUBLIC_VALUE, sensitivity="PUBLIC")
+    check = broker.run_with_secret(
+        "FAKE_PUBLIC_ITEM", [PY, "-c", _match_code("FAKE_PUBLIC_ITEM", PUBLIC_VALUE)]
+    )
+    assert check.status == "completed"
+    assert check.stdout == "match"
+    echo = broker.run_with_secret(
+        "FAKE_PUBLIC_ITEM",
+        [PY, "-c", "import os; print(os.environ['FAKE_PUBLIC_ITEM'])"],
+    )
+    assert PUBLIC_VALUE not in echo.stdout
+    assert echo.stdout.strip() == "[REDACTED]"
 
 
 def test_value_reaches_only_the_child_environment(broker, monkeypatch):
@@ -473,17 +529,21 @@ def test_vault_file_holds_no_plaintext_value_or_passphrase(broker, vault_dir):
     assert PASSPHRASE.encode("utf-8") not in raw
 
 
-def test_list_names_returns_names_groups_and_purposes_only(broker):
+def test_list_names_returns_name_group_purpose_and_class_never_a_value(broker):
     broker.initialize(PASSPHRASE)
     _put(broker, name="FAKE_ZETA_KEY", group="g2")
-    _put(broker, name="FAKE_ALPHA_KEY", group="g1")
+    _put(broker, name="FAKE_ALPHA_KEY", group="g1", sensitivity="SENSITIVE")
+    _put(broker, name="FAKE_PUBLIC_ITEM", value=PUBLIC_VALUE, group="g3", sensitivity="PUBLIC")
     broker.close()
-    listing = broker.list_names()
+    listing = broker.list_names()  # works while locked
     assert listing == [
-        {"name": "FAKE_ALPHA_KEY", "group": "g1", "purpose": PURPOSE},
-        {"name": "FAKE_ZETA_KEY", "group": "g2", "purpose": PURPOSE},
+        {"name": "FAKE_ALPHA_KEY", "group": "g1", "purpose": PURPOSE, "class": "SENSITIVE"},
+        {"name": "FAKE_PUBLIC_ITEM", "group": "g3", "purpose": PURPOSE, "class": "PUBLIC"},
+        {"name": "FAKE_ZETA_KEY", "group": "g2", "purpose": PURPOSE, "class": "SECRET"},
     ]
-    assert VALUE not in json.dumps(listing)
+    dumped = json.dumps(listing)
+    assert VALUE not in dumped
+    assert PUBLIC_VALUE not in dumped
 
 
 @pytest.mark.parametrize("bad_name", ["bad name", "1STARTS_WITH_DIGIT", "trailing\n", "", "A" * 129])
@@ -517,17 +577,16 @@ def test_values_must_be_at_least_eight_bytes(broker):
 @pytest.mark.parametrize(
     "mutate",
     [
-        lambda record: record.__setitem__("risk", "routine"),
         lambda record: record.__setitem__("allowed_commands", record["allowed_commands"] + ["/usr/bin/evil"]),
         lambda record: record.__setitem__("group", "other-group"),
         lambda record: record.__setitem__("ct", _flip_first_byte(record["ct"])),
     ],
-    ids=["risk", "allowlist", "group", "ciphertext"],
+    ids=["allowlist", "group", "ciphertext"],
 )
 def test_tampering_with_a_record_fails_the_integrity_check(vault_dir, store, mutate):
     first = sb.SecretsBroker(vault_dir, store)
     first.initialize(PASSPHRASE)
-    _put(first, risk="high")
+    _put(first, sensitivity="SENSITIVE")
     first.close()
     path = vault_dir / sb.VAULT_FILE_NAME
     doc = json.loads(path.read_text(encoding="utf-8"))
@@ -540,6 +599,145 @@ def test_tampering_with_a_record_fails_the_integrity_check(vault_dir, store, mut
     assert NAME in str(info.value)
     assert VALUE not in str(info.value)
     assert not second.is_unlocked()
+
+
+# -- sensitivity classes ----------------------------------------------------
+
+
+@pytest.mark.parametrize("cls", ["PUBLIC", "INTERNAL"])
+def test_public_and_internal_values_are_stored_unencrypted(broker, vault_dir, cls):
+    broker.initialize(PASSPHRASE)
+    value = PUBLIC_VALUE if cls == "PUBLIC" else INTERNAL_VALUE
+    _put(broker, name="FAKE_PLAIN_ITEM", value=value, sensitivity=cls)
+    record = _record(vault_dir, "FAKE_PLAIN_ITEM")
+    assert record["class"] == cls
+    assert record["value"] == value
+    assert "nonce" not in record and "ct" not in record
+    assert value.encode("utf-8") in (vault_dir / sb.VAULT_FILE_NAME).read_bytes()
+
+
+@pytest.mark.parametrize("cls", ["SECRET", "SENSITIVE"])
+def test_secret_and_sensitive_values_are_encrypted(broker, vault_dir, cls):
+    broker.initialize(PASSPHRASE)
+    _put(broker, name="FAKE_ENC_ITEM", value=SPECIAL_VALUE, sensitivity=cls)
+    record = _record(vault_dir, "FAKE_ENC_ITEM")
+    assert record["class"] == cls
+    assert "value" not in record
+    assert isinstance(record["nonce"], str) and isinstance(record["ct"], str)
+    raw = (vault_dir / sb.VAULT_FILE_NAME).read_bytes()
+    assert SPECIAL_VALUE.encode("utf-8") not in raw
+    assert base64.b64encode(SPECIAL_VALUE.encode("utf-8")) not in raw
+
+
+@pytest.mark.parametrize("unset", [None, "", "bogus", "public", "Sensitive"])
+def test_unknown_or_unset_class_fails_closed_to_secret(broker, vault_dir, unset):
+    broker.initialize(PASSPHRASE)
+    _put(broker, name="FAKE_UNSET_ITEM", value=SPECIAL_VALUE, sensitivity=unset)
+    record = _record(vault_dir, "FAKE_UNSET_ITEM")
+    assert record["class"] == "SECRET"
+    assert "value" not in record
+    listed = {row["name"]: row["class"] for row in broker.list_names()}
+    assert listed["FAKE_UNSET_ITEM"] == "SECRET"
+    result = broker.run_with_secret(
+        "FAKE_UNSET_ITEM", [PY, "-c", _match_code("FAKE_UNSET_ITEM", SPECIAL_VALUE)]
+    )
+    assert result.stdout == "match"
+
+
+def test_plain_entry_with_an_unknown_class_is_refused(broker, vault_dir):
+    broker.initialize(PASSPHRASE)
+    _put(broker)
+    path = vault_dir / sb.VAULT_FILE_NAME
+    doc = json.loads(path.read_text(encoding="utf-8"))
+    doc["secrets"][NAME] = {
+        "group": GROUP,
+        "purpose": PURPOSE,
+        "allowed_commands": [PY],
+        "class": "bogus",
+        "value": VALUE,
+    }
+    path.write_text(json.dumps(doc), encoding="utf-8")
+    with pytest.raises(sb.BrokerError) as info:
+        broker.list_names()
+    assert NAME in str(info.value)
+    assert VALUE not in str(info.value)
+
+
+@pytest.mark.parametrize(
+    "old_class, new_class, expected",
+    [
+        ("SECRET", "SENSITIVE", sb.IntegrityError),
+        ("SENSITIVE", "SECRET", sb.IntegrityError),
+        ("SECRET", "bogus", sb.IntegrityError),
+        ("SECRET", "INTERNAL", sb.BrokerError),
+        ("SECRET", "PUBLIC", sb.BrokerError),
+    ],
+)
+def test_changing_a_class_fails_verification(vault_dir, store, old_class, new_class, expected):
+    first = sb.SecretsBroker(vault_dir, store)
+    first.initialize(PASSPHRASE)
+    _put(first, sensitivity=old_class)
+    first.close()
+    path = vault_dir / sb.VAULT_FILE_NAME
+    doc = json.loads(path.read_text(encoding="utf-8"))
+    doc["secrets"][NAME]["class"] = new_class
+    path.write_text(json.dumps(doc), encoding="utf-8")
+    second = sb.SecretsBroker(vault_dir, store)
+    with pytest.raises(expected) as info:
+        second.unlock(PASSPHRASE)
+    assert VALUE not in str(info.value)
+    assert not second.is_unlocked()
+
+
+def test_recovery_wrap_covers_the_encrypted_vault_only(vault_dir, store):
+    first = sb.SecretsBroker(vault_dir, store)
+    recovery = first.initialize(PASSPHRASE)
+    _put(first, name="FAKE_ENC_ITEM", value=SPECIAL_VALUE)
+    _put(first, name="FAKE_PUBLIC_ITEM", value=PUBLIC_VALUE, sensitivity="PUBLIC")
+    first.close()
+    names = {"FAKE_ENC_ITEM", "FAKE_PUBLIC_ITEM"}
+
+    locked = sb.SecretsBroker(vault_dir, store)
+    assert {row["name"] for row in locked.list_names()} == names  # no key or wrap needed
+
+    original_wrap = store.items[sb.TARGET_RECOVERY_WRAP]
+    store.items[sb.TARGET_RECOVERY_WRAP] = "{}"  # damage the recovery wrap
+    with pytest.raises(sb.UnlockFailed):
+        locked.unlock_with_recovery(recovery)
+    assert {row["name"] for row in locked.list_names()} == names  # plain metadata unaffected
+
+    store.items[sb.TARGET_RECOVERY_WRAP] = original_wrap
+    locked.unlock_with_recovery(recovery)
+    enc = locked.run_with_secret(
+        "FAKE_ENC_ITEM", [PY, "-c", _match_code("FAKE_ENC_ITEM", SPECIAL_VALUE)]
+    )
+    plain = locked.run_with_secret(
+        "FAKE_PUBLIC_ITEM", [PY, "-c", _match_code("FAKE_PUBLIC_ITEM", PUBLIC_VALUE)]
+    )
+    assert enc.stdout == "match"
+    assert plain.stdout == "match"
+    locked.close()
+
+
+def test_audit_log_never_contains_a_plain_or_encrypted_value(broker, vault_dir):
+    broker.initialize(PASSPHRASE)
+    _put(broker, name="FAKE_PUBLIC_ITEM", value=PUBLIC_VALUE, sensitivity="PUBLIC")
+    _put(broker, name="FAKE_SENSITIVE_ITEM", value=SPECIAL_VALUE, sensitivity="SENSITIVE")
+    _put(broker, name="FAKE_ENC_ITEM", value=VALUE)
+    broker.run_with_secret("FAKE_PUBLIC_ITEM", [PY, "-c", "print('ok')"])
+    broker.run_with_secret("FAKE_SENSITIVE_ITEM", [PY, "-c", "pass"])
+    broker.run_with_secret("FAKE_ENC_ITEM", [PY, "-c", "pass"])
+    text = (vault_dir / sb.AUDIT_FILE_NAME).read_text(encoding="utf-8")
+    outcomes = [json.loads(line)["outcome"] for line in text.splitlines()]
+    assert outcomes == ["started", "completed", "approval_required", "started", "completed"]
+    for leaked in (
+        PUBLIC_VALUE,
+        SPECIAL_VALUE,
+        VALUE,
+        base64.b64encode(SPECIAL_VALUE.encode("utf-8")).decode("ascii"),
+        PASSPHRASE,
+    ):
+        assert leaked not in text
 
 
 # -- credential store adapters ----------------------------------------------

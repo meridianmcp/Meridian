@@ -2,15 +2,18 @@
 
 What this slice does:
 
-* Stores named secrets in an encrypted vault file. Each value is AES-256-GCM
-  encrypted under a random 32-byte master key. Names, groups, purposes, allowed
-  commands and risk tiers are plaintext metadata, but they are bound into each
-  record's AEAD associated data, so editing them on disk makes the record fail
-  its integrity check at unlock.
+* Stores named items in one vault file. Each item has a sensitivity class.
+  PUBLIC and INTERNAL values sit in plaintext in the plain index part of the
+  file. SECRET and SENSITIVE values are AES-256-GCM encrypted under a random
+  32-byte master key. Names, groups, purposes, allowed commands and classes are
+  plaintext metadata. For encrypted items they are bound into the AEAD
+  associated data, so editing them on disk fails the integrity check at unlock.
+  An unknown or unset class is treated as SECRET.
 * Wraps the master key twice: once under a passphrase and once under a one-time
   recovery code. Each wrapping key comes from hashlib.scrypt and each wrap is
   AES-256-GCM. Both wraps live in an OS credential store behind a small adapter
   interface. The passphrase and the recovery code are never written anywhere.
+  The recovery wrap protects the encrypted vault only, not PUBLIC or INTERNAL items.
 * Keeps on/off switches in memory only. Every secret and group is on after
   unlock. Closing the broker clears the key and turns everything off.
 * ``run_with_secret`` runs one allowed command with the value in the child's
@@ -19,9 +22,10 @@ What this slice does:
 * Appends JSON lines to an audit log that records names, commands and outcomes,
   never values.
 
-Not in this slice: the desktop approval prompt (a high-risk call returns
-``approval_required`` and does not run), the desktop UI, and a Linux credential
-store (the adapter is a stub that raises NotImplementedError).
+SENSITIVE is the high-risk approval tier: a call on a SENSITIVE item returns
+``approval_required`` and does not run. Not in this slice: the desktop approval
+prompt, the desktop UI, and a Linux credential store (the adapter is a stub that
+raises NotImplementedError).
 
 Handling rule: no code path here formats or logs a secret value. Exception
 messages never contain a value or a passphrase. ``RunResult`` output is redacted
@@ -38,6 +42,7 @@ from __future__ import annotations
 import base64
 import contextlib
 import ctypes
+import functools
 import hashlib
 import hmac
 import json
@@ -71,7 +76,20 @@ TARGET_PASSPHRASE_WRAP = "meridian-secrets-broker/master-wrap/passphrase"
 TARGET_RECOVERY_WRAP = "meridian-secrets-broker/master-wrap/recovery"
 VAULT_FILE_NAME = "vault.json"
 AUDIT_FILE_NAME = "audit.jsonl"
-RISK_TIERS = ("routine", "high")
+SENSITIVITY_PUBLIC = "PUBLIC"
+SENSITIVITY_INTERNAL = "INTERNAL"
+SENSITIVITY_SECRET = "SECRET"
+SENSITIVITY_SENSITIVE = "SENSITIVE"
+SENSITIVITY_CLASSES = (
+    SENSITIVITY_PUBLIC,
+    SENSITIVITY_INTERNAL,
+    SENSITIVITY_SECRET,
+    SENSITIVITY_SENSITIVE,
+)
+PLAIN_CLASSES = frozenset({SENSITIVITY_PUBLIC, SENSITIVITY_INTERNAL})
+ENCRYPTED_CLASSES = frozenset({SENSITIVITY_SECRET, SENSITIVITY_SENSITIVE})
+COMMON_PASSPHRASE_FILE = Path(__file__).resolve().parent / "secrets_data" / "common_passphrase_sha256.txt"
+COMMON_PASSPHRASE_MIN_DIGESTS = 1000
 REDACTED_TOKEN = b"[REDACTED]"
 MIN_VALUE_BYTES = 8
 MAX_VALUE_BYTES = 8192
@@ -85,7 +103,7 @@ UNLOCK_FAILED_MESSAGE = (
 _NAME_RE = re.compile(r"[A-Za-z_][A-Za-z0-9_]{0,127}")
 _GROUP_RE = re.compile(r"[A-Za-z0-9_.-]{1,64}")
 _WIN_ABSOLUTE_RE = re.compile(r"(?:[A-Za-z]:[\\/]|\\\\[^\\/]+[\\/][^\\/]+[\\/])")
-_RECORD_KEYS = ("group", "purpose", "allowed_commands", "risk", "nonce", "ct")
+_DIGEST_RE = re.compile(r"[0-9a-f]{64}")
 
 # Variables that change how a child process loads code. A stored value must not
 # be able to redirect an allowed command this way, so these names are refused.
@@ -110,43 +128,37 @@ _RESERVED_ENV_NAMES = frozenset(
     }
 )
 
-# Small built-in list, lowercase, all at least PASSPHRASE_MIN_LENGTH long so the
-# list is meaningful. A real deployment should use a much larger list.
-_COMMON_PASSPHRASES = frozenset(
-    {
-        "123456789012",
-        "1234567890123",
-        "abcdefghijkl",
-        "abcdefghijklmnop",
-        "administrator",
-        "adminadmin123",
-        "baseball12345",
-        "changeme1234",
-        "correcthorsebatterystaple",
-        "dragon1234567",
-        "football12345",
-        "hunter2hunter2",
-        "iloveyou12345",
-        "letmein123456",
-        "meridian12345",
-        "meridianadmin",
-        "monkey1234567",
-        "p@ssw0rd1234",
-        "p@ssword12345",
-        "passw0rd1234",
-        "password1234",
-        "password12345",
-        "passwordpassword",
-        "princess12345",
-        "qwertyuiop1234",
-        "qwertyuiopasdf",
-        "secretsecret",
-        "sunshine12345",
-        "superman12345",
-        "trustno1trustno1",
-        "welcome123456",
-    }
-)
+# Common passphrases are checked by SHA-256 digest against a bundled file. The file
+# holds digests only, never plaintext. See the header of that file for its source.
+def effective_sensitivity(value: object) -> str:
+    """Return the class to apply. An unknown or unset class is treated as SECRET."""
+    if isinstance(value, str) and value in SENSITIVITY_CLASSES:
+        return value
+    return SENSITIVITY_SECRET
+
+
+@functools.lru_cache(maxsize=1)
+def _common_passphrase_digests() -> frozenset[str]:
+    """SHA-256 digests of the common-passphrase list, read once from the bundled file.
+
+    A missing or malformed file raises BrokerError, so a broken list refuses
+    passphrases instead of allowing every one.
+    """
+    try:
+        text = COMMON_PASSPHRASE_FILE.read_text(encoding="ascii")
+    except (OSError, UnicodeDecodeError):
+        raise BrokerError("common-passphrase list is unavailable") from None
+    digests: set[str] = set()
+    for raw_line in text.splitlines():
+        line = raw_line.strip()
+        if not line or line.startswith("#"):
+            continue
+        if not _DIGEST_RE.fullmatch(line):
+            raise BrokerError("common-passphrase list is malformed")
+        digests.add(line)
+    if len(digests) < COMMON_PASSPHRASE_MIN_DIGESTS:
+        raise BrokerError("common-passphrase list is malformed")
+    return frozenset(digests)
 
 
 class BrokerError(Exception):
@@ -331,7 +343,8 @@ def check_passphrase(passphrase: object) -> None:
         raise PassphraseRejected("passphrase must be valid UTF-8 text") from None
     if len(passphrase.strip()) < PASSPHRASE_MIN_LENGTH:
         raise PassphraseRejected(f"passphrase must be at least {PASSPHRASE_MIN_LENGTH} characters")
-    if passphrase.strip().lower() in _COMMON_PASSPHRASES:
+    digest = hashlib.sha256(passphrase.strip().lower().encode("utf-8")).hexdigest()
+    if digest in _common_passphrase_digests():
         raise PassphraseRejected("passphrase is on the common-password list")
 
 
@@ -490,7 +503,7 @@ def _record_aad(name: str, record: dict) -> bytes:
         "group": record["group"],
         "purpose": record["purpose"],
         "allowed_commands": record["allowed_commands"],
-        "risk": record["risk"],
+        "class": record["class"],
     }
     return b"meridian-secrets-broker/record\n" + json.dumps(
         meta, sort_keys=True, separators=(",", ":")
@@ -507,12 +520,25 @@ def _decrypt_record(master: bytes, name: str, record: dict) -> bytes:
 
 
 def _check_record_shape(name: str, record: object) -> None:
-    ok = isinstance(record, dict) and all(key in record for key in _RECORD_KEYS)
+    """Fail closed on any record whose fields do not match its effective class.
+
+    PUBLIC and INTERNAL records carry a plaintext ``value`` and no ciphertext.
+    Every other record, including one with an unknown class, must carry
+    ciphertext and no ``value``, so a plaintext value can never sit under a
+    class that should be encrypted.
+    """
+    ok = isinstance(record, dict)
     if ok:
-        ok = all(isinstance(record[key], str) for key in ("group", "purpose", "risk", "nonce", "ct"))
-        ok = ok and record["risk"] in RISK_TIERS
-        ok = ok and isinstance(record["allowed_commands"], list)
+        ok = all(isinstance(record.get(key), str) for key in ("group", "purpose", "class"))
+        ok = ok and isinstance(record.get("allowed_commands"), list)
         ok = ok and all(isinstance(item, str) for item in record["allowed_commands"])
+    if ok:
+        if effective_sensitivity(record["class"]) in PLAIN_CLASSES:
+            ok = record["class"] in PLAIN_CLASSES and isinstance(record.get("value"), str)
+            ok = ok and "nonce" not in record and "ct" not in record
+        else:
+            ok = isinstance(record.get("nonce"), str) and isinstance(record.get("ct"), str)
+            ok = ok and "value" not in record
     if not ok:
         raise BrokerError(f"vault record '{name}' is malformed")
 
@@ -640,7 +666,8 @@ class SecretsBroker:
 
     def _open(self, master: bytes) -> None:
         for name, record in self._load_vault().items():
-            _decrypt_record(master, name, record)  # IntegrityError on any mismatch
+            if effective_sensitivity(record["class"]) in ENCRYPTED_CLASSES:
+                _decrypt_record(master, name, record)  # IntegrityError on any mismatch
         self.close()
         self._key = bytearray(master)
 
@@ -659,30 +686,45 @@ class SecretsBroker:
         group: str,
         purpose: str,
         allowed_commands: list[str],
-        risk: str = "high",
+        sensitivity: str | None = None,
     ) -> None:
-        """Create or replace a secret. Defaults to the high-risk tier (fail closed)."""
+        """Create or replace an item. An unknown or unset class is stored as SECRET.
+
+        Needs an unlocked broker for every class, so the write path has one rule.
+        """
         key = self._require_unlocked()
         _check_name(name)
+        cls = effective_sensitivity(sensitivity)
         core = {
             "group": _check_group(group),
             "purpose": _check_purpose(purpose),
             "allowed_commands": _normalize_allowed(allowed_commands),
-            "risk": risk,
+            "class": cls,
         }
-        if risk not in RISK_TIERS:
-            raise InvalidInput("risk must be 'routine' or 'high'")
-        plaintext = _encode_value(value)
-        nonce = secrets.token_bytes(12)
-        ciphertext = AESGCM(bytes(key)).encrypt(nonce, plaintext, _record_aad(name, core))
+        encoded = _encode_value(value)
         records = self._load_vault()
-        records[name] = {**core, "nonce": _b64(nonce), "ct": _b64(ciphertext)}
+        if cls in PLAIN_CLASSES:
+            records[name] = {**core, "value": value}
+        else:
+            nonce = secrets.token_bytes(12)
+            ciphertext = AESGCM(bytes(key)).encrypt(nonce, encoded, _record_aad(name, core))
+            records[name] = {**core, "nonce": _b64(nonce), "ct": _b64(ciphertext)}
         self._save_vault(records)
 
     def list_names(self) -> list[dict[str, str]]:
-        """Names, groups and purposes only. Metadata is unverified until unlock."""
+        """Name, group, purpose and class for every item. Never a value.
+
+        Works while locked. Encrypted items' class is verified at unlock (it is
+        bound into their AEAD data). PUBLIC and INTERNAL items have no AEAD, so
+        their metadata is not integrity-checked.
+        """
         return [
-            {"name": name, "group": record["group"], "purpose": record["purpose"]}
+            {
+                "name": name,
+                "group": record["group"],
+                "purpose": record["purpose"],
+                "class": effective_sensitivity(record["class"]),
+            }
             for name, record in sorted(self._load_vault().items())
         ]
 
@@ -746,12 +788,17 @@ class SecretsBroker:
         if not _command_allowed(command, record["allowed_commands"]):
             self._audit(name, command, "refused_command_not_allowed")
             raise CommandNotAllowed(f"command is not allowed for secret '{name}'")
-        if record["risk"] == "high":
+        cls = effective_sensitivity(record["class"])
+        if cls == SENSITIVITY_SENSITIVE:
             self._audit(name, command, "approval_required")
             return RunResult(status="approval_required", exit_code=None, stdout="", stderr="")
 
-        plaintext = _decrypt_record(bytes(self._key), name, record)
-        value_text = plaintext.decode("utf-8")
+        if cls in PLAIN_CLASSES:
+            value_text = record["value"]
+            plaintext = value_text.encode("utf-8")
+        else:
+            plaintext = _decrypt_record(bytes(self._key), name, record)
+            value_text = plaintext.decode("utf-8")
         self._audit(name, command, "started")  # fail closed: no audit line, no run
         env = {**os.environ, name: value_text}
         try:
