@@ -2092,7 +2092,9 @@ def _research_domain(host: str, path: str) -> bool:
         return False
     if any(host == h or host.endswith("." + h) for h in _RESEARCH_HOSTS):
         return True
-    return host == "pubmed.ncbi.nlm.nih.gov" or (host.endswith("ncbi.nlm.nih.gov") and "/pubmed" in path.lower())
+    # Dot-bounded: "xncbi.nlm.nih.gov" is not a subdomain of ncbi.nlm.nih.gov.
+    ncbi_host = host == "ncbi.nlm.nih.gov" or host.endswith(".ncbi.nlm.nih.gov")
+    return host == "pubmed.ncbi.nlm.nih.gov" or (ncbi_host and "/pubmed" in path.lower())
 
 
 def _query_params(query: str) -> dict[str, str]:
