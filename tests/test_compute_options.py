@@ -158,3 +158,92 @@ def test_a_catalog_without_an_offers_list_is_rejected(tmp_path):
     path.write_text(json.dumps({"as_of": "2026-10-24"}), encoding="utf-8")
     with pytest.raises(ValueError):
         co.load_catalog(path)
+
+
+# --- catalog fields and require_price (GPU offer catalog, pass 1) -------------------------------
+
+
+def test_trailing_catalog_fields_default_to_none_so_existing_offers_are_unchanged():
+    offer = _offer()
+    for name in (
+        "gpu_model",
+        "gpu_variant",
+        "gpu_count",
+        "max_gpu_count",
+        "price_per_gpu_hour",
+        "vram_gb_per_gpu",
+        "cloud_type",
+        "data_center",
+        "stock_status",
+    ):
+        assert getattr(offer, name) is None, name
+    # Existing meanings are unchanged: available still defaults to True, and the totals keep their values.
+    assert offer.available is True
+    assert offer.price_per_hour == 1.0
+    assert offer.vram_gb == 24.0
+
+
+def test_existing_positional_and_keyword_constructors_still_work():
+    positional = co.Offer("o", "runpod", 1.5, 24.0, 64.0, 8, "gpu", 100.0, False, "2026-11-09T14:03:00Z")
+    assert positional.available is False
+    assert positional.price_as_of == "2026-11-09T14:03:00Z"
+    assert co.Offer(id="o", provider="runpod", price_per_hour=1.0) == co.Offer(
+        id="o", provider="runpod", price_per_hour=1.0
+    )
+
+
+def test_unknown_is_none_not_zero_for_catalog_style_offers():
+    offer = co.Offer(id="o", provider="runpod", price_per_hour=None, vram_gb=None, ram_gb=None, vcpu=None)
+    assert offer.price_per_hour is None and offer.vram_gb is None
+    assert offer.ram_gb is None and offer.vcpu is None
+
+
+def test_require_price_false_accepts_a_missing_or_null_price_as_none():
+    assert co.offer_from_dict({"id": "x", "provider": "runpod"}, require_price=False).price_per_hour is None
+    assert (
+        co.offer_from_dict({"id": "x", "provider": "runpod", "price_per_hour": None}, require_price=False)
+        .price_per_hour
+        is None
+    )
+
+
+def test_require_price_true_is_the_default_and_still_rejects_a_missing_price():
+    with pytest.raises(ValueError):
+        co.offer_from_dict({"id": "x", "provider": "runpod"})
+    with pytest.raises(ValueError):
+        co.offer_from_dict({"id": "x", "provider": "runpod", "price_per_hour": None})
+
+
+@pytest.mark.parametrize("require_price", [True, False])
+@pytest.mark.parametrize("bad_price", [0, -1.0, float("nan"), float("inf")])
+def test_a_present_non_positive_or_non_finite_price_is_rejected_in_both_modes(bad_price, require_price):
+    entry = {"id": "x", "provider": "runpod", "price_per_hour": bad_price}
+    with pytest.raises(ValueError):
+        co.offer_from_dict(entry, require_price=require_price)
+
+
+def test_rank_offers_rejects_unknown_price_and_unknown_stock_without_crashing():
+    unknown_price = co.Offer(id="p", provider="runpod", price_per_hour=None, vram_gb=24.0)
+    unknown_stock = co.Offer(id="s", provider="runpod", price_per_hour=1.0, vram_gb=24.0, available=None)
+    ranked, rejected = co.rank_offers([unknown_price, unknown_stock, _offer(id="ok")], co.Job(min_vram_gb=0))
+    assert [r.offer.id for r in ranked] == ["ok"]
+    reasons = {r.offer.id: r.reasons for r in rejected}
+    assert "price is not reported" in reasons["p"]
+    assert "stock is unknown" in reasons["s"]
+
+
+def test_unreported_vram_ram_or_vcpu_is_rejected_only_when_the_job_needs_it():
+    no_vram = co.Offer(id="v", provider="runpod", price_per_hour=1.0, vram_gb=None, ram_gb=None, vcpu=None)
+    ranked, rejected = co.rank_offers([no_vram], co.Job())
+    assert [r.offer.id for r in ranked] == ["v"] and not rejected
+    _, rejected = co.rank_offers([no_vram], co.Job(min_vram_gb=24, min_ram_gb=8, min_vcpu=4))
+    text = " ".join(rejected[0].reasons)
+    assert "VRAM is not reported" in text and "RAM is not reported" in text and "vCPU is not reported" in text
+
+
+def test_a_known_price_below_a_cap_still_ranks_as_before():
+    cheap = _offer(id="cheap", price_per_hour=0.5)
+    dear = _offer(id="dear", price_per_hour=2.0)
+    ranked, rejected = co.rank_offers([dear, cheap], co.Job(max_price_per_hour=1.0))
+    assert [r.offer.id for r in ranked] == ["cheap"]
+    assert "above the 1/h cap" in rejected[0].reasons[0]

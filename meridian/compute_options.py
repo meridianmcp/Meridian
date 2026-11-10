@@ -16,6 +16,7 @@ the time is unknown, so those offers are ranked by price per hour and the result
 from __future__ import annotations
 
 import json
+import math
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Iterable, Sequence
@@ -31,18 +32,41 @@ class Offer:
     ``vram_gb`` and ``ram_gb`` are the totals for the offer, not per GPU. ``throughput`` is in whatever work
     unit the caller uses for :attr:`Job.work_units` (tokens per second, samples per second, and so on), and is
     ``None`` when it has not been measured.
+
+    The trailing fields after ``price_as_of`` describe a catalog row from a live provider (see
+    :mod:`meridian.compute_catalog`). They default to ``None``, which means "not reported", never zero. Catalog
+    rows carry one GPU (``gpu_count=1``), so their totals equal their per-GPU values. ``available`` is ``None``
+    when the stock is unknown; that is not the same as unavailable.
     """
 
     id: str
     provider: str
-    price_per_hour: float
-    vram_gb: float = 0.0
-    ram_gb: float = 0.0
-    vcpu: int = 0
+    price_per_hour: float | None
+    vram_gb: float | None = 0.0
+    ram_gb: float | None = 0.0
+    vcpu: int | None = 0
     gpu: str | None = None
     throughput: float | None = None
-    available: bool = True
+    available: bool | None = True
     price_as_of: str | None = None
+    #: Canonical cross-provider key, for grouping (for example ``h100-80gb-sxm``). Not the create key.
+    gpu_model: str | None = None
+    #: Parsed variant token (``sxm``, ``pcie``, ``nvl``), or ``None``.
+    gpu_variant: str | None = None
+    #: GPUs in the machine this offer describes.
+    gpu_count: int | None = None
+    #: Provider ceiling on GPUs per machine for this cloud. This is not stock.
+    max_gpu_count: int | None = None
+    #: USD per GPU-hour, list price.
+    price_per_gpu_hour: float | None = None
+    #: VRAM per GPU in GB.
+    vram_gb_per_gpu: int | None = None
+    #: ``secure``, ``community``, or ``spot`` (reserved for AWS; RunPod never emits it).
+    cloud_type: str | None = None
+    #: Provider data center id, or ``None`` for an aggregate row.
+    data_center: str | None = None
+    #: The provider stock enum (NONE, LOW, MEDIUM, HIGH), kept verbatim. ``None`` means unknown.
+    stock_status: str | None = None
 
 
 @dataclass(frozen=True)
@@ -116,17 +140,31 @@ def estimate_llm_vram_gb(
 
 def _feasibility(offer: Offer, job: Job) -> list[str]:
     reasons: list[str] = []
-    if not offer.available:
+    # ``None`` means "not reported" (catalog rows). It is never treated as zero or as available.
+    if offer.available is None:
+        reasons.append("stock is unknown")
+    elif not offer.available:
         reasons.append("offer is not available")
     if job.providers is not None and offer.provider not in job.providers:
         reasons.append(f"provider {offer.provider!r} is not allowed")
-    if offer.vram_gb < job.min_vram_gb:
+    if offer.vram_gb is None:
+        if job.min_vram_gb > 0:
+            reasons.append(f"VRAM is not reported, {job.min_vram_gb:g} GB needed")
+    elif offer.vram_gb < job.min_vram_gb:
         reasons.append(f"VRAM {offer.vram_gb:g} GB is below the {job.min_vram_gb:g} GB needed")
-    if offer.ram_gb < job.min_ram_gb:
+    if offer.ram_gb is None:
+        if job.min_ram_gb > 0:
+            reasons.append(f"RAM is not reported, {job.min_ram_gb:g} GB needed")
+    elif offer.ram_gb < job.min_ram_gb:
         reasons.append(f"RAM {offer.ram_gb:g} GB is below the {job.min_ram_gb:g} GB needed")
-    if offer.vcpu < job.min_vcpu:
+    if offer.vcpu is None:
+        if job.min_vcpu > 0:
+            reasons.append(f"vCPU is not reported, {job.min_vcpu} needed")
+    elif offer.vcpu < job.min_vcpu:
         reasons.append(f"{offer.vcpu} vCPU is below the {job.min_vcpu} needed")
-    if job.max_price_per_hour is not None and offer.price_per_hour > job.max_price_per_hour:
+    if offer.price_per_hour is None:
+        reasons.append("price is not reported")
+    elif job.max_price_per_hour is not None and offer.price_per_hour > job.max_price_per_hour:
         reasons.append(f"price {offer.price_per_hour:g}/h is above the {job.max_price_per_hour:g}/h cap")
     return reasons
 
@@ -145,7 +183,7 @@ def rank_offers(offers: Iterable[Offer], job: Job) -> tuple[list[Ranked], list[R
         est_hours: float | None = None
         est_cost: float | None = None
         notes: list[str] = []
-        if job.work_units is not None and offer.throughput:
+        if job.work_units is not None and offer.throughput and offer.price_per_hour is not None:
             est_hours = job.work_units / offer.throughput
             est_cost = est_hours * offer.price_per_hour
             if job.max_hours is not None and est_hours > job.max_hours:
@@ -173,13 +211,22 @@ def cheapest(offers: Iterable[Offer], job: Job) -> Ranked | None:
     return ranked[0] if ranked else None
 
 
-def offer_from_dict(data: dict[str, Any]) -> Offer:
-    """Build an :class:`Offer` from a catalog entry, rejecting malformed values."""
+def offer_from_dict(data: dict[str, Any], *, require_price: bool = True) -> Offer:
+    """Build an :class:`Offer` from a catalog entry, rejecting malformed values.
+
+    ``require_price=True`` (the default) rejects an entry with no price. ``require_price=False`` accepts a missing
+    or ``null`` price and stores ``None``, for capacity-only providers. A price that is present must be positive
+    in both modes.
+    """
     try:
+        if data.get("price_per_hour") is None and not require_price:
+            price: float | None = None
+        else:
+            price = float(data["price_per_hour"])
         offer = Offer(
             id=str(data["id"]),
             provider=str(data["provider"]),
-            price_per_hour=float(data["price_per_hour"]),
+            price_per_hour=price,
             vram_gb=float(data.get("vram_gb", 0.0)),
             ram_gb=float(data.get("ram_gb", 0.0)),
             vcpu=int(data.get("vcpu", 0)),
@@ -192,8 +239,8 @@ def offer_from_dict(data: dict[str, Any]) -> Offer:
         raise ValueError(f"malformed catalog entry {data.get('id', '<no id>')!r}: {exc}") from exc
     if not offer.id or not offer.provider:
         raise ValueError("catalog entries need a non-empty id and provider")
-    if offer.price_per_hour <= 0:
-        raise ValueError(f"offer {offer.id!r}: price_per_hour must be greater than zero")
+    if offer.price_per_hour is not None and (not math.isfinite(offer.price_per_hour) or offer.price_per_hour <= 0):
+        raise ValueError(f"offer {offer.id!r}: price_per_hour must be a finite number greater than zero")
     if offer.vram_gb < 0 or offer.ram_gb < 0 or offer.vcpu < 0:
         raise ValueError(f"offer {offer.id!r}: VRAM, RAM and vCPU cannot be negative")
     if offer.throughput is not None and offer.throughput <= 0:

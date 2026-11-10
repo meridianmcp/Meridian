@@ -1,0 +1,68 @@
+{
+  "_synthetic": "Synthetic. Built from the documented v2 catalog schema. Not recorded from RunPod (spec D21, F20). Replace with recorded_* after the live read.",
+  "gpus": [
+    {
+      "id": "NVIDIA H100 80GB HBM3",
+      "name": "H100 80GB HBM3",
+      "memory": 80,
+      "secure": true,
+      "community": true,
+      "maxCount": 8,
+      "price": {"secure": 2.99, "community": 2.49, "serverless": 4.5}
+    },
+    {
+      "id": "NVIDIA H100 PCIe",
+      "name": "H100 PCIe",
+      "memory": 80,
+      "secure": true,
+      "community": false,
+      "maxCount": 4,
+      "price": {"secure": 2.39, "community": null, "serverless": 3.6}
+    },
+    {
+      "id": "NVIDIA A100 80GB PCIe",
+      "name": "A100 80GB PCIe",
+      "memory": 80,
+      "secure": true,
+      "community": false,
+      "maxCount": 8,
+      "price": {"secure": 1.64, "community": null, "serverless": 2.7}
+    },
+    {
+      "id": "NVIDIA A100-SXM4-80GB",
+      "name": "A100-SXM4-80GB",
+      "memory": 80,
+      "secure": true,
+      "community": false,
+      "maxCount": 8,
+      "price": {"secure": 1.89, "community": null, "serverless": 2.72}
+    },
+    {
+      "id": "NVIDIA GeForce RTX 4090",
+      "name": "GeForce RTX 4090",
+      "memory": 24,
+      "secure": false,
+      "community": true,
+      "maxCount": 8,
+      "price": {"secure": null, "community": 0.44, "serverless": 0.69}
+    },
+    {
+      "id": "NVIDIA L40S",
+      "name": "L40S",
+      "memory": 48,
+      "secure": true,
+      "community": true,
+      "maxCount": 4,
+      "price": {"secure": 0.86, "community": 0.79, "serverless": 1.22}
+    },
+    {
+      "id": "NVIDIA RTX A6000",
+      "name": "RTX A6000",
+      "memory": 48,
+      "secure": true,
+      "community": true,
+      "maxCount": 2,
+      "price": {"secure": 0.79, "community": 0.49, "serverless": 0.92}
+    }
+  ]
+}
