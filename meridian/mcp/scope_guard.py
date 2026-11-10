@@ -345,6 +345,7 @@ OBJECT_ARGS: "dict[str, tuple[ObjectArg, ...]]" = {
 #: scoped caller must name one (in-scope, by the generic project rule).
 REQUIRE_PROJECT: "frozenset[str]" = frozenset({
     "list_hitl_requests",
+    "list_decisions",
     "get_file_claims",
     "list_worktrees_pending_cleanup",
     "get_workspace_proposals",

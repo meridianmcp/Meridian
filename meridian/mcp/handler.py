@@ -5196,6 +5196,14 @@ async def _handle_hitl_tools(
         if result is None:
             raise ValueError("hitl request not found")
         return result
+    if name == "list_decisions":
+        # Open decisions only: pending questions with answer options, most urgent first.
+        from ..decisions_view import open_decisions
+
+        rows = await db_module.list_hitl_requests(
+            db, args.get("project_id"), status="pending", limit=args.get("limit", 200),
+        )
+        return open_decisions(rows)
     if name == "list_hitl_requests":
         # dcf1e428 — default 'recent' (pending + answered last 24h) so dismissed HITLs
         # don't give false "no pending HITLs" confidence to planning sessions.

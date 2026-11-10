@@ -756,6 +756,27 @@ def build_mcp_server():
                 },
             ),
             Tool(
+                name="list_decisions",
+                description=(
+                    "List open human decisions for a project: pending HITL questions "
+                    "that carry answer options. Each entry has its numbered options, "
+                    "the recommended option, the urgency, and whether a human must "
+                    "answer (require_human). Answer one with answer_hitl."
+                ),
+                inputSchema={
+                    "type": "object",
+                    "properties": {
+                        "project_id": {"type": "string"},
+                        "project_name": {"type": "string", "description": "Project name — an alternative to project_id; resolved to the id internally. project_id wins if both are given."},
+                        "limit": {
+                            "type": "integer",
+                            "description": "Max decisions, default 200.",
+                        },
+                    },
+                    "required": [],
+                },
+            ),
+            Tool(
                 name="list_hitl_requests",
                 description=(
                     "v2.4 — list HITL requests for a project without needing "
@@ -2665,7 +2686,7 @@ def build_mcp_server():
                 "pin_decision", "update_decision", "get_pinned_decisions",
                 "archive_decision",
                 "request_hitl", "get_hitl_request",
-                "list_hitl_requests", "answer_hitl", "dismiss_hitl",
+                "list_hitl_requests", "list_decisions", "answer_hitl", "dismiss_hitl",
                 "update_md_section",
                 "list_sessions",
                 "add_note", "ingest_document", "get_document_structure", "get_latex_structure", "get_notes", "read_note", "delete_note",
