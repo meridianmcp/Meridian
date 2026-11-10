@@ -1221,6 +1221,20 @@ def test_audit_equation_style_unknown_file_returns_error():
 # ---------------------------------------------------------------------------
 
 
+# The real render gate bounds each backend attempt (render_gate's
+# _SOFFICE_TIMEOUT_SECONDS / _WORD_COM_TIMEOUT_SECONDS), and this test can run two
+# renders: the capability check, then insert_equation_local's own verification.
+# The runner's default per-test budget (60 s) is shorter than a single render, so
+# pytest-timeout kills the worker mid-render instead of letting the gate report
+# its own verdict. The budget is derived from the same bounds so they cannot drift.
+_REAL_RENDER_TEST_TIMEOUT_SECONDS = (
+    2 * docs_intel.render_gate._SOFFICE_TIMEOUT_SECONDS
+    + docs_intel.render_gate._WORD_COM_TIMEOUT_SECONDS
+    + 60.0
+)
+
+
+@pytest.mark.timeout(_REAL_RENDER_TEST_TIMEOUT_SECONDS)
 def test_insert_equation_local_real_render_gate_or_structural_fallback(tmp_path, monkeypatch):
     # Undo this module's autouse stub for this one test only -- restores the
     # genuine render_gate.check_render_capability implementation captured at

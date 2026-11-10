@@ -775,16 +775,23 @@ def test_recovered_status_reports_recovered_from_stale_pid_field(state_dir, brok
 
 def test_child_crash_is_reported_with_exit_code(state_dir):
     with _make_runner("crash-scope", _exit_cmd(7), state_dir=state_dir, broker=None) as runner:
-        status = runner.start()
-        assert status.child.state is lr.ChildState.CRASHED
+        runner.start()
+        # start() only waits crash_settle_seconds for a fast crash. A freshly
+        # spawned interpreter can still be starting up when that window closes,
+        # so poll for the exit rather than assume it has already happened.
+        assert _wait_until(lambda: runner.status().child.state is lr.ChildState.CRASHED, timeout=10.0)
+        status = runner.status()
         assert status.child.exit_code == 7
         assert status.child.last_exit_reason == "crashed"
 
 
 def test_clean_exit_zero_is_stopped_not_crashed(state_dir):
     with _make_runner("clean-exit-scope", _exit_cmd(0), state_dir=state_dir, broker=None) as runner:
-        status = runner.start()
-        assert status.child.state is lr.ChildState.STOPPED
+        runner.start()
+        # Same reasoning as the crash test above: the readiness window is only
+        # a fast-crash check, so wait for the clean exit to be observed.
+        assert _wait_until(lambda: runner.status().child.state is lr.ChildState.STOPPED, timeout=10.0)
+        status = runner.status()
         assert status.child.exit_code == 0
 
 
@@ -1271,6 +1278,9 @@ def test_doctor_reports_ok_after_a_healthy_start(state_dir, broker):
 def test_doctor_reports_fail_after_a_crash(state_dir):
     with _make_runner("doctor-crash", _exit_cmd(1), state_dir=state_dir, broker=None) as runner:
         runner.start()
+        # Same fixed-window caveat as the crash tests above: wait for the exit
+        # to be observed before asking doctor() to report on it.
+        assert _wait_until(lambda: runner.status().child.state is lr.ChildState.CRASHED, timeout=10.0)
         report = runner.doctor()
         by_name = {c.name: c for c in report.checks}
         assert by_name["child_process"].severity == "fail"

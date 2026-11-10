@@ -294,10 +294,6 @@ SILENT_ROUTES: dict[tuple[str, str], str] = {
     ("POST", "/projects/{project_id}/codebase-map"): (
         "regenerates a derived artifact on demand and returns it to the caller; not a list view"
     ),
-    ("POST", "/projects/{project_id}/decisions/consolidate"): (
-        "asks an LLM to PROPOSE a consolidation and returns the preview; nothing is written "
-        "until the user applies it through decisions-pinned/replace-all, which publishes"
-    ),
     ("PUT", "/projects/{project_id}/files/{filename}"): (
         "Files tab editor saving one project file; the editing tab owns the buffer and "
         "repaints it, there is no WebSocket-fed file list"
