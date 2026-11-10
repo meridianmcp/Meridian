@@ -76,7 +76,7 @@ export const VTAB_GROUPS: readonly VtabGroup[] = [
   // listed here, so groupForTab() returned null for it and revealGroupForTab()
   // could not expand its group. With groups collapsed by default that would
   // leave an active Experiments tab invisible in the rail (90952bad).
-  { id: "work", label: "Work", tabs: ["queue", "experiments", "gpu-offers", "hitl", "team", "sessions"] },
+  { id: "work", label: "Work", tabs: ["queue", "experiments", "hitl", "team", "sessions"] },
   { id: "content", label: "Content", tabs: ["files", "notes", "devlog", "documents", "docs", "codeintel"] },
   { id: "history", label: "History", tabs: ["timeline", "rewind"] },
   { id: "settings", label: "Settings", tabs: ["settings"] },

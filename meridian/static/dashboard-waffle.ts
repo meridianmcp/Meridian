@@ -47,7 +47,7 @@ import { groupForTab, revealGroupInStrip } from "./dashboard-tabgroups";
 export type WaffleIconName =
   | "status" | "live" | "goal" | "insights" | "blog" | "queue" | "experiments"
   | "hitl" | "team" | "sessions" | "files" | "notes" | "devlog" | "documents"
-  | "docs" | "codeintel" | "gpuoffers" | "timeline" | "rewind" | "settings" | "generic";
+  | "docs" | "codeintel" | "timeline" | "rewind" | "settings" | "generic";
 
 export interface WaffleTabMeta {
   /** data-vtab id of the rail button this tile activates. */
@@ -68,7 +68,6 @@ export const WAFFLE_TABS: readonly WaffleTabMeta[] = [
   { id: "blog", label: "Blog", icon: "blog", keywords: ["posts", "drafts", "publish", "writing"] },
   { id: "queue", label: "Queue", icon: "queue", keywords: ["active work", "sprint items", "todo", "backlog", "tasks"] },
   { id: "experiments", label: "Experiments", icon: "experiments", keywords: ["trials", "runs", "registry", "research"] },
-  { id: "gpu-offers", label: "GPU offers", icon: "gpuoffers", keywords: ["gpu", "runpod", "price", "pricing", "stock", "compute", "cost"] },
   { id: "hitl", label: "HITL", icon: "hitl", keywords: ["review", "approvals", "questions", "human in the loop", "researcher"] },
   { id: "team", label: "Team", icon: "team", keywords: ["people", "humans", "members", "activity"] },
   { id: "sessions", label: "Sessions", icon: "sessions", keywords: ["run history", "runs", "history"] },
@@ -93,7 +92,7 @@ export const WAFFLE_TABS: readonly WaffleTabMeta[] = [
 export const WAFFLE_DEFAULT_RANK: readonly string[] = [
   "goal", "notes", "insights", "queue", "live", "hitl", "status", "timeline",
   "team", "experiments", "documents", "docs", "files", "codeintel", "devlog",
-  "rewind", "blog", "sessions", "gpu-offers", "settings",
+  "rewind", "blog", "sessions", "settings",
 ];
 
 /** The owner's top picks. Pinned until the user unpins them. */
@@ -168,8 +167,6 @@ const ICON_PATHS: Record<WaffleIconName, string> = {
     '<path d="M3.5 6c2.6-1.1 5.6-.9 8.5.9 2.9-1.8 5.9-2 8.5-.9v12.5c-2.6-1.1-5.6-.9-8.5.9-2.9-1.8-5.9-2-8.5-.9z"/>' +
     '<path d="M12 6.9v12.5"/>',
   codeintel: '<path d="M8.5 8l-4 4 4 4M15.5 8l4 4-4 4M13.3 6.5l-2.6 11"/>',
-  gpuoffers:
-    '<circle cx="12" cy="12" r="8.5"/><path d="M14.5 9.2c-.5-.6-1.3-.9-2.5-.9-1.5 0-2.5.7-2.5 1.8 0 2.6 5.2 1.4 5.2 4.1 0 1.1-1 1.9-2.6 1.9-1.3 0-2.2-.4-2.8-1.1M12 6.5v1.4M12 16.1v1.4"/>',
   timeline:
     '<path d="M7 4.5v15"/><circle cx="7" cy="6.5" r="1.7"/><circle cx="7" cy="12" r="1.7"/><circle cx="7" cy="17.5" r="1.7"/>' +
     '<path d="M11.5 6.5H20M11.5 12H17M11.5 17.5H19"/>',
