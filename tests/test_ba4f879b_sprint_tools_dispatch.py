@@ -929,8 +929,13 @@ async def test_complete_sprint_item_handler_bounds_post_commit_advisories(
     )
     await db_module.claim_sprint_item(db, pid, item["id"])
 
+    # The advisory sleeps well past the outer budget below, so if the handler
+    # awaited it instead of bounding it, wait_for would raise TimeoutError. The
+    # outer budget covers the whole completion (cold DB + handler work, about
+    # 0.35s on this host when run alone), so it is kept generous enough not to
+    # flake on a slow or loaded machine while still staying far below the 3s sleep.
     async def _slow_board_change(*_args, **_kwargs):
-        await asyncio.sleep(1.0)
+        await asyncio.sleep(3.0)
 
     monkeypatch.setattr(mh, "_board_change_for_session", _slow_board_change)
     monkeypatch.setattr(st_mod, "_COMPLETION_ADVISORY_TIMEOUT_S", 0.05)
@@ -940,7 +945,7 @@ async def test_complete_sprint_item_handler_bounds_post_commit_advisories(
             {"project_id": pid, "item_id": item["id"], "session_id": sid},
             db, _DATA_DIR, None, None,
         ),
-        timeout=0.5,
+        timeout=2.0,
     )
 
     assert result["status"] == "done"
