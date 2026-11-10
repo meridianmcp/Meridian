@@ -107,20 +107,21 @@ def _argv_wants_tunnel_mode(argv: list[str]) -> bool:
     return True
 
 
-# psycopg3 requires SelectorEventLoop on Windows (ProactorEventLoop not supported).
-# Must be set before any asyncio.run() or uvicorn.run() call. Skipped for
-# --tunnel mode: the tunnel client never touches psycopg3/db (it's a pure
-# WebSocket relay + subprocess manager), but its run_cmd handling (used by
-# run_verification) DOES need real subprocess support
-# (asyncio.create_subprocess_shell/_exec), which SelectorEventLoop does not
-# implement on Windows — forcing it here made every run_cmd fail with a bare,
-# message-less NotImplementedError, surfaced to callers as a blank
-# `status: "error", message: ""`. Leaving tunnel mode on the Windows-default
-# ProactorEventLoop (via _ensure_event_loop's fallback) fixes that while
-# server/--mcp modes keep the SelectorEventLoop psycopg3 needs.
-if sys.platform == "win32" and not _argv_wants_tunnel_mode(sys.argv[1:]):
+def _install_windows_loop_policy(argv: list[str]) -> None:
+    """Choose the Windows event loop for this process. Called from main(), never at import.
+
+    psycopg3 requires SelectorEventLoop on Windows (ProactorEventLoop is not
+    supported), so server and --mcp modes get it. Tunnel mode keeps the Windows
+    default ProactorEventLoop: its run_cmd handling needs real subprocess support
+    (asyncio.create_subprocess_shell/_exec), which SelectorEventLoop does not
+    implement on Windows. Setting the policy at import time made every run_cmd
+    fail with a message-less NotImplementedError in any process that imported
+    this module (including the test suite), so it now runs only from main().
+    """
+    if sys.platform != "win32" or _argv_wants_tunnel_mode(argv):
+        return
     import selectors
-    # psycopg3 requires SelectorEventLoop — override Windows default ProactorEventLoop
+
     asyncio.set_event_loop_policy(asyncio.WindowsSelectorEventLoopPolicy())
     loop = asyncio.SelectorEventLoop(selectors.SelectSelector())
     asyncio.set_event_loop(loop)
@@ -297,6 +298,7 @@ def main(argv: list[str] | None = None) -> int:
     # Capture the exact argv we're dispatching on (not sys.argv) so the
     # frozen host/port heuristic is correct under tests and embedding.
     raw_argv = list(argv) if argv is not None else list(sys.argv[1:])
+    _install_windows_loop_policy(raw_argv)
     sub_rc = _dispatch_subcommand(raw_argv)
     if sub_rc is not None:
         return sub_rc
@@ -416,7 +418,7 @@ def main(argv: list[str] | None = None) -> int:
 
         _, run_stdio = build_mcp_server()
         # On Windows asyncio.run() creates a new ProactorEventLoop, breaking psycopg3.
-        # Use the SelectorEventLoop we set at module scope instead.
+        # Use the SelectorEventLoop that main() installed for this process.
         loop = _ensure_event_loop()
         loop.run_until_complete(run_stdio())
         return 0
@@ -438,7 +440,7 @@ def main(argv: list[str] | None = None) -> int:
             loop="none",
         )
         server = uvicorn.Server(config)
-        loop = _ensure_event_loop()  # SelectorEventLoop set above in module scope on win32
+        loop = _ensure_event_loop()  # SelectorEventLoop installed by main() on win32
         loop.run_until_complete(server.serve())
     else:
         uvicorn.run(

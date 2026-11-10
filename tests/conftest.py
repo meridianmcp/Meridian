@@ -655,6 +655,21 @@ def _isolate_md_root(monkeypatch, tmp_path):
 
 
 @pytest.fixture(autouse=True)
+def _restore_asyncio_loop_policy():
+    """Put the process event-loop policy back after every test.
+
+    ``meridian.__main__.main()`` installs a Windows SelectorEventLoop when it
+    runs. Any test that calls it would otherwise leak that policy into later
+    tests, and under the Selector policy asyncio subprocess spawns raise
+    NotImplementedError (the run_cmd consent tests failed this way after a
+    main() call in the same worker).
+    """
+    previous = asyncio.get_event_loop_policy()
+    yield
+    asyncio.set_event_loop_policy(previous)
+
+
+@pytest.fixture(autouse=True)
 def _isolate_tunnel_log(monkeypatch, tmp_path_factory):
     """4d6e87dd -- point ``MERIDIAN_TUNNEL_LOG`` at a per-test temp file for
     EVERY test.

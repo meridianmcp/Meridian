@@ -14,3 +14,5 @@ docs/mcp-tools.md text eol=lf
 /.claude/settings.json text eol=lf
 .claude/hooks/*.sh text eol=lf
 pixi.toml text eol=lf
+/meridian/static/dashboard.bundle.js -text
+/meridian/static/asset-manifest.json -text
