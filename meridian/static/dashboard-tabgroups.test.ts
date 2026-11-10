@@ -35,13 +35,14 @@ const ORIGINAL_FLAT_TABS = [
   "blog",
   "sessions",
   "experiments",
+  "gpu-offers",
 ];
 
 // The intended IA — pinned so an accidental reshuffle is caught.
 const EXPECTED_MEMBERSHIP: Record<string, string[]> = {
   overview: ["status", "live"],
   planning: ["goal", "insights", "blog"],
-  work: ["queue", "experiments", "hitl", "team", "sessions"],
+  work: ["queue", "experiments", "gpu-offers", "hitl", "team", "sessions"],
   content: ["files", "notes", "devlog", "documents", "docs", "codeintel"],
   history: ["timeline", "rewind"],
   settings: ["settings"],
