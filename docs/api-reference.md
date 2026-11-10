@@ -795,6 +795,7 @@ No auth required.
 
 | Method | Path | Description |
 |--------|------|-------------|
+| `GET` | `/compute/offers` | GPU offers from the live RunPod catalog, filtered and sorted server-side |
 | `GET` | `/compute/runpod/check` | Check that the default RunPod credential works (one billing call, one pod-listing call) |
 | `GET` | `/compute/runpod/pods` | List one page (up to 1000) of the account's RunPod pods as summaries |
 

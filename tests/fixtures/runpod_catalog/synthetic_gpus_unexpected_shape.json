@@ -1,0 +1,6 @@
+{
+  "_synthetic": "Synthetic. Wrong wrapper key on purpose: there is no top-level gpus list. Used to test unexpected_shape.",
+  "items": [
+    {"id": "NVIDIA L40S", "name": "L40S", "memory": 48, "secure": true, "community": true, "price": {"secure": 0.86}}
+  ]
+}

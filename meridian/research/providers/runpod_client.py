@@ -42,6 +42,11 @@ DEFAULT_BASE_URL = "https://api.runpod.io/v2"
 DEFAULT_TIMEOUT_SECONDS = 30.0
 #: Upper bound on bytes :meth:`RunPodClient.pod_logs` reads from the SSE stream.
 DEFAULT_LOG_MAX_BYTES = 256 * 1024
+#: GET path of the GPU catalog, relative to :data:`DEFAULT_BASE_URL` (the ``/v2`` base).
+GPU_CATALOG_PATH = "catalog/gpus"
+#: Per-request timeouts for the catalog reads. The pod endpoints keep :data:`DEFAULT_TIMEOUT_SECONDS`.
+CATALOG_TIMEOUT = httpx.Timeout(connect=5.0, read=15.0, write=10.0, pool=5.0)
+_AVAILABILITY_CLOUDS = frozenset({"SECURE", "COMMUNITY"})
 
 _LOG_SOURCES = frozenset({"container", "system"})
 _MAX_ERROR_CHARS = 500
@@ -379,6 +384,33 @@ class RunPodClient:
         return self._json(self._request("GET", "billing"))
 
     # ------------------------------------------------------------------
+    # GPU catalog (read only)
+    # ------------------------------------------------------------------
+
+    def get_gpu_prices(self) -> "dict[str, Any]":
+        """GET /v2/catalog/gpus with no query parameters: the list prices for each GPU type.
+
+        Returns the raw object. The ``gpus`` list holds each type's ``id`` (the create key), ``name``,
+        ``memory`` (VRAM in GB), ``secure`` and ``community`` flags, and ``price`` ``{secure, community,
+        serverless}`` in USD per GPU-hour. The response carries no timestamp, so the caller stamps the time.
+        Explicit timeouts (:data:`CATALOG_TIMEOUT`) apply to this call.
+        """
+        return self._json(self._request("GET", GPU_CATALOG_PATH, timeout=CATALOG_TIMEOUT))
+
+    def get_gpu_availability(self, cloud: str) -> "dict[str, Any]":
+        """GET /v2/catalog/gpus with ``include=AVAILABILITY``, ``product=POD``, ``count=1`` and ``cloud``.
+
+        ``cloud`` is ``SECURE`` or ``COMMUNITY``. Each GPU carries ``availability`` (NONE, LOW, MEDIUM or
+        HIGH) and ``dataCenters`` (``id``, ``name``, ``availability``). ``include`` requires ``product``, so both
+        are sent. Stock is for one GPU, not for a larger count. No other query parameter is sent.
+        """
+        if cloud not in _AVAILABILITY_CLOUDS:
+            raise ValueError("cloud must be 'SECURE' or 'COMMUNITY'")
+        params: dict[str, Any] = {"include": "AVAILABILITY", "product": "POD", "count": 1, "cloud": cloud}
+        assert params["product"], "include=AVAILABILITY requires product"
+        return self._json(self._request("GET", GPU_CATALOG_PATH, params=params, timeout=CATALOG_TIMEOUT))
+
+    # ------------------------------------------------------------------
     # Internals
     # ------------------------------------------------------------------
 
@@ -418,9 +450,13 @@ class RunPodClient:
         *,
         params: "dict[str, Any] | None" = None,
         json_body: "dict[str, Any] | None" = None,
+        timeout: "httpx.Timeout | None" = None,
     ) -> httpx.Response:
+        # A per-call timeout is passed only when given. httpx treats timeout=None as "no timeout",
+        # so the client default must not be overridden with None.
+        call_kwargs: dict[str, Any] = {} if timeout is None else {"timeout": timeout}
         try:
-            response = self._http.request(method, path, params=params, json=json_body)
+            response = self._http.request(method, path, params=params, json=json_body, **call_kwargs)
         except httpx.HTTPError as exc:
             transport_error = self._transport_error(exc)
         else:

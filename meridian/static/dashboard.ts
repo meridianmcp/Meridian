@@ -13,6 +13,8 @@ import "./dashboard-sprint";
 import "./dashboard-waves";
 import "./dashboard-settings";
 import "./dashboard-plugins";
+// GPU offers tab (GPU offer catalog, pass 1): price-sorted RunPod list prices and stock from /compute/offers.
+import { loadGpuOffersTab } from "./dashboard-gpu-offers";
 
 import "./dashboard-notes";
 import "./dashboard-documents";
@@ -3594,6 +3596,8 @@ function buildTabBody(project: any) {
 
           <button class="vtab-btn" data-vtab="experiments" title="Experiments — trial registry, run drill-down &amp; event timeline">🧪</button>
 
+          <button class="vtab-btn" data-vtab="gpu-offers" title="GPU offers — RunPod list prices and stock, sorted by price">💲</button>
+
           <button class="vtab-btn" data-vtab="hitl" title="Researcher Review Queue" style="position:relative">❓<span class="hitl-vtab-badge vtab-count-badge" data-pid="${project.id}" style="display:none;position:absolute;top:2px;right:2px;background:#f87171;color:#fff;font-size:8px;font-weight:700;padding:0 3px;border-radius:6px;line-height:14px;pointer-events:none">0</span></button>
 
           <button class="vtab-btn" data-vtab="team" title="Team — per-human activity">👥</button>
@@ -4486,6 +4490,13 @@ function buildTabBody(project: any) {
 
       </div>
 
+      <div class="drawer-panel" id="drawer-gpu-offers-${project.id}">
+        <div class="drawer-header">
+          <span>GPU OFFERS</span>
+        </div>
+        <div class="gpu-offers-root" id="gpu-offers-root-${project.id}" style="flex:1;overflow-y:auto;min-height:0"></div>
+      </div>
+
       <div class="drawer-panel" id="drawer-sessions-${project.id}">
 
         <div class="drawer-header">
@@ -4791,6 +4802,7 @@ function buildTabBody(project: any) {
         if (vtab === 'blog') loadBlogTab(project.id);
 
         if (vtab === 'sessions') loadSessionTimelineTab(project.id);
+        if (vtab === 'gpu-offers') loadGpuOffersTab(project.id);
 
       };
 

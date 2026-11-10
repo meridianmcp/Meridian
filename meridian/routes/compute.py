@@ -28,12 +28,15 @@ never sends it.
 """
 from __future__ import annotations
 
+import asyncio
+import threading
 from collections.abc import Callable
 from typing import Any
 
 from fastapi import APIRouter, Request
 from fastapi.responses import JSONResponse
 
+from ..compute_catalog import OffersCache, QueryError, build_offers_view, parse_offers_query
 from ..mcp.handlers.runpod_tools import (
     _check_payload,
     _error,
@@ -42,11 +45,19 @@ from ..mcp.handlers.runpod_tools import (
     handle_runpod_check_key,
     handle_runpod_list_pods,
 )
+from ..research.providers.runpod_catalog import RUNPOD_PROVIDER, RunPodOffersSource
 
 router = APIRouter()
 
 _HOSTED_ERROR_CODE = "hosted_refused"
 _LOCAL_ONLY_ERROR_CODE = "local_only"
+_OFFERS_HOSTED_MESSAGE = "GPU offers are available on local installs only."
+# GPU offers read the RunPod key from the environment only (decided 2026-11-10).
+# The MCP tools keep the full chain (env, keyring, runpodctl); this route does not.
+OFFERS_CREDENTIAL_REFS: tuple[str, ...] = ("env:RUNPOD_API_KEY",)
+
+_offers_cache_lock = threading.Lock()
+_offers_cache_instance: OffersCache | None = None
 
 # The rule routes/zotero.py applies inline. There is no shared helper for it yet, so the
 # same two sets are kept here.
@@ -104,3 +115,60 @@ async def runpod_list_pods_route(request: Request) -> JSONResponse:
     if refused is not None:
         return refused
     return _as_response(await handle_runpod_list_pods({}))
+
+
+def _offers_cache() -> OffersCache:
+    """The process-wide offers cache, built on first use with the env-only offers credential ref."""
+    global _offers_cache_instance
+    with _offers_cache_lock:
+        if _offers_cache_instance is None:
+            source = RunPodOffersSource(credential_refs=OFFERS_CREDENTIAL_REFS, hosted=False)
+            _offers_cache_instance = OffersCache({RUNPOD_PROVIDER: source})
+        return _offers_cache_instance
+
+
+def _offers_payload(kind: "str | None", error: dict[str, Any]) -> dict[str, Any]:
+    """The body for a refused or invalid offers request. It has the same keys as a successful one."""
+    return {
+        "ok": False,
+        "status": "error",
+        "credential_source": kind,
+        "error": error,
+        "providers": [],
+        "offers": [],
+        "count": 0,
+        "gpu_models": [],
+        "filters_applied": {},
+    }
+
+
+@router.get("/compute/offers")
+async def compute_offers_route(request: Request) -> JSONResponse:
+    """GPU offers from the live RunPod catalog, filtered and sorted server-side.
+
+    Read only: nothing is created, stopped or billed. Prices come from RunPod's list prices, and stock comes from
+    the per-cloud availability reads. Results come from an in-process cache (five minutes by default). A failed
+    refresh serves the last good data with status ``stale``. A missing key gives status ``not_configured``. Both
+    are HTTP 200, so the dashboard can show each state.
+
+    Refusals: a caller that is not on loopback, or whose request was relayed by a proxy, gets 403 ``local_only``.
+    On hosted, the route gives 403 ``hosted_refused`` before any credential is read. Any unknown query parameter
+    gives 400 ``unknown_parameter``, and any invalid value gives 400 ``invalid_filter``.
+    """
+    refused = _refuse_remote_caller(request, _offers_payload)
+    if refused is not None:
+        return refused
+    if _hosted_mode():
+        return JSONResponse(
+            _offers_payload(None, _error(_HOSTED_ERROR_CODE, _OFFERS_HOSTED_MESSAGE)), status_code=403,
+        )
+    try:
+        query = parse_offers_query(
+            {name: request.query_params.getlist(name) for name in request.query_params.keys()}
+        )
+    except QueryError as exc:
+        return JSONResponse(_offers_payload(None, _error(exc.code, exc.message)), status_code=400)
+    snapshot = await asyncio.to_thread(_offers_cache().get, query.provider)
+    view = build_offers_view([snapshot], query)
+    view["credential_source"] = snapshot.credential_source
+    return JSONResponse(view, status_code=200)
