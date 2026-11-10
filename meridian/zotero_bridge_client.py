@@ -178,6 +178,82 @@ def _batch_refusal(method: str, path: str) -> str | None:
     )
 
 
+# The top-level keys an item body reads. extensions/zotero-bridge/lib/api/items.js refuses any other key with 422. Older
+# plugin builds dropped such a key without a word, and the item was saved empty (a title sent at the top level, for example).
+# A batch is checked against the same lists before anything is sent, so the caller learns the right place at once.
+_CREATE_ITEM_KEYS = frozenset({"item_type", "fields", "creators", "tags", "collection_keys", "relations"})
+_UPDATE_ITEM_KEYS = frozenset(
+    {
+        "item_type",
+        "fields",
+        "creators",
+        "expected_modified",
+        "expected_version",
+        "set_tags",
+        "add_tags",
+        "remove_tags",
+        "set_collections",
+        "add_collections",
+        "remove_collections",
+        "add_relations",
+        "remove_relations",
+    }
+)
+_CREATOR_KEYS = frozenset({"creatorType", "firstName", "lastName", "name"})
+_ITEM_ROUTE = re.compile(rf"/v1/items/{_BATCH_KEY}")
+_PLAIN_NAME = re.compile(r"[A-Za-z_][A-Za-z0-9_]{0,63}")
+
+
+def _shown_key(key: Any) -> str:
+    """A key as the message shows it. Only a plain name is echoed; anything else is described, not repeated."""
+    if isinstance(key, str) and _PLAIN_NAME.fullmatch(key):
+        return f"'{key}'"
+    return "(not a plain name)"
+
+
+def _misplaced_key_hint(key: Any, create: bool) -> str:
+    """Where a top-level key the bridge does not read belongs. The key itself is never echoed as a value."""
+    if key in ("collections", "collection", "collection_key"):
+        if create:
+            return "belongs in collection_keys, a list of collection keys"
+        return "belongs in set_collections, add_collections or remove_collections, lists of collection keys"
+    if not create and key in ("tags", "tag"):
+        return "belongs in set_tags, add_tags or remove_tags"
+    if not create and key in ("relations", "relation"):
+        return "belongs in add_relations or remove_relations"
+    if create:
+        return "is not read here. Zotero fields go in fields, creators in creators, and collections in collection_keys"
+    return (
+        "is not read here. Zotero fields go in fields, creators in creators, and collection changes in "
+        "set_collections, add_collections or remove_collections"
+    )
+
+
+def _item_body_problem(method: str, path: str, body: dict[str, Any]) -> str | None:
+    """Why an item create or update body cannot be right, or None. The reason names a key, never a value."""
+    if method == "POST" and path == "/v1/items":
+        allowed, create = _CREATE_ITEM_KEYS, True
+    elif method == "PATCH" and _ITEM_ROUTE.fullmatch(path):
+        allowed, create = _UPDATE_ITEM_KEYS, False
+    else:
+        return None
+    for key in body:
+        if key not in allowed:
+            return f"has the top-level key {_shown_key(key)}, which {_misplaced_key_hint(key, create)}"
+    creators = body.get("creators")
+    if isinstance(creators, list):
+        for index, row in enumerate(creators):
+            if not isinstance(row, dict):
+                continue
+            for key in row:
+                if key not in _CREATOR_KEYS:
+                    return (
+                        f"creators[{index}] has the key {_shown_key(key)}, which is not a creator key. Use creatorType, "
+                        "firstName and lastName for a person, or name for an institution"
+                    )
+    return None
+
+
 def _batch_entry(operation: Any, index: int) -> dict[str, Any]:
     name = f"operations[{index}]"
     if not isinstance(operation, dict):
@@ -192,6 +268,10 @@ def _batch_entry(operation: Any, index: int) -> dict[str, Any]:
     reason = _batch_refusal(method, path)
     if reason is not None:
         raise ZoteroBridgeError("not_batchable", f"{name} {reason}")
+    if isinstance(body, dict):
+        problem = _item_body_problem(method, path, body)
+        if problem is not None:
+            raise _invalid(f"{name}.body", problem)
     entry: dict[str, Any] = {"method": method, "path": path}
     if body is not None:
         entry["body"] = body

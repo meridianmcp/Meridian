@@ -18,6 +18,63 @@ test('decodeBase64 refuses anything that is not standard base64 with padding', (
   }
 });
 
+// The pattern decodeBase64 used before. It is kept here only as the reference the current check must agree with.
+const OLD_BASE64_RE = /^(?:[A-Za-z0-9+/]{4})*(?:[A-Za-z0-9+/]{2}==|[A-Za-z0-9+/]{3}=)?$/;
+
+// True when decodeBase64 accepts the text. A refusal is an invalid_value error, and any other error is a bug.
+function accepts(text) {
+  try {
+    v.decodeBase64(text, 'data_base64', 1e9);
+    return true;
+  } catch (error) {
+    if (error.code !== 'invalid_value') throw error;
+    return false;
+  }
+}
+
+test('decodeBase64 accepts exactly the strings the old pattern accepted, for every string of up to eight characters', () => {
+  // Every string of up to eight characters from A, 0, +, = and !. The alphabet includes the two signs that break base64.
+  const alphabet = ['A', '0', '+', '=', '!'];
+  let frontier = [''];
+  let checked = 0;
+  for (let length = 0; length <= 8; length++) {
+    const next = [];
+    for (const text of frontier) {
+      assert.equal(accepts(text), OLD_BASE64_RE.test(text), JSON.stringify(text));
+      checked += 1;
+      if (length < 8) for (const ch of alphabet) next.push(text + ch);
+    }
+    frontier = next;
+  }
+  assert.equal(checked, 488281);
+});
+
+test('decodeBase64 round-trips a 4.5 MB payload and payloads at the 24 MiB limit, with each padding length', () => {
+  const limit = 24 * 1024 * 1024;
+  for (const size of [4500000, limit, limit - 1, limit - 2]) {
+    const payload = Buffer.alloc(size);
+    for (let i = 0; i < size; i += 4096) payload[i] = i & 0xff;
+    const decoded = v.decodeBase64(payload.toString('base64'), 'data_base64', limit);
+    assert.equal(decoded.length, size, `length for ${size}`);
+    assert.equal(Buffer.compare(Buffer.from(decoded), payload), 0, `bytes for ${size}`);
+  }
+});
+
+test('decodeBase64 refuses a payload one byte over the 24 MiB limit, after the length and pattern checks', () => {
+  const limit = 24 * 1024 * 1024;
+  const over = Buffer.alloc(limit + 1, 0x41).toString('base64');
+  assert.throws(
+    () => v.decodeBase64(over, 'data_base64', limit),
+    (error) => error.code === 'invalid_value' && /decodes to more than/.test(error.message)
+  );
+});
+
+test('decodeBase64 refuses a base64 string whose length is not a multiple of four, whatever its characters', () => {
+  for (const text of ['QUJDR', 'QUJDRA', 'QUJDREVG=', 'QQ=', 'QUJDRA==A']) {
+    assert.throws(() => v.decodeBase64(text, 'data_base64', 1000), (error) => error.code === 'invalid_value', text);
+  }
+});
+
 test('decodeBase64 refuses a payload over the byte limit before decoding it', () => {
   const big = Buffer.alloc(100, 1).toString('base64');
   assert.throws(() => v.decodeBase64(big, 'data_base64', 99), (error) => error.code === 'invalid_value');
