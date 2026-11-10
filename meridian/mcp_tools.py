@@ -2994,6 +2994,15 @@ _MCP_TOOLS_LIST: list[dict[str, Any]] = [
                     "description": "Filter: omit for pending+recent-answered (default), 'pending', 'answered', 'dismissed', or 'all'."},
          "limit": {"type": "integer", "description": "Max results, default 50."}},
          "required": []}},
+    {"name": "list_decisions", "description":
+        "Read-only: list open human decisions for a project: pending HITL questions that carry "
+        "answer options. Each entry has its numbered options, the recommended option, the urgency, "
+        "and whether a human must answer (require_human). Answer one with answer_hitl.",
+     "inputSchema": {"type": "object", "properties": {
+         "project_id": {"type": "string"},
+         "project_name": {"type": "string", "description": "Project name — an alternative to project_id; resolved to the id internally. project_id wins if both are given."},
+         "limit": {"type": "integer", "description": "Max decisions, default 200."}},
+         "required": []}},
     {"name": "answer_hitl", "description":
         "Answer a pending HITL request programmatically. Marks it answered so "
         "the waiting session can resume. Use list_hitl_requests to find request IDs.",
@@ -5051,7 +5060,7 @@ _READ_ONLY_TOOLS = {
     "list_guidestones", "load_guidestone",
     "get_experiment", "list_experiments", "get_experiment_run", "list_experiment_runs",
     "get_experiment_events",
-    "list_hitl_requests", "list_sessions", "get_sprint_notes",
+    "list_hitl_requests", "list_decisions", "list_sessions", "get_sprint_notes",
     "get_session_log", "get_session_activity", "get_connection_log", "get_server_logs",
     "search_server_logs", "get_server_log_checkpoint",
     "idle_until_session_done", "generate_handoff", "load_handoff",
@@ -5358,6 +5367,7 @@ _TOOL_CATEGORY: dict[str, str] = {
     "request_hitl":     "hitl",
     "get_hitl_request": "hitl",
     "list_hitl_requests": "hitl",
+    "list_decisions": "hitl",
     "answer_hitl":      "hitl",
     "dismiss_hitl":     "hitl",
     # workspace-level
@@ -5742,6 +5752,7 @@ _TOOL_ROLE_RELEVANCE: dict[str, str] = {
     "request_hitl":              "both",
     "get_hitl_request":          "both",
     "list_hitl_requests":        "both",
+    "list_decisions":            "both",
     "answer_hitl":               "both",
     "dismiss_hitl":              "both",
     "search_code_semantic":      "both",
@@ -5917,6 +5928,7 @@ _TOOL_WORKFLOW_TIER: dict[str, str] = {
     # hitl management
     "get_hitl_request":           "common-support",
     "list_hitl_requests":         "common-support",
+    "list_decisions":             "common-support",
     "answer_hitl":                "common-support",
     "dismiss_hitl":               "common-support",
     # file-locking (claim sequence per AGENTS.md)
@@ -6095,6 +6107,7 @@ _TITLE_OVERRIDES: dict[str, str] = {
     "request_hitl": "Request HITL",
     "get_hitl_request": "Get HITL Request",
     "list_hitl_requests": "List HITL Requests",
+    "list_decisions": "List Decisions",
     "answer_hitl": "Answer HITL",
     "dismiss_hitl": "Dismiss HITL",
     "update_md_section": "Update Markdown Section",
