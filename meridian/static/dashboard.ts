@@ -3940,8 +3940,6 @@ function buildTabBody(project: any) {
 
                 <div style="display:flex;gap:6px">
 
-                  <button class="secondary" id="consolidate-decisions-${project.id}" style="padding:3px 10px;font-size:10px" title="Use AI to deduplicate and merge decisions">✨ Consolidate</button>
-
                   <button class="secondary" id="add-pinned-decision-${project.id}" style="padding:3px 10px;font-size:10px">+ Pin</button>
 
                 </div>
@@ -4906,12 +4904,6 @@ function buildTabBody(project: any) {
       if (el) el.addEventListener('keydown', (e: any) => { if ((e.ctrlKey || e.metaKey) && e.key === 'Enter') doAddDecision(); });
     });
   }
-
-  const consolidateBtn = document.getElementById(`consolidate-decisions-${project.id}`);
-
-  if (consolidateBtn) consolidateBtn.onclick = () => consolidateDecisions(project.id);
-
-
 
   const saveGoalBtn = document.getElementById(`save-goal-${project.id}`);
   if (saveGoalBtn) saveGoalBtn.onclick = () => saveGoal(project.id);
@@ -11004,15 +10996,9 @@ function renderConstitutionWarning(projectId: any) {
 
         ${warn ? `<button class="secondary" id="constitution-archive-${projectId}" style="padding:2px 8px;font-size:10px">Archive oldest ${archiveCount}</button>` : ''}
 
-        <button class="secondary" id="constitution-consolidate-${projectId}" style="padding:2px 8px;font-size:10px">Consolidate now</button>
-
       </div>
 
     </div>`;
-
-  const consolidateBtn = document.getElementById(`constitution-consolidate-${projectId}`);
-
-  if (consolidateBtn) consolidateBtn.onclick = () => consolidateDecisions(projectId);
 
   const archiveBtn = document.getElementById(`constitution-archive-${projectId}`);
 
@@ -11978,191 +11964,6 @@ async function addPinnedDecision(projectId: any) {
 
 
 
-async function consolidateDecisions(projectId: any) {
-
-  /** v2.8 — AI consolidation flow for pinned decisions.
-
-   * Shows API key + model modal → calls /decisions/consolidate → shows preview
-
-   * → on confirm calls /decisions-pinned/replace-all. */
-
-  // Step 1: API key + model input modal
-
-  const overlay = document.createElement('div');
-
-  overlay.style.cssText = 'position:fixed;inset:0;background:rgba(0,0,0,0.72);z-index:9998;display:flex;align-items:center;justify-content:center';
-
-  overlay.innerHTML = `
-
-    <div style="background:var(--surface-1);border:1px solid var(--border);border-radius:6px;padding:20px;width:480px;max-width:92vw;display:flex;flex-direction:column;gap:12px;box-shadow:0 8px 32px #0008">
-
-      <div style="font-weight:600;font-size:13px;color:var(--accent)">✨ AI Decision Consolidation</div>
-
-      <div style="font-size:11px;color:var(--muted)">Sends your pinned decisions to an LLM to deduplicate and merge. Preview before applying. API key is never stored.</div>
-
-      <div>
-
-        <div style="font-size:10px;color:var(--muted);margin-bottom:4px;font-family:var(--font-mono)">MODEL</div>
-
-        <select id="_consolidate-model" style="width:100%;padding:6px 8px;background:var(--surface-2);border:1px solid var(--border);color:var(--text);border-radius:4px;font-family:var(--font-mono);font-size:11px">
-
-          <option value="claude-haiku-4-5-20251001">Claude Haiku 4.5 (fast, cheap)</option>
-
-          <option value="claude-sonnet-4-6">Claude Sonnet 4.6 (better)</option>
-
-          <option value="gpt-4o-mini">GPT-4o mini</option>
-
-          <option value="gpt-4o">GPT-4o</option>
-
-          <option value="deepseek-chat">DeepSeek Chat</option>
-
-        </select>
-
-      </div>
-
-      <div>
-
-        <div style="font-size:10px;color:var(--muted);margin-bottom:4px;font-family:var(--font-mono)">API KEY</div>
-
-        <input id="_consolidate-key" type="password" placeholder="sk-ant-... / sk-... / sk-..." style="width:100%;padding:6px 8px;background:var(--surface-2);border:1px solid var(--border);color:var(--text);border-radius:4px;font-family:var(--font-mono);font-size:11px;outline:none">
-
-      </div>
-
-      <div style="display:flex;gap:8px;justify-content:flex-end;margin-top:4px">
-
-        <button class="secondary" id="_consolidate-cancel" style="padding:5px 14px;font-size:11px">Cancel</button>
-
-        <button class="primary" id="_consolidate-run" style="padding:5px 14px;font-size:11px">Consolidate →</button>
-
-      </div>
-
-    </div>`;
-
-  document.body.appendChild(overlay);
-
-  overlay.addEventListener('click', e => { if (e.target === overlay) overlay.remove(); });
-
-  document.getElementById('_consolidate-cancel')!.onclick = () => overlay.remove();
-
-
-
-  document.getElementById('_consolidate-run')!.onclick = async () => {
-
-    const apiKey = document.getElementById('_consolidate-key')!.value.trim();
-
-    const model = document.getElementById('_consolidate-model')!.value;
-
-    if (!apiKey) { toast('API key required', true); return; }
-
-    const runBtn = document.getElementById('_consolidate-run');
-
-    runBtn!.textContent = 'Working…'; runBtn!.disabled = true;
-
-    try {
-
-      const result = await api(`/projects/${projectId}/decisions/consolidate`, {
-
-        method: 'POST',
-
-        body: JSON.stringify({ api_key: apiKey, model }),
-
-      });
-
-      overlay.remove();
-
-      // Step 2: Preview modal
-
-      const consolidated = result.consolidated || [];
-
-      const previewOverlay = document.createElement('div');
-
-      previewOverlay.style.cssText = 'position:fixed;inset:0;background:rgba(0,0,0,0.72);z-index:9999;display:flex;align-items:center;justify-content:center';
-
-      const previewHtml = consolidated.map((d: any) => {
-
-        const cat = (d.category || 'TECHNICAL').toUpperCase();
-
-        const color = _DECISION_CATEGORY_COLORS[cat] || _DECISION_CATEGORY_COLORS.TECHNICAL;
-
-        return `<div style="background:var(--surface-2);border-left:4px solid ${color};border-radius:4px;padding:8px 10px;margin-bottom:8px">
-
-          <div style="display:flex;gap:8px;align-items:center;margin-bottom:4px">
-
-            <span style="background:${color}22;color:${color};font-size:9px;font-weight:700;padding:1px 5px;border-radius:3px">${escapeHtml(cat)}</span>
-
-            <span style="color:var(--accent);font-weight:600;font-size:12px">${escapeHtml(d.title || '')}</span>
-
-          </div>
-
-          <div style="color:var(--text);font-size:11px;white-space:pre-wrap">${escapeHtml(d.body || '')}</div>
-
-        </div>`;
-
-      }).join('');
-
-      previewOverlay.innerHTML = `
-
-        <div style="background:var(--surface-1);border:1px solid var(--border);border-radius:6px;padding:20px;width:620px;max-width:92vw;max-height:80vh;display:flex;flex-direction:column;gap:12px;box-shadow:0 8px 32px #0008">
-
-          <div style="font-weight:600;font-size:13px;color:var(--accent)">Preview — ${consolidated.length} decisions (was ${result.original_count})</div>
-
-          <div style="flex:1;overflow-y:auto;font-family:var(--font-mono)">${previewHtml}</div>
-
-          <div style="color:var(--muted);font-size:10px">This will supersede all ${result.original_count} existing decisions and create ${consolidated.length} new ones.</div>
-
-          <div style="display:flex;gap:8px;justify-content:flex-end">
-
-            <button class="secondary" id="_preview-cancel" style="padding:5px 14px;font-size:11px">Cancel</button>
-
-            <button class="primary" id="_preview-apply" style="padding:5px 14px;font-size:11px">Apply →</button>
-
-          </div>
-
-        </div>`;
-
-      document.body.appendChild(previewOverlay);
-
-      previewOverlay.addEventListener('click', e => { if (e.target === previewOverlay) previewOverlay.remove(); });
-
-      document.getElementById('_preview-cancel')!.onclick = () => previewOverlay.remove();
-
-      document.getElementById('_preview-apply')!.onclick = async () => {
-
-        const applyBtn = document.getElementById('_preview-apply');
-
-        applyBtn!.textContent = 'Applying…'; applyBtn!.disabled = true;
-
-        try {
-
-          await api(`/projects/${projectId}/decisions-pinned/replace-all`, {
-
-            method: 'POST',
-
-            body: JSON.stringify({ decisions: consolidated }),
-
-          });
-
-          previewOverlay.remove();
-
-          toast(`Consolidated: ${consolidated.length} decisions applied`);
-
-          loadPinnedDecisions(projectId);
-
-        } catch (e: any) { toast('Apply failed: ' + e.message, true); applyBtn!.textContent = 'Apply →'; applyBtn!.disabled = false; }
-
-      };
-
-    } catch (e: any) {
-
-      runBtn!.textContent = 'Consolidate →'; runBtn!.disabled = false;
-
-      toast('Consolidation failed: ' + e.message, true);
-
-    }
-
-  };
-
-}
 
 
 
@@ -14135,4 +13936,4 @@ function toggleExpand(id: any) {
 
 // --- ITEM 4 esbuild: re-expose top-level symbols as globals so inline
 // handlers and cross-file references keep resolving after IIFE bundling.
-try { Object.assign(window, { loadCodeIntelTab, _initCodeIntelTabVisibility, hideHostedAdminControls, ensureSignOutLink, ensureWorkspaceSwitcher, getActiveWorkspaceRole, showConnectDbModal, showLocalServerControls, _summarizeApiErrorText, _projectLoadErrorInfo, wireProjectLoadRetry, renderProjectLoadError, recordProjectLoadError, clearProjectLoadError, renderProjectLoadAlert, retryProjectSurface, syncSidebarActiveProject, autosizeGoalField, githubIconSvg, getConstitutionLimit, loadProjectSettings, saveProjectSettings, loadExecutorRulesSection, loadTunnelPluginsSection, _demoTourDone, _demoTourSavedStep, _demoTourSaveStep, _demoTourMarkDone, _demoTourClose, _tourActivateVtab, startDemoTour, resumeDemoTour, api, projectApi, loadServerConfig, _armAccountSwitchWatch, _refreshOnFocus, _checkAccountSwitch, _showAccountSwitchBanner, updateGitHubConnectionIndicator, _updateConnectionIndicator, checkGitStatus, _doRestart, loadConfig, loadProjects, _makeProjectItem, openTab, closeTab, saveTabs, renderTabs, _makeTabEl, _openTabMenu, _setProjectIcon, _renameProject, _makeSubproject, _detachSubproject, _deleteProject, activateTab, buildTabBody, scheduleLiveRefresh, initLiveAutoRefresh, loadLiveTab, refreshLiveTab, wireSprintAddEnter, sprintAction, sprintArchive, filterBackburner, sprintPushPrompt, sprintFeedback, sprintFeedbackNote, sprintItemEdit, sprintItemNotesEdit, sprintItemResourcesEdit, resourceChipClick, sprintResetPending, addSprintItemFromInput, cacheMostRecentSession, renderLiveSessions, endLiveSession, openTimelineForSession, renderLiveQueue, addLiveTask, cancelLiveTask, showCopyPreview, wireClaudeLaunchPanel, stampHandoffTs, populateSessionDropdown, loadTimeline, _renderTimelineLog, loadDocsTab, normalizeNotifyTarget, displayNotifyTarget, osExecutorHintBanner, showFailoverBannerIfNeeded, suggestNtfyTopic, loadHitlTab, loadTeamTab, updateLiveFeed, loadRecentSessions, loadMilestones, loadRecentRuns, loadQueue, renderSearchResults, wireQueueSectionToggles, refreshTab, refreshGoal, parseDecisionsBlob, renderConstitutionWarning, _hitlBadgeClick, initHitlPanel, setVtabCountBadge, refreshProjectCountBadges, refreshHitl, _hitlAnswer, _hitlDismiss, loadPinnedDecisions, supersedePinnedDecision, addPinnedDecision, consolidateDecisions, renderDecisionsTable, wireGoalPreviewToggle, saveGoal, saveNorthStar, saveSprint, _sessionPresenceDot, refreshSessions, refreshTasks, renderTasks, _loadMoreTasks, renderTaskRow, deleteTaskRow, renderHitlRow, wireHitlRow, appendToGoal, hitlReply, hitlExecute, connectWs, connectAccountWs, handleAccountEvent, dismissEmptyAccountWizard, refreshDecisionsLog, handleWsEvent, restoreTabs, toggleExpand, flattenHierarchy, eligibleParents, state }); } catch (e: any) {}
+try { Object.assign(window, { loadCodeIntelTab, _initCodeIntelTabVisibility, hideHostedAdminControls, ensureSignOutLink, ensureWorkspaceSwitcher, getActiveWorkspaceRole, showConnectDbModal, showLocalServerControls, _summarizeApiErrorText, _projectLoadErrorInfo, wireProjectLoadRetry, renderProjectLoadError, recordProjectLoadError, clearProjectLoadError, renderProjectLoadAlert, retryProjectSurface, syncSidebarActiveProject, autosizeGoalField, githubIconSvg, getConstitutionLimit, loadProjectSettings, saveProjectSettings, loadExecutorRulesSection, loadTunnelPluginsSection, _demoTourDone, _demoTourSavedStep, _demoTourSaveStep, _demoTourMarkDone, _demoTourClose, _tourActivateVtab, startDemoTour, resumeDemoTour, api, projectApi, loadServerConfig, _armAccountSwitchWatch, _refreshOnFocus, _checkAccountSwitch, _showAccountSwitchBanner, updateGitHubConnectionIndicator, _updateConnectionIndicator, checkGitStatus, _doRestart, loadConfig, loadProjects, _makeProjectItem, openTab, closeTab, saveTabs, renderTabs, _makeTabEl, _openTabMenu, _setProjectIcon, _renameProject, _makeSubproject, _detachSubproject, _deleteProject, activateTab, buildTabBody, scheduleLiveRefresh, initLiveAutoRefresh, loadLiveTab, refreshLiveTab, wireSprintAddEnter, sprintAction, sprintArchive, filterBackburner, sprintPushPrompt, sprintFeedback, sprintFeedbackNote, sprintItemEdit, sprintItemNotesEdit, sprintItemResourcesEdit, resourceChipClick, sprintResetPending, addSprintItemFromInput, cacheMostRecentSession, renderLiveSessions, endLiveSession, openTimelineForSession, renderLiveQueue, addLiveTask, cancelLiveTask, showCopyPreview, wireClaudeLaunchPanel, stampHandoffTs, populateSessionDropdown, loadTimeline, _renderTimelineLog, loadDocsTab, normalizeNotifyTarget, displayNotifyTarget, osExecutorHintBanner, showFailoverBannerIfNeeded, suggestNtfyTopic, loadHitlTab, loadTeamTab, updateLiveFeed, loadRecentSessions, loadMilestones, loadRecentRuns, loadQueue, renderSearchResults, wireQueueSectionToggles, refreshTab, refreshGoal, parseDecisionsBlob, renderConstitutionWarning, _hitlBadgeClick, initHitlPanel, setVtabCountBadge, refreshProjectCountBadges, refreshHitl, _hitlAnswer, _hitlDismiss, loadPinnedDecisions, supersedePinnedDecision, addPinnedDecision, renderDecisionsTable, wireGoalPreviewToggle, saveGoal, saveNorthStar, saveSprint, _sessionPresenceDot, refreshSessions, refreshTasks, renderTasks, _loadMoreTasks, renderTaskRow, deleteTaskRow, renderHitlRow, wireHitlRow, appendToGoal, hitlReply, hitlExecute, connectWs, connectAccountWs, handleAccountEvent, dismissEmptyAccountWizard, refreshDecisionsLog, handleWsEvent, restoreTabs, toggleExpand, flattenHierarchy, eligibleParents, state }); } catch (e: any) {}
