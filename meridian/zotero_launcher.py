@@ -166,40 +166,13 @@ def _http_status(response):
 
 
 def _autoinstall_zotero_plugin():
-    """Before Meridian launches Zotero, install the bridge plugin when enabled.
+    """Pre-launch hook. Automatic install is off: nothing is written to the Zotero profile when Zotero launches.
 
-    Windows only. It also needs a recorded first-run decision (see
-    effective_autoinstall), so an undecided or unreadable settings file installs
-    nothing. Best effort: every failure becomes one log line and the launch goes
-    on. Nothing is installed while Zotero runs, because install_into_profile checks.
-    Returns the install result, or None when nothing was attempted.
+    The bridge is installed only from the Meridian tray, after the user has read and accepted the bridge's licence
+    notice there. Returns None, so the launch always goes on.
     """
-    try:
-        if not _is_windows():
-            return None
-        settings = _zotero_plugin.load_settings(_zotero_plugin.settings_path())
-        if not _zotero_plugin.effective_autoinstall(settings, os.environ):
-            return None
-        profile = _zotero_plugin.find_default_profile_dir(_zotero_plugin.zotero_data_dir())
-        if profile is None:
-            _log.info("zotero plugin autoinstall: no default Zotero profile found; skipped")
-            return None
-        stored = _zotero_plugin.signed_install_state()
-        if stored.tampered:
-            # The stored file no longer matches its record. Launching Zotero goes on; signing again is a CLI step.
-            _log.info("zotero plugin autoinstall: the stored signed file failed its integrity check; skipped")
-            return None
-        if not stored.signed:
-            # Not signed, or no signed file can be used for it (submitted without one, or an unreadable record).
-            # Launching Zotero goes on; signing is a separate CLI step.
-            _log.info("zotero plugin autoinstall: not signed, or no usable signed file; skipped")
-            return None
-        result = _zotero_plugin.install_into_profile(profile, stored.path, expected_sha256=stored.sha256)
-        _log.info("zotero plugin autoinstall: %s", result["status"])
-        return result
-    except Exception as exc:  # noqa: BLE001 -- the plugin must never block Zotero's launch
-        _log.warning("zotero plugin autoinstall skipped: %s", exc)
-        return None
+    _log.info("zotero plugin autoinstall: off. Install the bridge from the Meridian tray after accepting its licence.")
+    return None
 
 
 def _run_before_launch(hook):

@@ -656,7 +656,7 @@ def test_settings_live_in_the_meridian_per_user_state_dir(monkeypatch, tmp_path)
 
 def test_settings_defaults_when_the_file_is_missing(tmp_path):
     assert zpi.load_settings(tmp_path / "zotero_plugin.json") == {
-        "autoinstall": False, "decided": False, "close_zotero_for_install": True,
+        "autoinstall": False, "decided": False, "close_zotero_for_install": True, "licence_accepted": False,
     }
 
 
@@ -675,7 +675,7 @@ def test_settings_defaults_when_the_file_is_missing(tmp_path):
 def test_unreadable_or_wrong_shape_settings_are_undecided_with_autoinstall_off(tmp_path, text):
     path = _write(tmp_path / "zotero_plugin.json", text)
     settings = zpi.load_settings(path)
-    assert settings == {"autoinstall": False, "decided": False, "close_zotero_for_install": True}
+    assert settings == {"autoinstall": False, "decided": False, "close_zotero_for_install": True, "licence_accepted": False}
     assert zpi.effective_autoinstall(settings, {}) is False
     assert zpi.effective_autoinstall(settings, {ENV_AUTOINSTALL: "1"}) is False
 
@@ -695,9 +695,9 @@ def test_save_refuses_settings_that_are_not_two_booleans(tmp_path):
 def test_settings_round_trip_creates_the_folder_and_leaves_no_temp_file(tmp_path):
     path = tmp_path / "state" / "zotero_plugin.json"
     zpi.save_settings(path, {"autoinstall": False, "decided": True})
-    assert zpi.load_settings(path) == {"autoinstall": False, "decided": True, "close_zotero_for_install": True}
+    assert zpi.load_settings(path) == {"autoinstall": False, "decided": True, "close_zotero_for_install": True, "licence_accepted": False}
     assert json.loads(path.read_text(encoding="utf-8")) == {
-        "autoinstall": False, "decided": True, "close_zotero_for_install": True,
+        "autoinstall": False, "decided": True, "close_zotero_for_install": True, "licence_accepted": False,
     }
     assert sorted(p.name for p in path.parent.iterdir()) == ["zotero_plugin.json"]
 
@@ -1726,13 +1726,13 @@ def test_the_default_restart_reports_an_os_error_from_the_launcher_as_error(monk
 
 def test_close_setting_defaults_to_true_and_a_legacy_file_keeps_its_decision(tmp_path):
     path = _write(tmp_path / "zotero_plugin.json", '{"autoinstall": true, "decided": true}')
-    assert zpi.load_settings(path) == {"autoinstall": True, "decided": True, "close_zotero_for_install": True}
+    assert zpi.load_settings(path) == {"autoinstall": True, "decided": True, "close_zotero_for_install": True, "licence_accepted": False}
 
 
 def test_close_setting_round_trips_as_false(tmp_path):
     path = tmp_path / "zotero_plugin.json"
     zpi.save_settings(path, {"autoinstall": True, "decided": True, "close_zotero_for_install": False})
-    assert zpi.load_settings(path) == {"autoinstall": True, "decided": True, "close_zotero_for_install": False}
+    assert zpi.load_settings(path) == {"autoinstall": True, "decided": True, "close_zotero_for_install": False, "licence_accepted": False}
     assert json.loads(path.read_text(encoding="utf-8"))["close_zotero_for_install"] is False
 
 
@@ -1741,7 +1741,7 @@ def test_a_non_boolean_close_setting_makes_the_whole_file_wrong_shape(tmp_path):
         tmp_path / "zotero_plugin.json",
         '{"autoinstall": true, "decided": true, "close_zotero_for_install": "no"}',
     )
-    assert zpi.load_settings(path) == {"autoinstall": False, "decided": False, "close_zotero_for_install": True}
+    assert zpi.load_settings(path) == {"autoinstall": False, "decided": False, "close_zotero_for_install": True, "licence_accepted": False}
 
 
 def test_save_refuses_a_non_boolean_close_setting(tmp_path):
@@ -2025,3 +2025,14 @@ def test_cli_installs_the_signed_bytes_and_not_the_unsigned_build(monkeypatch, c
     assert zpi.cli_main(["--profile", str(profile)]) == 0
     assert (profile / "extensions" / XPI_NAME).read_bytes() == signed_payload
     assert signed_payload != zpi.build_xpi_bytes()
+
+
+
+
+def test_the_licence_acceptance_is_a_saved_boolean_that_defaults_to_not_accepted(tmp_path):
+    from meridian import zotero_plugin_install as zpi
+
+    path = tmp_path / "zotero_plugin.json"
+    assert zpi.load_settings(path)[zpi.LICENCE_SETTING_KEY] is False
+    zpi.save_settings(path, {**zpi.load_settings(path), zpi.LICENCE_SETTING_KEY: True})
+    assert zpi.load_settings(path)[zpi.LICENCE_SETTING_KEY] is True

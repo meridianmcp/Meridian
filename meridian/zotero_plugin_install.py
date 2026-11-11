@@ -96,7 +96,28 @@ _ZIP_TIMESTAMP = (1980, 1, 1, 0, 0, 0)
 _ZIP_FILE_MODE = 0o644
 _ZIP_CREATE_SYSTEM_UNIX = 3
 
-_DEFAULT_SETTINGS = {"autoinstall": False, "decided": False, CLOSE_SETTING_KEY: True}
+# The bridge is MIT-licensed and is installed only after the user has read its licence notice and clicked to accept it
+# in the Meridian tray. The acceptance is a boolean in the settings file. Nothing is installed without it.
+LICENCE_SETTING_KEY = "licence_accepted"
+LICENCE_NOT_ACCEPTED_STATUS = "licence_not_accepted"
+LICENCE_NOT_ACCEPTED_MESSAGE = (
+    "The Meridian Zotero bridge is released under the MIT licence. Nothing was installed: read its licence notice "
+    "in the Meridian tray and accept it there first. Nothing was written."
+)
+# The notice the person reads and accepts before the bridge is installed. A summary: the licence text is the authority.
+LICENCE_NOTICE_TEXT = (
+    "The Meridian Zotero bridge is released under the MIT licence. Anyone may use, copy, modify, merge, publish, "
+    "distribute, sublicense and sell copies of it, provided the copyright notice and permission notice are kept. "
+    "It is provided without warranty.\n\n"
+    "It runs inside Zotero and listens only on this computer (127.0.0.1).\n\n"
+    "Installing it does more than copy the plugin into your Zotero profile. It also sets the Zotero preference "
+    "extensions.startupScanScopes to 1 in user.js; adds two settings there that point the plugin at Meridian's local "
+    "port, 127.0.0.1:23125; writes a token file that only your Windows user account can read; and registers the "
+    "plugin as enabled in Zotero's extensions.json. Removing the plugin does not undo these changes.\n\n"
+    "Source: the bridge's own repository, meridian-zotero-bridge, which will be linked here once published. "
+    "This is a summary, not legal advice; the licence text in that repository's LICENSE file is the authority."
+)
+_DEFAULT_SETTINGS = {"autoinstall": False, "decided": False, CLOSE_SETTING_KEY: True, LICENCE_SETTING_KEY: False}
 _DEFAULT_STATE_SUBDIR = "zotero_plugin"
 PROFILE_MARKERS = ("prefs.js", "zotero.sqlite")
 _NOT_PROFILE_MESSAGE = (
@@ -1300,9 +1321,13 @@ def _valid_settings(payload: Any) -> "dict[str, Any] | None":
     autoinstall = payload.get("autoinstall")
     decided = payload.get("decided")
     close = payload.get(CLOSE_SETTING_KEY, True)
+    # The licence acceptance is optional too: a file written before it existed reads as not accepted.
+    licence = payload.get(LICENCE_SETTING_KEY, False)
     if not isinstance(autoinstall, bool) or not isinstance(decided, bool) or not isinstance(close, bool):
         return None
-    return {"autoinstall": autoinstall, "decided": decided, CLOSE_SETTING_KEY: close}
+    if not isinstance(licence, bool):
+        return None
+    return {"autoinstall": autoinstall, "decided": decided, CLOSE_SETTING_KEY: close, LICENCE_SETTING_KEY: licence}
 
 
 def load_settings(path: "Path | str") -> dict[str, Any]:

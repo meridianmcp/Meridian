@@ -1330,6 +1330,68 @@ def _ask_zotero_plugin_first_run(parent: Any | None = None) -> "bool | None":
     return bool(answer["value"])
 
 
+def _ask_zotero_licence(parent: Any | None = None) -> bool:
+    """Show the bridge's licence notice. True only when the person ticks it and clicks Install.
+
+    Without a GUI nothing can be accepted, so this returns False and nothing is installed.
+    """
+    try:
+        import tkinter as tk
+    except ImportError:
+        return False
+    owns_root = parent is None
+    try:
+        root = parent if parent is not None else tk.Tk()
+    except tk.TclError:
+        return False
+    if owns_root:
+        root.withdraw()
+    answer = {"ticked": False, "value": False}
+    try:
+        dialog = tk.Toplevel(root)
+        dialog.title("Zotero bridge licence")
+        dialog.resizable(False, False)
+        notice = tk.Text(dialog, width=76, height=18, wrap="word")
+        scroll = tk.Scrollbar(dialog, orient="vertical", command=notice.yview)
+        notice.configure(yscrollcommand=scroll.set)
+        notice.insert("1.0", zotero_plugin.LICENCE_NOTICE_TEXT)
+        notice.configure(state="disabled")
+        notice.grid(row=0, column=0, padx=(12, 0), pady=(12, 6), sticky="nsew")
+        scroll.grid(row=0, column=1, padx=(0, 12), pady=(12, 6), sticky="ns")
+        install = tk.Button(dialog, text="Install", width=12, state="disabled")
+        box_var = tk.BooleanVar(value=False)
+
+        def _on_tick() -> None:
+            answer["ticked"] = bool(box_var.get())
+            install.configure(state="normal" if answer["ticked"] else "disabled")
+
+        def _on_install() -> None:
+            if answer["ticked"]:
+                answer["value"] = True
+            dialog.destroy()
+
+        tk.Checkbutton(
+            dialog, text="I have read the licence notice and accept it", variable=box_var, command=_on_tick,
+        ).grid(row=1, column=0, columnspan=2, padx=12, sticky="w")
+        install.configure(command=_on_install)
+        install.grid(row=2, column=0, padx=12, pady=12, sticky="e")
+        tk.Button(dialog, text="Cancel", width=12, command=dialog.destroy).grid(
+            row=2, column=1, padx=12, pady=12, sticky="w",
+        )
+        dialog.protocol("WM_DELETE_WINDOW", dialog.destroy)
+        dialog.transient(root)
+        try:
+            dialog.wait_visibility()
+            dialog.grab_set()
+        except tk.TclError:
+            pass  # some window managers refuse a grab; the dialog still works without one
+        root.wait_window(dialog)
+    finally:
+        if owns_root:
+            root.destroy()
+    return bool(answer["value"])
+
+
 def _run_zotero_plugin_first_run(*, parent: Any | None = None, path: "Path | None" = None) -> "dict | None":
     """Ask once, then store the answer. Returns the saved settings, or None when nothing was saved.
 
@@ -1345,7 +1407,12 @@ def _run_zotero_plugin_first_run(*, parent: Any | None = None, path: "Path | Non
         return None
     if answer is None:
         return None
+    # Install needs the licence notice accepted too. Declining it leaves the bridge uninstalled, as "Not now" does.
+    accepted = bool(answer) and _ask_zotero_licence(parent=parent)
+    answer = accepted
     updated = zotero_plugin_settings_after_answer(zotero_plugin.load_settings(target), answer)
+    if accepted:
+        updated = {**updated, zotero_plugin.LICENCE_SETTING_KEY: True}
     try:
         zotero_plugin.save_settings(target, updated)
     except OSError as exc:
@@ -1567,7 +1634,27 @@ def _report_zotero_plugin_error(text: str, parent: Any | None = None) -> None:
 
 def _install_zotero_plugin_now_and_report(dispatch: Any, *, parent: Any | None = None) -> str:
     """Menu action body: run the install, then show its result through ``dispatch``. Never raises."""
-    settings = zotero_plugin.load_settings(zotero_plugin.settings_path())
+    path = zotero_plugin.settings_path()
+    settings = zotero_plugin.load_settings(path)
+    if not settings.get(zotero_plugin.LICENCE_SETTING_KEY):
+        # Nothing is installed until the licence notice is accepted here, as it is for the first-run prompt.
+        if not _ask_zotero_licence(parent=parent):
+            text = zotero_plugin.LICENCE_NOT_ACCEPTED_MESSAGE
+            try:
+                dispatch(lambda text=text: _report_zotero_plugin_install(text, parent=parent))
+            except Exception:  # noqa: BLE001 -- a broken dispatcher must never take the tray down
+                _logger.warning("tray_main: could not queue the licence refusal", exc_info=True)
+            return text
+        settings = {**settings, zotero_plugin.LICENCE_SETTING_KEY: True}
+        try:
+            zotero_plugin.save_settings(path, settings)
+        except OSError as exc:
+            text = zotero_plugin_save_failed_text(exc, install=True)
+            try:
+                dispatch(lambda text=text: _report_zotero_plugin_install(text, parent=parent))
+            except Exception:  # noqa: BLE001 -- a broken dispatcher must never take the tray down
+                _logger.warning("tray_main: could not queue the save failure", exc_info=True)
+            return text
     text = zotero_plugin_install_message(lambda: zotero_plugin.install_default_with_close(settings))
     try:
         dispatch(lambda text=text: _report_zotero_plugin_install(text, parent=parent))
