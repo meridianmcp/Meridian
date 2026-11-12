@@ -868,9 +868,9 @@ No auth required.
 
 | Method | Path | Description |
 |--------|------|-------------|
-| `GET` | `/desktop/code/search` |  |
-| `GET` | `/desktop/outputs/search` |  |
-| `GET` | `/desktop/research/runs` |  |
+| `GET` | `/desktop/code/search` | Search the local code index of the configured repository. Loopback only |
+| `GET` | `/desktop/outputs/search` | Search the local outputs index of the configured outputs directory. Loopback only |
+| `GET` | `/desktop/research/runs` | Read research runs from the local store, newest first. Loopback only |
 | `GET` | `/desktop/research/search` | Desktop Search tab: read-only research search across the named sources (loopback only) |
 
 

@@ -8,6 +8,7 @@ the real keyring, the real %LOCALAPPDATA%, or the network.
 from __future__ import annotations
 
 import asyncio
+import os
 import shutil
 from datetime import datetime, timezone
 from pathlib import Path
@@ -26,6 +27,14 @@ CODE = "/desktop/code/search"
 OUTPUTS = "/desktop/outputs/search"
 RUNS = "/desktop/research/runs"
 ROUTES = (CODE, OUTPUTS, RUNS)
+# Query parameters each route accepts, used when a test needs a request that is
+# otherwise valid.
+VALID_PARAMS = {CODE: {"q": "needle"}, OUTPUTS: {"q": "needle"}, RUNS: {}}
+
+LOOPBACK = ("127.0.0.1", 50000)
+# TestClient's default peer is "testclient", which is not a loopback address.
+NON_LOOPBACK_PEERS = (("203.0.113.9", 40000), ("10.0.0.5", 40000), ("testclient", 50000))
+FORWARDED_HEADERS = ("X-Forwarded-For", "X-Forwarded-Host", "X-Real-IP", "Forwarded")
 
 
 def _write(path: Path, text: str) -> None:
@@ -95,8 +104,9 @@ def desk(tmp_path, monkeypatch):
     app.include_router(desktop_read.router)
     app.state.db = conn
     try:
-        with TestClient(app) as client:
+        with TestClient(app, client=LOOPBACK) as client:
             yield {
+                "app": app,
                 "client": client,
                 "conn": conn,
                 "repo": repo,
@@ -516,3 +526,86 @@ def test_blank_missing_or_oversized_query_is_a_plain_400(desk, route):
     oversized = client.get(route, params={"q": "x" * (desktop_read.MAX_QUERY_CHARS + 1)})
     assert oversized.status_code == 400
     assert "at most" in oversized.json()["error"]
+
+
+# ---------------------------------------------------------------------------
+# Loopback only: peer address and forwarding headers
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize("route", ROUTES)
+@pytest.mark.parametrize("peer", NON_LOOPBACK_PEERS)
+def test_non_loopback_peer_is_refused_on_every_desktop_route(desk, route, peer):
+    outsider = TestClient(desk["app"], client=peer)
+
+    response = outsider.get(route, params=VALID_PARAMS[route])
+
+    assert response.status_code == 403
+    assert "results" not in response.json() and "runs" not in response.json()
+
+
+@pytest.mark.parametrize("route", ROUTES)
+@pytest.mark.parametrize("header", FORWARDED_HEADERS)
+def test_loopback_peer_with_a_forwarding_header_is_refused(desk, route, header):
+    client = desk["client"]
+    assert client.get(route, params=VALID_PARAMS[route]).status_code == 200
+
+    value = "for=203.0.113.9" if header == "Forwarded" else "203.0.113.9"
+    response = client.get(route, params=VALID_PARAMS[route], headers={header: value})
+
+    assert response.status_code == 403
+    assert "results" not in response.json() and "runs" not in response.json()
+
+
+# ---------------------------------------------------------------------------
+# Query parameter allowlist
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize("route", ROUTES)
+def test_unknown_query_parameter_is_refused_and_named(desk, route):
+    response = desk["client"].get(route, params={"bogus": "1"})
+
+    assert response.status_code == 400
+    assert "'bogus'" in response.json()["error"]
+
+
+def test_research_runs_does_not_accept_a_search_query(desk):
+    response = desk["client"].get(RUNS, params={"q": "needle"})
+
+    assert response.status_code == 400
+    assert "'q'" in response.json()["error"]
+    assert "project_id" in response.json()["error"]
+
+
+# ---------------------------------------------------------------------------
+# Symlinks that leave the repository
+# ---------------------------------------------------------------------------
+
+
+def test_a_symlink_that_leaves_the_repository_is_never_indexed_or_read(desk, monkeypatch):
+    outside = desk["tmp"] / "outside" / "secret.py"
+    _write(outside, "escapedtoken = 1\n")
+    _write(desk["repo"] / "inside.py", "insidetoken = 1\n")
+    try:
+        os.symlink(outside, desk["repo"] / "linked.py")
+        os.symlink(desk["repo"] / "inside.py", desk["repo"] / "alias.py")
+    except OSError:
+        pytest.skip("creating a symlink needs extra privilege on this platform")
+
+    reads: list[Path] = []
+    real_read = code_search._read_text
+
+    def recording_read(path, size):
+        reads.append(Path(path).resolve())
+        return real_read(path, size)
+
+    monkeypatch.setattr(code_search, "_read_text", recording_read)
+    code_search.refresh_index(desk["repo"])
+
+    client = desk["client"]
+    assert client.get(CODE, params={"q": "escapedtoken"}).json()["results"] == []
+    assert outside.resolve() not in reads
+    hits = client.get(CODE, params={"q": "insidetoken"}).json()["results"]
+    # A symlink whose target stays inside the repository is still indexed.
+    assert {hit["path"] for hit in hits} == {"inside.py", "alias.py"}

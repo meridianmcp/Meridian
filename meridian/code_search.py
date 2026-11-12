@@ -3,7 +3,9 @@
 SQLite FTS5 ranks matches with BM25 (its built-in ``bm25()``), so this needs no
 extra dependency. Each project gets its own index under the Meridian data
 directory; nothing is written into the repository being searched. Files that
-look like secrets, binaries and oversized files are never indexed.
+look like secrets, binaries and oversized files are never indexed. A symlink
+(or junction) whose target lies outside the repository is never indexed, and its
+content is never read.
 
 Refresh is incremental: each search re-checks file mtimes and sizes, re-reads
 only what changed, and drops rows for deleted files.
@@ -204,15 +206,20 @@ def refresh_index(root: Path, base: Path | None = None) -> RefreshReport:
                     continue
                 full = root / rel
                 try:
-                    st = full.stat()
+                    real = full.resolve(strict=True)
+                    st = real.stat()
                 except OSError:
+                    skipped += 1
+                    continue
+                if not real.is_relative_to(root):
+                    # Followed symlinks (and junctions) must stay inside the repository.
                     skipped += 1
                     continue
                 if known.get(rel) == (st.st_mtime, st.st_size):
                     live.add(rel)
                     continue
                 _delete_path(conn, rel)
-                text = _read_text(full, st.st_size)
+                text = _read_text(real, st.st_size)
                 if text is None:
                     skipped += 1
                     continue

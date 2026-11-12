@@ -35,14 +35,21 @@ Routes
 Trust boundary
 --------------
 * The caller never supplies a filesystem path. The repository root and the outputs
-  directory come from server configuration only (see below). A request carrying a
-  path-like parameter (``path``, ``root``, ``outputs_dir``, ...) is refused with 400
-  instead of being silently ignored.
+  directory come from server configuration only (see below). Each route accepts only
+  the query parameters in its allowlist. Any other parameter is refused with 400
+  instead of being silently ignored; a path-like name (``path``, ``root``,
+  ``outputs_dir``, ...) gets the path refusal message.
 * Code search only reads an index that already exists. A GET never indexes or walks
   the tree. An index is used only when it lives in the code-search index directory
   and records the configured root in its ``meta`` table.
-* Hosted Meridian answers 404 on all three routes. They expose the server's own
-  filesystem and database, which only a local single-user server should serve.
+* All three routes are loopback-only. A peer that is not 127.0.0.1 or ::1, and any
+  request carrying a ``Forwarded``, ``X-Forwarded-For``, ``X-Forwarded-Host`` or
+  ``X-Real-IP`` header, gets 403 before the handler runs.
+* Hosted Meridian: anonymous callers get 401 from the app-wide hosted gate. Authenticated
+  hosted callers arrive through the public proxy, so the loopback check answers them 403
+  first. The handler's 404 is reached only by a loopback request on a hosted server.
+  These routes expose the server's own filesystem and database, which only a local
+  single-user server should serve.
 * Errors are plain JSON. Tracebacks are written to the server log, never returned.
 
 Configuration
@@ -65,7 +72,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
-from fastapi import APIRouter, Query, Request
+from fastapi import APIRouter, Depends, Query, Request
 from fastapi.responses import JSONResponse
 
 from .. import code_search
@@ -73,6 +80,7 @@ from .. import db as db_module
 from .. import outputs_indexer
 from .._deps import _db, _hosted_mode
 from ..db import research_runs as run_db
+from .desktop_research import _require_loopback
 
 _log = logging.getLogger(__name__)
 
@@ -91,11 +99,18 @@ RUNS_DEFAULT_LIMIT = 20
 RUNS_MAX_LIMIT = 100
 MAX_QUERY_CHARS = 500
 MAX_PROJECT_ID_CHARS = 128
+MAX_PARAM_NAME_CHARS = 64
 TITLE_MAX_CHARS = 120
 
-# Query parameters that would let a caller name a filesystem location. Refused
-# outright (400) so a caller cannot believe a path was honoured when it was not.
-_PATH_PARAMS = frozenset({
+# Query parameters each route accepts. Anything else is refused (400) so a caller
+# cannot believe a parameter was honoured when it was not.
+_CODE_PARAMS = frozenset({"q", "limit"})
+_OUTPUTS_PARAMS = frozenset({"q", "limit"})
+_RUNS_PARAMS = frozenset({"limit", "project_id"})
+
+# Names that would let a caller point at a filesystem location. Never accepted; a
+# rejected name from this set gets the path refusal message instead of the generic one.
+_PATH_LIKE_PARAMS = frozenset({
     "path", "paths", "file", "files", "root", "roots", "root_dir", "dir",
     "directory", "outputs_dir", "project_path", "repo", "repo_path", "cwd", "src",
 })
@@ -106,6 +121,7 @@ _NOT_HOSTED_MESSAGE = "Not found."
 _PATH_REFUSED_MESSAGE = (
     "Filesystem paths are not accepted. Searches run only over the configured local indexes."
 )
+_UNKNOWN_PARAM_MESSAGE = "Unknown query parameter '{name}'. Accepted parameters: {accepted}."
 _QUERY_REQUIRED_MESSAGE = "q is required"
 _QUERY_TOO_LONG_MESSAGE = f"q must be at most {MAX_QUERY_CHARS} characters"
 
@@ -114,13 +130,18 @@ def _error(status: int, message: str) -> JSONResponse:
     return JSONResponse(status_code=status, content={"error": message})
 
 
-def _refusal(request: Request) -> JSONResponse | None:
-    """Gate shared by every desktop route: hosted refusal, then path-parameter refusal."""
+def _refusal(request: Request, accepted: frozenset[str]) -> JSONResponse | None:
+    """Gate shared by every desktop route: hosted refusal, then query-parameter refusal."""
     if _hosted_mode():
         return _error(404, _NOT_HOSTED_MESSAGE)
-    if _PATH_PARAMS.intersection(request.query_params.keys()):
+    unknown = [name for name in request.query_params.keys() if name not in accepted]
+    if not unknown:
+        return None
+    if any(name in _PATH_LIKE_PARAMS for name in unknown):
         return _error(400, _PATH_REFUSED_MESSAGE)
-    return None
+    name = unknown[0][:MAX_PARAM_NAME_CHARS]
+    listed = ", ".join(sorted(accepted))
+    return _error(400, _UNKNOWN_PARAM_MESSAGE.format(name=name, accepted=listed))
 
 
 def _query_error(q: str) -> JSONResponse | None:
@@ -214,13 +235,14 @@ def _code_search(q: str, limit: int) -> tuple[str, list[dict[str, Any]], str | N
     return INDEX_READY, results, None
 
 
-@router.get("/desktop/code/search")
+@router.get("/desktop/code/search", dependencies=[Depends(_require_loopback)])
 def desktop_code_search(
     request: Request,
     q: str = Query(default=""),
     limit: int = Query(default=code_search.DEFAULT_LIMIT),
 ) -> JSONResponse:
-    refusal = _refusal(request)
+    """Search the local code index of the configured repository. Loopback only."""
+    refusal = _refusal(request, _CODE_PARAMS)
     if refusal is not None:
         return refusal
     invalid = _query_error(q)
@@ -358,13 +380,14 @@ def _outputs_body(
     return body
 
 
-@router.get("/desktop/outputs/search")
+@router.get("/desktop/outputs/search", dependencies=[Depends(_require_loopback)])
 def desktop_outputs_search(
     request: Request,
     q: str = Query(default=""),
     limit: int = Query(default=OUTPUTS_DEFAULT_LIMIT),
 ) -> JSONResponse:
-    refusal = _refusal(request)
+    """Search the local outputs index of the configured outputs directory. Loopback only."""
+    refusal = _refusal(request, _OUTPUTS_PARAMS)
     if refusal is not None:
         return refusal
     invalid = _query_error(q)
@@ -415,13 +438,14 @@ def _run_view(run: dict[str, Any]) -> dict[str, Any]:
     }
 
 
-@router.get("/desktop/research/runs")
+@router.get("/desktop/research/runs", dependencies=[Depends(_require_loopback)])
 async def desktop_research_runs(
     request: Request,
     limit: int = Query(default=RUNS_DEFAULT_LIMIT),
     project_id: str | None = Query(default=None),
 ) -> JSONResponse:
-    refusal = _refusal(request)
+    """Read research runs from the local store, newest first. Loopback only."""
+    refusal = _refusal(request, _RUNS_PARAMS)
     if refusal is not None:
         return refusal
     scope = (project_id or "").strip()
