@@ -45,12 +45,15 @@ class FakeClock:
 class FakeBridge:
     """Answers the grant routes and the write routes, and records every request it receives.
 
+    The current bridge takes a write on the bearer token alone. ``requires_grant`` makes it refuse a write sent without
+    a key, as an older bridge does. A write that sends a key the bridge does not hold is refused either way.
     ``grant_states`` are the answers to successive GET /v1/grants/{id} polls; the last one repeats. ``forced`` holds
-    (method, path-prefix, reply) entries that answer the next matching authorised write, once each.
+    (method, path-prefix, reply) entries that answer the next matching write, once each.
     """
 
-    def __init__(self, grant_states: tuple[str, ...] = ("granted",)) -> None:
+    def __init__(self, grant_states: tuple[str, ...] = ("granted",), *, requires_grant: bool = False) -> None:
         self.calls: list[dict[str, Any]] = []
+        self.requires_grant = requires_grant
         self.grant_states = list(grant_states)
         self.expires_at = START + timedelta(hours=1)
         self.valid_keys: set[str] = set()
@@ -61,7 +64,12 @@ class FakeBridge:
         self._states: list[str] = []
 
     def __call__(self, method: str, path: str, headers: dict[str, str], body: Any) -> tuple[int, Any]:
-        self.calls.append({"method": method, "path": path, "headers": dict(headers), "body": body})
+        self.calls.append({"method": method, "path": path, "headers": dict(headers), "body": body, "status": None})
+        status, reply = self._answer(method, path, headers, body)
+        self.calls[-1]["status"] = status
+        return status, reply
+
+    def _answer(self, method: str, path: str, headers: dict[str, str], body: Any) -> tuple[int, Any]:
         if method == "POST" and path == "/v1/grants":
             if self.post_grant_reply is not None:
                 return self.post_grant_reply
@@ -69,7 +77,8 @@ class FakeBridge:
             return 202, {"grant_id": GRANT_ID, "status": "pending"}
         if path.startswith("/v1/grants/"):
             return self._grant_route(method)
-        if headers.get("Meridian-Write-Grant") not in self.valid_keys:
+        key = headers.get("Meridian-Write-Grant")
+        if (key is None and self.requires_grant) or (key is not None and key not in self.valid_keys):
             return 403, _err("grant_required", "Writes need a grant from the desktop.")
         for index, (forced_method, prefix, reply) in enumerate(self.forced):
             if forced_method == method and path.startswith(prefix):
@@ -171,13 +180,43 @@ def writes_of(bridge: FakeBridge) -> list[dict[str, Any]]:
     return [c for c in bridge.calls if c["path"] != "/v1/grants" and not c["path"].startswith("/v1/grants/")]
 
 
+def accepted_writes(bridge: FakeBridge) -> list[dict[str, Any]]:
+    """The writes the bridge answered with a 2xx. Refused attempts are left out."""
+    return [c for c in writes_of(bridge) if 200 <= c["status"] < 300]
+
+
 # ---------------------------------------------------------------------------------------------
 # Grant lifecycle
 # ---------------------------------------------------------------------------------------------
 
 
-def test_three_writes_share_one_grant_request():
+def test_first_write_sends_the_bearer_token_alone_and_requests_no_grant():
     bridge = FakeBridge()
+    client, _ = make_client(bridge)
+
+    assert client.create_collection("Papers") == "COLL0001"
+
+    assert grant_requests(bridge) == []
+    [write] = writes_of(bridge)
+    assert write["headers"] == {"Content-Type": "application/json"}
+    assert write["status"] == 201
+
+
+def test_writes_on_a_token_only_bridge_never_request_a_grant():
+    bridge = FakeBridge()
+    client, _ = make_client(bridge)
+
+    client.create_collection("Papers")
+    client.create_webpage("A page", "https://example.org/a")
+    client.move_item("ITEM0001", add_collections=["COLL0001"])
+
+    assert grant_requests(bridge) == []
+    assert len(accepted_writes(bridge)) == 3
+    assert all("Meridian-Write-Grant" not in c["headers"] for c in writes_of(bridge))
+
+
+def test_grant_required_refusal_requests_one_grant_and_shares_it_across_writes():
+    bridge = FakeBridge(requires_grant=True)
     client, _ = make_client(bridge)
 
     client.create_collection("Papers")
@@ -186,12 +225,14 @@ def test_three_writes_share_one_grant_request():
 
     assert len(grant_requests(bridge)) == 1
     writes = writes_of(bridge)
-    assert len(writes) == 3
-    assert {c["headers"]["Meridian-Write-Grant"] for c in writes} == {f"{1:064x}"}
+    # The first write goes out with no key and is refused. Its retry and the two writes after it carry the key.
+    assert ["Meridian-Write-Grant" in c["headers"] for c in writes] == [False, True, True, True]
+    assert {c["headers"]["Meridian-Write-Grant"] for c in writes[1:]} == {f"{1:064x}"}
+    assert len(accepted_writes(bridge)) == 3
 
 
 def test_grant_required_403_triggers_one_re_request_with_constant_app_name():
-    bridge = FakeBridge()
+    bridge = FakeBridge(requires_grant=True)
     client, _ = make_client(bridge)
     client.create_collection("First")
 
@@ -201,8 +242,11 @@ def test_grant_required_403_triggers_one_re_request_with_constant_app_name():
     posts = grant_requests(bridge)
     assert len(posts) == 2
     assert [post["body"] for post in posts] == [{"app_name": "Meridian"}, {"app_name": "Meridian"}]
-    assert len(writes_of(bridge)) == 3  # first write, the refused attempt, and the retry
-    assert writes_of(bridge)[-1]["headers"]["Meridian-Write-Grant"] == f"{2:064x}"
+    writes = writes_of(bridge)
+    # Write 0 has no key and is refused. Write 1 retries under the first grant. Write 2 sends that key, which the
+    # bridge has forgotten, and is refused. Write 3 retries under the second grant.
+    assert len(writes) == 4
+    assert writes[-1]["headers"]["Meridian-Write-Grant"] == f"{2:064x}"
 
 
 def test_second_grant_required_stops_without_another_request():
@@ -217,8 +261,9 @@ def test_second_grant_required_stops_without_another_request():
         client.create_collection("Stuck")
 
     assert info.value.code == "grant_required"
-    assert len(grant_requests(bridge)) == 2
+    assert len(grant_requests(bridge)) == 1  # one grant request, one retry, and no third attempt
     assert len(writes_of(bridge)) == 2
+    assert accepted_writes(bridge) == []
 
 
 @pytest.mark.parametrize(
@@ -226,7 +271,7 @@ def test_second_grant_required_stops_without_another_request():
     [("denied", "grant_denied"), ("cooldown", "grant_cooldown"), ("poll_gone", "not_found")],
 )
 def test_denied_or_refused_grant_is_reported_and_nothing_is_written(outcome: str, code: str):
-    bridge = FakeBridge()
+    bridge = FakeBridge(requires_grant=True)
     if outcome == "denied":
         bridge.grant_states = ["pending", "denied"]
     elif outcome == "cooldown":
@@ -240,11 +285,11 @@ def test_denied_or_refused_grant_is_reported_and_nothing_is_written(outcome: str
 
     assert info.value.code == code
     assert len(grant_requests(bridge)) == 1
-    assert writes_of(bridge) == []
+    assert accepted_writes(bridge) == []
 
 
-def test_expired_grant_is_replaced_from_expires_at_without_a_403():
-    bridge = FakeBridge()
+def test_expired_grant_is_not_sent_again_and_is_replaced_after_a_refusal():
+    bridge = FakeBridge(requires_grant=True)
     clock = FakeClock()
     client, _ = make_client(bridge, clock=clock)
     client.create_collection("Before expiry")
@@ -253,11 +298,14 @@ def test_expired_grant_is_replaced_from_expires_at_without_a_403():
     client.create_collection("After expiry")
 
     assert len(grant_requests(bridge)) == 2
-    assert len(writes_of(bridge)) == 2  # no refused write, so the 403 path was not needed
+    writes = writes_of(bridge)
+    assert "Meridian-Write-Grant" not in writes[2]["headers"]  # the expired key is not sent
+    assert writes[3]["headers"]["Meridian-Write-Grant"] == f"{2:064x}"
+    assert len(accepted_writes(bridge)) == 2
 
 
 def test_unanswered_grant_is_ended_and_reported():
-    bridge = FakeBridge(grant_states=("pending",))
+    bridge = FakeBridge(grant_states=("pending",), requires_grant=True)
     client, sleeps = make_client(bridge, grant_polls=3)
 
     with pytest.raises(GrantError) as info:
@@ -267,7 +315,7 @@ def test_unanswered_grant_is_ended_and_reported():
     polls = [c for c in bridge.calls if c["method"] == "GET"]
     assert len(polls) == 3
     assert bridge.calls[-1]["method"] == "DELETE"
-    assert writes_of(bridge) == []
+    assert accepted_writes(bridge) == []
     assert sleeps == [1.0, 1.0]  # one wait between each pair of checks, none after the last
 
 
@@ -598,9 +646,9 @@ def test_batch_refuses_a_route_off_the_list_before_anything_is_sent(
 
 
 def test_errors_never_carry_the_grant_key_or_a_token():
-    bridge = FakeBridge()
+    bridge = FakeBridge(requires_grant=True)
     client, _ = make_client(bridge)
-    client.create_collection("Warm up")
+    client.create_collection("Warm up")  # refused without a key, then granted, so a key is held
     issued = next(iter(bridge.valid_keys))
     token = "sk_meridian_" + "A" * 40
     echo = {"error": {"code": "invalid_fields", "message": f"echoed {issued} and {token}"}}

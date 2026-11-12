@@ -273,11 +273,29 @@ def test_the_client_built_on_the_real_transport_keeps_the_token_out_of_its_error
 # ---------------------------------------------------------------------------
 
 
-def test_a_grant_then_a_write_runs_through_the_real_transport_and_client(token_path):
+def test_a_write_runs_through_the_real_transport_on_the_bearer_token_alone(token_path):
+    opener = FakeOpener(FakeResponse(201, b'{"key": "ABCD1234"}'))
+    client = ZoteroBridgeClient(
+        transport=transport_mod.make_write_transport(opener=opener),
+        reader=transport_mod.make_reader(opener=FakeOpener()),
+        sleep=lambda seconds: None,
+    )
+
+    key = client.create_collection("Reading list")
+
+    assert key == "ABCD1234"
+    assert [request.get_method() for request, _ in opener.calls] == ["POST"]
+    headers = _headers(opener.calls[0][0])
+    assert headers["authorization"] == f"Bearer {_token(token_path)}"
+    assert "meridian-write-grant" not in headers
+
+
+def test_a_grant_required_refusal_then_a_grant_then_a_retry_runs_through_the_real_transport(token_path):
     grant_id = "0" * 32
     write_key = secrets.token_hex(32)
     expires = (datetime.now(timezone.utc) + timedelta(minutes=5)).isoformat()
     opener = FakeOpener(
+        http_error(403, b'{"error": {"code": "grant_required", "message": "A grant is needed."}}'),
         FakeResponse(200, json.dumps({"grant_id": grant_id}).encode()),
         FakeResponse(200, json.dumps({"status": "granted", "write_key": write_key, "expires_at": expires}).encode()),
         FakeResponse(201, b'{"key": "ABCD1234"}'),
@@ -291,8 +309,9 @@ def test_a_grant_then_a_write_runs_through_the_real_transport_and_client(token_p
     key = client.create_collection("Reading list")
 
     assert key == "ABCD1234"
-    assert [request.get_method() for request, _ in opener.calls] == ["POST", "GET", "POST"]
-    assert _headers(opener.calls[2][0])["meridian-write-grant"] == write_key
+    assert [request.get_method() for request, _ in opener.calls] == ["POST", "POST", "GET", "POST"]
+    assert "meridian-write-grant" not in _headers(opener.calls[0][0])
+    assert _headers(opener.calls[3][0])["meridian-write-grant"] == write_key
 
 
 # ---------------------------------------------------------------------------

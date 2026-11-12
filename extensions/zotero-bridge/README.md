@@ -22,10 +22,9 @@ the old placeholder `update_url`, so it does not auto-update from GitHub), `0.1.
   passed 52 live checks: admission (token, Host, Origin), item, note, attachment, relation, collection, tag, batch
   and BibTeX routes, and error responses. A missing token file left the API off while Zotero ran normally.
   Those checks ran before the limit, collection, restore, linked-file, batch rollback, BibTeX key and creator-role
-  changes listed below, so those changes are not live-checked yet. They also predate write grants, so writes in those
-  checks would now need a grant key.
-- **Write grants, verified live on 2026-10-19 in a throwaway Zotero 10.0.6 profile.** A write without a grant key was
-  refused with `grant_required`. The desktop prompt showed the app name and the self-reported warning. Allow for 1 hour
+  changes listed below, so those changes are not live-checked yet. They also predate write grants, which no write checks now.
+- **Write grants, verified live on 2026-10-19 in a throwaway Zotero 10.0.6 profile.** On that date, a write without a grant
+  key was refused with `grant_required`. No write checks a grant key now. The desktop prompt showed the app name and the self-reported warning. Allow for 1 hour
   gave a grant that expired about an hour later, and Allow until Zotero restarts gave one that expired about eight
   hours later. Deny, Escape and Enter all refused. A refused app name was turned away with `grant_cooldown` when it asked
   again at once. The key came back once. A
@@ -104,16 +103,9 @@ Each connection carries one request, and the server closes it after the answer.
 
 ```bash
 TOKEN=$(cat "$HOME/.meridian/local_runner/zotero_bridge/api_token")
-# 1. Ask for a grant. A person at the desktop answers the prompt.
-curl -s -X POST http://127.0.0.1:23125/v1/grants \
-  -H "Host: 127.0.0.1:23125" -H "Authorization: Bearer $TOKEN" -H "Content-Type: application/json" \
-  -d '{"app_name": "My script"}'
-# 2. Poll the grant until its status is granted. The write_key comes back once: keep it.
-curl -s http://127.0.0.1:23125/v1/grants/<grant_id> \
-  -H "Host: 127.0.0.1:23125" -H "Authorization: Bearer $TOKEN"
-# 3. Write with the grant key.
+# A write needs only the bearer token. No grant is asked for, and no Zotero prompt appears.
 curl -s -X POST http://127.0.0.1:23125/v1/items \
-  -H "Host: 127.0.0.1:23125" -H "Authorization: Bearer $TOKEN" -H "Meridian-Write-Grant: <write_key>" \
+  -H "Host: 127.0.0.1:23125" -H "Authorization: Bearer $TOKEN" \
   -H "Content-Type: application/json" \
   -d '{"item_type": "book", "fields": {"title": "A title"}, "tags": ["reading"]}'
 ```
@@ -128,8 +120,8 @@ prompt is shown in Zotero for a write.
   **Allow for this app, remembered** and **Deny**. Deny is the default, so Enter and Escape both refuse.
 - `GET /v1/grants/<grant_id>` reports `pending`, `granted`, `denied`, `expired` or `revoked`. When a grant is first seen
   as granted, the reply carries `write_key` once. A later request does not return it again.
-- Send the key as `Meridian-Write-Grant: <write_key>` on every write. A write without a live key is refused with
-  `403 grant_required`. The batch route is a write, so each operation in a batch needs the same key.
+- No write sends or checks `Meridian-Write-Grant`. A write needs no grant key, and the batch route, which is a write
+  too, needs only the bearer token.
 - `DELETE /v1/grants/<grant_id>` ends a grant at once.
 - An hour grant ends after one hour. A session grant ends when Zotero restarts, or after eight hours at most. Nothing is
   written to disk, so a restart clears every grant.
@@ -186,7 +178,7 @@ Collection responses have the same fields except `date_modified`, because Zotero
 | `DELETE /v1/collections/{key}/items` | `item_keys` | Removes items from the collection. The items stay in the library. |
 | `POST /v1/tags/rename` | `from`, `to` | Renames a tag across the user library. Not allowed inside a batch. |
 | `POST /v1/import/bibtex` | `bibtex`, optional `collection_key`, optional `dry_run` | Returns the plan: what would import, the exact duplicates, and the conflicts. `dry_run: true` writes nothing. A file whose library changes during the parse is refused with 409 `library_changed`, and nothing is imported. Not allowed inside a batch. |
-| `POST /v1/batch` | `operations`: a list of `{method, path, body}` | Runs the operations in one transaction. Any failure rolls the whole batch back and reports `failed_index`. Needs a write grant key. |
+| `POST /v1/batch` | `operations`: a list of `{method, path, body}` | Runs the operations in one transaction. Any failure rolls the whole batch back and reports `failed_index`. Needs only the bearer token. |
 | `POST /v1/grants` | `app_name` | Asks a person at the desktop for a write grant. Answers 202 with a `grant_id`. A remembered app name is granted at once, with no prompt. The token is enough here. |
 | `GET /v1/grants/{id}` | none | Reports the grant's status. Returns `write_key` once, when the grant is first granted. The token is enough here. |
 | `DELETE /v1/grants/{id}` | none | Ends the grant at once. The token is enough here. |
@@ -445,9 +437,9 @@ Do not use your real library.
    menu entries.
 10. Remove the plugin. Menus and the pane are gone, the API stops, and no plugin errors appear.
 11. Remembered apps: `POST /v1/grants` with a new app name, and choose **Allow for this app, remembered**. Poll the grant
-    until it is granted and write with its key. Then request the same name again, in a different letter case. Expect
+    until it is granted. Then request the same name again, in a different letter case. Expect
     `granted` at once, with no dialog. Open the preferences pane, the name is listed, and click **Revoke**. Expect the
-    earlier key to be refused at once, and the next request for that name to show the dialog again. Check also that
+    earlier grant to read `revoked` at once, and the next request for that name to show the dialog again. Check also that
     the four buttons show, that Enter and Escape refuse, and that the preference holds a JSON list.
 
 ## Tests

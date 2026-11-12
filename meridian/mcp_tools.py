@@ -4921,17 +4921,16 @@ _MCP_TOOLS_LIST: list[dict[str, Any]] = [
     {"name": "zotero_create_collection", "description":
         "Creates a collection named `name` in the local Zotero library, under `parent_key` when it is given and at the "
         "top level when it is not. Returns the new collection key. Writes to the Zotero library on this machine only, "
-        "through the Zotero Bridge plugin. A grant prompt may appear in the Zotero desktop app the first time, and a "
-        "person must approve it; the call waits for that answer. Local only: refused on hosted Meridian.",
+        "through the Zotero Bridge plugin. Writes need only the bridge token: no Zotero prompt appears. Local only: "
+        "refused on hosted Meridian.",
      "inputSchema": {"type": "object", "properties": {
          "name": {"type": "string", "description": "Name of the new collection. Must not be blank."},
          "parent_key": {"type": "string", "description": "Optional. The 8-character key of the collection to create this one under. Omit it to create the collection at the top level."}},
          "required": ["name"]}},
     {"name": "zotero_move_collection", "description":
         "Moves the collection `key` under `parent_key`. Omit `parent_key` or pass null to move it to the top level. "
-        "Writes to the Zotero library on this machine only, through the Zotero Bridge plugin. A grant prompt may appear "
-        "in the Zotero desktop app the first time, and a person must approve it; the call waits for that answer. Local "
-        "only: refused on hosted Meridian.",
+        "Writes to the Zotero library on this machine only, through the Zotero Bridge plugin. Writes need only the bridge "
+        "token: no Zotero prompt appears. Local only: refused on hosted Meridian.",
      "inputSchema": {"type": "object", "properties": {
          "key": {"type": "string", "description": "The 8-character key of the collection to move."},
          "parent_key": {"type": ["string", "null"], "description": "Optional. The 8-character key of the new parent collection. Omit it or pass null to move the collection to the top level."}},
@@ -4939,9 +4938,8 @@ _MCP_TOOLS_LIST: list[dict[str, Any]] = [
     {"name": "zotero_move_item", "description":
         "Adds a Zotero item to the collections in `add_collections` and removes it from the collections in "
         "`remove_collections`. Give at least one collection in either list. A collection cannot be in both lists. "
-        "Writes to the Zotero library on this machine only, through the Zotero Bridge plugin. A grant prompt may appear "
-        "in the Zotero desktop app the first time, and a person must approve it; the call waits for that answer. Local "
-        "only: refused on hosted Meridian.",
+        "Writes to the Zotero library on this machine only, through the Zotero Bridge plugin. Writes need only the bridge "
+        "token: no Zotero prompt appears. Local only: refused on hosted Meridian.",
      "inputSchema": {"type": "object", "properties": {
          "item_key": {"type": "string", "description": "The 8-character key of the item to move."},
          "add_collections": {"type": "array", "items": {"type": "string"}, "description": "Optional. Keys of the collections to add the item to."},
@@ -4950,9 +4948,8 @@ _MCP_TOOLS_LIST: list[dict[str, Any]] = [
     {"name": "zotero_create_webpage", "description":
         "Creates a webpage item in the local Zotero library with the given title and absolute http or https URL. With "
         "`collection_keys`, the item is added to those collections. Returns the new item key. Writes to the Zotero "
-        "library on this machine only, through the Zotero Bridge plugin. A grant prompt may appear in the Zotero desktop "
-        "app the first time, and a person must approve it; the call waits for that answer. Local only: refused on "
-        "hosted Meridian.",
+        "library on this machine only, through the Zotero Bridge plugin. Writes need only the bridge token: no Zotero "
+        "prompt appears. Local only: refused on hosted Meridian.",
      "inputSchema": {"type": "object", "properties": {
          "title": {"type": "string", "description": "Title of the webpage item. Must not be blank."},
          "url": {"type": "string", "description": "Absolute http or https URL of the page. It must not contain spaces."},
@@ -4963,8 +4960,8 @@ _MCP_TOOLS_LIST: list[dict[str, Any]] = [
         "to a file that starts with %PDF-. Files of 24 MiB or less are imported into Zotero. Larger files are linked by "
         "path, and the bridge decides whether it may link them. Returns status already_attached, with nothing written, "
         "when the item already has a PDF attachment. Writes to the Zotero library on this machine only, through the "
-        "Zotero Bridge plugin. A grant prompt may appear in the Zotero desktop app the first time, and a person must "
-        "approve it; the call waits for that answer. Local only: refused on hosted Meridian.",
+        "Zotero Bridge plugin. Writes need only the bridge token: no Zotero prompt appears. Local only: refused on hosted "
+        "Meridian.",
      "inputSchema": {"type": "object", "properties": {
          "item_key": {"type": "string", "description": "The 8-character key of the parent item."},
          "path": {"type": "string", "description": "Absolute path to the PDF file on this machine."},
@@ -4974,8 +4971,8 @@ _MCP_TOOLS_LIST: list[dict[str, Any]] = [
         "Adds a child note holding `html` to the Zotero item `parent_key`. The note carries `dedup_marker`, which must be "
         "8 to 128 letters, digits, dots, underscores or hyphens. If a child note of that item already carries the marker, "
         "nothing is written and the result is status already_present. Writes to the Zotero library on this machine only, "
-        "through the Zotero Bridge plugin. A grant prompt may appear in the Zotero desktop app the first time, and a "
-        "person must approve it; the call waits for that answer. Local only: refused on hosted Meridian.",
+        "through the Zotero Bridge plugin. Writes need only the bridge token: no Zotero prompt appears. Local only: refused "
+        "on hosted Meridian.",
      "inputSchema": {"type": "object", "properties": {
          "parent_key": {"type": "string", "description": "The 8-character key of the parent item."},
          "html": {"type": "string", "description": "HTML content of the note."},
@@ -4989,8 +4986,8 @@ _MCP_TOOLS_LIST: list[dict[str, Any]] = [
         "and /restore; POST and DELETE /v1/collections/<key>/items. Every other route or method is refused before anything "
         "is sent, including grant routes, the status route, attachments, tag renames and BibTeX imports (attach a PDF with "
         "zotero_attach_pdf). All operations apply or none do. Writes to the Zotero library on this machine only, through "
-        "the Zotero Bridge plugin. A grant prompt may appear in the Zotero desktop app the first time, and a person must "
-        "approve it; the call waits for that answer. Local only: refused on hosted Meridian.",
+        "the Zotero Bridge plugin. Writes need only the bridge token: no Zotero prompt appears. Local only: refused on "
+        "hosted Meridian.",
      "inputSchema": {"type": "object", "properties": {
          "operations": {"type": "array", "minItems": 1, "maxItems": 200, "description": "The operations to run, in order.",
              "items": {"type": "object", "properties": {

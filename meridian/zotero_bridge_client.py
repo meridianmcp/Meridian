@@ -1,21 +1,23 @@
 """Meridian-side client for the Zotero Bridge local write API (extensions/zotero-bridge).
 
-The bridge listens on 127.0.0.1:23125. Each request needs a bearer token, and each write also needs a grant key that a
-person approves at the Zotero desktop. This client builds the write requests, holds one grant key, and runs the
-duplicate checks, which read Zotero's own local API on 127.0.0.1:23119. It opens no socket, and it reads no file or
-environment variable on its own. The caller injects two callables:
+The bridge listens on 127.0.0.1:23125. Each request needs a bearer token. A write needs nothing more, so the client
+sends the token alone. An older bridge that still refuses a write with grant_required makes the client ask for a grant
+and retry once. This client builds the write requests, holds any grant key it was given, and runs the duplicate
+checks, which read Zotero's own local API on 127.0.0.1:23119. It opens no socket, and it reads no file or environment
+variable on its own. The caller injects two callables:
 
 - ``transport(method, path, headers, body) -> (status, json_body)`` sends one request to the write API. The transport
   adds the Host and Authorization headers, so the bearer token never reaches this module. The client sends only the
-  ``Meridian-Write-Grant`` and ``Content-Type`` headers.
+  ``Content-Type`` header, and the ``Meridian-Write-Grant`` header when it holds a grant key.
 - ``reader(path) -> (status, json_body)`` sends one GET to Zotero's local API. ``path`` includes the query string, for
   example ``/api/users/0/items/<key>/children?format=json&limit=100&start=0``.
 
 A client built with fakes cannot reach the network. That is the convention in meridian/research/providers/runpod.py.
 
-Grants. The client asks for a grant under the app name "Meridian" when it holds no live key. It asks again only after a
-write comes back 403 grant_required. It polls the grant a bounded number of times. A denied, expired or revoked grant,
-a refused request, or a grant that is never answered raises GrantError. Nothing is retried in a loop.
+Grants. A write goes out under the bearer token alone, and no grant is requested up front. Only after a write comes back
+403 grant_required does the client ask for a grant under the app name "Meridian", and then retry that write once. It
+polls the grant a bounded number of times. A denied, expired or revoked grant, a refused request, or a grant that is
+never answered raises GrantError. Nothing is retried in a loop.
 
 Errors. Every failure raises ZoteroBridgeError or a subclass, carrying the bridge's error code. Messages are scrubbed of
 the grant key and of token-shaped strings. A transport or reader exception is replaced by a fixed message, so its text,
@@ -244,7 +246,8 @@ def _is_note_with_marker(child: dict[str, Any], marker: str) -> bool:
 
 
 class ZoteroBridgeClient:
-    """Writes to the bridge through one grant key held for the client's lifetime. Not thread-safe: use one per process."""
+    """Writes to the bridge with the bearer token alone. A grant key is requested only when a bridge refuses a write with
+    grant_required, and the key is then held for the client's lifetime. Not thread-safe: use one per process."""
 
     def __init__(
         self,
@@ -394,8 +397,9 @@ class ZoteroBridgeClient:
     # ----- writes and grants -------------------------------------------------------------------
 
     def _write(self, method: str, path: str, body: dict[str, Any] | None = None) -> Any:
-        """One write under a live grant key. Asks for a new grant once, and only after a grant_required 403."""
-        key = self._ensure_key()
+        """One write. Sends the bearer token alone unless a live grant key is held, and requests a grant only after a
+        grant_required 403. That request is followed by one retry, and no other grant is requested."""
+        key = self._live_key()
         status, reply = self._call(method, path, body, grant=key)
         if _refused_for_grant(status, reply):
             self._forget_key()
@@ -411,10 +415,11 @@ class ZoteroBridgeClient:
             raise self._bridge_error(status, reply)
         return reply
 
-    def _ensure_key(self) -> str:
+    def _live_key(self) -> str | None:
+        """The held grant key, or None when there is none or it has expired. Requests nothing."""
         if self._key is not None and self._expires_at is not None and self._now() < self._expires_at:
             return self._key
-        return self._acquire_grant()
+        return None
 
     def _forget_key(self) -> None:
         self._key = None
@@ -475,6 +480,7 @@ class ZoteroBridgeClient:
     def _call(
         self, method: str, path: str, body: dict[str, Any] | None = None, grant: str | None = None
     ) -> tuple[int, Any]:
+        """One request. The grant key goes in the Meridian-Write-Grant header only when ``grant`` is passed."""
         headers: dict[str, str] = {}
         if body is not None:
             headers["Content-Type"] = "application/json"

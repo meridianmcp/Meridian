@@ -11,7 +11,6 @@ from __future__ import annotations
 import base64
 import json
 import secrets
-from datetime import datetime, timedelta, timezone
 
 import pytest
 
@@ -363,18 +362,12 @@ async def test_attach_pdf_through_the_real_client_writes_nothing_when_a_pdf_is_a
 
 
 @pytest.mark.asyncio
-async def test_attach_pdf_imports_a_small_file_as_base64_under_a_grant(monkeypatch, tmp_path):
-    grant_id = "0" * 32
-    expires = (datetime.now(timezone.utc) + timedelta(minutes=5)).isoformat()
+async def test_attach_pdf_imports_a_small_file_as_base64_on_the_bridge_token_alone(monkeypatch, tmp_path):
     sent: list[tuple[str, str, object]] = []
     pdf_bytes = b"%PDF-1.4\nsmall file\n"
 
     def transport(method, path, headers, body):
         sent.append((method, path, body))
-        if path == "/v1/grants":
-            return 200, {"grant_id": grant_id}
-        if path == f"/v1/grants/{grant_id}":
-            return 200, {"status": "granted", "write_key": "K" * 64, "expires_at": expires}
         return 201, {"key": "ATT00001"}
 
     real = ZoteroBridgeClient(
@@ -387,6 +380,7 @@ async def test_attach_pdf_imports_a_small_file_as_base64_under_a_grant(monkeypat
     payload = await handlers.handle_zotero_attach_pdf({"item_key": "WXYZ5678", "path": str(pdf)})
 
     assert payload == {"ok": True, "error": None, "status": "attached", "attachment_key": "ATT00001"}
+    assert [path for _, path, _ in sent] == ["/v1/items/WXYZ5678/attachments"]  # no grant route is sent
     method, path, body = sent[-1]
     assert (method, path) == ("POST", "/v1/items/WXYZ5678/attachments")
     assert body["mode"] == "imported_file"
@@ -394,7 +388,7 @@ async def test_attach_pdf_imports_a_small_file_as_base64_under_a_grant(monkeypat
 
 
 # ---------------------------------------------------------------------------
-# Registration: descriptions say what is written, the grant prompt, and local only
+# Registration: descriptions say what is written, that writes need only the bridge token, and local only
 # ---------------------------------------------------------------------------
 
 REQUIRED = {
@@ -417,12 +411,12 @@ def test_every_zotero_tool_is_listed_with_its_required_arguments():
 
 
 @pytest.mark.parametrize("name", ALL_TOOLS)
-def test_every_zotero_description_says_local_only_grant_prompt_and_what_it_writes(name):
+def test_every_zotero_description_says_local_only_bridge_token_only_and_what_it_writes(name):
     by_name = {tool["name"]: tool for tool in _MCP_TOOLS_LIST}
     description = by_name[name]["description"]
     assert "Local only: refused on hosted Meridian." in description
-    assert "grant prompt" in description
-    assert "person must approve" in description
+    assert "Writes need only the bridge token: no Zotero prompt appears." in description
+    assert "grant prompt" not in description
     assert "Zotero Bridge plugin" in description
     assert "Writes to the Zotero" in description
 

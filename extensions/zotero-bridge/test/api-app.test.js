@@ -363,9 +363,16 @@ test('a write with a grant header that is not valid is not refused for it, becau
 });
 
 test('the batch route accepts the token alone too', async () => {
-  const { app } = build();
-  const out = await call(app, 'POST', '/v1/batch', { json: { operations: [] }, noGrant: true });
-  assert.notEqual(out.body && out.body.error && out.body.error.code, 'grant_required');
+  const { app, zotero } = build();
+  const out = await call(app, 'POST', '/v1/batch', {
+    json: {
+      operations: [{ method: 'POST', path: '/v1/items', body: { item_type: 'book', fields: { title: 'Token only' } } }],
+    },
+    noGrant: true,
+  });
+  assert.equal(out.status, 200);
+  assert.equal(out.body.results.length, 1);
+  assert.equal(zotero._state.items.length, 1, 'the batch wrote its one item');
 });
 
 test('the grant routes need the token but no grant key, and pass their body and ids to the store', async () => {
