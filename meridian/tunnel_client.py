@@ -1644,8 +1644,18 @@ async def _probe_slot_health(
                                 pass
             if r.status_code < 400:
                 return True
-        except Exception:  # noqa: BLE001 — connection refused / not up yet
-            pass
+            print(
+                f"tunnel:probe port {port}: attempt {attempt + 1} of {max(1, attempts)} "
+                f"answered HTTP {r.status_code}",
+                flush=True,
+            )
+        except Exception as exc:  # noqa: BLE001 — connection refused / timed out / not up yet
+            # Name the failure class only (never the message), so the tunnel log says why a probe missed.
+            print(
+                f"tunnel:probe port {port}: attempt {attempt + 1} of {max(1, attempts)} "
+                f"failed: {type(exc).__name__}",
+                flush=True,
+            )
         if attempt + 1 < max(1, attempts):
             await asyncio.sleep(delay)
     return False
