@@ -27,6 +27,11 @@ on:
 env:
   FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
 
+# Least privilege (CodeQL actions/missing-workflow-permissions): every job
+# inherits read-only contents unless it declares broader scopes itself.
+permissions:
+  contents: read
+
 jobs:
   drift:
     runs-on: ubuntu-latest

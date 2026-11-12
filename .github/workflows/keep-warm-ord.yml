@@ -36,6 +36,11 @@ on:
         default: 'ord'
         type: string
 
+# Least privilege (CodeQL actions/missing-workflow-permissions): every job
+# inherits read-only contents unless it declares broader scopes itself.
+permissions:
+  contents: read
+
 jobs:
   keep-warm:
     runs-on: ubuntu-latest

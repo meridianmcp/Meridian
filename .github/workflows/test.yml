@@ -18,6 +18,11 @@ env:
   # when the runner is destroyed after the job anyway.
   PYTHONDONTWRITEBYTECODE: 1
 
+# Least privilege (CodeQL actions/missing-workflow-permissions): every job
+# inherits read-only contents unless it declares broader scopes itself.
+permissions:
+  contents: read
+
 jobs:
   test-core:
     runs-on: ubuntu-latest
