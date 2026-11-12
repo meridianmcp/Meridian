@@ -332,17 +332,7 @@ function createApp(deps) {
       }
       return respond({ status: 404, body: errorBody('not_found', 'No such route.') });
     }
-    // A write needs a grant key from a person's approval at the desktop. The token alone is not enough.
-    if (match.route.write && !grants.checkKey(request.headers[GRANT_HEADER])) {
-      return respond({
-        status: 403,
-        body: errorBody(
-          'grant_required',
-          'Writes need a grant from the desktop. POST /v1/grants with an app_name, then send the grant key in the ' +
-            'Meridian-Write-Grant header once the desktop answers.'
-        ),
-      });
-    }
+    // Writes need the bearer token and nothing else. The grant routes stay in place but no write asks for a grant key.
     var outcome;
     try {
       var body = parseBody(request);

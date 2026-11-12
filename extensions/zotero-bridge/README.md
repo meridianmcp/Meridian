@@ -10,7 +10,7 @@ Menu actions and a local write API for Zotero:
   notes, attachments, relations, collections and tags, and it imports BibTeX. Reads stay on Zotero's own local API.
   See "Local write API" below.
 
-Plugin ID: `meridian-zotero@usemeridian.us`. Version `0.1.4` (source; not yet signed or released).
+Plugin ID: `meridian-zotero@usemeridian.us`. Version `0.1.5` (source; not yet signed or released).
 Earlier builds: `0.1.3` (released; it had the write API, but accepted any readable file as a linked attachment, which
 0.1.4 closes), `0.1.2` (Mozilla-signed, menus only, no write API), `0.1.1` (on Mozilla, uploaded by the owner, with
 the old placeholder `update_url`, so it does not auto-update from GitHub), `0.1.0` (Mozilla-approved, no
@@ -61,11 +61,10 @@ Zotero's own restore does. That restore is API-only.
 - A write comes from one of two places: a menu command you choose inside Zotero, or the local write API.
 - The write API listens on `127.0.0.1` only. It answers only a `Host` header of `127.0.0.1:<port>`. It refuses any
   request with an `Origin` header, so a browser page cannot drive it. It needs `Authorization: Bearer <token>`,
-  compared in constant time. A write also needs a grant key that a person approved at the desktop (see Write grants).
-- **Local trust.** The token admits a request, but it does not grant a write. A write needs a grant that a person
-  approves at the desktop. The API cannot tell that person from another process of the same user, so the desktop
-  prompt is the protection, and it shows the app name as self-reported. A remembered app name is granted without a
-  prompt (see Write grants). The processes share one connection limit of
+  compared in constant time. A write needs no grant key.
+- **Local trust.** The token is the only credential a write needs. There is no approval prompt, so any process of the
+  same user that can read the token file can write to the library. Host, Origin and loopback checks stop browser pages
+  and DNS rebinding; they do not stop a local process that holds the token. The processes share one connection limit of
   eight. A connection that sends no complete request is closed after ten seconds, so one process can hold a slot for
   up to ten seconds that way. After an answer, the socket stays open for up to five more
   seconds. This affects local availability only: a local process can keep other callers from connecting.
@@ -97,7 +96,7 @@ Every request needs these headers:
 
 - `Host: 127.0.0.1:23125`
 - `Authorization: Bearer <token>`
-- `Meridian-Write-Grant: <write_key>`, for any write. Reads and grant requests do not need it. See Write grants.
+- No grant key is needed for a write. The grant routes under `/v1/grants` are still served but no write checks them.
 - `Content-Type: application/json`, for any request with a body. The body is one JSON object, at most 40 MiB.
 
 Every response is JSON. Errors have the shape `{"error": {"code": "...", "message": "...", "details": {...}}}`.
@@ -121,8 +120,8 @@ curl -s -X POST http://127.0.0.1:23125/v1/items \
 
 ### Write grants
 
-A write needs a grant key, and a person at the desktop has to approve the grant. A process that holds only the token
-cannot write on its own.
+A write needs only the bearer token. The grant routes are kept, but no write asks for or checks a grant key, so no
+prompt is shown in Zotero for a write.
 
 - `POST /v1/grants` with `{"app_name": "..."}` asks for a grant. The answer is `202` and a `grant_id`. Zotero shows a
   prompt that names the app. Its buttons are **Allow for 1 hour**, **Allow until Zotero restarts**,

@@ -43,7 +43,7 @@ function build(overrides) {
   const tracker = { inBatch: false, touched: [], created: [] };
   const deps = {
     zotero,
-    version: '0.1.4',
+    version: '0.1.5',
     host: HOST,
     token: TOKEN,
     validate: v,
@@ -113,7 +113,7 @@ test('GET /v1/status answers with the versions, for an admitted caller', async (
   const { app } = build();
   const out = await call(app, 'GET', '/v1/status');
   assert.equal(out.status, 200);
-  assert.deepEqual(out.body, { plugin_version: '0.1.4', api_version: 1, zotero_version: '10.0.6', library_id: 1 });
+  assert.deepEqual(out.body, { plugin_version: '0.1.5', api_version: 1, zotero_version: '10.0.6', library_id: 1 });
 });
 
 test('no token is a 401 that says how to send one', async () => {
@@ -347,27 +347,25 @@ test('createApp refuses to start without the shared tracker', () => {
   );
 });
 
-test('a write without a grant key is refused with grant_required, even with the right token', async () => {
+test('a write with the bearer token alone is accepted, with no grant key', async () => {
   const { app } = build();
   const out = await call(app, 'POST', '/v1/items', { json: { item_type: 'book', fields: { title: 'x' } }, noGrant: true });
-  assert.equal(out.status, 403);
-  assert.equal(out.body.error.code, 'grant_required');
+  assert.equal(out.status, 201);
 });
 
-test('a wrong grant key is refused the same way, so the token alone is never a grant', async () => {
+test('a write with a grant header that is not valid is not refused for it, because no write asks for a grant', async () => {
   const { app } = build();
   const out = await call(app, 'PATCH', '/v1/items/AAAAAAAA', {
     json: { fields: {} },
     headers: { 'meridian-write-grant': 'x'.repeat(64) },
   });
-  assert.equal(out.status, 403);
-  assert.equal(out.body.error.code, 'grant_required');
+  assert.notEqual(out.body && out.body.error && out.body.error.code, 'grant_required');
 });
 
-test('the batch route is a write, so one grant check covers every operation in it', async () => {
+test('the batch route accepts the token alone too', async () => {
   const { app } = build();
   const out = await call(app, 'POST', '/v1/batch', { json: { operations: [] }, noGrant: true });
-  assert.equal(out.body.error.code, 'grant_required');
+  assert.notEqual(out.body && out.body.error && out.body.error.code, 'grant_required');
 });
 
 test('the grant routes need the token but no grant key, and pass their body and ids to the store', async () => {
