@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import asyncio
 import shutil
+from datetime import datetime, timezone
 from pathlib import Path
 
 import pytest
@@ -296,6 +297,112 @@ def test_outputs_search_unavailable_when_the_index_raises(desk, monkeypatch):
     assert body["index_state"] == "unavailable"
     assert "duckdb" not in response.text
     assert "Traceback" not in response.text
+
+
+def test_outputs_search_sends_hits_as_the_same_list_as_results(desk):
+    _write(desk["outputs"] / "runs" / "alpha.csv", "temperature,pressure\n300,1\n")
+    body = desk["client"].get(OUTPUTS, params={"q": "temperature"}).json()
+    assert body["index_state"] == "ready"
+    assert body["results"]
+    assert body["hits"] == body["results"]
+
+
+def test_outputs_search_hits_are_empty_when_no_index_is_configured(desk, monkeypatch):
+    monkeypatch.delenv(desktop_read.OUTPUTS_DIR_ENV, raising=False)
+    body = desk["client"].get(OUTPUTS, params={"q": "temperature"}).json()
+    assert body["hits"] == []
+    assert body["results"] == []
+
+
+def test_outputs_search_convergence_has_the_fields_the_desktop_client_reads(desk):
+    _write(desk["outputs"] / "runs" / "alpha.csv", "temperature,pressure\n300,1\n")
+    body = desk["client"].get(OUTPUTS, params={"q": "temperature"}).json()
+    convergence = body["convergence"]
+    assert set(convergence) == {
+        "partial_index", "pending_count", "degraded", "inconclusive",
+        "walk_errors", "db_write_error", "last_rebuilt_at",
+    }
+    assert convergence["partial_index"] is False
+    assert convergence["pending_count"] == 0
+    assert convergence["degraded"] is False
+    assert convergence["walk_errors"] == []
+    assert convergence["db_write_error"] is None
+    stamp = convergence["last_rebuilt_at"]
+    assert isinstance(stamp, str) and stamp.endswith("+00:00")
+    # The index_state string is still sent alongside the new object.
+    assert body["index_state"] == "ready"
+
+
+def test_outputs_search_partial_index_without_a_snapshot_is_degraded(desk, monkeypatch):
+    monkeypatch.setattr(
+        outputs_indexer, "search_outputs",
+        lambda *args, **kwargs: {"hits": [], "partial": True},
+    )
+    body = desk["client"].get(OUTPUTS, params={"q": "temperature"}).json()
+    assert body["partial"] is True
+    assert body["convergence"]["partial_index"] is True
+    assert body["convergence"]["degraded"] is True
+
+
+def test_outputs_search_pending_and_write_failures_are_reported_without_detail(desk, monkeypatch):
+    monkeypatch.setattr(
+        outputs_indexer, "search_outputs",
+        lambda *args, **kwargs: {
+            "hits": [], "partial": True, "pending_count": 7,
+            "db_write_error": "disk I/O error at /private/outputs.db",
+        },
+    )
+    response = desk["client"].get(OUTPUTS, params={"q": "temperature"})
+    body = response.json()
+    convergence = body["convergence"]
+    assert convergence["pending_count"] == 7
+    assert convergence["inconclusive"] is True
+    assert convergence["degraded"] is True
+    assert convergence["db_write_error"] == desktop_read.INDEX_DB_WRITE_MESSAGE
+    assert "/private" not in response.text
+
+
+def test_outputs_search_passes_the_indexer_snapshot_through_without_paths(desk, monkeypatch):
+    snapshot = {
+        "partial_index": False,
+        "pending_count": 0,
+        "degraded": True,
+        "inconclusive": True,
+        "walk_errors": ["/secret/one", "/secret/two"],
+        "db_write_error": None,
+        "last_rebuilt_at": datetime(2024, 11, 12, 8, 26, 40, tzinfo=timezone.utc).timestamp(),
+    }
+    monkeypatch.setattr(
+        outputs_indexer, "search_outputs",
+        lambda *args, **kwargs: {"hits": [], "convergence": snapshot, "degraded": True},
+    )
+    response = desk["client"].get(OUTPUTS, params={"q": "temperature"})
+    convergence = response.json()["convergence"]
+    assert convergence["degraded"] is True
+    assert convergence["walk_errors"] == [desktop_read.INDEX_WALK_MESSAGE] * 2
+    assert convergence["last_rebuilt_at"] == "2024-11-12T08:26:40+00:00"
+    assert "/secret" not in response.text
+
+
+def test_outputs_search_without_an_index_is_never_a_confirmed_miss(desk, monkeypatch):
+    monkeypatch.setenv(desktop_read.OUTPUTS_DIR_ENV, str(desk["tmp"] / "absent"))
+    body = desk["client"].get(OUTPUTS, params={"q": "temperature"}).json()
+    assert body["index_state"] == "not_indexed"
+    assert body["convergence"]["degraded"] is True
+    assert body["convergence"]["last_rebuilt_at"] is None
+
+
+def test_outputs_search_unavailable_reports_a_degraded_convergence_and_no_hits(desk, monkeypatch):
+    def explode(*args, **kwargs):
+        raise RuntimeError("duckdb failure")
+
+    monkeypatch.setattr(outputs_indexer, "search_outputs", explode)
+    body = desk["client"].get(OUTPUTS, params={"q": "temperature"}).json()
+    assert body["index_state"] == "unavailable"
+    assert body["hits"] == []
+    assert body["results"] == []
+    assert body["convergence"]["degraded"] is True
+    assert body["convergence"]["inconclusive"] is True
 
 
 # ---------------------------------------------------------------------------

@@ -14,7 +14,12 @@ Routes
     BM25 search over the outputs index (``meridian/outputs_indexer.py``) for the
     configured outputs directory. Returns ``{"results": [{path, score, kind,
     generating_script, csv_columns, json_keys, is_archival, canonical_path, size,
-    mtime}], "index_state": ...}``. The outputs index holds no line or snippet.
+    mtime}], "hits": [...same list...], "index_state": ..., "convergence": {...}}``.
+    ``hits`` is the same list as ``results``: the desktop outputs client reads
+    ``hits``, and ``results`` is kept for existing callers. The outputs index holds
+    no line or snippet. ``convergence`` is the index health the desktop client reads:
+    ``partial_index``, ``pending_count``, ``degraded``, ``inconclusive``,
+    ``walk_errors``, ``db_write_error`` and ``last_rebuilt_at`` (ISO 8601 UTC, or null).
 
 ``GET /desktop/research/runs?limit=&project_id=``
     Research runs from the project-scoped store (``meridian/db/research_runs.py``),
@@ -56,6 +61,7 @@ import logging
 import os
 import re
 import sqlite3
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
@@ -250,19 +256,106 @@ def _outputs_dir() -> str:
     return str(os.environ.get(OUTPUTS_DIR_ENV) or "").strip()
 
 
-def _outputs_search(q: str, limit: int) -> tuple[str, list[dict[str, Any]], str | None, bool]:
+# Fixed sentences for the two index faults the client shows. The indexer's own
+# messages carry exception text and paths, so they never leave the server.
+INDEX_DB_WRITE_MESSAGE = (
+    "The outputs index could not be saved to disk, so its results may be incomplete."
+)
+INDEX_WALK_MESSAGE = "A folder in the outputs directory could not be read."
+
+
+def _iso_utc(stamp: Any) -> str | None:
+    if isinstance(stamp, bool) or not isinstance(stamp, (int, float)):
+        return None
+    try:
+        return datetime.fromtimestamp(float(stamp), tz=timezone.utc).isoformat()
+    except (OverflowError, OSError, ValueError):
+        return None
+
+
+def _count(value: Any) -> int:
+    return value if isinstance(value, int) and not isinstance(value, bool) and value > 0 else 0
+
+
+def _index_convergence(found: dict[str, Any]) -> dict[str, Any]:
+    """Index health from one ``search_outputs`` result, in the shape the desktop client reads.
+
+    Uses the indexer's ``convergence`` snapshot when it has one, otherwise the top-level
+    ``partial`` / ``pending_count`` / ``db_write_error`` fields. ``degraded`` is conservative:
+    a partial, queued, unreadable or unsaved index is degraded whatever the snapshot says.
+    """
+    snapshot = found.get("convergence")
+    source: dict[str, Any] = snapshot if isinstance(snapshot, dict) else found
+    partial = bool(source.get("partial_index", source.get("partial")))
+    pending = _count(source.get("pending_count"))
+    walk_errors = source.get("walk_errors")
+    walk_errors = walk_errors if isinstance(walk_errors, list) else []
+    db_failed = bool(source.get("db_write_error"))
+    inconclusive = bool(source.get("inconclusive")) or bool(walk_errors) or db_failed
+    degraded = bool(source.get("degraded")) or partial or pending > 0 or inconclusive
+    return {
+        "partial_index": partial,
+        "pending_count": pending,
+        "degraded": degraded,
+        "inconclusive": inconclusive,
+        "walk_errors": [INDEX_WALK_MESSAGE for _ in walk_errors],
+        "db_write_error": INDEX_DB_WRITE_MESSAGE if db_failed else None,
+        "last_rebuilt_at": _iso_utc(source.get("last_rebuilt_at")),
+    }
+
+
+def _unknown_index(*, inconclusive: bool) -> dict[str, Any]:
+    """Index health when no index answered. An empty result is then never a confirmed miss."""
+    return {
+        "partial_index": False,
+        "pending_count": 0,
+        "degraded": True,
+        "inconclusive": inconclusive,
+        "walk_errors": [],
+        "db_write_error": None,
+        "last_rebuilt_at": None,
+    }
+
+
+def _outputs_search(
+    q: str, limit: int,
+) -> tuple[str, list[dict[str, Any]], str | None, dict[str, Any]]:
     directory = _outputs_dir()
     if not directory or not os.path.isdir(directory):
         return (
             INDEX_NOT_INDEXED, [],
             f"No outputs index: set {OUTPUTS_DIR_ENV} to an existing outputs directory.",
-            False,
+            _unknown_index(inconclusive=False),
         )
     found = outputs_indexer.search_outputs(directory, q, limit=limit)
     if found.get("error"):
-        return INDEX_UNAVAILABLE, [], "The outputs index could not be searched.", False
+        return (
+            INDEX_UNAVAILABLE, [], "The outputs index could not be searched.",
+            _unknown_index(inconclusive=True),
+        )
     results = [{field: hit.get(field) for field in _OUTPUT_FIELDS} for hit in found.get("hits", [])]
-    return INDEX_READY, results, None, bool(found.get("partial"))
+    return INDEX_READY, results, None, _index_convergence(found)
+
+
+def _outputs_body(
+    results: list[dict[str, Any]],
+    state: str,
+    message: str | None,
+    index: dict[str, Any],
+) -> dict[str, Any]:
+    body: dict[str, Any] = {
+        "results": results,
+        # The desktop outputs client reads "hits". It is the same list as "results".
+        "hits": results,
+        "index_state": state,
+        "convergence": index,
+    }
+    if message:
+        body["message"] = message
+    if index["partial_index"]:
+        # The outputs tree is still being indexed; a short result list is not final.
+        body["partial"] = True
+    return body
 
 
 @router.get("/desktop/outputs/search")
@@ -278,23 +371,17 @@ def desktop_outputs_search(
     if invalid is not None:
         return invalid
     try:
-        state, results, message, partial = _outputs_search(
+        state, results, message, index = _outputs_search(
             q.strip(), _clamp_limit(limit, OUTPUTS_MAX_LIMIT),
         )
     except Exception:  # noqa: BLE001 - plain error to the client, traceback to the log only
         _log.warning("desktop outputs search: index unavailable", exc_info=True)
-        return JSONResponse({
-            "results": [],
-            "index_state": INDEX_UNAVAILABLE,
-            "message": "The outputs index could not be searched. Try again shortly.",
-        })
-    body: dict[str, Any] = {"results": results, "index_state": state}
-    if message:
-        body["message"] = message
-    if partial:
-        # The outputs tree is still being indexed; a short result list is not final.
-        body["partial"] = True
-    return JSONResponse(body)
+        return JSONResponse(_outputs_body(
+            [], INDEX_UNAVAILABLE,
+            "The outputs index could not be searched. Try again shortly.",
+            _unknown_index(inconclusive=True),
+        ))
+    return JSONResponse(_outputs_body(results, state, message, index))
 
 
 # ---------------------------------------------------------------------------
