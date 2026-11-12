@@ -93,7 +93,7 @@ A running plan needs the owner to inspect the audit log and the InvenTree state 
 
 A write has an unknown outcome when its request may have reached InvenTree but no usable answer came back. That is:
 
-- a timeout, or an unreachable error after the request was sent;
+- a timeout, or a connection error raised while sending the request. The client cannot prove the request was never sent, so it treats such an error as an unknown outcome;
 - an HTTP 502, 503 or 504 from a gateway in front of InvenTree (other 5xx answers are ordinary failures);
 - a 2xx answer too large or too deeply nested for the client to read;
 - a 2xx answer with no JSON body, or with no usable primary key. A 2xx answer is success only when it names the object it changed.
@@ -147,7 +147,7 @@ Just before the write, `run_plan` also re-reads the live state and compares its 
 
 ## Version gate
 
-Before the first write, `run_plan` reads `GET /api/` and refuses unless the version is inside the supported range. Propose uses the same check. The range is set by `SUPPORTED_VERSION_PREFIXES` in `meridian_inventree/server.py`. Pass that value to `run_plan` as `supported_prefixes`. With no range set, every run is refused.
+With a range set, `run_plan` reads `GET /api/` before the first write and refuses unless the version is inside the range. `propose` uses the same check. The range is set by `SUPPORTED_VERSION_PREFIXES` in `meridian_inventree/server.py`. Pass that value to `run_plan` as `supported_prefixes`. With no range set, every run and every propose is refused before any request is sent, so no `GET /api/` is made.
 
 ## What approval does and does not protect against
 
@@ -159,7 +159,7 @@ The real boundary is the write-capable `INVENTREE_TOKEN`. It must not be availab
 
 ## Limits in this version
 
-- **Writes are refused until the InvenTree version is named.** `SUPPORTED_VERSION_PREFIXES` in `meridian_inventree/server.py` is empty. Every write is refused until the owner sets the version range for their instance. `inventree_propose` refuses before it reads anything. The read tools keep working.
+- **Writes are refused until the InvenTree version is named.** `SUPPORTED_VERSION_PREFIXES` in `meridian_inventree/server.py` is empty. Every write is refused until the owner sets the version range for their instance. `inventree_propose` refuses before it sends any request, including the version read. The read tools keep working.
 - **No command runs an approved plan yet.** Running is a Python call to `write_tools.run_plan(plan, client, audit, store=store, supported_prefixes=...)`, made by the owner. A command-line runner is still to be built.
 - **No deletes, no user or permission changes, no bulk file import** in v1. Those need a separate plan.
 - **Body field names are unconfirmed.** Each one is marked `VERIFY-LIVE` in `write_tools.py` and must be checked against the owner's instance before writes are enabled.

@@ -29,6 +29,7 @@ from meridian_inventree.write_tools import (
     MAX_OPERATIONS,
     OPERATION_NAMES,
     PlanRefused,
+    check_write_version,
     execute,
     preview,
     run_plan,
@@ -903,10 +904,35 @@ def test_run_refuses_an_unresolved_key_without_sending_anything(
     assert fake.writes == []  # no POST or PATCH was sent
     assert all(method == "GET" for method, _path in fake.requests)  # only the version check read InvenTree
     run_events = [event["event"] for event in audit.read_events() if event["plan_id"] == stored["plan_id"]]
-    assert run_events == ["op_failed"]
+    assert run_events == ["op_skipped"]  # a skipped event, not op_failed, so the refusal does not settle the key
+    assert "k1" in audit.unresolved_keys()  # the key is still unresolved after the run
     current = store.get(stored["plan_id"])
     assert current["status"] == "failed"
     assert current["results"][0]["error_code"] == "key_unresolved"
+
+
+def test_second_run_with_a_still_unresolved_key_is_refused_again(
+    fake: FakeInvenTree,
+    client: InvenTreeClient,
+    store: PlanStore,
+    tmp_path: Path,
+) -> None:
+    audit = AuditLog(tmp_path / "audit.jsonl")
+    first = approved_in_store(store, client, [op("create_location", {"name": "A"}, "k1")])
+    audit.append({"event": OP_STARTED, "plan_id": "f" * 32, "index": 0, "client_key": "k1", "phase": "started"})
+    assert run_plan(first, client, audit, store=store, supported_prefixes=RANGE).outcomes[0].error_code == "key_unresolved"
+    fake.requests.clear()
+
+    # A second plan that holds the same key was approved before the unresolved write, so propose would refuse
+    # the key itself. write_raw puts it on disk the way such an approval would have left it.
+    second_id = write_raw(store, [op("create_location", {"name": "B"}, "k1")], [{"before": {}, "after": {}}])
+    report = run_plan({"plan_id": second_id}, client, audit, store=store, supported_prefixes=RANGE)
+
+    assert [outcome.error_code for outcome in report.outcomes] == ["key_unresolved"]
+    assert report.complete is False
+    assert fake.writes == []  # no POST was sent for the second plan either
+    assert "k1" in audit.unresolved_keys()
+    assert store.get(second_id)["status"] == "failed"
 
 
 # ---------------------------------------------------------------- fix 4: version gate at run time
@@ -953,6 +979,15 @@ def test_run_with_no_supported_range_refuses_every_version(
         run_plan(stored, client, RecordingAudit(timeline), store=store)
     assert info.value.code == "version_unsupported"
     assert fake.writes == []
+    assert fake.requests == []  # with no range, not even the version read is sent
+
+
+def test_propose_gate_with_no_version_range_sends_no_request(fake: FakeInvenTree, client: InvenTreeClient) -> None:
+    # propose runs check_write_version before it previews anything. With no range set it refuses before any GET /api/.
+    with pytest.raises(PlanRefused) as info:
+        check_write_version(client, ())
+    assert info.value.code == "version_unsupported"
+    assert fake.requests == []
 
 
 # ---------------------------------------------------------------- fix 5: the stored request is what is sent

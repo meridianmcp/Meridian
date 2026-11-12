@@ -86,9 +86,11 @@ MAX_OPERATIONS: Final[int] = 50
 AUDIT_AFTER_NOTE: Final[str] = "audit_failed_after"
 SKIPPED_NOTE: Final[str] = "client_key already succeeded in the audit log"
 KEY_UNRESOLVED_NOTE: Final[str] = "client_key has an unsettled earlier write; nothing was sent for it"
-# Client error codes that mean no usable answer came back for a request that was sent. The client
-# reports a timeout as "unreachable". For a write, "bad_response" means the status was 2xx but the
-# body was too large or nested too deeply for the client to read, so the write was probably applied.
+# Client error codes that mean no usable answer came back for a request that may have been sent. The
+# client reports every connection error as "unreachable", including one raised before the request left,
+# and it cannot tell the two apart, so a write is recorded as an unknown outcome. "bad_response" means the
+# status was 2xx but the body was too large or nested too deeply for the client to read, so the write was
+# probably applied.
 _UNANSWERED_CODES: Final[frozenset[str]] = frozenset({"unreachable", "timeout", "bad_response"})
 # HTTP answers from a gateway in front of InvenTree. The upstream may have applied the write, so for
 # a write these are unknown outcomes. Other 5xx answers stay ordinary failures.
@@ -457,8 +459,15 @@ def reported_version(data: Mapping[str, Any]) -> str | None:
 def check_write_version(client: InvenTreeClient, prefixes: Sequence[str]) -> None:
     """Refuse unless the live InvenTree version is inside the supported range. Sends one GET /api/.
 
+    With no range set, every version is refused before any request, so no GET /api/ is sent.
     propose and run_plan both call this, so the two cannot disagree about the range.
     """
+    if not prefixes:
+        # Nothing can be supported, so there is no version to compare. Refuse without reading InvenTree.
+        raise PlanRefused(
+            "version_unsupported",
+            "No supported InvenTree version range is set, so writes are refused. No version was read.",
+        )
     try:
         data = client.check_version()
     except InvenTreeError as exc:
@@ -824,7 +833,7 @@ def run_plan(
     Before the first request, and with nothing changed until the last step:
     1. reload from disk and verify status, approval and hash;
     2. validate every operation;
-    3. check the InvenTree version (one GET /api/);
+    3. check the InvenTree version (one GET /api/, or no request when no range is set);
     4. read the client keys that already succeeded in the audit log;
     5. move the plan from approved to running, under the plan lock.
 
@@ -867,8 +876,10 @@ def run_plan(
                 continue
             if key in unresolved and key not in succeeded:
                 # Nothing is sent for this key. An earlier write with it may already have reached InvenTree.
+                # The event is "skipped", which unresolved_keys ignores, so it does not settle the key. An
+                # automatic op_failed would settle it and let a later plan reuse the key.
                 outcome = OpOutcome(index, op, key, "failed", error_code="key_unresolved", note=KEY_UNRESOLVED_NOTE)
-                if not _record(audit, _event(plan_id, index, op, key, "failed")):
+                if not _record(audit, _event(plan_id, index, op, key, "skipped", error_code="key_unresolved")):
                     outcome = OpOutcome(index, op, key, "failed", error_code="audit_failed")
                 outcomes.append(outcome)
                 stopped = _stops(outcome)

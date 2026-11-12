@@ -266,7 +266,7 @@ def test_writes_are_refused_while_no_version_range_is_set(tmp_path: Path, monkey
     app, transport = _app(tmp_path, _version_routes("0.17.5"))
     with pytest.raises(ToolError, match="version_unsupported"):
         app.tools["inventree_propose"](operations=[_create_part("Resistor 10k")])
-    assert transport.methods == {"GET"}  # only the version read was sent
+    assert transport.methods == set()  # no request at all was sent, not even the version read
     assert list((tmp_path / "state" / "plans").glob("*.json")) == []
 
 

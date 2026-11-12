@@ -1,6 +1,8 @@
 # InvenTree MCP server: read and write, with approval
 
-Status: plan, not built. Owner asked for a read/write MCP server for InvenTree, with writes done by a subagent swarm after planning.
+> `extensions/meridian-inventree/README.md` is the source of truth for what is built. This file is the original plan. Where the two differ, the README is right.
+
+Status: built. The read tools, plan store, terminal approval (`approve_cli.py`), audit file and `run_plan` are in the package. Two things are still open: writes are refused until the owner sets the supported version range, and `run_plan` has no command-line runner yet. The original request was a read/write MCP server for InvenTree, with writes done by a subagent swarm after planning.
 
 ## What it is
 
@@ -31,8 +33,8 @@ Read tools are paginated and capped in size. Results are truncated with a note, 
 Writes are never executed by the tool call that proposes them.
 
 1. `inventree_propose(operations[])`: validates each operation, fetches the current state of every object it would change, and stores a plan with a preview (before and after for each field). Returns a `plan_id`. Nothing is written.
-2. Approval: the owner approves the plan through a Meridian HITL request (`request_hitl`), or in the desktop once that exists. An agent cannot approve a plan, and cannot pass an approval flag.
-3. `inventree_execute(plan_id)`: runs only if the plan is approved, unchanged since approval (hash check), and not already executed. It runs operations in order. It stops on the first failure and reports what was done.
+2. Approval: the owner approves the plan in a terminal with `python -m meridian_inventree.approve_cli`. The command shows each operation and the plan hash, and the owner types the hash to approve. No MCP tool approves a plan, and an agent cannot pass an approval flag.
+3. Running: there is no execute tool. The owner runs an approved plan from Python with `write_tools.run_plan`. It runs only if the plan is approved, unchanged since approval (hash check), and not already run. It runs operations in order and stops on the first failure, then reports what was done.
 
 Write operations in v1:
 - `create_part`, `update_part`
@@ -43,10 +45,10 @@ Not in v1: any delete, any user or permission change, any bulk import from a fil
 
 ## Safety rules
 
-- Every write op is recorded before and after it runs, in an append-only audit file under the Meridian state folder, and as a Meridian task log entry.
+- Every write op is recorded before and after it runs, in an append-only audit file under the Meridian state folder. There is no task-log mirror.
 - Idempotency: each op carries a client key. A retry of the same key is a no-op after the first success.
 - Batch limit: a plan holds at most 50 operations. Larger work is split into plans.
-- Dry run is the default. `inventree_execute` needs an explicit `confirm=true` in addition to approval.
+- Propose is a dry run: it stores a plan and writes nothing. There is no `confirm` flag. Approval in the terminal is the gate before a run.
 - Stock quantity changes never go below zero, and a transfer must name a real destination.
 - Subagents may propose freely. Only an approved plan can run. The swarm's job is to produce plans, not to write.
 
@@ -61,7 +63,7 @@ Not in v1: any delete, any user or permission change, any bulk import from a fil
 
 1. Create and update request bodies for parts, locations and stock. Must be taken from the live `/api-doc/` of the target instance. Not in the docs I could reach.
 2. Which InvenTree version the owner runs. Decides the fixtures and the supported range.
-3. Where the owner's approval comes from in v1: Meridian HITL, or a local confirm in the MCP host.
+3. Resolved: the owner's approval comes from the terminal approval CLI (`approve_cli.py`), not from Meridian HITL or the MCP host.
 
 ## Build order for the swarm
 
