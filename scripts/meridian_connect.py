@@ -226,6 +226,41 @@ def _local_repo_hint() -> str:
 
 
 # ---------------------------------------------------------------------------
+# Per-host label for the permanent hooks token.
+#
+# POST /auth/tokens deletes every existing token that carries the same label
+# before it mints the new one (the label is a unique slot). A single shared
+# "hooks-installer" label therefore let a second machine's install revoke the
+# first machine's token. Scoping the label by hostname gives each machine its
+# own slot, the same way the tunnel-cli label is scoped (server.py, e37187f3).
+# ---------------------------------------------------------------------------
+
+_HOOKS_LABEL_BASE = "hooks-installer"
+# Mirrors meridian/server.py _sanitize_tunnel_hostname: keep only alnum, dot,
+# dash and underscore, capped at 200 characters. Duplicated on purpose because
+# this script is dependency-free; tests/test_hooks_installer_host_label.py pins
+# the two rules together.
+_HOSTNAME_DROP = re.compile(r"[^A-Za-z0-9._-]")
+_HOSTNAME_MAX_LEN = 200
+
+
+def _hooks_token_label() -> str:
+    """Label for this machine's permanent hooks token: ``hooks-installer-<host>``.
+
+    Falls back to the legacy shared ``hooks-installer`` label when no usable
+    hostname can be read (unreadable, or empty once sanitized). Existing tokens
+    that already carry the legacy label are not touched; this only changes the
+    label this installer sends from now on.
+    """
+    try:
+        raw = socket.gethostname()
+    except Exception:
+        raw = ""
+    host = _HOSTNAME_DROP.sub("", raw or "")[:_HOSTNAME_MAX_LEN]
+    return f"{_HOOKS_LABEL_BASE}-{host}" if host else _HOOKS_LABEL_BASE
+
+
+# ---------------------------------------------------------------------------
 # bb307c27 -- Codex / Cursor config writers that MERGE instead of clobbering.
 #
 # The previous writers (a) regex-deleted the user's whole ``[hooks]`` table in
@@ -895,8 +930,10 @@ def main() -> int:
 
     # ---- Step 3: Generate permanent token ------------------------------------
     if not is_local and token:
+        # Per-host label (see _hooks_token_label): a shared label would let this
+        # install revoke another machine's permanent token.
         perm = _http("POST", f"{meridian_url}/auth/tokens", token=token,
-                     body={"label": "hooks-installer"})
+                     body={"label": _hooks_token_label()})
         if perm and perm.get("token"):
             token = perm["token"]
             print("  Permanent token created.")
