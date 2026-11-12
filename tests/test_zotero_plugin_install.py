@@ -705,13 +705,24 @@ def test_settings_round_trip_creates_the_folder_and_leaves_no_temp_file(tmp_path
 def test_first_run_install_choice_enables_autoinstall_and_marks_decided():
     original = {"autoinstall": False, "decided": False}
     updated = zpi.apply_first_run_choice(original, True)
-    assert updated == {"autoinstall": True, "decided": True, "close_zotero_for_install": True}
+    assert updated == {
+        "autoinstall": True, "decided": True, "close_zotero_for_install": True, "licence_accepted": False,
+    }
     assert original == {"autoinstall": False, "decided": False}
 
 
 def test_first_run_not_now_choice_disables_autoinstall_and_marks_decided():
     updated = zpi.apply_first_run_choice({"autoinstall": True, "decided": False}, False)
-    assert updated == {"autoinstall": False, "decided": True, "close_zotero_for_install": True}
+    assert updated == {
+        "autoinstall": False, "decided": True, "close_zotero_for_install": True, "licence_accepted": False,
+    }
+
+
+def test_first_run_not_now_keeps_an_accepted_licence():
+    accepted = {"autoinstall": True, "decided": True, "close_zotero_for_install": True, "licence_accepted": True}
+    updated = zpi.apply_first_run_choice(accepted, False)
+    assert updated["licence_accepted"] is True
+    assert updated["autoinstall"] is False
 
 
 # ---------------------------------------------------------------------------
@@ -1754,7 +1765,7 @@ def test_save_refuses_a_non_boolean_close_setting(tmp_path):
 def test_first_run_choice_keeps_the_saved_close_setting():
     original = {"autoinstall": False, "decided": False, "close_zotero_for_install": False}
     assert zpi.apply_first_run_choice(original, True) == {
-        "autoinstall": True, "decided": True, "close_zotero_for_install": False,
+        "autoinstall": True, "decided": True, "close_zotero_for_install": False, "licence_accepted": False,
     }
 
 

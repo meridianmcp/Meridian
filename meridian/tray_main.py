@@ -1168,8 +1168,12 @@ def _saved_close(settings: dict) -> bool:
 
 
 def toggle_zotero_plugin_autoinstall(settings: dict) -> dict:
-    """Flip the saved auto-install choice from the tray menu. A menu action counts as a decision."""
+    """Flip the saved auto-install choice from the tray menu. A menu action counts as a decision.
+
+    Every other saved key is kept, the licence acceptance included.
+    """
     return {
+        **settings,
         "autoinstall": not bool(settings.get("autoinstall", False)),
         "decided": True,
         zotero_plugin.CLOSE_SETTING_KEY: _saved_close(settings),
@@ -1211,9 +1215,11 @@ def toggle_zotero_plugin_close(settings: dict) -> dict:
     """Flip the saved close-Zotero choice from the tray menu. The first-run decision is left as it was.
 
     Turning the close choice off or on is not an answer to the first-run prompt, so the
-    prompt still asks when the user has not answered it yet.
+    prompt still asks when the user has not answered it yet. Every other saved key is kept,
+    the licence acceptance included.
     """
     return {
+        **settings,
         "autoinstall": bool(settings.get("autoinstall", False)),
         "decided": bool(settings.get("decided", False)),
         zotero_plugin.CLOSE_SETTING_KEY: not _saved_close(settings),

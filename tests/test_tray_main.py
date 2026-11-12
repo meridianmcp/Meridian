@@ -50,7 +50,8 @@ def _accept_the_zotero_licence(monkeypatch):
 
 
 def _without_licence(settings):
-    # The licence key is checked by its own tests. These tests are about the autoinstall and close settings.
+    # Only the first-run tests use this: they compare the saved settings without the licence key. The toggle tests
+    # check the licence key too, because a menu toggle must never erase a saved licence acceptance.
     return {key: value for key, value in settings.items() if key != zpi.LICENCE_SETTING_KEY}
 
 
@@ -1957,8 +1958,10 @@ def test_toggle_flips_the_saved_choice_and_records_a_decision(tmp_path):
     path = tmp_path / "zotero_plugin.json"
     zpi.save_settings(path, {"autoinstall": True, "decided": False})
     updated = tray_main._toggle_zotero_plugin_preference(path)
-    assert updated == {"autoinstall": False, "decided": True, "close_zotero_for_install": True}
-    assert _without_licence(zpi.load_settings(path)) == updated
+    assert updated == {
+        "autoinstall": False, "decided": True, "close_zotero_for_install": True, zpi.LICENCE_SETTING_KEY: False,
+    }
+    assert zpi.load_settings(path) == updated
 
 
 # ---------------------------------------------------------------------------
@@ -2647,14 +2650,18 @@ def test_install_answer_enables_autoinstall_and_marks_the_choice_made():
     updated = tray_main.zotero_plugin_settings_after_answer(
         {"autoinstall": False, "decided": False}, True,
     )
-    assert updated == {"autoinstall": True, "decided": True, "close_zotero_for_install": True}
+    assert updated == {
+        "autoinstall": True, "decided": True, "close_zotero_for_install": True, "licence_accepted": False,
+    }
 
 
 def test_not_now_answer_disables_autoinstall_and_marks_the_choice_made():
     updated = tray_main.zotero_plugin_settings_after_answer(
         {"autoinstall": True, "decided": False}, False,
     )
-    assert updated == {"autoinstall": False, "decided": True, "close_zotero_for_install": True}
+    assert updated == {
+        "autoinstall": False, "decided": True, "close_zotero_for_install": True, "licence_accepted": False,
+    }
 
 
 def test_no_answer_leaves_the_settings_undecided():
@@ -2733,8 +2740,38 @@ def test_menu_toggle_persists_the_new_preference(tmp_path):
     # Auto-install defaults to off, so the first toggle from an unanswered file turns it on.
     path = tmp_path / "zotero_plugin.json"
     first = tray_main._toggle_zotero_plugin_preference(path)
-    assert first == {"autoinstall": True, "decided": True, "close_zotero_for_install": True}
-    assert _without_licence(zpi.load_settings(path)) == first
+    assert first == {
+        "autoinstall": True, "decided": True, "close_zotero_for_install": True, zpi.LICENCE_SETTING_KEY: False,
+    }
+    assert zpi.load_settings(path) == first
+
+
+def test_toggles_keep_the_licence_key_in_the_settings_they_are_given():
+    accepted = {
+        "autoinstall": True, "decided": True, "close_zotero_for_install": True, zpi.LICENCE_SETTING_KEY: True,
+    }
+    assert tray_main.toggle_zotero_plugin_autoinstall(accepted)[zpi.LICENCE_SETTING_KEY] is True
+    assert tray_main.toggle_zotero_plugin_close(accepted)[zpi.LICENCE_SETTING_KEY] is True
+
+
+def _accept_the_licence_through_the_first_run_install(monkeypatch, path):
+    # The Install answer accepts the licence notice (the autouse fixture says yes) and installs. The install is stubbed.
+    monkeypatch.delenv(_ZOTERO_ENV, raising=False)
+    monkeypatch.setattr(tray_main, "_ask_zotero_plugin_first_run", lambda parent=None: True)
+    _install_returns(monkeypatch, lambda: {"status": "installed", "path": "P", "error": None})
+    tray_main._run_zotero_plugin_first_run(path=path)
+    assert zpi.load_settings(path)[zpi.LICENCE_SETTING_KEY] is True
+
+
+def test_autoinstall_toggle_keeps_the_licence_acceptance_it_was_given(monkeypatch, tmp_path):
+    path = tmp_path / "zotero_plugin.json"
+    _accept_the_licence_through_the_first_run_install(monkeypatch, path)
+
+    tray_main._toggle_zotero_plugin_preference(path)
+
+    assert zpi.load_settings(path) == {
+        "autoinstall": False, "decided": True, "close_zotero_for_install": True, zpi.LICENCE_SETTING_KEY: True,
+    }
 
 
 def test_run_tray_schedules_the_first_run_prompt_and_exposes_the_plugin_toggle(monkeypatch):
@@ -3254,7 +3291,9 @@ def test_toggle_menu_callback_saves_the_flipped_preference(monkeypatch, tmp_path
 
     _menu_callback(fake_pystray, "_toggle_zotero_plugin_autoinstall")(None, None)
 
-    assert _without_licence(zpi.load_settings(path)) == {"autoinstall": True, "decided": True, "close_zotero_for_install": True}
+    assert zpi.load_settings(path) == {
+        "autoinstall": True, "decided": True, "close_zotero_for_install": True, zpi.LICENCE_SETTING_KEY: False,
+    }
 
 
 # ---------------------------------------------------------------------------
@@ -3416,8 +3455,21 @@ def test_close_toggle_persists_the_new_preference(tmp_path):
     path = tmp_path / "zotero_plugin.json"
     zpi.save_settings(path, {"autoinstall": True, "decided": True, "close_zotero_for_install": True})
     updated = tray_main._toggle_zotero_plugin_close_preference(path)
-    assert updated == {"autoinstall": True, "decided": True, "close_zotero_for_install": False}
-    assert _without_licence(zpi.load_settings(path)) == updated
+    assert updated == {
+        "autoinstall": True, "decided": True, "close_zotero_for_install": False, zpi.LICENCE_SETTING_KEY: False,
+    }
+    assert zpi.load_settings(path) == updated
+
+
+def test_close_toggle_keeps_the_licence_acceptance_it_was_given(monkeypatch, tmp_path):
+    path = tmp_path / "zotero_plugin.json"
+    _accept_the_licence_through_the_first_run_install(monkeypatch, path)
+
+    tray_main._toggle_zotero_plugin_close_preference(path)
+
+    assert zpi.load_settings(path) == {
+        "autoinstall": True, "decided": True, "close_zotero_for_install": False, zpi.LICENCE_SETTING_KEY: True,
+    }
 
 
 def test_install_now_refuses_without_closing_when_the_saved_setting_is_off(monkeypatch, tmp_path):
@@ -3464,7 +3516,9 @@ def test_run_tray_exposes_the_close_toggle_and_it_saves_the_flip(monkeypatch, tm
 
     _menu_callback(fake_pystray, "_toggle_zotero_plugin_close")(None, None)
 
-    assert _without_licence(zpi.load_settings(path)) == {"autoinstall": True, "decided": True, "close_zotero_for_install": False}
+    assert zpi.load_settings(path) == {
+        "autoinstall": True, "decided": True, "close_zotero_for_install": False, zpi.LICENCE_SETTING_KEY: False,
+    }
 
 
 def test_docs_name_the_close_toggle_label_and_the_keep_open_flag():

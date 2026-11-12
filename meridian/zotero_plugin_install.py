@@ -1354,11 +1354,17 @@ def save_settings(path: "Path | str", settings: Mapping[str, Any]) -> None:
 
 
 def apply_first_run_choice(settings: Mapping[str, Any], install: bool) -> dict[str, Any]:
-    """A new settings dict: the answer is recorded and ``decided`` becomes true. The close choice is kept."""
+    """A new settings dict: the answer is recorded and ``decided`` becomes true.
+
+    The saved close choice and the licence acceptance are kept. Dropping the acceptance here would make a
+    "Not now" answer erase a licence the user had already accepted.
+    """
+    current = _valid_settings(settings) or dict(_DEFAULT_SETTINGS)
     return {
         "autoinstall": bool(install),
         "decided": True,
-        CLOSE_SETTING_KEY: saved_close_zotero(settings),
+        CLOSE_SETTING_KEY: bool(current[CLOSE_SETTING_KEY]),
+        LICENCE_SETTING_KEY: bool(current[LICENCE_SETTING_KEY]),
     }
 
 
