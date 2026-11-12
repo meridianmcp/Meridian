@@ -868,6 +868,9 @@ No auth required.
 
 | Method | Path | Description |
 |--------|------|-------------|
+| `GET` | `/desktop/code/search` |  |
+| `GET` | `/desktop/outputs/search` |  |
+| `GET` | `/desktop/research/runs` |  |
 | `GET` | `/desktop/research/search` | Desktop Search tab: read-only research search across the named sources (loopback only) |
 
 
