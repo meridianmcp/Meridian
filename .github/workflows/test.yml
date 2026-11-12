@@ -9,8 +9,12 @@ name: Test (dev branch)
 on:
   push:
     branches: [dev]
+  # dev is listed so a pull request into dev runs this same gate before it
+  # merges, not only after the merge. It does not promote anything: deploy.yml's
+  # auto-promote job requires workflow_run.event == 'push', so a PR run here can
+  # never merge dev -> main.
   pull_request:
-    branches: [main]
+    branches: [main, dev]
 
 env:
   FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
