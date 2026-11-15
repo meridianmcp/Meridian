@@ -3,7 +3,7 @@
 The offers are built from the same fields RunPod's v2 catalog returned, with made-up key values.
 """
 
-from PySide6.QtWidgets import QLabel, QLineEdit, QPushButton, QTableWidget
+from PySide6.QtWidgets import QCheckBox, QComboBox, QLabel, QLineEdit, QPushButton, QTableWidget
 
 from meridian_desktop.gpu_catalog import (
     NO_KEY_MESSAGE,
@@ -154,6 +154,7 @@ def _shown(qtbot, catalog):
 
 def test_the_panel_lists_each_gpu_with_its_stock_prices_and_data_centers(qtbot):
     panel = _shown(qtbot, _FakeCatalog())
+    panel.findChild(QCheckBox, "gpu-offers-in-stock").setChecked(False)  # show every GPU, not only the ones in stock
     table = panel.findChild(QTableWidget, "gpu-offers-table")
     assert table.rowCount() == 3
     first = [table.item(0, column).text() for column in range(len(COLUMNS))]

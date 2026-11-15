@@ -9,6 +9,7 @@ expected shape, or any failure, gives a fixed message and never echoes the reply
 from __future__ import annotations
 
 import json
+import re
 import urllib.error
 import urllib.request
 from collections.abc import Callable
@@ -184,13 +185,18 @@ def filter_offers(
     tier: str = TIER_ANY,
     data_center: str = "",
     max_price: float = 0.0,
+    manufacturer: str = "",
+    in_stock_only: bool = False,
 ) -> tuple[GpuOffer, ...]:
     """The offers that pass every filter, in their order. A zero minimum or price, or an empty text or data
     center, means no filter on that field."""
-    needle = text.strip().casefold()
     kept = []
     for offer in offers:
-        if needle and needle not in " ".join((offer.gpu_id, offer.name, offer.manufacturer)).casefold():
+        if not search_matches(text, offer):
+            continue
+        if manufacturer and offer.manufacturer.casefold() != manufacturer.casefold():
+            continue
+        if in_stock_only and not in_stock(offer, data_center):
             continue
         if min_memory_gb and (offer.memory_gb is None or offer.memory_gb < min_memory_gb):
             continue
@@ -208,6 +214,60 @@ def filter_offers(
     return tuple(kept)
 
 
+_NOT_WORD = re.compile(r"[^0-9a-z]+")
+IN_STOCK_LEVELS = ("LOW", "MEDIUM", "HIGH")
+STOCK_RANK = {"NONE": 0, "LOW": 1, "MEDIUM": 2, "HIGH": 3}
+SORT_KEYS = ("name", "memory_desc", "memory_asc", "secure_price", "community_price", "stock")
+
+
+def search_matches(query: str, offer: GpuOffer) -> bool:
+    """Every word of the query must appear in the offer's id, name or maker.
+
+    Case, spaces and hyphens are ignored, so "a100 sxm" finds "NVIDIA A100-SXM4-80GB", and "rtx4090" finds
+    "NVIDIA GeForce RTX 4090". An empty query matches every offer.
+    """
+    words = [word for word in _NOT_WORD.split(query.casefold()) if word]
+    if not words:
+        return True
+    haystack = re.sub(r"[^0-9a-z]", "", " ".join((offer.gpu_id, offer.name, offer.manufacturer)).casefold())
+    return all(word in haystack for word in words)
+
+
+def in_stock(offer: GpuOffer, data_center: str = "") -> bool:
+    """RunPod reports a stock level above NONE: for the chosen data center when one is chosen, else overall."""
+    if data_center:
+        return any(dc.id == data_center and dc.availability in IN_STOCK_LEVELS for dc in offer.data_centers)
+    return offer.availability in IN_STOCK_LEVELS
+
+
+def _sort_number(offer: GpuOffer, key: str) -> float | None:
+    if key == "memory_desc":
+        return None if offer.memory_gb is None else -offer.memory_gb
+    if key == "memory_asc":
+        return None if offer.memory_gb is None else offer.memory_gb
+    if key == "secure_price":
+        return offer.price_secure if offered_secure(offer) else None
+    if key == "community_price":
+        return offer.price_community if offered_community(offer) else None
+    if key == "stock":
+        return -STOCK_RANK.get(offer.availability, -1)
+    return None
+
+
+def sort_offers(offers: tuple[GpuOffer, ...] | list[GpuOffer], key: str) -> tuple[GpuOffer, ...]:
+    """Sort by one of SORT_KEYS. An offer with no value for the key sorts last, whichever way the list runs."""
+    if key not in SORT_KEYS:
+        raise ValueError("unknown sort key")
+    if key == "name":
+        return tuple(sorted(offers, key=lambda offer: offer.name.casefold()))
+
+    def position(offer: GpuOffer) -> tuple[bool, float]:
+        value = _sort_number(offer, key)
+        return (value is None, 0.0 if value is None else value)
+
+    return tuple(sorted(offers, key=position))
+
+
 __all__ = [
     "CATALOG_QUERY",
     "CATALOG_URL",
@@ -218,7 +278,11 @@ __all__ = [
     "TIER_COMMUNITY",
     "TIER_SECURE",
     "fetch_catalog",
+    "SORT_KEYS",
     "filter_offers",
+    "in_stock",
+    "search_matches",
+    "sort_offers",
     "offered_community",
     "offered_secure",
     "parse_catalog",

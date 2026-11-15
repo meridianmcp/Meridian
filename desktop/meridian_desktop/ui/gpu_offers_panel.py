@@ -14,6 +14,7 @@ from typing import Any
 from PySide6.QtCore import QRunnable, Qt, QThreadPool, Slot
 from PySide6.QtWidgets import (
     QAbstractItemView,
+    QCheckBox,
     QComboBox,
     QDoubleSpinBox,
     QHBoxLayout,
@@ -36,6 +37,7 @@ from meridian_desktop.gpu_catalog import (
     GpuCatalogError,
     GpuOffer,
     filter_offers,
+    sort_offers,
     tier_price,
 )
 from meridian_desktop.ui.delivery import Delivered, shared_delivery
@@ -47,6 +49,16 @@ FAILED_TEXT = "The check failed unexpectedly ({})."
 COLUMNS = ("GPU", "Manufacturer", "Memory GB", "Stock", "Secure $/h", "Community $/h", "Max GPUs per pod", "Data centers")
 TIER_CHOICES = (("Any cloud", TIER_ANY), ("Secure cloud", TIER_SECURE), ("Community cloud", TIER_COMMUNITY))
 NOT_OFFERED_TEXT = "not offered"
+ANY_MAKER_TEXT = "Any maker"
+IN_STOCK_TEXT = "In stock only"
+SORT_CHOICES = (
+    ("Sort: name", "name"),
+    ("Memory, most first", "memory_desc"),
+    ("Memory, least first", "memory_asc"),
+    ("Secure price, cheapest first", "secure_price"),
+    ("Community price, cheapest first", "community_price"),
+    ("Stock, most first", "stock"),
+)
 NO_DATA_CENTERS_TEXT = "none listed"
 
 
@@ -179,6 +191,22 @@ class GpuOffersPanel(QWidget):
         self._center.addItem("Any data center", "")
         filters.addWidget(self._center)
 
+        self._maker = QComboBox(self)
+        self._maker.setObjectName("gpu-offers-maker")
+        self._maker.addItem(ANY_MAKER_TEXT, "")
+        filters.addWidget(self._maker)
+
+        self._in_stock = QCheckBox(IN_STOCK_TEXT, self)
+        self._in_stock.setObjectName("gpu-offers-in-stock")
+        self._in_stock.setChecked(True)
+        filters.addWidget(self._in_stock)
+
+        self._sort = QComboBox(self)
+        self._sort.setObjectName("gpu-offers-sort")
+        for text, key in SORT_CHOICES:
+            self._sort.addItem(text, key)
+        filters.addWidget(self._sort)
+
         self._max_price = QDoubleSpinBox(self)
         self._max_price.setObjectName("gpu-offers-price")
         self._max_price.setRange(0.0, 1000.0)
@@ -207,6 +235,9 @@ class GpuOffersPanel(QWidget):
         self._memory.valueChanged.connect(self._apply_filters)
         self._tier.currentIndexChanged.connect(self._apply_filters)
         self._center.currentIndexChanged.connect(self._apply_filters)
+        self._maker.currentIndexChanged.connect(self._apply_filters)
+        self._in_stock.toggled.connect(self._apply_filters)
+        self._sort.currentIndexChanged.connect(self._apply_filters)
         self._max_price.valueChanged.connect(self._apply_filters)
         self._check.clicked.connect(self._on_check_clicked)
 
@@ -268,6 +299,7 @@ class GpuOffersPanel(QWidget):
         self._offers = offers
         self._checked_text = datetime.now(timezone.utc).strftime("%H:%M:%S UTC")
         self._refresh_data_centers()
+        self._refresh_makers()
         self._apply_filters()
 
     def _refresh_data_centers(self) -> None:
@@ -282,6 +314,19 @@ class GpuOffersPanel(QWidget):
         self._center.setCurrentIndex(index if index >= 0 else 0)
         self._center.blockSignals(False)
 
+    def _refresh_makers(self) -> None:
+        """Rebuild the maker choices from the offers, and keep the choice made before if it still exists."""
+        chosen = self._maker.currentData() or ""
+        makers = sorted({offer.manufacturer for offer in self._offers if offer.manufacturer})
+        self._maker.blockSignals(True)
+        self._maker.clear()
+        self._maker.addItem(ANY_MAKER_TEXT, "")
+        for maker in makers:
+            self._maker.addItem(maker, maker)
+        index = self._maker.findData(chosen)
+        self._maker.setCurrentIndex(index if index >= 0 else 0)
+        self._maker.blockSignals(False)
+
     # ----------------------------------------------------------- filters
 
     def _apply_filters(self, *_args: Any) -> None:
@@ -292,7 +337,10 @@ class GpuOffersPanel(QWidget):
             tier=self._tier.currentData() or TIER_ANY,
             data_center=self._center.currentData() or "",
             max_price=self._max_price.value(),
+            manufacturer=self._maker.currentData() or "",
+            in_stock_only=self._in_stock.isChecked(),
         )
+        kept = sort_offers(kept, self._sort.currentData() or "name")
         self._table.setRowCount(len(kept))
         for row, offer in enumerate(kept):
             for column, value in enumerate(offer_cells(offer)):
