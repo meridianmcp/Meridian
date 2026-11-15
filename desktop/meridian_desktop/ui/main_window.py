@@ -216,6 +216,24 @@ def _saved_only_active(store: SettingsStore) -> bool:
     return store.load().settings.sessions_only_active_projects
 
 
+def _saved_gpu_refresh(store: SettingsStore) -> int:
+    """The GPUs tab's Auto refresh interval as saved. Read once when the tab is built, from the local settings file."""
+    return store.load().settings.gpu_refresh_seconds
+
+
+def _save_gpu_refresh(store: SettingsStore) -> Callable[[int], bool]:
+    """The save callback for the GPUs tab's Auto refresh. It returns False when the settings file could not be written."""
+
+    def write(value: int) -> bool:
+        try:
+            store.set_gpu_refresh_seconds(value)
+        except (OSError, SettingsUnreadable, ValueError):
+            return False
+        return True
+
+    return write
+
+
 def _save_only_active(store: SettingsStore) -> Callable[[bool], bool]:
     """The save callback for the Sessions tab's switch. It returns False when the file could not be written, so the tab
     says the choice holds for this session only. It holds no window."""
@@ -459,11 +477,13 @@ class MainWindow(QMainWindow):
                 )
             elif name == "GPUs":
                 # Nothing is read on build. The first show and the Refresh button read the GPUs. While the tab stays
-                # visible, a 5-second timer reads them again. The saved SSH hosts and the RunPod list are read on the worker thread.
+                # visible, the timer reads them again at the Auto refresh interval the owner chose (Off is allowed). The saved SSH hosts and the RunPod list are read on the worker thread.
                 jobs = GpuJobsPanel(
                     _saved_gpu_hosts(self._store),
                     _saved_runpod_pods(self._store),
                     parent=self.tabs,
+                    refresh_seconds=_saved_gpu_refresh(self._store),
+                    on_refresh_changed=_save_gpu_refresh(self._store),
                 )
                 # The RunPod offers list sits above the jobs. Its key is read from the credential store on a worker thread.
                 column = QWidget(self.tabs)

@@ -44,7 +44,6 @@ from meridian_desktop.ui.gpu_jobs_panel import (
     JOB_COLUMNS,
     LOADING_TEXT,
     NOT_READ_TEXT,
-    REFRESH_MS,
     STATUS_COLUMNS,
     GpuJobsPanel,
 )
@@ -182,7 +181,7 @@ def test_a_timer_reads_only_while_the_tab_is_visible(qtbot):
     panel = make_panel(qtbot, run=run)
     timer = panel.findChild(QTimer)
     assert timer is not None
-    assert timer.interval() == REFRESH_MS
+    assert timer.interval() == 300_000  # every 5 minutes, the default Auto refresh interval
     assert timer.isActive() is False
     panel.show()
     assert timer.isActive() is True
@@ -326,8 +325,10 @@ def test_the_tab_has_one_control_and_no_write_controls(qtbot):
     panel = make_panel(qtbot)
     buttons = panel.findChildren(QPushButton)
     assert [widget.objectName() for widget in buttons] == ["gpu-refresh"]
-    for widget_type in (QToolButton, QCheckBox, QRadioButton, QLineEdit, QComboBox, QAbstractSpinBox):
+    for widget_type in (QToolButton, QCheckBox, QRadioButton, QLineEdit, QAbstractSpinBox):
         assert panel.findChildren(widget_type) == [], widget_type.__name__
+    # The one combo box is the Auto refresh interval. It changes how often the tab reads, never a GPU or a host.
+    assert [widget.objectName() for widget in panel.findChildren(QComboBox)] == ["gpu-refresh-interval"]
 
 
 def test_every_table_is_read_only_and_its_cells_are_not_editable(qtbot):

@@ -176,6 +176,9 @@ class Settings:
     # The Sessions tab's "Only projects with active sessions" switch (meridian_desktop/ui/sessions_panel.py). Off by
     # default. save() writes the key only when it is on, so a file that never turned it on keeps the keys it had.
     sessions_only_active_projects: bool = False
+    # The GPUs tab's auto-refresh interval in seconds: 0 is off. Every 5 minutes (300) is the default, so save() writes
+    # the key only when the owner picks another interval.
+    gpu_refresh_seconds: int = 300
     # The file-size note switch on the Limits group. On is the default. Off means the total-size note never shows. A
     # download is never asked about or blocked in either state, and virus scanning always applies.
     limit_approval_enabled: bool = True
@@ -195,6 +198,11 @@ class Settings:
 
 # The default of each switch, read from Settings so the two can never drift apart.
 CONTROL_FLAG_DEFAULTS = {key: getattr(Settings(), key) for key in CONTROL_FLAG_KEYS}
+
+
+# The GPUs tab's auto-refresh choices, in seconds. 0 is off.
+GPU_REFRESH_CHOICES = (0, 60, 300, 900)
+DEFAULT_GPU_REFRESH_SECONDS = 300
 
 
 class SettingsUnreadable(Exception):
@@ -421,6 +429,14 @@ def _from_mapping(data: Mapping) -> tuple[Settings, list[str]]:
         else:
             problems.append("sessions_only_active_projects must be true or false; using false")
 
+    # gpu_refresh_seconds: an absent key means 300 (every 5 minutes), with no warning. Only a listed interval is accepted.
+    if "gpu_refresh_seconds" in data:
+        value = data["gpu_refresh_seconds"]
+        if isinstance(value, int) and not isinstance(value, bool) and value in GPU_REFRESH_CHOICES:
+            values["gpu_refresh_seconds"] = value
+        else:
+            problems.append("gpu_refresh_seconds must be 0, 60, 300 or 900; using 300")
+
     # limit_approval_enabled: an absent key means on, with no warning. Only a real true or false is accepted.
     if "limit_approval_enabled" in data:
         value = data["limit_approval_enabled"]
@@ -618,6 +634,9 @@ class SettingsStore:
         if not settings.sessions_only_active_projects:
             # Off is the default, so the Sessions tab's switch is written only once the owner turns it on.
             del data["sessions_only_active_projects"]
+        if settings.gpu_refresh_seconds == DEFAULT_GPU_REFRESH_SECONDS:
+            # Every 5 minutes is the default, so the key is written only once the owner picks another interval.
+            data.pop("gpu_refresh_seconds", None)
         if settings.limit_approval_enabled:
             # On is the default, so the file-size note switch is written only once the owner turns it off.
             del data["limit_approval_enabled"]
@@ -712,6 +731,21 @@ class SettingsStore:
         # A readable file with one bad value is copied aside before the write, as the other writers do.
         self.keep_unreadable_copy()
         updated = replace(self.load().settings, gpu_hosts=hosts)
+        self.save(updated)
+        return updated
+
+    def set_gpu_refresh_seconds(self, value: int) -> Settings:
+        """Save the GPUs tab's auto-refresh interval (0 is off). Every other field in the file is kept.
+
+        An interval that is not listed raises ValueError. An unreadable file is handled as the other setters handle it.
+        """
+        if value not in GPU_REFRESH_CHOICES:
+            raise ValueError("the GPU refresh interval must be 0, 60, 300 or 900 seconds")
+        if self.is_unreadable():
+            copied = self._keep_copy()
+            raise SettingsUnreadable(SETTINGS_UNREADABLE_TEXT if copied else SETTINGS_UNREADABLE_NO_COPY_TEXT)
+        self.keep_unreadable_copy()
+        updated = replace(self.load().settings, gpu_refresh_seconds=int(value))
         self.save(updated)
         return updated
 

@@ -8,7 +8,7 @@ Every read runs on the thread pool, never on the UI thread. The reads come back 
 this computer's part (GPUs, processes, Slurm, LSF and RunPod) and one part per saved SSH host. A part is shown as soon as
 it arrives, so one slow host never holds back the local tables. Each delivery is tagged with this panel's owner token, so a
 result that belongs to another tab is dropped. While the tab is visible, a timer starts a local read on each tick. A saved host is read no more often than every
-gpu_jobs.REMOTE_REFRESH_SECONDS (30 s); the local part is read on every tick, 5 s apart.
+gpu_jobs.REMOTE_REFRESH_SECONDS (30 s); the local part is read on every tick. Auto refresh sets the ticks: Off, 1, 5 (the default) or 15 minutes.
 
 The panel takes three injected callables. The window passes the real ones, and tests pass fakes:
 - hosts_provider() -> sequence of SSH host names, from Settings. It runs on the worker thread.
@@ -27,6 +27,7 @@ from typing import Any
 from PySide6.QtCore import QRunnable, Qt, QThreadPool, QTimer, Slot
 from PySide6.QtWidgets import (
     QAbstractItemView,
+    QComboBox,
     QHBoxLayout,
     QHeaderView,
     QLabel,
@@ -39,10 +40,13 @@ from PySide6.QtWidgets import (
 
 from meridian_desktop import gpu_jobs, resources
 from meridian_desktop.gpu_jobs import GpuSnapshot, HostBackoff, Reading, Runner
+from meridian_desktop.settings_store import DEFAULT_GPU_REFRESH_SECONDS, GPU_REFRESH_CHOICES
 from meridian_desktop.ui.delivery import Delivered, shared_delivery
 from meridian_desktop.ui.text import enable_table_copy, make_selectable
 
-REFRESH_MS = 5000
+# The Auto refresh choices, as (seconds, text). 0 is off. Every 5 minutes is the default, kept in settings.
+REFRESH_CHOICE_TEXT = ((0, "Off"), (60, "Every 1 minute"), (300, "Every 5 minutes"), (900, "Every 15 minutes"))
+INTERVAL_NOT_SAVED_TEXT = "This interval holds for this session only: the settings file could not be written."
 # The job table draws at most this many rows. A longer list says how many there are, so a huge list never rebuilds the
 # table on each tick.
 JOB_ROW_LIMIT = 200
@@ -144,7 +148,7 @@ def _label(parent: QWidget, name: str, text: str) -> QLabel:
 
 
 class GpuJobsPanel(QWidget):
-    """The GPUs tab. Read on first show and on Refresh, and while visible on a 5-second timer."""
+    """The GPUs tab. Read on first show and on Refresh, and while visible at the Auto refresh interval (5 minutes by default, or Off)."""
 
     def __init__(
         self,
@@ -154,6 +158,8 @@ class GpuJobsPanel(QWidget):
         *,
         run: Runner | None = None,
         clock: Callable[[], float] = time.monotonic,
+        refresh_seconds: int = DEFAULT_GPU_REFRESH_SECONDS,
+        on_refresh_changed: Callable[[int], bool] | None = None,
     ) -> None:
         super().__init__(parent)
         self.setObjectName("gpu-jobs-panel")
@@ -162,6 +168,10 @@ class GpuJobsPanel(QWidget):
         self._run: Runner = run if run is not None else gpu_jobs.run_command
         # Reads the time the remote hosts are spaced by. Tests pass a clock they move by hand.
         self._clock = clock
+        # The Auto refresh interval in seconds (0 is off), and the save callback for a change. The callback returns
+        # False when the choice could not be written to the settings file.
+        self._refresh_seconds = refresh_seconds if refresh_seconds in GPU_REFRESH_CHOICES else DEFAULT_GPU_REFRESH_SECONDS
+        self._on_refresh_changed = on_refresh_changed
         self._remote_started: dict[str, float] = {}
         # Identifies this tab's reads. A plain object, so a job can hold it without holding the tab.
         self._owner = object()
@@ -191,7 +201,7 @@ class GpuJobsPanel(QWidget):
         self._rendered: tuple[tuple, ...] | None = None
         shared_delivery().delivered.connect(self._on_delivered)
         self._timer = QTimer(self)
-        self._timer.setInterval(REFRESH_MS)
+        self._timer.setInterval(max(self._refresh_seconds, 1) * 1000)
         self._timer.timeout.connect(self._on_tick)
         self._build()
 
@@ -206,6 +216,17 @@ class GpuJobsPanel(QWidget):
         self._refresh.setObjectName("gpu-refresh")
         self._refresh.clicked.connect(self.refresh)
         row.addWidget(self._refresh)
+        row.addWidget(_label(self, "gpu-refresh-label", "Auto refresh"))
+        self._interval = QComboBox(self)
+        self._interval.setObjectName("gpu-refresh-interval")
+        for seconds, text in REFRESH_CHOICE_TEXT:
+            self._interval.addItem(text, seconds)
+        self._interval.setCurrentIndex(max(0, self._interval.findData(self._refresh_seconds)))
+        # Connected after the current choice is set, so building the tab does not save anything.
+        self._interval.currentIndexChanged.connect(self._on_interval_changed)
+        row.addWidget(self._interval)
+        self._interval_note = _label(self, "gpu-refresh-note", "")
+        row.addWidget(self._interval_note)
         self._status = _label(self, "gpu-status", NOT_READ_TEXT)
         row.addWidget(self._status, 1)
         layout.addLayout(row)
@@ -389,13 +410,32 @@ class GpuJobsPanel(QWidget):
 
     # ----------------------------------------------------------- timer
 
+    def _on_interval_changed(self, _index: int = 0) -> None:
+        """The owner picked another Auto refresh interval. It applies now, and the save callback writes it for next time."""
+        seconds = int(self._interval.currentData())
+        self._refresh_seconds = seconds
+        self._apply_interval()
+        if self._on_refresh_changed is None:
+            return
+        saved = self._on_refresh_changed(seconds)
+        self._interval_note.setText("" if saved else INTERVAL_NOT_SAVED_TEXT)
+
+    def _apply_interval(self) -> None:
+        """Stop the timer, then run it again at the chosen interval. It runs only while the tab is visible, and never when Off."""
+        self._timer.stop()
+        if self._refresh_seconds > 0:
+            self._timer.setInterval(self._refresh_seconds * 1000)
+            if self.isVisible():
+                self._timer.start()
+
     def _on_tick(self) -> None:
         if not self._local_in_flight:
             self._start_local()
 
     def showEvent(self, event: Any) -> None:  # noqa: N802 - Qt naming
         super().showEvent(event)
-        self._timer.start()
+        if self._refresh_seconds > 0:
+            self._timer.start()
         if not self._read_once:
             self._read_once = True
             # The first read is the tab opening, not a Refresh, so it does not count toward a host's Refresh spacing.
