@@ -403,6 +403,28 @@ def test_restart_app_yes_quits_only_after_the_new_copy_stayed_running(qtbot, set
     assert seen["warnings"] == []
 
 
+def test_restart_app_waits_to_quit_until_the_local_scope_is_not_busy(qtbot, settings_path, monkeypatch):
+    window = _plain_window(qtbot, settings_path)
+    seen = _restart_app_fakes(monkeypatch, answer=True, child=_Child(None))
+    busy = {"on": True}
+    monkeypatch.setattr(window._restart_banner_local, "scope_busy", lambda: busy["on"])
+    window._restart_app()
+    assert len(seen["popen"]) == 1
+    # The hold passes while a local action is busy: the window stays open and keeps polling.
+    qtbot.wait(600)
+    assert seen["quit"] == 0
+    assert window._relaunch_timer.isActive()
+    window._restart_app()  # a second press during the wait starts no second copy
+    assert len(seen["popen"]) == 1
+    busy["on"] = False
+    qtbot.waitUntil(lambda: seen["quit"] == 1, timeout=3000)
+    qtbot.wait(300)
+    assert seen["quit"] == 1
+    assert not window._relaunch_timer.isActive()
+    assert len(seen["popen"]) == 1
+    assert seen["warnings"] == []
+
+
 def test_restart_app_keeps_the_window_open_when_the_new_copy_exits(qtbot, settings_path, monkeypatch):
     window = _plain_window(qtbot, settings_path)
     seen = _restart_app_fakes(monkeypatch, answer=True, child=_Child(1))

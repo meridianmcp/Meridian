@@ -668,13 +668,18 @@ class MainWindow(QMainWindow):
 
     @Slot()
     def _check_relaunch(self) -> None:
-        """One poll of the new copy. It quits this app once the copy stayed running, and warns if the copy exited."""
+        """One poll of the new copy. It quits this app once the copy stayed running, and warns if the copy exited.
+
+        While the local scope is busy (a local action confirmed during the hold, its start question included), the quit
+        waits and the timer keeps polling, so quitting never drops a queued start. It quits once that action has ended."""
         watch = self._relaunch_watch
         if watch is None:
             self._relaunch_timer.stop()
             return
         state, text = watch.check()
         if state == app_relaunch.RUNNING:
+            return
+        if state == app_relaunch.ALIVE and self._restart_banner_local.scope_busy():
             return
         self._relaunch_timer.stop()
         self._relaunch_watch = None
