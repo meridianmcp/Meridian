@@ -92,6 +92,21 @@ def test_a_missing_price_or_count_is_none_not_zero():
     assert offers[0].memory_gb is None
 
 
+@pytest.mark.parametrize("bad", ["NaN", "Infinity", "-Infinity"])
+def test_an_entry_with_a_number_that_is_not_finite_is_skipped_and_the_rest_are_kept(bad):
+    # json.loads accepts NaN and Infinity, and int() on them raises, so one such entry must not stop the whole read.
+    body = (
+        '{"gpus": ['
+        f'{{"id": "BAD-MEMORY", "memory": {bad}}},'
+        f'{{"id": "BAD-PRICE", "memory": 24, "price": {{"secure": {bad}}}}},'
+        f'{{"id": "BAD-COUNT", "maxCount": {{"community": {bad}}}}},'
+        '{"id": "GOOD", "memory": 24, "price": {"secure": 0.5}}'
+        "]}"
+    ).encode("utf-8")
+    offers = fetch_catalog(SECRET_KEY, _Reply(body=body))
+    assert [offer.gpu_id for offer in offers] == ["GOOD"]
+
+
 @pytest.mark.parametrize("payload", [{"other": 1}, ["a", "list"], {"gpus": "not-a-list"}])
 def test_a_reply_without_a_gpu_list_is_refused_with_fixed_text(payload):
     with pytest.raises(GpuCatalogError) as caught:

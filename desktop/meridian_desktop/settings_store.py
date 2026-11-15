@@ -207,8 +207,9 @@ CONTROL_FLAG_DEFAULTS = {key: getattr(Settings(), key) for key in CONTROL_FLAG_K
 GPU_REFRESH_CHOICES = (0, 60, 300, 900)
 
 # The GPUs tab's saved offer filters: each known key and the type it must have. Any other key is dropped.
+# The free-text name box is not saved: a key pasted into it by mistake must never reach settings.json in plain text.
+# A "name" an older build saved is dropped on load and is gone from the file after the next filter save.
 OFFER_FILTER_TYPES: dict[str, type] = {
-    "name": str,
     "memory_gb": int,
     "tier": str,
     "center": str,
@@ -782,7 +783,9 @@ class SettingsStore:
         return updated
 
     def set_gpu_refresh_seconds(self, value: int) -> Settings:
-        """Save the GPUs tab's auto-refresh interval (0 is off). Every other field in the file is kept.
+        """Save the GPUs tab's auto-refresh interval (0 is off). Every other setting this build knows is kept. A top-level
+        key this build does not know is dropped on write, as save() does for every setter, so a token-like key is never
+        written back.
 
         An interval that is not listed raises ValueError. An unreadable file is handled as the other setters handle it.
         """
@@ -797,9 +800,10 @@ class SettingsStore:
         return updated
 
     def set_gpu_offer_filters(self, filters: dict[str, object]) -> Settings:
-        """Save the GPUs tab's offer filters and sort. Every other field in the file is kept.
+        """Save the GPUs tab's offer filters and sort. Every other setting this build knows is kept, and a top-level key
+        this build does not know is dropped on write, as save() does for every setter.
 
-        Keys this build does not know are dropped, and a value with the wrong type is dropped too. An unreadable file is
+        Filter keys this build does not know are dropped, and a value with the wrong type is dropped too. An unreadable file is
         handled as the other setters handle it.
         """
         if self.is_unreadable():

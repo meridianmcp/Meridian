@@ -11,7 +11,7 @@ from collections.abc import Callable
 from datetime import datetime, timezone
 from typing import Any
 
-from PySide6.QtCore import QRunnable, Qt, QThreadPool, Slot
+from PySide6.QtCore import QRunnable, Qt, QThreadPool, QTimer, Slot
 from PySide6.QtWidgets import (
     QAbstractItemView,
     QCheckBox,
@@ -46,6 +46,9 @@ from meridian_desktop.ui.text import make_selectable
 
 UNCHECKED_TEXT = "RunPod GPU offers: not checked yet."
 CHECKING_TEXT = "RunPod GPU offers: checking..."
+NONE_LISTED_TEXT = "RunPod lists no GPU types right now. Checked at {}."
+# How long the filters wait after the last change before they are saved.
+SAVE_DELAY_MS = 500
 FAILED_TEXT = "The check failed unexpectedly ({})."
 COLUMNS = (
     "GPU",
@@ -190,12 +193,21 @@ class GpuOffersPanel(QWidget):
         self._owner = object()
         # Each check takes the next number. A result with an older number is dropped.
         self._generation = 0
-        shared_delivery().delivered.connect(self._on_delivered)
-        self._build()
-        # The filters the owner last left. A saved maker or data center waits until a check lists it.
+        # True once a check has succeeded, and False again after a failed one. It decides the status line for an empty
+        # list: no GPU types listed after a good check, and the failure text is left alone after a failed one.
+        self._listed = False
+        # The filters the owner last left. A saved maker or data center waits until a check lists it. A pick the owner
+        # makes in that box replaces the waiting value.
         self._pending_maker: str | None = None
         self._pending_center: str | None = None
         self._on_filters_changed = on_filters_changed
+        # A change is saved once the owner stops for SAVE_DELAY_MS, so typing never writes the file on each key.
+        self._save_timer = QTimer(self)
+        self._save_timer.setSingleShot(True)
+        self._save_timer.setInterval(SAVE_DELAY_MS)
+        self._save_timer.timeout.connect(self._save_filters_if_changed)
+        shared_delivery().delivered.connect(self._on_delivered)
+        self._build()
         self._restore_filters(saved_filters or {})
         self._saved_filters = self._filter_state()
 
@@ -274,7 +286,10 @@ class GpuOffersPanel(QWidget):
         self._name.textChanged.connect(self._apply_filters)
         self._memory.valueChanged.connect(self._apply_filters)
         self._tier.currentIndexChanged.connect(self._apply_filters)
+        # The owner's pick clears the waiting saved value first, so the filters then save the pick.
+        self._center.currentIndexChanged.connect(self._on_center_picked)
         self._center.currentIndexChanged.connect(self._apply_filters)
+        self._maker.currentIndexChanged.connect(self._on_maker_picked)
         self._maker.currentIndexChanged.connect(self._apply_filters)
         self._in_stock.toggled.connect(self._apply_filters)
         self._sort.currentIndexChanged.connect(self._apply_filters)
@@ -288,6 +303,15 @@ class GpuOffersPanel(QWidget):
         if not self._probed_on_show:
             self._probed_on_show = True
             self._start_check()
+
+    def hideEvent(self, event: Any) -> None:  # noqa: N802 - Qt naming
+        # A change still waiting to be saved is saved now, so leaving the tab never loses it.
+        self.flush_saved_filters()
+        super().hideEvent(event)
+
+    def closeEvent(self, event: Any) -> None:  # noqa: N802 - Qt naming
+        self.flush_saved_filters()
+        super().closeEvent(event)
 
     @Slot()
     def _on_check_clicked(self) -> None:
@@ -333,43 +357,58 @@ class GpuOffersPanel(QWidget):
         self._check.setEnabled(True)
         if failure is not None or not isinstance(offers, tuple):
             self._offers = ()
+            self._listed = False
             self._table.setRowCount(0)
+            # The choices are rebuilt from the empty list, so no data center or maker from an older check is offered.
+            self._refresh_data_centers()
+            self._refresh_makers()
             self._status.setText(failure or FAILED_TEXT.format("NoResult"))
             return
         self._offers = offers
+        self._listed = True
         self._checked_text = datetime.now(timezone.utc).strftime("%H:%M:%S UTC")
         self._refresh_data_centers()
         self._refresh_makers()
         self._apply_filters()
 
+    @Slot(int)
+    def _on_center_picked(self, _index: int = 0) -> None:
+        self._pending_center = None
+
+    @Slot(int)
+    def _on_maker_picked(self, _index: int = 0) -> None:
+        self._pending_maker = None
+
     def _refresh_data_centers(self) -> None:
-        """Rebuild the data-center choices from the offers, and keep the choice made before if it still exists."""
-        chosen = self._pending_center if self._pending_center is not None else (self._center.currentData() or "")
-        self._center.blockSignals(True)
-        self._center.clear()
-        self._center.addItem("Any data center", "")
-        for center_id in data_center_ids(self._offers):
-            self._center.addItem(center_id, center_id)
-        index = self._center.findData(chosen)
-        self._center.setCurrentIndex(index if index >= 0 else 0)
-        if index >= 0:
-            self._pending_center = None
-        self._center.blockSignals(False)
+        """Rebuild the data-center choices from the offers. See _rebuild_choices."""
+        ids = data_center_ids(self._offers)
+        self._pending_center = self._rebuild_choices(self._center, "Any data center", ids, self._pending_center)
 
     def _refresh_makers(self) -> None:
-        """Rebuild the maker choices from the offers, and keep the choice made before if it still exists."""
-        chosen = self._pending_maker if self._pending_maker is not None else (self._maker.currentData() or "")
+        """Rebuild the maker choices from the offers. See _rebuild_choices."""
         makers = sorted({offer.manufacturer for offer in self._offers if offer.manufacturer})
-        self._maker.blockSignals(True)
-        self._maker.clear()
-        self._maker.addItem(ANY_MAKER_TEXT, "")
-        for maker in makers:
-            self._maker.addItem(maker, maker)
-        index = self._maker.findData(chosen)
-        self._maker.setCurrentIndex(index if index >= 0 else 0)
-        if index >= 0:
-            self._pending_maker = None
-        self._maker.blockSignals(False)
+        self._pending_maker = self._rebuild_choices(self._maker, ANY_MAKER_TEXT, makers, self._pending_maker)
+
+    @staticmethod
+    def _rebuild_choices(combo: QComboBox, any_text: str, values: list[str], pending: str | None) -> str | None:
+        """Refill one choice box and return the value still waiting to be listed, or None.
+
+        The choice is the waiting value when there is one, else the current pick. It is selected when the new list has
+        it. When the list does not have it, the box shows the "any" choice and the value keeps waiting, so a later check
+        that lists it selects it again. The owner's own pick in the box clears the waiting value.
+        """
+        chosen = pending if pending is not None else (combo.currentData() or "")
+        combo.blockSignals(True)
+        try:
+            combo.clear()
+            combo.addItem(any_text, "")
+            for value in values:
+                combo.addItem(value, value)
+            index = combo.findData(chosen)
+            combo.setCurrentIndex(index if index >= 0 else 0)
+        finally:
+            combo.blockSignals(False)
+        return None if index >= 0 or not chosen else chosen
 
     # ----------------------------------------------------------- filters
 
@@ -395,14 +434,26 @@ class GpuOffersPanel(QWidget):
             self._status.setText(
                 f"Showing {len(kept)} of {len(self._offers)} GPU types. Checked at {self._checked_text}."
             )
-        self._save_filters_if_changed()
+        elif self._listed:
+            self._status.setText(NONE_LISTED_TEXT.format(self._checked_text))
+        if self._on_filters_changed is not None:
+            self._save_timer.start()
+
+    def flush_saved_filters(self) -> None:
+        """Save a change that is still waiting on the save delay, now."""
+        if self._save_timer.isActive():
+            self._save_timer.stop()
+            self._save_filters_if_changed()
 
     def _filter_state(self) -> dict[str, object]:
-        """The filters and sort as the owner sees them. A saved maker or data center not listed yet still counts as chosen."""
+        """The filters and sort as the owner sees them. A saved maker or data center not listed yet still counts as chosen.
+
+        The name box is left out on purpose. It is free text, so a key pasted into it by mistake would otherwise be
+        written to settings.json in plain text. The name box still filters the list while the tab is open.
+        """
         maker = self._pending_maker if self._pending_maker is not None else (self._maker.currentData() or "")
         center = self._pending_center if self._pending_center is not None else (self._center.currentData() or "")
         return {
-            "name": self._name.text(),
             "memory_gb": self._memory.value(),
             "tier": self._tier.currentData() or TIER_ANY,
             "center": center,
@@ -413,9 +464,11 @@ class GpuOffersPanel(QWidget):
         }
 
     def _restore_filters(self, saved: dict[str, object]) -> None:
-        """Put back the filters the owner last left. A value that is not valid is ignored, and the default stays."""
+        """Put back the filters the owner last left. A value that is not valid is ignored, and the default stays.
+
+        A name saved by an older build is ignored: the name box always opens empty.
+        """
         widgets = (
-            self._name,
             self._memory,
             self._tier,
             self._center,
@@ -427,9 +480,6 @@ class GpuOffersPanel(QWidget):
         for widget in widgets:
             widget.blockSignals(True)
         try:
-            name = saved.get("name")
-            if isinstance(name, str):
-                self._name.setText(name)
             memory = saved.get("memory_gb")
             if isinstance(memory, int) and not isinstance(memory, bool):
                 self._memory.setValue(max(0, min(1024, memory)))
@@ -461,7 +511,8 @@ class GpuOffersPanel(QWidget):
     def _save_filters_if_changed(self) -> None:
         """Pass the filters to the owner's settings when they differ from the last saved state.
 
-        A write that fails is tried again on the next change.
+        Runs when the save delay ends, or when the panel is hidden or closed. A write that fails is tried again on the
+        next change.
         """
         state = self._filter_state()
         if self._on_filters_changed is None or state == self._saved_filters:

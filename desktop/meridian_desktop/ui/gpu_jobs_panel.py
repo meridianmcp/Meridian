@@ -1,8 +1,9 @@
 """The GPUs tab: this computer's GPUs and GPU jobs, the SSH hosts saved in Settings, Slurm and LSF, and RunPod pods.
 
-This is Qt code and sits in ui/, so the boundary check allows it. The panel has one control that does anything, the
-Refresh button. Every table is read-only. There is no start, stop, kill, submit or edit control, and nothing is read
-until the tab is first shown or Refresh is pressed.
+This is Qt code and sits in ui/, so the boundary check allows it. The panel has two controls: the Refresh button, and
+the Auto refresh choice, which is saved in this computer's settings file. Every table is read-only. There is no start,
+stop, kill, submit or edit control for a GPU, job, host or pod, and nothing is read until the tab is first shown or
+Refresh is pressed. The RunPod offers panel above it on the tab saves its filters and sort in the same settings file.
 
 Every read runs on the thread pool, never on the UI thread. The reads come back as parts, each one a separate delivery:
 this computer's part (GPUs, processes, Slurm, LSF and RunPod) and one part per saved SSH host. A part is shown as soon as
@@ -59,7 +60,8 @@ RESOURCE_COLUMNS = ("Target", "Cores", "CPU now", "Memory", "Note")
 RESOURCES_HEADING = "CPU, cores and memory"
 INTRO_TEXT = (
     "GPUs and GPU jobs on this computer, the SSH hosts saved in Settings, Slurm and LSF, and RunPod pods. "
-    "Read-only: nothing is started, stopped or changed."
+    "No GPU, job, host or pod is started, stopped or changed here. "
+    "Auto refresh and the offer filters are saved in this computer's settings."
 )
 REFRESH_TEXT = "Refresh"
 NOT_READ_TEXT = "Press Refresh to read the GPUs. Nothing is read until then."
@@ -450,7 +452,6 @@ class GpuJobsPanel(QWidget):
 __all__ = [
     "GPU_COLUMNS",
     "JOB_COLUMNS",
-    "REFRESH_MS",
     "STATUS_COLUMNS",
     "TABLE_MAX_HEIGHT",
     "GpuJobsPanel",

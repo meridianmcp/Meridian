@@ -9,6 +9,7 @@ expected shape, or any failure, gives a fixed message and never echoes the reply
 from __future__ import annotations
 
 import json
+import math
 import re
 import urllib.error
 import urllib.request
@@ -78,6 +79,12 @@ def _number(value: Any, kind: type) -> Any:
     return kind(value)
 
 
+def _all_finite(*values: Any) -> bool:
+    """False when any value is a float that is NaN or infinite. json.loads accepts NaN and Infinity, and int() on them
+    raises, so such an entry is skipped rather than stopping the whole read."""
+    return not any(isinstance(value, float) and not math.isfinite(value) for value in values)
+
+
 def _data_centers(value: Any) -> tuple[DataCenterStock, ...]:
     if not isinstance(value, list):
         return ()
@@ -89,7 +96,8 @@ def _data_centers(value: Any) -> tuple[DataCenterStock, ...]:
 
 
 def parse_catalog(payload: Any) -> tuple[GpuOffer, ...]:
-    """Read RunPod's catalog reply. Items that are not objects, or have no id, are skipped."""
+    """Read RunPod's catalog reply. Items that are not objects, have no id, or carry a NaN or infinite number are
+    skipped, and the rest are kept."""
     if not isinstance(payload, dict) or not isinstance(payload.get("gpus"), list):
         raise GpuCatalogError(BAD_SHAPE_MESSAGE)
     offers = []
@@ -98,6 +106,15 @@ def parse_catalog(payload: Any) -> tuple[GpuOffer, ...]:
             continue
         price = entry.get("price") if isinstance(entry.get("price"), dict) else {}
         max_count = entry.get("maxCount") if isinstance(entry.get("maxCount"), dict) else {}
+        numbers = (
+            entry.get("memory"),
+            price.get("secure"),
+            price.get("community"),
+            max_count.get("secure"),
+            max_count.get("community"),
+        )
+        if not _all_finite(*numbers):
+            continue
         offers.append(
             GpuOffer(
                 gpu_id=_text(entry["id"]),
