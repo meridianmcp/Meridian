@@ -129,11 +129,15 @@ def unlock(path: Path, password: str) -> Vault:
         raise VaultError(NOT_FOUND_TEXT)
     document = _read_document(path)
     salt = _decode(document, "salt")
+    nonce = _decode(document, "nonce")
+    ciphertext = _decode(document, "ciphertext")
+    if len(salt) != SALT_BYTES or len(nonce) != NONCE_BYTES:
+        raise VaultError(DAMAGED_TEXT)
     key = _derive_key(password, salt)
     header = _header_bytes(document["kdf"], salt)
     try:
-        plaintext = AESGCM(key).decrypt(_decode(document, "nonce"), _decode(document, "ciphertext"), header)
-    except InvalidTag as exc:
+        plaintext = AESGCM(key).decrypt(nonce, ciphertext, header)
+    except (InvalidTag, ValueError) as exc:
         raise VaultError(WRONG_PASSWORD_TEXT) from exc
     entries = _parse_entries(plaintext)
     return Vault(path=path, _salt=salt, _key=key, _entries=entries)

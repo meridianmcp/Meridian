@@ -86,6 +86,8 @@ from meridian_desktop.secret_store import SecretStore, SecretStoreError
 from meridian_desktop.settings_store import SettingsStore
 from meridian_desktop.ui.confirm import ask_yes_no
 from meridian_desktop.ui.delivery import Delivered, shared_delivery
+from meridian_desktop.ui.key_export_dialog import KeyExportDialog, PathChooser
+from meridian_desktop.ui.key_import_dialog import KeyImportDialog
 from meridian_desktop.ui.key_vault_box import REVEAL_TEXT, KeyVaultBox
 from meridian_desktop.ui.runner_actions import submit
 from meridian_desktop.projects_backup import BACKUP_DIR_NAME, utc_now
@@ -205,6 +207,18 @@ UNCLASSIFIED_HEADING_TEXT = "Non-critical: any other name. Set automatically."
 EXPORT_TEXT = "Export key names"
 EXPORTED_TEXT = "Saved the key names and their classification to {path}. No value is in the file."
 EXPORT_FAILED_TEXT = "Not saved: the key names could not be written. Try again."
+# Import keys from a vault file: the button, its file picker, and what the list says after an import. The dialog itself is
+# ui/key_import_dialog.py. The Windows user variables are never written by an import.
+IMPORT_VAULT_TEXT = "Import keys from a vault file"
+IMPORT_CHOOSER_TITLE = "Choose a vault file to import"
+IMPORT_CHOOSER_FILTER = "Key vault files (*.json);;All files (*)"
+IMPORTED_SECTION_ONE_TEXT = "Imported 1 key from the vault file into the keychain. Windows user variables were not changed."
+IMPORTED_SECTION_MANY_TEXT = "Imported {count} keys from the vault file into the keychain. Windows user variables were not changed."
+# The Export keys control: an encrypted vault file (the default) or a plaintext file, written only to a path the owner picks.
+# The dialog is ui/key_export_dialog.py. Nothing is exported from the list or at startup.
+EXPORT_KEYS_TEXT = "Export keys"
+EXPORTED_KEYS_ONE_TEXT = "Exported 1 key to a file. The keychain and the Windows user variables were not changed."
+EXPORTED_KEYS_MANY_TEXT = "Exported {count} keys to a file. The keychain and the Windows user variables were not changed."
 # The Reveal, Hide value and Copy value controls of a keychain name. A shown value is masked after REVEAL_SECONDS, and a copied
 # value is cleared from the clipboard after CLIPBOARD_SECONDS, but only while the clipboard still holds that value.
 REVEAL_SECONDS = 30
@@ -333,6 +347,12 @@ def _ask_keys_file(parent: QWidget) -> str:
     return path
 
 
+def _ask_vault_file(parent: QWidget) -> str:
+    """The file dialog that picks a vault file to import. It opens on the owner's home folder. "" means it was cancelled."""
+    path, _filter = QFileDialog.getOpenFileName(parent, IMPORT_CHOOSER_TITLE, str(Path.home()), IMPORT_CHOOSER_FILTER)
+    return path
+
+
 def _listed_text(total: int) -> str:
     """What the file status says about the names the file lists."""
     if total == 1:
@@ -401,6 +421,9 @@ class KeysSection(QWidget):
         confirm: Confirm | None = None,
         transport: Transport | None = None,
         choose_file: FileChooser | None = None,
+        choose_vault: FileChooser | None = None,
+        choose_export_path: PathChooser | None = None,
+        confirm_export: Confirm | None = None,
     ) -> None:
         super().__init__(parent)
         self.setObjectName("keys-section")
@@ -417,6 +440,13 @@ class KeysSection(QWidget):
         # unchanged listing is not written again.
         self._logged_listing: tuple[str, FileNames] | None = None
         self._choose_file = choose_file if choose_file is not None else _ask_keys_file
+        # The vault file picker for an import, and the import dialog it opened. None means the real file dialog.
+        self._choose_vault = choose_vault if choose_vault is not None else _ask_vault_file
+        self._import_dialog: KeyImportDialog | None = None
+        # The Export keys dialog, and the file picker and replace question it uses. None means the real ones.
+        self._export_dialog: KeyExportDialog | None = None
+        self._choose_export_path = choose_export_path
+        self._confirm_export = confirm_export
         # The names a From file card was removed for, by slug. This session keeps them, and the file is never changed.
         self._hidden_file_slugs: set[str] = set()
         self._cards: dict[str, _Card] = {}
@@ -555,9 +585,17 @@ class KeysSection(QWidget):
         self._export_button = QPushButton(EXPORT_TEXT, self)
         self._export_button.setObjectName("keys-export-names")
         export_row.addWidget(self._export_button)
+        self._export_keys_button = QPushButton(EXPORT_KEYS_TEXT, self)
+        self._export_keys_button.setObjectName("keys-export")
+        export_row.addWidget(self._export_keys_button)
+        self._import_button = QPushButton(IMPORT_VAULT_TEXT, self)
+        self._import_button.setObjectName("keys-import-vault")
+        export_row.addWidget(self._import_button)
         export_row.addStretch(1)
         column.addLayout(export_row)
         self._export_button.clicked.connect(self._on_export_names)
+        self._import_button.clicked.connect(self._on_import_vault)
+        self._export_keys_button.clicked.connect(self._on_export_keys)
 
         self._add_button.clicked.connect(self._on_add_clicked)
         self._new_value.returnPressed.connect(self._on_add_clicked)
@@ -1412,6 +1450,42 @@ class KeysSection(QWidget):
             self._show(EXPORT_FAILED_TEXT)
             return
         self._show(EXPORTED_TEXT.format(path=written))
+
+    @Slot()
+    def _on_import_vault(self) -> None:
+        """Choose a vault file and open the import dialog on it. The dialog opens as a window and is never run with exec()."""
+        chosen = self._choose_vault(self)
+        if not chosen:
+            return  # the owner cancelled the file dialog, so nothing opened
+        previous = self._import_dialog
+        if previous is not None:
+            previous.deleteLater()
+        dialog = KeyImportDialog(Path(chosen), self._keys, self)
+        dialog.imported.connect(self._on_vault_imported)
+        self._import_dialog = dialog
+        dialog.open()
+
+    @Slot(int)
+    def _on_vault_imported(self, count: int) -> None:
+        """Show the imported names in the list, and say how many keys came in. The Windows user variables are not touched."""
+        self.refresh()
+        self._show(IMPORTED_SECTION_ONE_TEXT if count == 1 else IMPORTED_SECTION_MANY_TEXT.format(count=count))
+
+    @Slot()
+    def _on_export_keys(self) -> None:
+        """Open the Export keys dialog. It writes only to a path the owner picks, and it is never run with exec()."""
+        previous = self._export_dialog
+        if previous is not None:
+            previous.deleteLater()
+        dialog = KeyExportDialog(self._keys, self, choose_path=self._choose_export_path, confirm=self._confirm_export)
+        dialog.exported.connect(self._on_keys_exported)
+        self._export_dialog = dialog
+        dialog.open()
+
+    @Slot(int)
+    def _on_keys_exported(self, count: int) -> None:
+        """Say how many keys were written. The list is not refreshed, because an export changes no keychain value."""
+        self._show(EXPORTED_KEYS_ONE_TEXT if count == 1 else EXPORTED_KEYS_MANY_TEXT.format(count=count))
 
     def _save_keys_file(self, path: str) -> None:
         """Save the keys file path, or "" to stop using a file. Every other settings key is kept.
