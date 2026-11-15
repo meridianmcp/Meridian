@@ -58,6 +58,8 @@ from typing import Any
 from PySide6.QtCore import QThreadPool, Qt, Slot
 from PySide6.QtGui import QGuiApplication
 from PySide6.QtWidgets import (
+    QApplication,
+    QMessageBox,
     QComboBox,
     QHBoxLayout,
     QLabel,
@@ -84,6 +86,9 @@ from meridian_desktop.ui.home_tab import HomeDeps, HomeTab
 from meridian_desktop.ui.keys_tab import KeysTab
 from meridian_desktop.ui.projects_tab import ProjectsTab, default_sources
 from meridian_desktop.ui.restart_banner import RestartBanner
+from meridian_desktop import app_relaunch
+from meridian_desktop.runner_controls import SCOPE_LOCAL
+from meridian_desktop.ui.scope_controls import RESTART, ScopeControls, local_gate
 from meridian_desktop.ui.runner_actions import RunnerActions
 from meridian_desktop.ui.search_tab import SearchTab
 from meridian_desktop.ui.sessions_panel import SessionsPanel
@@ -409,7 +414,19 @@ class MainWindow(QMainWindow):
         layout.addWidget(self._connection_bar)
         layout.addLayout(self._build_mode_bar(central))
         # Hidden until the code or the local server changes on disk. Dismiss hides it, and it returns only for a new change.
-        self._restart_banner = RestartBanner(self._restart_watch, parent=central)
+        self._restart_banner = RestartBanner(
+            self._restart_watch,
+            parent=central,
+            restart_app=self._restart_app,
+            server_controls=ScopeControls(
+                SCOPE_LOCAL,
+                self._runner_actions,
+                local_gate,
+                prefix="restart-banner-local",
+                offered=(RESTART,),
+                parent=central,
+            ),
+        )
         layout.addWidget(self._restart_banner)
 
         # The status-bar notice holds the one update check of this window, and Home's Updates card reads its result, so
@@ -612,6 +629,26 @@ class MainWindow(QMainWindow):
         self.tabs.setCurrentWidget(self._settings_page)
 
     @Slot()
+    def _restart_app(self) -> None:
+        """Ask, then start a new copy of the app on the code now on disk and close this window. The copy starts first."""
+        answer = QMessageBox.question(
+            self,
+            "Restart the app",
+            "Restart the app now to run the code on disk? The window closes and opens again. Save anything open first.",
+        )
+        if answer != QMessageBox.StandardButton.Yes:
+            return
+        import sys  # noqa: PLC0415 - read here, where the app is restarted
+
+        plan = app_relaunch.relaunch_plan(
+            getattr(sys, "frozen", False), sys.executable, sys.argv[1:], app_relaunch.package_parent()
+        )
+        failure = app_relaunch.start_new_copy(plan)
+        if failure is not None:
+            QMessageBox.warning(self, "Restart the app", failure)
+            return
+        QApplication.quit()
+
     def _sign_in_from_bar(self) -> None:
         """The top bar's sign-in button: show Settings and start the same browser sign-in as its own button."""
         self._show_settings()

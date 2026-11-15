@@ -57,10 +57,12 @@ CHECKED_AT_PATTERN = re.compile(r"Checked at \d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}
 START_WORDS = re.compile(r"\b(start|stop|restart)\b", re.IGNORECASE)
 # A runner control is named <scope>-<verb>, for the scope it drives and the verb it runs. The runner check finds them by
 # object name, never by the words on the button.
-RUNNER_CONTROL_NAME = re.compile(r"^(home-local|home-tunnel|local|tunnel|zotero)-(start|stop|restart)$")
+# restart-banner-local-* are the restart notice's copy of the local server's controls: the same ScopeControls and local_gate
+# as the Settings local scope, shown only when the local server changed on disk.
+RUNNER_CONTROL_NAME = re.compile(r"^(home-local|home-tunnel|local|tunnel|zotero|restart-banner-local)-(start|stop|restart)$")
 # A button whose text says stop but which runs no process: Stop using this file, on the Keys block, only stops listing a
 # keys file's names. It is named by object name, so the text sweep still catches every other start-like button.
-NOT_A_RUNNER_CONTROL = frozenset({"keys-file-stop"})
+NOT_A_RUNNER_CONTROL = frozenset({"keys-file-stop", "restart-banner-app"})
 
 
 # ------------------------------------------------------------------ fakes
@@ -619,6 +621,7 @@ def test_tunnel_controls_sit_on_the_tunnel_tab_and_home_offers_only_start_all_di
     assert runner_controls == [
         "home-tunnel-start",
         "local-restart", "local-start", "local-stop",
+        "restart-banner-local-restart",
         "tunnel-restart", "tunnel-start", "tunnel-stop",
         "zotero-start",
     ]
