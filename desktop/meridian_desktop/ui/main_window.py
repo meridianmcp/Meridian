@@ -55,7 +55,7 @@ from collections.abc import Callable
 from pathlib import Path
 from typing import Any
 
-from PySide6.QtCore import QThreadPool, Qt, Slot
+from PySide6.QtCore import QThreadPool, Qt, QTimer, Slot
 from PySide6.QtGui import QGuiApplication
 from PySide6.QtWidgets import (
     QApplication,
@@ -79,6 +79,7 @@ from meridian_desktop.secret_store import KeyringSecretStore, SecretStore
 from meridian_desktop.settings_store import HOSTED_MODE, SettingsStore, SettingsUnreadable
 from meridian_desktop.tools_status import ToolsStatus, read_tools_status
 from meridian_desktop.tunnel_status import BAR_CHECKING_TEXT, DEPENDENCY_TEXT, bar_texts, read_tunnel_status
+from meridian_desktop.ui.confirm import ask_yes_no
 from meridian_desktop.ui.connection_bar import ConnectionBar
 from meridian_desktop.ui.delivery import Delivered, shared_delivery
 from meridian_desktop.ui.gpu_jobs_panel import GpuJobsPanel
@@ -102,6 +103,14 @@ from meridian_desktop.ui.writing_area import WRITING_SECTION, WritingArea
 from meridian_desktop.ui.latex_panel import LatexPanel
 from meridian_desktop.ui.zotero_panel import ZoteroPanel
 from meridian_desktop.version import APP_VERSION
+
+RESTART_APP_TITLE = "Restart the app"
+RESTART_APP_QUESTION = (
+    "Restart the app now to run the code on disk? The window closes and opens again. Save anything open first. "
+    "When it opens again, the launch-time starts run again where you have switched them on in Settings: "
+    "Zotero, the local server and the hosted tunnel. This window closes only after the new copy has kept running "
+    "for a few seconds."
+)
 
 # (tab name, wave that built it). Display order is the tuple order. Each tab is a top-level area: the rest of the
 # areas are cards on Home, the Search tab's kinds, or sections of Settings.
@@ -414,18 +423,25 @@ class MainWindow(QMainWindow):
         layout.addWidget(self._connection_bar)
         layout.addLayout(self._build_mode_bar(central))
         # Hidden until the code or the local server changes on disk. Dismiss hides it, and it returns only for a new change.
+        # The strip's local Restart is connected to the Settings local state read once Settings is built, below.
+        self._restart_banner_local = ScopeControls(
+            SCOPE_LOCAL,
+            self._runner_actions,
+            local_gate,
+            prefix="restart-banner-local",
+            offered=(RESTART,),
+            parent=central,
+        )
+        # The startup check of a new copy started by Restart app, while it runs. None otherwise.
+        self._relaunch_watch: app_relaunch.StartupWatch | None = None
+        self._relaunch_timer = QTimer(self)
+        self._relaunch_timer.setInterval(app_relaunch.POLL_INTERVAL_MS)
+        self._relaunch_timer.timeout.connect(self._check_relaunch)
         self._restart_banner = RestartBanner(
             self._restart_watch,
             parent=central,
             restart_app=self._restart_app,
-            server_controls=ScopeControls(
-                SCOPE_LOCAL,
-                self._runner_actions,
-                local_gate,
-                prefix="restart-banner-local",
-                offered=(RESTART,),
-                parent=central,
-            ),
+            server_controls=self._restart_banner_local,
         )
         layout.addWidget(self._restart_banner)
 
@@ -564,6 +580,8 @@ class MainWindow(QMainWindow):
         # A sign-in or sign-out in Settings checks the top bar again at once.
         self._settings_tab.signedInChanged.connect(self._connection_bar.refresh)
         self._connection_bar.signInRequested.connect(self._sign_in_from_bar)
+        # A local Restart from the restart notice reads the Settings local state again, as a Settings Restart does.
+        self._restart_banner_local.actionFinished.connect(self._settings_tab.after_local_action)
         column.addWidget(self._settings_tab)
         # The Writing area sits in Settings, not as a tab: DOCX and Slides, each Not connected with its reason.
         column.addWidget(make_selectable(QLabel(WRITING_SECTION, container)))
@@ -628,27 +646,44 @@ class MainWindow(QMainWindow):
         """Switch to the Settings tab. Home's Settings buttons use this."""
         self.tabs.setCurrentWidget(self._settings_page)
 
-    @Slot()
     def _restart_app(self) -> None:
-        """Ask, then start a new copy of the app on the code now on disk and close this window. The copy starts first."""
-        answer = QMessageBox.question(
-            self,
-            "Restart the app",
-            "Restart the app now to run the code on disk? The window closes and opens again. Save anything open first.",
-        )
-        if answer != QMessageBox.StandardButton.Yes:
+        """Ask, then start a new copy of the app on the code now on disk. This window closes only after that copy has
+        stayed running for app_relaunch.STARTUP_HOLD_SECONDS; a copy that exits first leaves this window open."""
+        if self._relaunch_watch is not None:
+            return
+        if not ask_yes_no(self, RESTART_APP_TITLE, RESTART_APP_QUESTION):
             return
         import sys  # noqa: PLC0415 - read here, where the app is restarted
 
         plan = app_relaunch.relaunch_plan(
             getattr(sys, "frozen", False), sys.executable, sys.argv[1:], app_relaunch.package_parent()
         )
-        failure = app_relaunch.start_new_copy(plan)
+        child, failure = app_relaunch.start_new_copy(plan)
         if failure is not None:
-            QMessageBox.warning(self, "Restart the app", failure)
+            QMessageBox.warning(self, RESTART_APP_TITLE, failure)
+            return
+        # The GUI thread is not blocked: the timer polls the new copy until it has stayed running, or has exited.
+        self._relaunch_watch = app_relaunch.StartupWatch(child)
+        self._relaunch_timer.start()
+
+    @Slot()
+    def _check_relaunch(self) -> None:
+        """One poll of the new copy. It quits this app once the copy stayed running, and warns if the copy exited."""
+        watch = self._relaunch_watch
+        if watch is None:
+            self._relaunch_timer.stop()
+            return
+        state, text = watch.check()
+        if state == app_relaunch.RUNNING:
+            return
+        self._relaunch_timer.stop()
+        self._relaunch_watch = None
+        if state == app_relaunch.EXITED:
+            QMessageBox.warning(self, RESTART_APP_TITLE, text)
             return
         QApplication.quit()
 
+    @Slot()
     def _sign_in_from_bar(self) -> None:
         """The top bar's sign-in button: show Settings and start the same browser sign-in as its own button."""
         self._show_settings()

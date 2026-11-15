@@ -62,6 +62,9 @@ START_WORDS = re.compile(r"\b(start|stop|restart)\b", re.IGNORECASE)
 RUNNER_CONTROL_NAME = re.compile(r"^(home-local|home-tunnel|local|tunnel|zotero|restart-banner-local)-(start|stop|restart)$")
 # A button whose text says stop but which runs no process: Stop using this file, on the Keys block, only stops listing a
 # keys file's names. It is named by object name, so the text sweep still catches every other start-like button.
+# restart-banner-app (Restart app, on the restart notice) relaunches this desktop app after its own Yes or No question. It
+# does not stop or start the runner itself. Any runner start in the new copy goes through that copy's own confirmed
+# launch-time starts, which the owner switched on in Settings.
 NOT_A_RUNNER_CONTROL = frozenset({"keys-file-stop", "restart-banner-app"})
 
 

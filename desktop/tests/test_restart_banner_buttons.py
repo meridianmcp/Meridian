@@ -2,6 +2,7 @@
 for a server change; Dismiss still works. No process is started and no file is read: the watch is a fake.
 """
 
+from PySide6.QtCore import Signal
 from PySide6.QtWidgets import QPushButton, QWidget
 
 from meridian_desktop.restart_check import Restart
@@ -14,6 +15,27 @@ class _FakeWatch:
 
     def check(self):
         return self.restart
+
+
+class _BusyControls(QWidget):
+    """Stands in for ScopeControls: the busy state is set by the test, and busyChanged is emitted as the real one does."""
+
+    busyChanged = Signal(bool)
+
+    def __init__(self):
+        super().__init__()
+        self.own = False
+        self.other = False
+
+    def in_flight(self):
+        return self.own
+
+    def scope_busy(self):
+        return self.own or self.other
+
+    def set_busy(self, own, other=False):
+        self.own, self.other = own, other
+        self.busyChanged.emit(self.scope_busy())
 
 
 def _button(banner, name):
@@ -74,3 +96,40 @@ def test_dismiss_still_hides_the_banner_with_the_new_buttons_present(qtbot):
     assert dismiss.text() == DISMISS_TEXT
     dismiss.click()
     assert banner.isHidden()
+
+
+def test_a_check_mid_action_keeps_the_banner_and_the_server_controls_shown(qtbot):
+    # The server record clears when the server stops, so a check during the strip's own Restart reports no change.
+    watch = _FakeWatch(Restart(server=True))
+    controls = _BusyControls()
+    banner = RestartBanner(watch, restart_app=lambda: None, server_controls=controls)
+    qtbot.addWidget(banner)
+    banner.check_now()
+    assert not banner.isHidden()
+    controls.set_busy(True)
+    watch.restart = Restart()
+    banner.check_now()
+    assert not banner.isHidden()
+    assert not controls.isHidden()
+    # The action has ended, so the next check may hide the strip.
+    controls.set_busy(False)
+    banner.check_now()
+    assert banner.isHidden()
+
+
+def test_restart_app_is_off_while_the_local_scope_is_busy(qtbot):
+    controls = _BusyControls()
+    banner = RestartBanner(
+        _FakeWatch(Restart(code=("core.py",), server=True)), restart_app=lambda: None, server_controls=controls
+    )
+    qtbot.addWidget(banner)
+    banner.check_now()
+    button = _button(banner, "restart-banner-app")
+    assert button.isEnabled()
+    controls.set_busy(True)
+    assert not button.isEnabled()
+    controls.set_busy(False)
+    assert button.isEnabled()
+    # Another control (Settings) holding the scope turns it off too.
+    controls.set_busy(False, other=True)
+    assert not button.isEnabled()
