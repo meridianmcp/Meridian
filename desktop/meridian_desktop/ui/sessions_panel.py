@@ -557,6 +557,8 @@ class _Reads:
         local = local_sessions(self._local_url(), project_id, transport=self._local_transport)
         if local.state != NOT_RUNNING:
             return local
+        if self._mode() == LOCAL_MODE:
+            return local
         hosted_url, token = self._hosted()
         if not isinstance(token, str) or not token.strip():
             return local

@@ -66,6 +66,8 @@ def _checker(
             transport=transport,
             probe=probe,
             clock=clock,
+            # Local mode sends no request to the hosted service, on the timer or on Check.
+            hosted_checks=settings.mode != "local",
         )
         return settings.hosted_url, snapshot
 

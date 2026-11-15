@@ -11,13 +11,19 @@ import pytest
 from PySide6.QtCore import QTimer
 from PySide6.QtWidgets import QFrame, QLabel, QPushButton
 
+from _fakes import MemoryKeyring
 from meridian_desktop import local_client, updater
+from meridian_desktop.data_source import DataSources
 from meridian_desktop.runner_client import ERR_NOT_AVAILABLE, NOT_AVAILABLE_MESSAGE, RunnerResult
+from meridian_desktop.secret_store import KeyringSecretStore
 from meridian_desktop.settings_store import Settings, SettingsStore
 from meridian_desktop.tools_status import YES, ToolRow, ToolsStatus
+from meridian_desktop.tunnel_panel_model import RUNNING_HEADLINE
 from meridian_desktop.ui import home_tab
 from meridian_desktop.ui.home_tab import CHECK_INTERVAL_MS, HomeDeps, HomeTab
+from meridian_desktop.ui.main_window import MainWindow
 from meridian_desktop.ui.runner_actions import RunnerActions
+from meridian_desktop.ui.scope_controls import TUNNEL_LOCAL_MODE_TEXT
 from meridian_desktop.ui.text import SELECTABLE_TEXT
 from meridian_desktop.ui.update_notice import UpdateNoticeBar
 from meridian_desktop.zotero_client import API_NOT_RUNNING, ApiCheck, ZoteroStatus
@@ -61,6 +67,11 @@ class FakeZotero:
 
 def _tunnel_not_available(scope):
     return RunnerResult(verb="status", ok=False, error_code=ERR_NOT_AVAILABLE, error_message=NOT_AVAILABLE_MESSAGE)
+
+
+def _tunnel_running(scope):
+    payload = {"scope": scope, "generated_at": 1.0, "child": {"state": "running", "pid": 808}}
+    return RunnerResult(verb="status", ok=True, payload=payload)
 
 
 def _tools_ready():
@@ -286,9 +297,10 @@ def _wait_settled_to(qtbot, tab, key, text):
 
 # ----------------------------------------------------------------- tunnel
 
-def _core_settings(tmp_path):
+def _core_settings(tmp_path, mode="hosted"):
+    """The core is set and the tunnel switch is on. Hosted mode by default, because the tunnel's Start is off in Local mode."""
     store = SettingsStore(tmp_path / "settings.json")
-    store.save(Settings(core_python=str(tmp_path / "python.exe"), core_checkout=str(tmp_path / "core")))
+    store.save(Settings(core_python=str(tmp_path / "python.exe"), core_checkout=str(tmp_path / "core"), mode=mode))
     return store
 
 
@@ -400,6 +412,109 @@ def test_a_tunnel_call_on_another_control_disables_the_home_start_until_it_ends(
     assert start.isEnabled() is False
     actions.end_scope_call("tunnel", other)
     assert start.isEnabled() is True
+
+
+def test_the_home_tunnel_start_is_off_in_local_mode_even_with_the_core_and_the_switch_on(qtbot, tmp_path):
+    store = _core_settings(tmp_path, mode="local")
+    asked = []
+
+    def confirm(parent, title, body, confirm_text):
+        asked.append(confirm_text)
+        return True
+
+    actions = RunnerActions(store, make_control=lambda python, cwd: None, confirm=confirm)
+    tab = _shown(qtbot, _deps(tmp_path, actions=actions))
+    _wait_settled(qtbot, tab, "tunnel")
+    start = tab.findChild(QPushButton, "home-tunnel-start")
+    assert start.isEnabled() is False
+    assert tab.findChild(QLabel, "home-tunnel-control-note").text() == TUNNEL_LOCAL_MODE_TEXT
+    # A click on a switched-off Start asks nothing and starts nothing.
+    start.click()
+    assert asked == []
+
+
+def test_in_local_mode_with_a_tunnel_running_the_home_start_stays_off_and_the_card_holds_no_stop(qtbot, tmp_path):
+    store = _core_settings(tmp_path, mode="local")
+    actions = RunnerActions(store, make_control=lambda python, cwd: None, confirm=lambda *args: False)
+    tab = _shown(qtbot, _deps(tmp_path, actions=actions, tunnel=_tunnel_running))
+    _wait_settled(qtbot, tab, "tunnel")
+    assert tab.findChild(QPushButton, "home-tunnel-start").isEnabled() is False
+    assert tab.findChild(QLabel, "home-tunnel-control-note").text() == TUNNEL_LOCAL_MODE_TEXT
+    # The Home card offers Start alone, so a running tunnel has no Stop or Restart here. Stop is on the Tunnel tab.
+    assert tab.findChild(QPushButton, "home-tunnel-stop") is None
+    assert tab.findChild(QPushButton, "home-tunnel-restart") is None
+
+
+# ----------------------------------------------------------------- the mode switch on the top bar
+
+
+class _TunnelStatusStub:
+    """The window's tunnel status call. It answers with the given child state and starts nothing. Stopped by default."""
+
+    def __init__(self, state="stopped"):
+        self._state = state
+
+    def status(self, scope):
+        payload = {"scope": scope, "generated_at": 1.0, "child": {"state": self._state, "pid": None}}
+        return RunnerResult(verb="status", ok=True, payload=payload)
+
+
+def _no_read(*args):
+    raise AssertionError("no data source is read in this test")
+
+
+def _mode_window(qtbot, tmp_path, mode, tunnel_state="stopped"):
+    """The real main window with fakes only: no socket, no process, and an in-memory keychain."""
+    store = _core_settings(tmp_path, mode=mode)
+    actions = RunnerActions(store, make_control=lambda python, cwd: None, confirm=lambda *args: False)
+    sources = DataSources(
+        probe=lambda url: local_client.HEALTH_NOT_RUNNING,
+        read_server=_no_read,
+        read_file=_no_read,
+        get_token=lambda: None,
+        list_hosted=lambda url, token: [],
+    )
+    window = MainWindow(
+        store,
+        secret_store=KeyringSecretStore(backend=MemoryKeyring()),
+        data_sources=sources,
+        tunnel_runner=_TunnelStatusStub(tunnel_state),
+        runner_actions=actions,
+    )
+    qtbot.addWidget(window)
+    return window
+
+
+def test_a_mode_change_on_the_top_bar_reads_the_tunnel_controls_again_on_home_and_the_tunnel_tab(qtbot, tmp_path):
+    """Switching to Local mode turns the Home card's Start and the Tunnel tab's controls off at once, and switching back
+    turns them on again. A mode change emits no coreChanged, so nothing else reads them until the next show or check."""
+    window = _mode_window(qtbot, tmp_path, "hosted")
+    home_start = window.findChild(QPushButton, "home-tunnel-start")
+    tunnel_start = window.findChild(QPushButton, "tunnel-start")
+    assert home_start.isEnabled() is True
+    assert tunnel_start.isEnabled() is True
+
+    window.mode_selector.setCurrentIndex(window.mode_selector.findData("local"))
+    assert home_start.isEnabled() is False
+    assert tunnel_start.isEnabled() is False
+    assert window.findChild(QLabel, "home-tunnel-control-note").text() == TUNNEL_LOCAL_MODE_TEXT
+    assert window.findChild(QLabel, "tunnel-control-note").text() == TUNNEL_LOCAL_MODE_TEXT
+
+    window.mode_selector.setCurrentIndex(window.mode_selector.findData("hosted"))
+    assert home_start.isEnabled() is True
+    assert tunnel_start.isEnabled() is True
+
+
+def test_in_local_mode_with_a_tunnel_running_the_tunnel_tab_keeps_stop_on_and_start_and_restart_off(qtbot, tmp_path):
+    window = _mode_window(qtbot, tmp_path, "hosted", tunnel_state="running")
+    window.mode_selector.setCurrentIndex(window.mode_selector.findData("local"))
+    window._tunnel_panel.check()
+    qtbot.waitUntil(lambda: window.findChild(QLabel, "tunnelpanel-headline").text() == RUNNING_HEADLINE, timeout=5000)
+
+    assert window.findChild(QPushButton, "tunnel-start").isEnabled() is False
+    assert window.findChild(QPushButton, "tunnel-restart").isEnabled() is False
+    assert window.findChild(QPushButton, "tunnel-stop").isEnabled() is True
+    assert window.findChild(QLabel, "tunnel-control-note").text() == TUNNEL_LOCAL_MODE_TEXT
 
 
 def test_open_tunnel_panel_asks_the_window_to_switch_to_the_tunnel_tab(qtbot, tmp_path):

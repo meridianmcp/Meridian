@@ -38,16 +38,43 @@ from Microsoft at https://aka.ms/vs/17/release/vc_redist.x64.exe. Microsoft's ow
 download and its use. The Universal CRT comes with Windows 10 and later, so it needs no install.
 
 8. Network use
-Meridian Desktop sends network requests to two places.
-(a) A Meridian server on this computer. Its address comes from the local_url setting and must be http on 127.0.0.1,
-localhost or ::1. The desktop checks it with a request to its /health path, and reads RunPod status through it.
-(b) The Meridian hosted service, at the hosted_url setting (https://usemeridian.us by default). This happens only in
-Hosted mode. Hosted mode is used when you choose it, or when a hosted sign-in token is saved on this computer. In
-Hosted mode the desktop sends requests there to check your account and to list your projects and sessions, using that
-sign-in token.
-The desktop has no RunPod address of its own. The RunPod key stays in the operating system credential store on this
-computer. The Meridian server and the hosted service are separate programs, and this section does not cover their
-network use.
+Meridian Desktop contacts only the destinations listed below, and only for the reason shown beside each one.
+(a) A Meridian server on this computer, at the local_url setting, which must be http on 127.0.0.1, localhost or ::1.
+The desktop uses it for a health check, and for local data and status, including RunPod status. The desktop has no
+RunPod address of its own.
+(b) The Meridian hosted service, at the hosted_url setting (https://usemeridian.us by default). In Hosted mode the desktop
+uses it, with your sign-in token, to check your account, to renew your sign-in when it is close to expiry, and to list your
+projects and sessions. Sign in with browser in Settings uses it to sign you in. In Local mode the connection bar sends no
+request to it and offers no sign-in. In Local mode the Projects tab reads the local server or a local database file, and
+the Sessions tab reads only the local server. Sign in with browser, Test connection and Try again in Settings still reach
+the hosted service in Local mode when you press them.
+Once the hosted tunnel is started, its process connects to the Meridian hosted service, as the core's tunnel client does. The
+desktop runs the Meridian core's runner command with the core's Python, in the core checkout set in Settings, using a fixed
+argument list. It adds no hosted URL and no token to that
+command. Start, Stop and Restart on the Tunnel tab, and Start on the Home tunnel card, each ask you first. A launch-time
+start runs only after you have turned its switch on in Settings. In Local mode the Home tunnel card's Start and the Tunnel
+tab's Start and Restart are off, and no launch-time start runs, so neither can start or restart the hosted tunnel. The
+Tunnel tab's Stop stays on in Local mode. It runs the core's stop command for the tunnel, which ends only the tunnel process
+the runner started on this computer, and it sends no request to the hosted URL.
+(c) The GitHub releases service, to check for a newer version of this app and to download a release file.
+(d) The OpenAI and Anthropic API services, and the GitHub API, only when you press Check on a saved key. The key is
+sent in the request to that one service, to test it.
+(e) SSH hosts you have saved, using ssh.exe, to read GPU information for GPU jobs.
+(f) The npm and PyPI package services, through the AI clients. The desktop writes the commands for Meridian's local servers
+into the Claude Desktop and Codex configs, in a client setup and in its local cache at a real start. It does not run those
+commands. When an AI client starts one of those servers, npx fetches the npm packages it names, and uvx fetches
+serena-agent from PyPI, with the other Python packages those servers need. If no Python 3.12 is installed, uvx also
+downloads a managed Python 3.12 build from GitHub when it starts Serena.
+(g) Services on 127.0.0.1 only: the LaTeX engine, the Zotero local API, and the slot ports, which the desktop checks with a
+connect-only probe.
+Your saved keys are kept in the operating system credential store on this computer. A key you mark as critical can also be
+copied into an encrypted vault file, keys-vault.json, which is kept beside settings.json on this computer. The vault is
+encrypted with a passphrase that you choose. Copying a key into the vault leaves its keychain copy in place. The "Set as
+Windows user variable" button copies one key, in plain text, into the Windows user environment, where other programs can
+read it, until you remove it in Windows settings. The app asks you to confirm first. The export feature writes a file you
+choose, and anyone who can open a plaintext export can read every key in it.
+The Meridian server, the tunnel process that the core starts, and the hosted service are separate programs, and this section
+does not cover their network use.
 
 9. Termination
 Your rights under this agreement end if you break its terms. The rights the LGPL-3.0 and the

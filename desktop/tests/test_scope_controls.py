@@ -21,6 +21,7 @@ from meridian_desktop.settings_store import Settings, SettingsStore
 from meridian_desktop.ui.runner_actions import CHOOSE_CANCELLED_TEXT, CHOSEN_TEXT, CoreSetup, RunnerActions
 from meridian_desktop.ui.scope_controls import (
     CORE_NOT_SET_TEXT,
+    TUNNEL_LOCAL_MODE_TEXT,
     TUNNEL_OFF_TEXT,
     ScopeControls,
     local_gate,
@@ -442,6 +443,26 @@ def test_the_tunnel_buttons_are_enabled_by_default_once_the_core_is_set(qtbot, s
 
     for name in ("tunnel-start", "tunnel-stop", "tunnel-restart"):
         assert _button(widget, name).isEnabled() is True, name
+
+
+def test_a_stop_gate_keeps_stop_on_while_start_and_restart_are_off(qtbot, settings_path, tmp_path):
+    # The start gate turns Start and Restart off with the Local mode reason; the stop gate is the tunnel gate, which is on.
+    _settings(settings_path)
+    spawn, confirm = Spawn(_done(0, _status("tunnel", "stopped", pid=10))), Confirm(True)
+    actions = _actions(settings_path, spawn, confirm, tmp_path / "log.txt")
+    widget = ScopeControls(
+        "tunnel", actions, lambda core: (False, TUNNEL_LOCAL_MODE_TEXT), prefix="tunnel", stop_gate=tunnel_gate,
+    )
+    qtbot.addWidget(widget)
+
+    assert _button(widget, "tunnel-start").isEnabled() is False
+    assert _button(widget, "tunnel-restart").isEnabled() is False
+    assert _button(widget, "tunnel-stop").isEnabled() is True
+    assert _label(widget, "tunnel-control-note").text() == TUNNEL_LOCAL_MODE_TEXT
+
+    _button(widget, "tunnel-stop").click()
+    qtbot.waitUntil(lambda: spawn.verbs == ["stop"] and _button(widget, "tunnel-stop").isEnabled(), timeout=5000)
+    assert len(confirm.asked) == 1 and confirm.asked[0][2] == "Stop"
 
 
 # ------------------------------------------------------------------ the one-step fix next to a greyed control

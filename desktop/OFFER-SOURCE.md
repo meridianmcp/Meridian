@@ -1,6 +1,6 @@
 # Written offer for source code
 
-This offer applies to MeridianDesktop 0.1.0 as distributed in its ONEDIR bundle. It covers
+This offer applies to MeridianDesktop 0.2.0 as distributed in its ONEDIR bundle. It covers
 the Qt for Python and Qt components under LGPL-3.0-only that the bundle contains.
 
 ## Covered components
@@ -66,4 +66,4 @@ folder that holds the replacement files.
 ## Scope of the offer
 
 This offer also covers any other component that THIRD_PARTY_LICENSES.txt lists under LGPL-3.0-only
-in this release. The table above covers the components shipped in MeridianDesktop 0.1.0.
+in this release. The table above covers the components shipped in MeridianDesktop 0.2.0.
