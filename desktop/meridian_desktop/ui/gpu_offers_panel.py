@@ -29,6 +29,7 @@ from PySide6.QtWidgets import (
 )
 
 from meridian_desktop import gpu_catalog
+from meridian_desktop.gpu_reference import spec_for
 from meridian_desktop.gpu_catalog import (
     TIER_ANY,
     TIER_COMMUNITY,
@@ -46,7 +47,18 @@ from meridian_desktop.ui.text import make_selectable
 UNCHECKED_TEXT = "RunPod GPU offers: not checked yet."
 CHECKING_TEXT = "RunPod GPU offers: checking..."
 FAILED_TEXT = "The check failed unexpectedly ({})."
-COLUMNS = ("GPU", "Manufacturer", "Memory GB", "Stock", "Secure $/h", "Community $/h", "Max GPUs per pod", "Data centers")
+COLUMNS = (
+    "GPU",
+    "Manufacturer",
+    "Memory GB",
+    "Stock",
+    "Secure $/h",
+    "Community $/h",
+    "Max GPUs per pod",
+    "Data centers",
+    "Peak FP16 TFLOPS (dense)",
+    "Bandwidth GB/s",
+)
 TIER_CHOICES = (("Any cloud", TIER_ANY), ("Secure cloud", TIER_SECURE), ("Community cloud", TIER_COMMUNITY))
 NOT_OFFERED_TEXT = "not offered"
 ANY_MAKER_TEXT = "Any maker"
@@ -58,8 +70,16 @@ SORT_CHOICES = (
     ("Secure price, cheapest first", "secure_price"),
     ("Community price, cheapest first", "community_price"),
     ("Stock, most first", "stock"),
+    ("Peak FP16 TFLOPS, highest first", "tflops_desc"),
+    ("Bandwidth, highest first", "bandwidth_desc"),
 )
 NO_DATA_CENTERS_TEXT = "none listed"
+NOT_STATED_TEXT = "not stated"
+NOT_IN_REFERENCE_TEXT = "not in reference"
+REFERENCE_NOTE_TEXT = (
+    "The last two columns are vendor datasheet peak figures, not speed measured for your job. "
+    "Blank means the datasheet does not state it, and the two are not comparable across every card."
+)
 
 
 def money_text(value: float | None) -> str:
@@ -93,7 +113,18 @@ def offer_cells(offer: GpuOffer) -> tuple[str, ...]:
         money_text(tier_price(offer, TIER_COMMUNITY)),
         counts_text(offer.max_count_secure, offer.max_count_community),
         centers_text(offer.data_centers),
+        _figure_text(offer, "fp16_tensor_tflops_dense"),
+        _figure_text(offer, "memory_bandwidth_gbs"),
     )
+
+
+def _figure_text(offer: GpuOffer, field: str) -> str:
+    """A vendor figure for the offer's model: the number, 'not stated', or 'not in reference' for an unlisted model."""
+    spec = spec_for(offer.gpu_id)
+    if spec is None:
+        return NOT_IN_REFERENCE_TEXT
+    value = getattr(spec, field)
+    return NOT_STATED_TEXT if value is None else f"{value:g}"
 
 
 def data_center_ids(offers: tuple[GpuOffer, ...]) -> list[str]:
@@ -166,6 +197,7 @@ class GpuOffersPanel(QWidget):
         layout = QVBoxLayout(self)
         self._status = _label(self, "gpu-offers-status", UNCHECKED_TEXT)
         layout.addWidget(self._status)
+        layout.addWidget(_label(self, "gpu-offers-reference-note", REFERENCE_NOTE_TEXT))
 
         filters = QHBoxLayout()
         self._name = QLineEdit(self)

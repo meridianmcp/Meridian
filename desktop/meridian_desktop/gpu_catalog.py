@@ -16,6 +16,8 @@ from collections.abc import Callable
 from dataclasses import dataclass
 from typing import Any
 
+from meridian_desktop.gpu_reference import spec_for
+
 CATALOG_URL = "https://api.runpod.io/v2/catalog/gpus"
 CATALOG_QUERY = "include=AVAILABILITY&product=POD"
 MAX_REPLY_BYTES = 2_000_000
@@ -217,7 +219,16 @@ def filter_offers(
 _NOT_WORD = re.compile(r"[^0-9a-z]+")
 IN_STOCK_LEVELS = ("LOW", "MEDIUM", "HIGH")
 STOCK_RANK = {"NONE": 0, "LOW": 1, "MEDIUM": 2, "HIGH": 3}
-SORT_KEYS = ("name", "memory_desc", "memory_asc", "secure_price", "community_price", "stock")
+SORT_KEYS = (
+    "name",
+    "memory_desc",
+    "memory_asc",
+    "secure_price",
+    "community_price",
+    "stock",
+    "tflops_desc",
+    "bandwidth_desc",
+)
 
 
 def search_matches(query: str, offer: GpuOffer) -> bool:
@@ -251,6 +262,12 @@ def _sort_number(offer: GpuOffer, key: str) -> float | None:
         return offer.price_community if offered_community(offer) else None
     if key == "stock":
         return -STOCK_RANK.get(offer.availability, -1)
+    if key == "tflops_desc":
+        spec = spec_for(offer.gpu_id)
+        return None if spec is None or spec.fp16_tensor_tflops_dense is None else -spec.fp16_tensor_tflops_dense
+    if key == "bandwidth_desc":
+        spec = spec_for(offer.gpu_id)
+        return None if spec is None or spec.memory_bandwidth_gbs is None else -spec.memory_bandwidth_gbs
     return None
 
 
