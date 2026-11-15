@@ -8,6 +8,8 @@ labels and plain table cells), so Zotero's text is never read as HTML. The resul
 and has the shared Copy action (Ctrl+C or the right-click menu). The save section at the foot sends lines of
 reading-list items through the Meridian Zotero bridge. The bridge check runs with the other checks, and Save runs on the
 thread pool as well. A line whose outcome is unknown is held back until the person checks Zotero and presses I checked Zotero.
+The bridge section checks the installed bridge at start and when this tab first opens, only while the owner's update-check
+switch is on. It never installs by itself, and it asks the owner before a forced close of Zotero unless the owner has opted in.
 """
 
 from __future__ import annotations
@@ -21,6 +23,7 @@ from typing import Any
 from PySide6.QtCore import QRunnable, Qt, QThreadPool, QTimer, Slot
 from PySide6.QtWidgets import (
     QAbstractItemView,
+    QCheckBox,
     QComboBox,
     QGridLayout,
     QHBoxLayout,
@@ -35,7 +38,8 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
-from meridian_desktop import zotero_bridge, zotero_client, zotero_journal, zotero_scope
+from meridian_desktop import zotero_bridge, zotero_bridge_install, zotero_client, zotero_journal, zotero_scope
+from meridian_desktop.settings_store import SettingsUnreadable, licence_accepted_for
 from meridian_desktop.ui.delivery import Delivered, shared_delivery
 from meridian_desktop.ui.text import enable_table_copy, make_selectable
 from meridian_desktop.zotero_client import (
@@ -161,6 +165,67 @@ CLEAR = "clear"
 PROJECTS = "projects"
 LIBRARIES = "libraries"
 COLLECTIONS = "collections"
+BRIDGE_INSTALL_STATE = "bridge_install_state"
+BRIDGE_LICENCE = "bridge_licence"
+BRIDGE_INSTALL = "bridge_install"
+BRIDGE_UPDATE = "bridge_update"
+
+# The Zotero bridge install section. Every text names no path: the token file is referred to, never shown.
+BRIDGE_HEADING = "Zotero bridge"
+BRIDGE_INTRO = (
+    "The Meridian Zotero bridge is the plugin that saves reading-list items into Zotero. Meridian Desktop carries a signed "
+    "copy of it and installs or updates it in your Zotero profile. Zotero must be closed for the install."
+)
+INSTALL_CHECKING_TEXT = "Zotero bridge: checking..."
+BRIDGE_CHECK_FAILED_TEXT = "Zotero bridge: could not be checked. Press Refresh to try again."
+BRIDGE_NO_BUNDLE_TEXT = "No bundled bridge in this build."
+BRIDGE_DAMAGED_TEXT = "The bridge record in this build is damaged. Rebuild Meridian Desktop with the signed bridge file."
+BRIDGE_NO_PROFILE_TEXT = "Zotero's default profile was not found. Open Zotero once, then press Refresh."
+BRIDGE_UNREADABLE_TEXT = (
+    "Zotero's extensions.json could not be read, so the installed bridge version is not known. Nothing will be written."
+)
+BRIDGE_NOT_INSTALLED_TEXT = "Zotero bridge: not installed. The bundled version is {}."
+BRIDGE_OLDER_TEXT = "Zotero bridge: installed {}, older than the bundled {}."
+BRIDGE_UNKNOWN_TEXT = "Zotero bridge: the installed version could not be read. The bundled version is {}."
+BRIDGE_CURRENT_TEXT = "Zotero bridge: installed {}, up to date."
+BRIDGE_NEWER_TEXT = "Zotero bridge: installed {}, newer than the bundled {}. Nothing will be changed."
+BRIDGE_REG_NOT_LISTED = (
+    "Zotero does not list the bridge yet. After the install, start Zotero and turn the bridge on once in Tools > Plugins."
+)
+BRIDGE_REG_DISABLED = "Zotero has the bridge turned off. The install does not change that: turn it on in Tools > Plugins."
+BRIDGE_REG_BLOCKED = "Zotero blocks the bridge. The install does not change that."
+LICENCE_NEEDED_TEXT = "Read and accept the licence notice before the bridge can be installed."
+LICENCE_NO_STORE_TEXT = "Settings are not available in this window, so the licence acceptance cannot be saved here."
+INSTALL_BUTTON_TEXT = "Install Zotero bridge"
+UPDATE_BUTTON_TEXT = "Update Zotero bridge"
+LICENCE_BUTTON_TEXT = "Read the licence notice"
+LICENCE_TITLE = "Zotero bridge licence"
+LICENCE_ACCEPT_TEXT = "Accept"
+LICENCE_ACCEPTED_TEXT = "Licence accepted. You can install the bridge now."
+LICENCE_DECLINED_TEXT = "Licence not accepted. Nothing was installed and nothing was saved."
+LICENCE_SAVE_FAILED_TEXT = "The licence acceptance could not be saved ({}). Nothing was installed."
+INSTALL_TITLE = "Install Zotero bridge"
+INSTALL_CONFIRM_BUTTON = "Install"
+INSTALL_CANCELLED_TEXT = "Install cancelled. Nothing was written and Zotero was not closed."
+INSTALLING_TEXT = "Installing the Zotero bridge..."
+INSTALL_NO_RESULT_TEXT = "The install ended without a result, so nothing is known to have been written. Press Refresh to check."
+INSTALL_FAILED_TEXT = "The install stopped with an error, so nothing is known to have been written. Press Refresh to check."
+FORCING_TEXT = "Forcing Zotero to close now, as you chose. This takes up to about 10 seconds."
+# The update check. The switch is saved on this tab, and the check runs only while the switch is on.
+UPDATE_CHECK_TEXT = "Check for bridge updates when Meridian starts or this tab opens"
+UPDATE_AVAILABLE_TEXT = (
+    "A newer Zotero bridge ({bundled}) is bundled in this build than the one installed ({installed}). "
+    "It can be installed below. Nothing has been installed."
+)
+UPDATE_CHECK_NOT_SAVED_TEXT = "The update-check switch could not be saved ({}). Nothing was changed."
+# The force-close question, and the opt-in its checkbox stores.
+FORCE_TITLE = "Force close Zotero"
+FORCE_QUESTION_TEXT = "Zotero did not close. Force close it now? Unsaved Zotero work may be lost."
+FORCE_YES_TEXT = "Yes"
+FORCE_NO_TEXT = "No"
+FORCE_REMEMBER_TEXT = "Force close next time"
+FORCE_NOT_SAVED_TEXT = "The choice to force close next time could not be saved ({}). Nothing was closed or written."
+NOTHING_CLOSED_TEXT = "Nothing was closed or written."
 
 
 def _label(parent: QWidget, name: str, text: str) -> QLabel:
@@ -239,6 +304,211 @@ def _launch(client: Any, exe: str) -> tuple[str, bool]:
     line = client.start_zotero(exe)
     check = client.probe_api()
     return line, check.state == API_ON
+
+
+def ask_licence(parent: QWidget | None, notice: str) -> bool:
+    """The Zotero bridge licence notice in a dialog. True only when Accept is chosen. Closing the dialog is a no."""
+    box = QMessageBox(parent)
+    box.setWindowTitle(LICENCE_TITLE)
+    box.setIcon(QMessageBox.Icon.Information)
+    box.setTextFormat(Qt.TextFormat.PlainText)
+    box.setText(notice)
+    accept = box.addButton(LICENCE_ACCEPT_TEXT, QMessageBox.ButtonRole.AcceptRole)
+    cancel = box.addButton(QMessageBox.StandardButton.Cancel)
+    box.setDefaultButton(cancel)
+    box.setEscapeButton(cancel)
+    for child in box.findChildren(QLabel):
+        child.setTextFormat(Qt.TextFormat.PlainText)
+        make_selectable(child)
+    box.exec()
+    return box.clickedButton() is accept
+
+
+def ask_bridge_install(parent: QWidget | None, text: str) -> bool:
+    """The install confirmation: what will be written, and that Zotero must close. True only when Install is chosen."""
+    box = QMessageBox(parent)
+    box.setWindowTitle(INSTALL_TITLE)
+    box.setIcon(QMessageBox.Icon.Question)
+    box.setTextFormat(Qt.TextFormat.PlainText)
+    box.setText(text)
+    install = box.addButton(INSTALL_CONFIRM_BUTTON, QMessageBox.ButtonRole.AcceptRole)
+    cancel = box.addButton(QMessageBox.StandardButton.Cancel)
+    box.setDefaultButton(cancel)
+    box.setEscapeButton(cancel)
+    for child in box.findChildren(QLabel):
+        child.setTextFormat(Qt.TextFormat.PlainText)
+        make_selectable(child)
+    box.exec()
+    return box.clickedButton() is install
+
+
+def ask_force_close(parent: QWidget | None) -> tuple[bool, bool]:
+    """The force-close question. Returns (force, remember). ``force`` is True only for Yes, and ``remember`` only for Yes with
+    "Force close next time" ticked. Closing the dialog, or No, is no, and No is the default button."""
+    box = QMessageBox(parent)
+    box.setWindowTitle(FORCE_TITLE)
+    box.setIcon(QMessageBox.Icon.Warning)
+    box.setTextFormat(Qt.TextFormat.PlainText)
+    box.setText(FORCE_QUESTION_TEXT)
+    remember = QCheckBox(FORCE_REMEMBER_TEXT, box)
+    box.setCheckBox(remember)
+    yes = box.addButton(FORCE_YES_TEXT, QMessageBox.ButtonRole.YesRole)
+    no = box.addButton(FORCE_NO_TEXT, QMessageBox.ButtonRole.NoRole)
+    box.setDefaultButton(no)
+    box.setEscapeButton(no)
+    for child in box.findChildren(QLabel):
+        child.setTextFormat(Qt.TextFormat.PlainText)
+        make_selectable(child)
+    box.exec()
+    forced = box.clickedButton() is yes
+    return forced, forced and remember.isChecked()
+
+
+def bridge_state_text(check: "zotero_bridge_install.BridgeCheck | None") -> str:
+    """The one-line bridge state for the panel, with the registration note when Zotero needs the owner to act. Pure."""
+    if check is None:
+        return INSTALL_CHECKING_TEXT
+    state = check.state
+    if state == zotero_bridge_install.STATE_NO_BUNDLE:
+        return BRIDGE_NO_BUNDLE_TEXT
+    if state == zotero_bridge_install.STATE_DAMAGED:
+        return BRIDGE_DAMAGED_TEXT
+    if state == zotero_bridge_install.STATE_NO_PROFILE:
+        return BRIDGE_NO_PROFILE_TEXT
+    if state == zotero_bridge_install.STATE_UNREADABLE:
+        return BRIDGE_UNREADABLE_TEXT
+    bundled = check.bundled_version or ""
+    installed = check.installed_version or ""
+    if state == zotero_bridge_install.STATE_NOT_INSTALLED:
+        text = BRIDGE_NOT_INSTALLED_TEXT.format(bundled)
+    elif state == zotero_bridge_install.STATE_OLDER:
+        text = BRIDGE_OLDER_TEXT.format(installed, bundled)
+    elif state == zotero_bridge_install.STATE_UNKNOWN:
+        text = BRIDGE_UNKNOWN_TEXT.format(bundled)
+    elif state == zotero_bridge_install.STATE_CURRENT:
+        text = BRIDGE_CURRENT_TEXT.format(installed)
+    elif state == zotero_bridge_install.STATE_NEWER:
+        text = BRIDGE_NEWER_TEXT.format(installed, bundled)
+    else:
+        return BRIDGE_CHECK_FAILED_TEXT
+    note = {
+        zotero_bridge_install.REG_NOT_LISTED: BRIDGE_REG_NOT_LISTED,
+        zotero_bridge_install.REG_DISABLED: BRIDGE_REG_DISABLED,
+        zotero_bridge_install.REG_BLOCKED: BRIDGE_REG_BLOCKED,
+    }.get(check.registration, "")
+    return f"{text} {note}" if note else text
+
+
+def bridge_install_confirm_text(check: "zotero_bridge_install.BridgeCheck") -> str:
+    """What the install confirmation says will be written, and that Zotero must close. Names no path. Pure."""
+    update = check.state in (zotero_bridge_install.STATE_OLDER, zotero_bridge_install.STATE_UNKNOWN)
+    action = "Update" if update else "Install"
+    return (
+        f"{action} the Zotero bridge {check.bundled_version} in your Zotero profile.\n\n"
+        "Meridian will write:\n"
+        "  - the bridge plugin file, in the profile's extensions folder;\n"
+        "  - three lines in the profile's user.js: the scan setting, the bridge's local port, and the token file's location;\n"
+        "  - the bridge's token file, readable only by your Windows account, if it does not exist yet.\n\n"
+        "Zotero must close first. Meridian asks Zotero to close and waits up to 60 seconds. If Zotero does not close, "
+        "nothing is written. Meridian then asks you before it forces Zotero to close, which can lose unsaved Zotero work, "
+        "unless you have ticked Force close next time. Meridian does not start Zotero again.\n\n"
+        "This build does not turn the bridge on in Zotero: if Zotero does not list it, turn it on once in Tools > Plugins.\n\n"
+        f"{action} now?"
+    )
+
+
+def _licence_saved(store: Any) -> bool:
+    """Whether the settings file records an acceptance of the notice shown now. Reads only. Runs on a worker thread. Never raises.
+
+    An acceptance counts only with the SHA-256 of the current notice text beside it. An acceptance of an older notice, or one
+    with no digest, is not accepted, so the owner is asked to read and accept the notice again.
+    """
+    if store is None:
+        return False
+    try:
+        return licence_accepted_for(store.load().settings, zotero_bridge_install.LICENCE_NOTICE_SHA256)
+    except Exception:  # noqa: BLE001 -- an unreadable settings file means the licence is not accepted
+        return False
+
+
+def _read_install_state(installer: Any, store: Any) -> tuple:
+    """The bridge check and the licence acceptance, read together on a worker thread. Writes nothing."""
+    return installer.check(), _licence_saved(store)
+
+
+def _save_licence(store: Any) -> tuple:
+    """Record the licence acceptance in the settings file. Runs on a worker thread. Returns (saved, plain reason)."""
+    try:
+        store.set_licence_accepted(True, notice_sha256=zotero_bridge_install.LICENCE_NOTICE_SHA256)
+    except (SettingsUnreadable, ValueError) as exc:
+        return False, str(exc)
+    except Exception as exc:  # noqa: BLE001 -- an OSError text can name a path, so only the class is shown
+        return False, exc.__class__.__name__
+    return True, ""
+
+
+@dataclass(frozen=True)
+class _InstallDone:
+    """What one install run decided, on the worker thread. ``result`` is the installer's result, or None when the run stopped
+    before the installer, with the reason in ``note``. ``force_allowed`` is whether a forced close was allowed for the run."""
+
+    result: Any
+    force_allowed: bool
+    note: str = ""
+
+
+def _force_close_allowed(store: Any) -> bool:
+    """Whether the owner has opted in to a forced close. Reads only. Runs on a worker thread. Never raises."""
+    if store is None:
+        return False
+    try:
+        return bool(store.load().settings.zotero_force_close_allowed)
+    except Exception:  # noqa: BLE001 -- an unreadable settings file means no opt-in
+        return False
+
+
+def _update_checks_on(store: Any) -> bool:
+    """Whether the owner has turned the bridge update check on. Reads only. Never raises."""
+    if store is None:
+        return False
+    try:
+        return bool(store.load().settings.zotero_update_checks)
+    except Exception:  # noqa: BLE001 -- an unreadable settings file means the check stays off
+        return False
+
+
+def _run_install(installer: Any, store: Any, *, force_now: bool = False) -> _InstallDone:
+    """The install, run on a worker thread after a yes. The installer reads the licence itself and refuses without it.
+
+    A forced close is allowed when the owner has opted in, or when this run is the owner's yes to the force-close question.
+    Only that yes skips the normal close window (``skip_graceful``). An opt-in alone still waits the window first.
+    """
+    force = force_now or _force_close_allowed(store)
+    result = installer.install(allow_close=True, allow_force_close=force, skip_graceful=force_now)
+    return _InstallDone(result, force)
+
+
+def _run_forced_install(installer: Any, store: Any, remember: bool) -> _InstallDone:
+    """The install run after the owner's yes to the force-close question. With "Force close next time" ticked, the opt-in is
+    stored first. If it cannot be stored, the install does not run, so nothing is closed or written."""
+    if remember:
+        try:
+            store.set_zotero_force_close_allowed(True)
+        except SettingsUnreadable as exc:
+            return _InstallDone(None, False, f"{exc} {NOTHING_CLOSED_TEXT}")
+        except Exception as exc:  # noqa: BLE001 -- an OSError text can name a path, so only the class is shown
+            return _InstallDone(None, False, FORCE_NOT_SAVED_TEXT.format(exc.__class__.__name__))
+    return _run_install(installer, store, force_now=True)
+
+
+def _run_update_check(installer: Any, store: Any) -> Any:
+    """The read-only bridge check for the update line, run on a worker thread. It runs only while the owner's switch is on.
+
+    Returns None when the switch is off, so nothing is checked. Otherwise it returns the installer's read-only check.
+    """
+    if not _update_checks_on(store):
+        return None
+    return installer.check_for_update()
 
 
 class _Job(QRunnable):
@@ -463,6 +733,11 @@ class ZoteroPanel(QWidget):
         journal_path: Path | None = None,
         projects: Callable[[], Sequence[tuple[str, str, str]]] | None = None,
         scopes_path: Path | None = None,
+        bridge_installer: Any = None,
+        settings: Any = None,
+        licence_dialog: Callable[[QWidget, str], bool] | None = None,
+        confirm_install: Callable[[QWidget, str], bool] | None = None,
+        confirm_force_close: Callable[[QWidget], tuple[bool, bool]] | None = None,
     ) -> None:
         super().__init__(parent)
         self.setObjectName("zotero-panel")
@@ -499,6 +774,20 @@ class ZoteroPanel(QWidget):
         # The held entries from the last read that finished. A read that fails keeps them on screen.
         self._held_entries: list[zotero_journal.JournalEntry] = []
         self._confirm = ask_start if confirm is None else confirm
+        # The Zotero bridge install. The installer reads and installs; the settings store keeps the licence acceptance and the
+        # force-close opt-in. The installer reads the licence from the same store, so an install without one is refused.
+        # Without a settings store the licence cannot be saved, so the install stays off in this window.
+        self._settings = settings
+        if bridge_installer is None:
+            self._installer = zotero_bridge_install.ZoteroBridgeInstaller.for_this_build(settings=settings)
+        else:
+            self._installer = bridge_installer
+        self._ask_licence = ask_licence if licence_dialog is None else licence_dialog
+        self._ask_install = ask_bridge_install if confirm_install is None else confirm_install
+        self._ask_force = ask_force_close if confirm_force_close is None else confirm_force_close
+        self._bridge_check: zotero_bridge_install.BridgeCheck | None = None
+        self._licence_accepted = False
+        self._bridge_busy = False
         self._exe: str | None = None
         self._running: bool | None = None
         self._checking = False
@@ -515,6 +804,9 @@ class ZoteroPanel(QWidget):
         shared_delivery().delivered.connect(self._on_delivered)
         self._build()
         self._start_journal_read()
+        # The bridge update check runs once per start, and again when this tab first opens. It does nothing while the switch
+        # is off.
+        self._start_update_check()
 
     # ----------------------------------------------------------- layout
 
@@ -544,6 +836,7 @@ class ZoteroPanel(QWidget):
         self._start_result = _label(self, "zotero-start-result", "")
         layout.addWidget(self._start_result)
 
+        self._build_bridge(layout)
         self._build_scope(layout)
 
         search_row = QHBoxLayout()
@@ -609,6 +902,39 @@ class ZoteroPanel(QWidget):
         self._held_button.clicked.connect(self._on_held_checked_clicked)
 
     # ----------------------------------------------------------- project scope
+
+    def _build_bridge(self, layout: QVBoxLayout) -> None:
+        layout.addWidget(_label(self, "zotero-bridge-heading", BRIDGE_HEADING))
+        layout.addWidget(_label(self, "zotero-bridge-intro", BRIDGE_INTRO))
+        # The update check's switch and its line sit above the install state, so "below" in the line points at the buttons.
+        self._update_checks = QCheckBox(UPDATE_CHECK_TEXT, self)
+        self._update_checks.setObjectName("zotero-update-checks")
+        self._update_checks.setChecked(_update_checks_on(self._settings))
+        self._update_checks.setEnabled(self._settings is not None)
+        self._update_line = _label(self, "zotero-bridge-update-line", "")
+        self._update_line.setVisible(False)
+        layout.addWidget(self._update_checks)
+        layout.addWidget(self._update_line)
+        self._update_checks.toggled.connect(self._on_update_checks_toggled)
+        self._bridge_install_state = _label(self, "zotero-bridge-install-state", INSTALL_CHECKING_TEXT)
+        self._bridge_licence_note = _label(self, "zotero-bridge-licence-note", "")
+        self._bridge_licence_note.setVisible(False)
+        layout.addWidget(self._bridge_install_state)
+        layout.addWidget(self._bridge_licence_note)
+        actions = QHBoxLayout()
+        self._bridge_licence_button = QPushButton(LICENCE_BUTTON_TEXT, self)
+        self._bridge_licence_button.setObjectName("zotero-bridge-licence")
+        self._bridge_install_button = QPushButton(INSTALL_BUTTON_TEXT, self)
+        self._bridge_install_button.setObjectName("zotero-bridge-install")
+        for button in (self._bridge_licence_button, self._bridge_install_button):
+            button.setVisible(False)
+            actions.addWidget(button)
+        actions.addStretch(1)
+        layout.addLayout(actions)
+        self._bridge_install_result = _label(self, "zotero-bridge-install-result", "")
+        layout.addWidget(self._bridge_install_result)
+        self._bridge_licence_button.clicked.connect(self._on_bridge_licence_clicked)
+        self._bridge_install_button.clicked.connect(self._on_bridge_install_clicked)
 
     def _build_scope(self, layout: QVBoxLayout) -> None:
         layout.addWidget(_label(self, "zotero-scope-heading", SCOPE_HEADING))
@@ -888,6 +1214,7 @@ class ZoteroPanel(QWidget):
             self._refresh()
             self._load_projects()
             self._load_libraries()
+            self._start_update_check()
 
     @Slot()
     def _on_refresh_clicked(self) -> None:
@@ -906,6 +1233,7 @@ class ZoteroPanel(QWidget):
         self._start_hint.setText("")
         self._start_read(STATUS, self._client.status)
         self._start_bridge_check()
+        self._start_install_check()
 
     def _start_bridge_check(self) -> None:
         self._bridge_state.setText(BRIDGE_CHECKING_TEXT)
@@ -954,6 +1282,14 @@ class ZoteroPanel(QWidget):
             self._on_libraries_ready(done.payload)
         elif done.kind == COLLECTIONS:
             self._on_collections_ready(done.payload)
+        elif done.kind == BRIDGE_INSTALL_STATE:
+            self._on_install_state_ready(done.payload)
+        elif done.kind == BRIDGE_LICENCE:
+            self._on_licence_ready(done.payload)
+        elif done.kind == BRIDGE_INSTALL:
+            self._on_install_ready(done.payload)
+        elif done.kind == BRIDGE_UPDATE:
+            self._on_update_ready(done.payload)
 
     def _on_status_ready(self, payload: tuple) -> None:
         result, failure = payload
@@ -1067,6 +1403,182 @@ class ZoteroPanel(QWidget):
                 cell = QTableWidgetItem(value)
                 cell.setFlags(cell.flags() & ~Qt.ItemFlag.ItemIsEditable)
                 self._results.setItem(row, column, cell)
+
+    # ----------------------------------------------------------- bridge install
+
+    def _start_install_check(self) -> None:
+        """Read the bridge state and the licence acceptance on the thread pool. Writes nothing."""
+        self._start_read(BRIDGE_INSTALL_STATE, functools.partial(_read_install_state, self._installer, self._settings))
+
+    def _on_install_state_ready(self, payload: tuple) -> None:
+        result, failure = payload
+        if failure is not None or not isinstance(result, tuple) or len(result) != 2:
+            self._bridge_check = None
+            self._licence_accepted = False
+            self._bridge_install_state.setText(BRIDGE_CHECK_FAILED_TEXT)
+            self._bridge_install_button.setVisible(False)
+            self._bridge_licence_button.setVisible(False)
+            self._bridge_licence_note.setVisible(False)
+            return
+        check, accepted = result
+        self._bridge_check = check
+        self._licence_accepted = bool(accepted)
+        self._render_bridge()
+
+    def _render_bridge(self) -> None:
+        """Show the bridge state, and the buttons that state allows. Install needs the licence accepted and no install running."""
+        check = self._bridge_check
+        self._bridge_install_state.setText(bridge_state_text(check))
+        state = check.state if check is not None else None
+        installable = state in (
+            zotero_bridge_install.STATE_NOT_INSTALLED,
+            zotero_bridge_install.STATE_OLDER,
+            zotero_bridge_install.STATE_UNKNOWN,
+        )
+        self._bridge_install_button.setText(
+            UPDATE_BUTTON_TEXT
+            if state in (zotero_bridge_install.STATE_OLDER, zotero_bridge_install.STATE_UNKNOWN)
+            else INSTALL_BUTTON_TEXT
+        )
+        self._bridge_install_button.setVisible(installable)
+        self._bridge_install_button.setEnabled(installable and self._licence_accepted and not self._bridge_busy)
+        licence_needed = installable and not self._licence_accepted
+        self._bridge_licence_button.setVisible(licence_needed)
+        self._bridge_licence_button.setEnabled(licence_needed and not self._bridge_busy)
+        note = ""
+        if licence_needed:
+            note = LICENCE_NEEDED_TEXT if self._settings is not None else LICENCE_NO_STORE_TEXT
+        self._bridge_licence_note.setText(note)
+        self._bridge_licence_note.setVisible(bool(note))
+
+    @Slot()
+    def _on_bridge_licence_clicked(self) -> None:
+        if self._bridge_busy or self._licence_accepted:
+            return
+        if self._settings is None:
+            self._bridge_install_result.setText(LICENCE_NO_STORE_TEXT)
+            return
+        if not self._ask_licence(self, zotero_bridge_install.LICENCE_NOTICE_TEXT):
+            self._bridge_install_result.setText(LICENCE_DECLINED_TEXT)
+            return
+        self._bridge_busy = True
+        self._render_bridge()
+        self._start_read(BRIDGE_LICENCE, functools.partial(_save_licence, self._settings))
+
+    def _on_licence_ready(self, payload: tuple) -> None:
+        result, failure = payload
+        self._bridge_busy = False
+        if failure is not None or not isinstance(result, tuple) or len(result) != 2:
+            self._bridge_install_result.setText(LICENCE_SAVE_FAILED_TEXT.format(failure or "NoResult"))
+        else:
+            saved, reason = result
+            if saved:
+                self._licence_accepted = True
+                self._bridge_install_result.setText(LICENCE_ACCEPTED_TEXT)
+                # A state read that started before this save may still be running, and it would report the licence as not
+                # accepted. Starting the check again makes that older read superseded, so _on_delivered drops it.
+                self._start_install_check()
+            else:
+                self._bridge_install_result.setText(LICENCE_SAVE_FAILED_TEXT.format(reason))
+        self._render_bridge()
+
+    @Slot()
+    def _on_bridge_install_clicked(self) -> None:
+        check = self._bridge_check
+        if self._bridge_busy or check is None or not self._licence_accepted:
+            return
+        if not self._ask_install(self, bridge_install_confirm_text(check)):
+            self._bridge_install_result.setText(INSTALL_CANCELLED_TEXT)
+            return
+        self._bridge_busy = True
+        self._render_bridge()
+        self._bridge_install_result.setText(INSTALLING_TEXT)
+        self._start_read(BRIDGE_INSTALL, functools.partial(_run_install, self._installer, self._settings))
+
+    def _on_install_ready(self, payload: tuple) -> None:
+        result, failure = payload
+        self._bridge_busy = False
+        done = result if isinstance(result, _InstallDone) else None
+        install = done.result if done is not None else None
+        ask_force = False
+        if failure is not None:
+            # The job reduces an exception to a check-failed text, which is wrong for an install. Show the install's own text.
+            self._bridge_install_result.setText(INSTALL_FAILED_TEXT)
+        elif done is None:
+            self._bridge_install_result.setText(INSTALL_NO_RESULT_TEXT)
+        elif install is None:
+            # The run stopped before the installer, for example because the force-close opt-in could not be stored.
+            self._bridge_install_result.setText(done.note)
+        elif not isinstance(install, zotero_bridge_install.InstallResult):
+            self._bridge_install_result.setText(INSTALL_NO_RESULT_TEXT)
+        else:
+            self._bridge_install_result.setText(install.message)
+            # The owner is asked only when a forced close could still help and the opt-in is not already on.
+            ask_force = install.can_force_close and not done.force_allowed
+            if install.status == zotero_bridge_install.ST_INSTALLED:
+                # The bundled bridge is now in place, so no update is pending. Zotero's extensions.json can still list the old
+                # version until Zotero starts again, so the line is hidden here, not recomputed from that older entry.
+                self._update_line.setVisible(False)
+        # The state is read again, so the buttons follow what is now on disk.
+        self._bridge_check = None
+        self._render_bridge()
+        self._start_install_check()
+        if ask_force:
+            self._offer_force_close()
+
+    def _offer_force_close(self) -> None:
+        """Ask whether to force Zotero closed. Yes runs the install again, with a forced close allowed and the normal close window
+        skipped, since the owner has just said yes. No writes nothing.
+
+        "Force close next time" is stored first, by the worker, when it is ticked with Yes.
+        """
+        force, remember = self._ask_force(self)
+        if not force:
+            return
+        self._bridge_busy = True
+        self._render_bridge()
+        self._bridge_install_result.setText(FORCING_TEXT)
+        self._start_read(BRIDGE_INSTALL, functools.partial(_run_forced_install, self._installer, self._settings, remember))
+
+    # ----------------------------------------------------------- bridge update check
+
+    def _start_update_check(self) -> None:
+        """The bridge update check, on the thread pool. It runs only while the owner's switch is on, and it only reads."""
+        self._start_read(BRIDGE_UPDATE, functools.partial(_run_update_check, self._installer, self._settings))
+
+    def _on_update_ready(self, payload: tuple) -> None:
+        """Show the line when the installed bridge is older than the bundled one. Any other outcome, a failed check included,
+        shows nothing."""
+        result, failure = payload
+        newer = (
+            failure is None
+            and isinstance(result, zotero_bridge_install.BridgeCheck)
+            and result.state == zotero_bridge_install.STATE_OLDER
+        )
+        if newer:
+            self._update_line.setText(
+                UPDATE_AVAILABLE_TEXT.format(bundled=result.bundled_version or "", installed=result.installed_version or "")
+            )
+        self._update_line.setVisible(newer)
+
+    def _on_update_checks_toggled(self, checked: bool) -> None:
+        """Save the update-check switch. Turning it off hides the line. A save that fails puts the switch back and says why."""
+        if not checked:
+            self._update_line.setVisible(False)
+        if self._settings is None:
+            return
+        try:
+            self._settings.set_zotero_update_checks(bool(checked))
+        except SettingsUnreadable as exc:
+            self._revert_update_checks(not checked, str(exc))
+        except Exception as exc:  # noqa: BLE001 -- an OSError text can name a path, so only the class is shown
+            self._revert_update_checks(not checked, UPDATE_CHECK_NOT_SAVED_TEXT.format(exc.__class__.__name__))
+
+    def _revert_update_checks(self, checked: bool, text: str) -> None:
+        self._update_checks.blockSignals(True)
+        self._update_checks.setChecked(checked)
+        self._update_checks.blockSignals(False)
+        self._bridge_install_result.setText(text)
 
     # ----------------------------------------------------------- bridge and save
 
