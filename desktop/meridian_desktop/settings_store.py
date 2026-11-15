@@ -17,7 +17,7 @@ import shutil
 import tempfile
 import time
 from collections.abc import Callable
-from dataclasses import asdict, dataclass, replace
+from dataclasses import asdict, dataclass, field, replace
 from pathlib import Path
 from typing import Mapping
 
@@ -179,6 +179,9 @@ class Settings:
     # The GPUs tab's auto-refresh interval in seconds: 0 is off. Every 5 minutes (300) is the default, so save() writes
     # the key only when the owner picks another interval.
     gpu_refresh_seconds: int = 300
+    # The GPUs tab's offer filters and sort as the owner last left them (name, memory, tier, center, maker, in stock,
+    # sort, max price). An empty dict is the default, so save() writes the key only when there is something to keep.
+    gpu_offer_filters: dict[str, object] = field(default_factory=dict)
     # The file-size note switch on the Limits group. On is the default. Off means the total-size note never shows. A
     # download is never asked about or blocked in either state, and virus scanning always applies.
     limit_approval_enabled: bool = True
@@ -202,6 +205,43 @@ CONTROL_FLAG_DEFAULTS = {key: getattr(Settings(), key) for key in CONTROL_FLAG_K
 
 # The GPUs tab's auto-refresh choices, in seconds. 0 is off.
 GPU_REFRESH_CHOICES = (0, 60, 300, 900)
+
+# The GPUs tab's saved offer filters: each known key and the type it must have. Any other key is dropped.
+OFFER_FILTER_TYPES: dict[str, type] = {
+    "name": str,
+    "memory_gb": int,
+    "tier": str,
+    "center": str,
+    "maker": str,
+    "in_stock": bool,
+    "sort": str,
+    "max_price": float,
+}
+
+
+def _clean_offer_filters(value: object, problems: list[str]) -> dict[str, object]:
+    """Keep the GPUs tab's saved filters that have the right type. A key with the wrong type is noted and dropped."""
+    if not isinstance(value, dict):
+        problems.append("gpu_offer_filters must be an object; using the defaults")
+        return {}
+    kept: dict[str, object] = {}
+    for key, kind in OFFER_FILTER_TYPES.items():
+        if key not in value:
+            continue
+        item = value[key]
+        if kind is bool:
+            ok = isinstance(item, bool)
+        elif kind is int:
+            ok = isinstance(item, int) and not isinstance(item, bool)
+        elif kind is float:
+            ok = isinstance(item, (int, float)) and not isinstance(item, bool)
+        else:
+            ok = isinstance(item, str)
+        if ok:
+            kept[key] = float(item) if kind is float else item
+        else:
+            problems.append(f"gpu_offer_filters.{key} is not valid; using its default")
+    return kept
 DEFAULT_GPU_REFRESH_SECONDS = 300
 
 
@@ -437,6 +477,10 @@ def _from_mapping(data: Mapping) -> tuple[Settings, list[str]]:
         else:
             problems.append("gpu_refresh_seconds must be 0, 60, 300 or 900; using 300")
 
+    # gpu_offer_filters: an absent key means nothing saved, so the tab opens with its defaults.
+    if "gpu_offer_filters" in data:
+        values["gpu_offer_filters"] = _clean_offer_filters(data["gpu_offer_filters"], problems)
+
     # limit_approval_enabled: an absent key means on, with no warning. Only a real true or false is accepted.
     if "limit_approval_enabled" in data:
         value = data["limit_approval_enabled"]
@@ -637,6 +681,9 @@ class SettingsStore:
         if settings.gpu_refresh_seconds == DEFAULT_GPU_REFRESH_SECONDS:
             # Every 5 minutes is the default, so the key is written only once the owner picks another interval.
             data.pop("gpu_refresh_seconds", None)
+        if not settings.gpu_offer_filters:
+            # Nothing kept is the default, so the key is written only when the owner has filters to keep.
+            data.pop("gpu_offer_filters", None)
         if settings.limit_approval_enabled:
             # On is the default, so the file-size note switch is written only once the owner turns it off.
             del data["limit_approval_enabled"]
@@ -746,6 +793,21 @@ class SettingsStore:
             raise SettingsUnreadable(SETTINGS_UNREADABLE_TEXT if copied else SETTINGS_UNREADABLE_NO_COPY_TEXT)
         self.keep_unreadable_copy()
         updated = replace(self.load().settings, gpu_refresh_seconds=int(value))
+        self.save(updated)
+        return updated
+
+    def set_gpu_offer_filters(self, filters: dict[str, object]) -> Settings:
+        """Save the GPUs tab's offer filters and sort. Every other field in the file is kept.
+
+        Keys this build does not know are dropped, and a value with the wrong type is dropped too. An unreadable file is
+        handled as the other setters handle it.
+        """
+        if self.is_unreadable():
+            copied = self._keep_copy()
+            raise SettingsUnreadable(SETTINGS_UNREADABLE_TEXT if copied else SETTINGS_UNREADABLE_NO_COPY_TEXT)
+        self.keep_unreadable_copy()
+        cleaned = _clean_offer_filters(filters, [])
+        updated = replace(self.load().settings, gpu_offer_filters=cleaned)
         self.save(updated)
         return updated
 

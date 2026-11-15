@@ -175,6 +175,8 @@ class GpuOffersPanel(QWidget):
         key_reader: Callable[[], str | None],
         fetch: Callable[[str | None], tuple[GpuOffer, ...]] = gpu_catalog.fetch_catalog,
         parent: QWidget | None = None,
+        saved_filters: dict[str, object] | None = None,
+        on_filters_changed: Callable[[dict[str, object]], bool] | None = None,
     ) -> None:
         super().__init__(parent)
         self.setObjectName("gpu-offers-panel")
@@ -190,6 +192,12 @@ class GpuOffersPanel(QWidget):
         self._generation = 0
         shared_delivery().delivered.connect(self._on_delivered)
         self._build()
+        # The filters the owner last left. A saved maker or data center waits until a check lists it.
+        self._pending_maker: str | None = None
+        self._pending_center: str | None = None
+        self._on_filters_changed = on_filters_changed
+        self._restore_filters(saved_filters or {})
+        self._saved_filters = self._filter_state()
 
     # ----------------------------------------------------------- layout
 
@@ -336,7 +344,7 @@ class GpuOffersPanel(QWidget):
 
     def _refresh_data_centers(self) -> None:
         """Rebuild the data-center choices from the offers, and keep the choice made before if it still exists."""
-        chosen = self._center.currentData() or ""
+        chosen = self._pending_center if self._pending_center is not None else (self._center.currentData() or "")
         self._center.blockSignals(True)
         self._center.clear()
         self._center.addItem("Any data center", "")
@@ -344,11 +352,13 @@ class GpuOffersPanel(QWidget):
             self._center.addItem(center_id, center_id)
         index = self._center.findData(chosen)
         self._center.setCurrentIndex(index if index >= 0 else 0)
+        if index >= 0:
+            self._pending_center = None
         self._center.blockSignals(False)
 
     def _refresh_makers(self) -> None:
         """Rebuild the maker choices from the offers, and keep the choice made before if it still exists."""
-        chosen = self._maker.currentData() or ""
+        chosen = self._pending_maker if self._pending_maker is not None else (self._maker.currentData() or "")
         makers = sorted({offer.manufacturer for offer in self._offers if offer.manufacturer})
         self._maker.blockSignals(True)
         self._maker.clear()
@@ -357,6 +367,8 @@ class GpuOffersPanel(QWidget):
             self._maker.addItem(maker, maker)
         index = self._maker.findData(chosen)
         self._maker.setCurrentIndex(index if index >= 0 else 0)
+        if index >= 0:
+            self._pending_maker = None
         self._maker.blockSignals(False)
 
     # ----------------------------------------------------------- filters
@@ -383,6 +395,79 @@ class GpuOffersPanel(QWidget):
             self._status.setText(
                 f"Showing {len(kept)} of {len(self._offers)} GPU types. Checked at {self._checked_text}."
             )
+        self._save_filters_if_changed()
+
+    def _filter_state(self) -> dict[str, object]:
+        """The filters and sort as the owner sees them. A saved maker or data center not listed yet still counts as chosen."""
+        maker = self._pending_maker if self._pending_maker is not None else (self._maker.currentData() or "")
+        center = self._pending_center if self._pending_center is not None else (self._center.currentData() or "")
+        return {
+            "name": self._name.text(),
+            "memory_gb": self._memory.value(),
+            "tier": self._tier.currentData() or TIER_ANY,
+            "center": center,
+            "maker": maker,
+            "in_stock": self._in_stock.isChecked(),
+            "sort": self._sort.currentData() or "name",
+            "max_price": float(self._max_price.value()),
+        }
+
+    def _restore_filters(self, saved: dict[str, object]) -> None:
+        """Put back the filters the owner last left. A value that is not valid is ignored, and the default stays."""
+        widgets = (
+            self._name,
+            self._memory,
+            self._tier,
+            self._center,
+            self._maker,
+            self._in_stock,
+            self._sort,
+            self._max_price,
+        )
+        for widget in widgets:
+            widget.blockSignals(True)
+        try:
+            name = saved.get("name")
+            if isinstance(name, str):
+                self._name.setText(name)
+            memory = saved.get("memory_gb")
+            if isinstance(memory, int) and not isinstance(memory, bool):
+                self._memory.setValue(max(0, min(1024, memory)))
+            self._select(self._tier, saved.get("tier"))
+            self._select(self._sort, saved.get("sort"))
+            in_stock = saved.get("in_stock")
+            if isinstance(in_stock, bool):
+                self._in_stock.setChecked(in_stock)
+            price = saved.get("max_price")
+            if isinstance(price, (int, float)) and not isinstance(price, bool):
+                self._max_price.setValue(max(0.0, min(1000.0, float(price))))
+            maker = saved.get("maker")
+            if isinstance(maker, str):
+                self._pending_maker = maker
+            center = saved.get("center")
+            if isinstance(center, str):
+                self._pending_center = center
+        finally:
+            for widget in widgets:
+                widget.blockSignals(False)
+
+    @staticmethod
+    def _select(combo: QComboBox, value: object) -> None:
+        if isinstance(value, str):
+            index = combo.findData(value)
+            if index >= 0:
+                combo.setCurrentIndex(index)
+
+    def _save_filters_if_changed(self) -> None:
+        """Pass the filters to the owner's settings when they differ from the last saved state.
+
+        A write that fails is tried again on the next change.
+        """
+        state = self._filter_state()
+        if self._on_filters_changed is None or state == self._saved_filters:
+            return
+        if self._on_filters_changed(state):
+            self._saved_filters = state
 
 
 __all__ = [

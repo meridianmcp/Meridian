@@ -216,6 +216,24 @@ def _saved_only_active(store: SettingsStore) -> bool:
     return store.load().settings.sessions_only_active_projects
 
 
+def _saved_gpu_filters(store: SettingsStore) -> dict[str, object]:
+    """The GPUs tab's offer filters as saved. Read once when the tab is built, from the local settings file."""
+    return dict(store.load().settings.gpu_offer_filters)
+
+
+def _save_gpu_filters(store: SettingsStore) -> Callable[[dict[str, object]], bool]:
+    """The save callback for the GPUs tab's offer filters. It returns False when the settings file could not be written."""
+
+    def write(filters: dict[str, object]) -> bool:
+        try:
+            store.set_gpu_offer_filters(filters)
+        except (OSError, SettingsUnreadable, ValueError):
+            return False
+        return True
+
+    return write
+
+
 def _saved_gpu_refresh(store: SettingsStore) -> int:
     """The GPUs tab's Auto refresh interval as saved. Read once when the tab is built, from the local settings file."""
     return store.load().settings.gpu_refresh_seconds
@@ -488,7 +506,14 @@ class MainWindow(QMainWindow):
                 # The RunPod offers list sits above the jobs. Its key is read from the credential store on a worker thread.
                 column = QWidget(self.tabs)
                 stack = QVBoxLayout(column)
-                stack.addWidget(GpuOffersPanel(_runpod_key_reader(self._secrets), parent=column))
+                stack.addWidget(
+                    GpuOffersPanel(
+                        _runpod_key_reader(self._secrets),
+                        saved_filters=_saved_gpu_filters(self._store),
+                        on_filters_changed=_save_gpu_filters(self._store),
+                        parent=column,
+                    )
+                )
                 stack.addWidget(jobs)
                 page = _scroll_page(column, self.tabs)
             elif name == "Tunnel":
