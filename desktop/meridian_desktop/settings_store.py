@@ -154,6 +154,13 @@ class Settings:
     # The listed names of the API keys the owner marked critical, RunPod included. A critical key is listed first and
     # shows a badge. Only names: the mark never sits with a value. save() writes the key only when there is a name.
     critical_keys: tuple[str, ...] = ()
+    # The group label the owner gave each API key, as (listed name, label) pairs. A key with no pair shows its default group
+    # (api_keys.DEFAULT_GROUPS) or the fallback. Labels only, never a value. save() writes the key only when there is a pair.
+    key_groups: tuple[tuple[str, str], ...] = ()
+    # The subgroup the owner put each API key in, as (listed name, label) pairs. Keys that only work as a set (an access key
+    # ID with its secret) share one subgroup. A key with no pair has no subgroup. Labels only, never a value. save() writes the
+    # key only when there is a pair.
+    key_subgroups: tuple[tuple[str, str], ...] = ()
     # The MCP tools the owner switched off, as "group:tool" keys (meridian_desktop/tool_catalog.py). Every tool is on by
     # default, so an empty tuple is the default. save() writes the key only when it is not empty.
     disabled_tools: tuple[str, ...] = ()
@@ -341,6 +348,26 @@ def _from_mapping(data: Mapping) -> tuple[Settings, list[str]]:
             values["critical_keys"] = tuple(dict.fromkeys(item.strip() for item in value))
         else:
             problems.append("critical_keys must be a list of names; using none")
+
+    # key_groups: an absent key means no saved labels, with no warning. Only an object of name to label text is accepted.
+    if "key_groups" in data:
+        value = data["key_groups"]
+        if isinstance(value, dict) and all(isinstance(k, str) and isinstance(v, str) for k, v in value.items()):
+            values["key_groups"] = tuple(
+                (name.strip(), label.strip()) for name, label in value.items() if name.strip() and label.strip()
+            )
+        else:
+            problems.append("key_groups must be an object of name to label; using none")
+
+    # key_subgroups: an absent key means no saved subgroups, with no warning. Only an object of name to label text is accepted.
+    if "key_subgroups" in data:
+        value = data["key_subgroups"]
+        if isinstance(value, dict) and all(isinstance(k, str) and isinstance(v, str) for k, v in value.items()):
+            values["key_subgroups"] = tuple(
+                (name.strip(), label.strip()) for name, label in value.items() if name.strip() and label.strip()
+            )
+        else:
+            problems.append("key_subgroups must be an object of name to label; using none")
 
     # keys_file_path: an absent key means no file is chosen, with no warning. Only text is accepted, and it is kept without
     # being checked here, so a file that is gone does not break loading. The Keys block says so when it reads the file.
@@ -564,6 +591,18 @@ class SettingsStore:
         if not settings.critical_keys:
             # No critical marks is the default, so a file with none has no such key.
             del data["critical_keys"]
+        if not settings.key_groups:
+            # No saved group labels is the default, so a file with none has no such key.
+            del data["key_groups"]
+        else:
+            # Written as a JSON object of name to label, not as a list of pairs.
+            data["key_groups"] = {name: label for name, label in settings.key_groups}
+        if not settings.key_subgroups:
+            # No saved subgroups is the default, so a file with none has no such key.
+            del data["key_subgroups"]
+        else:
+            # Written as a JSON object of name to label, the same shape as the group labels.
+            data["key_subgroups"] = {name: label for name, label in settings.key_subgroups}
         if not settings.disabled_tools:
             # Every tool on is the default, so a file with no switched-off tool has no such key.
             del data["disabled_tools"]

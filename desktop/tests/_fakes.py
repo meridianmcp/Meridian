@@ -76,6 +76,7 @@ class FakeUserRegistry:
 
     def __init__(self, *, announced: bool = True, fail_write: BaseException | None = None) -> None:
         self.writes: list[tuple[str, str]] = []
+        self.values: dict[str, str] = {}
         self.announcements = 0
         self._announced = announced
         self._fail_write = fail_write
@@ -84,6 +85,13 @@ class FakeUserRegistry:
         if self._fail_write is not None:
             raise self._fail_write
         self.writes.append((name, value))
+        self.values[name] = value
+
+    def read_user_value(self, name: str) -> str | None:
+        return self.values.get(name)
+
+    def delete_user_value(self, name: str) -> bool:
+        return self.values.pop(name, None) is not None
 
     def announce_change(self) -> bool:
         self.announcements += 1

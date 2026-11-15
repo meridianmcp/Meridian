@@ -75,6 +75,10 @@ class RegistryBackend(Protocol):
 
     def write_user_value(self, name: str, value: str) -> None: ...
 
+    def read_user_value(self, name: str) -> str | None: ...
+
+    def delete_user_value(self, name: str) -> bool: ...
+
     def announce_change(self) -> bool: ...
 
 
@@ -95,6 +99,28 @@ class WindowsRegistry:
 
         with winreg.OpenKey(winreg.HKEY_CURRENT_USER, ENVIRONMENT_SUBKEY, 0, winreg.KEY_SET_VALUE) as key:
             winreg.SetValueEx(key, name, 0, winreg.REG_SZ, value)
+
+    def read_user_value(self, name: str) -> str | None:
+        """The text of ``name`` for this user, or None when the variable is not set or is not text."""
+        import winreg  # lazy: only Windows has it
+
+        try:
+            with winreg.OpenKey(winreg.HKEY_CURRENT_USER, ENVIRONMENT_SUBKEY, 0, winreg.KEY_QUERY_VALUE) as key:
+                value, kind = winreg.QueryValueEx(key, name)
+        except FileNotFoundError:
+            return None
+        return value if kind == winreg.REG_SZ and isinstance(value, str) else None
+
+    def delete_user_value(self, name: str) -> bool:
+        """Delete ``name`` for this user. Return True when it was removed, False when it was not set."""
+        import winreg  # lazy: only Windows has it
+
+        try:
+            with winreg.OpenKey(winreg.HKEY_CURRENT_USER, ENVIRONMENT_SUBKEY, 0, winreg.KEY_SET_VALUE) as key:
+                winreg.DeleteValue(key, name)
+        except FileNotFoundError:
+            return False
+        return True
 
     def announce_change(self) -> bool:
         import ctypes  # lazy: ctypes.windll exists only on Windows
@@ -151,6 +177,31 @@ class UserEnvironment:
             return bool(_call("announce", backend.announce_change))
         except UserEnvironmentError:
             return False
+
+    def read(self, name: str) -> str | None:
+        """The current text of ``name`` for this user, or None when it is not set. The caller decides what to do with it."""
+        problem = variable_name_problem(name)
+        if problem is not None:
+            raise UserEnvironmentError(problem)
+        return _call("read", self._module().read_user_value, name)
+
+    def delete(self, name: str) -> bool:
+        """Delete ``name`` for this user. Return True when it was removed, False when it was not set.
+
+        The name is checked first. A failed delete raises and leaves the variable as it was. The change is announced
+        after a successful delete, and a failed announcement does not undo the delete.
+        """
+        problem = variable_name_problem(name)
+        if problem is not None:
+            raise UserEnvironmentError(problem)
+        backend = self._module()
+        removed = bool(_call("delete", backend.delete_user_value, name))
+        if removed:
+            try:
+                _call("announce", backend.announce_change)
+            except UserEnvironmentError:
+                pass
+        return removed
 
 
 __all__ = [

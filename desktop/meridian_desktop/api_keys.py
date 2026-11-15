@@ -11,8 +11,8 @@ secret. A value is never written there. The critical marks are kept there too, a
 A key can also be set as a Windows user variable (set_user_environment). The value is read from the keychain, handed to
 meridian_desktop.user_environment, and dropped. It is never stored in settings and never returned to the caller.
 
-Nothing here returns a value: ``status`` tests only whether a value is set, and a failed read reads as unreadable. Errors
-name the step and the class, never the value.
+Only ``read_value`` returns a value, for the owner's Reveal and Copy on one card. ``status`` tests only whether a value is set,
+and a failed read reads as unreadable. Errors name the step and the class, never the value.
 """
 
 from __future__ import annotations
@@ -27,6 +27,14 @@ from meridian_desktop.user_environment import UserEnvironment, variable_name_pro
 KEY_SERVICE = RUNPOD_SERVICE
 RUNPOD_NAME = "RunPod"
 BUILT_IN_NAMES: tuple[str, ...] = (RUNPOD_NAME,)
+# The group a key starts in, by its name. The owner can change any group, so these are where a key starts, not a rule.
+# A name with no default starts in FALLBACK_GROUP. Labels hold text only, never a value.
+DEFAULT_GROUP_NAMES: dict[str, str] = {"OpenAI": "AI", "Anthropic": "AI", "Fly.io": "Hosting", "Neon": "Hosting"}
+FALLBACK_GROUP = "Other"
+# The subgroup a key starts in, by its name. A subgroup holds keys that only work as a set, such as an access key ID with its
+# secret. No multi-value service is registered in the desktop app, so none is seeded. A key with no subgroup has none.
+DEFAULT_SUBGROUP_NAMES: dict[str, str] = {}
+MAX_GROUP_LENGTH = 40
 MAX_NAME_LENGTH = 40
 MAX_CUSTOM_NAMES = 50
 CUSTOM_ACCOUNT_PREFIX = "key-"
@@ -92,6 +100,27 @@ def account_for(name: str) -> str:
     if key == slug(RUNPOD_NAME):
         return RUNPOD_ACCOUNT
     return f"{CUSTOM_ACCOUNT_PREFIX}{key}"
+
+
+def clean_group(text: str) -> str:
+    """The group label the owner typed, with its spaces collapsed. Raise KeyNameError for an empty or too long label."""
+    cleaned = " ".join(str(text).split())
+    if not cleaned:
+        raise KeyNameError("Type a group name first.")
+    if len(cleaned) > MAX_GROUP_LENGTH:
+        raise KeyNameError(f"A group name can be at most {MAX_GROUP_LENGTH} characters.")
+    return cleaned
+
+
+def clean_subgroup(text: str) -> str:
+    """The subgroup label the owner typed, with its spaces collapsed. An empty label is "", which clears the subgroup.
+
+    Raise KeyNameError for a label longer than MAX_GROUP_LENGTH characters.
+    """
+    cleaned = " ".join(str(text).split())
+    if len(cleaned) > MAX_GROUP_LENGTH:
+        raise KeyNameError(f"A subgroup name can be at most {MAX_GROUP_LENGTH} characters.")
+    return cleaned
 
 
 def environment_name(name: str) -> str:
@@ -168,6 +197,72 @@ class ApiKeys:
         self._settings.save(replace(current, critical_keys=tuple(kept)))
         return listed
 
+    def group_of(self, name: str) -> str:
+        """The group a listed key is shown under: the owner's label when there is one, else its default, else the fallback."""
+        listed = self._listed(clean_name(name))
+        if listed is None:
+            raise KeyNameError("That key name is not listed.")
+        key = slug(listed)
+        for saved_name, label in self._settings.load().settings.key_groups:
+            if slug(saved_name) == key:
+                return label
+        for default_name, default_label in DEFAULT_GROUP_NAMES.items():
+            if slug(default_name) == key:
+                return default_label
+        return FALLBACK_GROUP
+
+    def set_group(self, name: str, label: str) -> str:
+        """Save the owner's group label for a listed key, and return it. Only the label is stored, never a value.
+
+        Raise KeyNameError when the name is not listed or the label is empty or too long. Raise OSError when the settings
+        file cannot be written.
+        """
+        listed = self._listed(clean_name(name))
+        if listed is None:
+            raise KeyNameError("That key name is not listed.")
+        cleaned = clean_group(label)
+        key = slug(listed)
+        current = self._settings.load().settings
+        kept = tuple(pair for pair in current.key_groups if slug(pair[0]) != key)
+        self._settings.save(replace(current, key_groups=(*kept, (listed, cleaned))))
+        return cleaned
+
+    def subgroup_of(self, name: str) -> str:
+        """The subgroup a listed key is in, or "" when it has none. The owner's label wins over a default.
+
+        Raise KeyNameError when the name is not listed.
+        """
+        listed = self._listed(clean_name(name))
+        if listed is None:
+            raise KeyNameError("That key name is not listed.")
+        key = slug(listed)
+        for saved_name, label in self._settings.load().settings.key_subgroups:
+            if slug(saved_name) == key:
+                return label
+        for default_name, default_label in DEFAULT_SUBGROUP_NAMES.items():
+            if slug(default_name) == key:
+                return default_label
+        return ""
+
+    def set_subgroup(self, name: str, label: str) -> str:
+        """Save the owner's subgroup label for a listed key, and return it. Only the label is stored, never a value.
+
+        An empty label clears the owner's label, so the key falls back to its default subgroup, if one is seeded, or to none.
+        Raise KeyNameError when the name is not listed or the label is too long. Raise OSError when the settings file cannot
+        be written.
+        """
+        listed = self._listed(clean_name(name))
+        if listed is None:
+            raise KeyNameError("That key name is not listed.")
+        cleaned = clean_subgroup(label)
+        key = slug(listed)
+        current = self._settings.load().settings
+        kept = tuple(pair for pair in current.key_subgroups if slug(pair[0]) != key)
+        if cleaned:
+            kept = (*kept, (listed, cleaned))
+        self._settings.save(replace(current, key_subgroups=kept))
+        return cleaned
+
     def environment_name(self, name: str) -> str:
         """The Windows user variable this listed key is set as. Raise KeyNameError when it is not listed or cannot be one."""
         listed = self._listed(clean_name(name))
@@ -200,6 +295,18 @@ class ApiKeys:
             return STATUS_UNREADABLE
         return STATUS_SET if value else STATUS_NOT_SET
 
+    def read_value(self, name: str) -> str | None:
+        """The saved value of a listed key, or None when no value is set. The only call here that returns a value.
+
+        The owner's Reveal and Copy controls use it, one card at a time. Nothing calls it at startup or to fill a list, and
+        it never logs the value. Raise KeyNameError when the name is not listed. Raise SecretStoreError when the keychain
+        cannot be read, so a failed read is never reported as an unset key.
+        """
+        listed = self._listed(clean_name(name))
+        if listed is None:
+            raise KeyNameError("That key name is not listed.")
+        return self._secrets.get_secret(KEY_SERVICE, account_for(listed)) or None
+
     def save(self, name: str, value: str) -> str:
         """Save a value under a name. A new name is added to the list. Return the name as it is listed.
 
@@ -231,13 +338,36 @@ class ApiKeys:
         listed = self._listed(clean_name(name))
         if listed is None:
             raise KeyNameError("That key name is not listed.")
+        # The Windows variable goes first. If it cannot be deleted, the keychain value stays, so the owner can try again.
+        self._remove_user_variable(listed)
         removed = bool(self._secrets.delete_secret(KEY_SERVICE, account_for(listed)))
         if listed not in BUILT_IN_NAMES:
             # A custom name that leaves the list also loses its critical mark, so no stale mark is left behind.
             gone = slug(listed)
             marks = tuple(raw for raw in self._settings.load().settings.critical_keys if slug(raw) != gone)
             self._write_custom([kept for kept in self._custom_names() if slug(kept) != gone], critical_keys=marks)
+            # A removed custom name also loses its group and subgroup labels, so no stale label is left behind.
+            current = self._settings.load().settings
+            groups = tuple(pair for pair in current.key_groups if slug(pair[0]) != gone)
+            subgroups = tuple(pair for pair in current.key_subgroups if slug(pair[0]) != gone)
+            if groups != current.key_groups or subgroups != current.key_subgroups:
+                self._settings.save(replace(current, key_groups=groups, key_subgroups=subgroups))
         return removed
+
+    def _remove_user_variable(self, listed: str) -> None:
+        """Delete the Windows user variable this key was set as, but only when it holds this key's saved value.
+
+        A variable of the same name that holds some other text, or that another program set, is left alone. With no
+        saved value there is nothing to compare, so nothing is deleted. Errors come from the registry as
+        UserEnvironmentError, and the message names the step and the class only, never the value.
+        """
+        variable = environment_name(listed)
+        saved = self._secrets.get_secret(KEY_SERVICE, account_for(listed))
+        if not saved:
+            return
+        if self._user_environment.read(variable) != saved:
+            return
+        self._user_environment.delete(variable)
 
     def _listed(self, name: str) -> str | None:
         """The listed name with the same slug as ``name``, or None when there is none."""

@@ -3,16 +3,18 @@ add form. Qt code.
 
 The RunPod entry is the RunPod panel's own card (ui/runpod_panel.py), so its checks, its pod list and its key row work as
 they did before. Every other name is a card of its own: its status, a password box for a new value, Save value and Remove.
-A name is added with the form at the foot of the block. The search box above the list shows only the cards whose name
-contains its text, ignoring case. It searches names only, never values or statuses.
+A name is added with the form at the foot of the block. The search box above the list shows the cards whose name, known
+service description, group label or subgroup label contains its text, ignoring case. It never searches values or statuses.
 
 Each card, RunPod's included, has a Mark critical box and a Set as Windows user variable button. A critical name is listed
 first and shows a Critical badge. The mark is saved in settings by name. Setting a user variable asks first, and then writes
 the saved value to the Windows user environment.
 
-Values go to the keychain through api_keys. This block never shows a value, never reads one back into a control, and never
-writes one to the settings file. A status is read only to test whether a value is set. A failed read shows as unreadable.
-Remove asks first, because the saved value is deleted from the keychain.
+Values go to the keychain through api_keys, and this block never writes one to the settings file. A value is read back only
+when the owner presses Reveal on one card. It then shows in a read-only field, and it is masked again after 30 seconds or at
+once with Hide value. Copy value puts it on the clipboard, which is cleared 30 seconds later if it still holds that value.
+No value is read at startup or into a list. A status is read only to test whether a value is set. A failed read shows as
+unreadable. Remove asks first, because the saved value is deleted from the keychain.
 
 A keys file the owner chose lists more names (keys_file.py). Each one is a card marked From file, with no value box: its
 value stays in the file and is read only when its Check is pressed. The app never writes the file. Remove on such a name
@@ -26,13 +28,16 @@ and shows one fixed message. The form can pick a service, which fills in the nam
 
 from __future__ import annotations
 
+import hashlib
+import hmac
 from collections.abc import Callable
 from dataclasses import dataclass, replace
 from itertools import count
 from pathlib import Path
 from typing import Any
 
-from PySide6.QtCore import Qt, Slot
+from PySide6.QtCore import Qt, QTimer, Slot
+from PySide6.QtGui import QClipboard, QGuiApplication
 from PySide6.QtWidgets import (
     QCheckBox,
     QComboBox,
@@ -81,7 +86,7 @@ from meridian_desktop.secret_store import SecretStore, SecretStoreError
 from meridian_desktop.settings_store import SettingsStore
 from meridian_desktop.ui.confirm import ask_yes_no
 from meridian_desktop.ui.delivery import Delivered, shared_delivery
-from meridian_desktop.ui.key_vault_box import KeyVaultBox
+from meridian_desktop.ui.key_vault_box import REVEAL_TEXT, KeyVaultBox
 from meridian_desktop.ui.runner_actions import submit
 from meridian_desktop.projects_backup import BACKUP_DIR_NAME, utc_now
 from meridian_desktop.ui.text import make_selectable
@@ -102,7 +107,10 @@ ADD_TEXT = "Add key"
 SAVE_VALUE_TEXT = "Save value"
 REMOVE_TEXT = "Remove"
 REMOVE_TITLE = "Remove this key?"
-REMOVE_BODY = "The saved value for {name} is deleted from the keychain. {listing} This cannot be undone."
+REMOVE_BODY = (
+    "The saved value for {name} is deleted from the keychain. If Meridian set a Windows user variable for it that still "
+    "holds this value, that variable is deleted too. {listing} This cannot be undone."
+)
 REMOVE_LISTING = "The name also leaves the list."
 CANCELLED_TEXT = "Cancelled. Nothing was removed."
 STATUS_TEXT = {
@@ -118,6 +126,21 @@ REMOVED_NO_VALUE_TEXT = "Removed {name} from the list. No value was saved for it
 NOT_REMOVED_TEXT = "Not removed. {detail}"
 # A removal that failed on the disk or in the keychain. The message names no path and no value.
 NOT_REMOVED_OS_TEXT = "Not removed. The key could not be deleted or its name could not be written. Try again."
+# The Windows user variable could not be deleted. The keychain value is not touched, so the key is still saved.
+NOT_REMOVED_ENV_TEXT = "Not removed. The Windows user variable could not be deleted, so the key is still saved. Try again."
+# The group label on each keychain card, and the editor that changes it. A label is text the owner typed, never a value.
+GROUP_TEXT = "Group: {group}"
+GROUP_PLACEHOLDER = "Group, for example AI"
+GROUP_SAVE_TEXT = "Save group"
+GROUP_SAVED_TEXT = "{name} is in the group {group}."
+# The subgroup line on each keychain card, and the editor that changes it. Keys that only work as a set share one subgroup.
+SUBGROUP_TEXT = "Subgroup: {subgroup}"
+# Shown in place of a subgroup name on a card with no subgroup. The search never matches this text, only the label itself.
+NO_SUBGROUP_TEXT = "none"
+SUBGROUP_PLACEHOLDER = "Subgroup, for example AWS keys"
+SUBGROUP_SAVE_TEXT = "Save subgroup"
+SUBGROUP_SAVED_TEXT = "{name} is in the subgroup {subgroup}."
+SUBGROUP_CLEARED_TEXT = "{name} is no longer in a subgroup."
 NAMES_NOT_READ_TEXT = "The saved key names could not be read. Reopen Settings to try again."
 NOT_WRITTEN_TEXT = "Not saved: the settings file could not be written."
 RUNPOD_HEADING_TEXT = RUNPOD_NAME
@@ -182,6 +205,19 @@ UNCLASSIFIED_HEADING_TEXT = "Non-critical: any other name. Set automatically."
 EXPORT_TEXT = "Export key names"
 EXPORTED_TEXT = "Saved the key names and their classification to {path}. No value is in the file."
 EXPORT_FAILED_TEXT = "Not saved: the key names could not be written. Try again."
+# The Reveal, Hide value and Copy value controls of a keychain name. A shown value is masked after REVEAL_SECONDS, and a copied
+# value is cleared from the clipboard after CLIPBOARD_SECONDS, but only while the clipboard still holds that value.
+REVEAL_SECONDS = 30
+CLIPBOARD_SECONDS = 30
+HIDE_VALUE_TEXT = "Hide value"
+COPY_VALUE_TEXT = "Copy value"
+REVEAL_SHOWN_TEXT = "Showing the value of {name} for {seconds} seconds. It is hidden again after that, or with Hide value."
+REVEAL_HIDDEN_TEXT = "The value of {name} is hidden again."
+REVEAL_NO_VALUE_TEXT = "No value is saved for {name}, so there is nothing to show."
+REVEAL_NOT_READ_TEXT = "The keychain could not be read, so no value is shown."
+COPIED_VALUE_TEXT = "Copied the value of {name} to the clipboard. It is cleared in {seconds} seconds if it still holds it."
+COPY_NO_VALUE_TEXT = "No value is saved for {name}, so nothing was copied."
+COPY_NOT_READ_TEXT = "The keychain could not be read, so nothing was copied."
 
 # A confirmation: (parent, title, text) -> True only when the owner clicks Yes.
 Confirm = Callable[[QWidget, str, str], bool]
@@ -196,6 +232,21 @@ def _service_text(name: str) -> str:
     """
     service = service_for(name)
     return service.description.casefold() if service is not None else ""
+
+
+def _subgroup_key(label: str) -> str:
+    """The identity of a subgroup: its label, casefolded, so "AWS keys" and "aws keys" are one subgroup."""
+    return label.casefold()
+
+
+def _system_clipboard() -> QClipboard:
+    """The clipboard the Copy value control writes to. Tests replace this, so the real clipboard is never touched."""
+    return QGuiApplication.clipboard()
+
+
+def _digest(value: str) -> bytes:
+    """A digest of a copied value. The section keeps this for the clipboard check, so it never keeps the value itself."""
+    return hashlib.sha256(value.encode("utf-8")).digest()
 
 
 def _details_toggle(frame: QFrame, key: str) -> QPushButton:
@@ -321,7 +372,21 @@ class _Card:
     mark: _Mark | None = None
     check: QPushButton | None = None
     check_result: QLabel | None = None
+    # The subgroup line of a keychain card, which the layout and the search read. None on a From file card.
+    subgroup: QLabel | None = None
     from_file: bool = False
+
+
+@dataclass
+class _Reveal:
+    """The Reveal, Hide value and Copy value controls of one keychain name, with the field its value is shown in.
+
+    ``timer`` masks that field again after REVEAL_SECONDS. Reveal, Copy value and the timer's handler are wired by the section.
+    """
+
+    shown: QLineEdit
+    hide: QPushButton
+    timer: QTimer
 
 
 class KeysSection(QWidget):
@@ -355,6 +420,10 @@ class KeysSection(QWidget):
         # The names a From file card was removed for, by slug. This session keeps them, and the file is never changed.
         self._hidden_file_slugs: set[str] = set()
         self._cards: dict[str, _Card] = {}
+        # One heading per subgroup, by its subgroup key. A heading is made once and reused. Only the subgroups with a keychain
+        # card on the list are in the layout (_subgroup_in_use), and only those can show.
+        self._subgroup_headings: dict[str, QLabel] = {}
+        self._subgroup_in_use: set[str] = set()
         # The RunPod card's frame and its marks, when a RunPod card is hosted. The frame sits in the same list as the others,
         # so a critical RunPod is listed first, and the search filters it by its name like the others.
         self._runpod_frame: QFrame | None = None
@@ -370,6 +439,15 @@ class KeysSection(QWidget):
         self._pending: dict[str, int] = {}
         shared_delivery().delivered.connect(self._on_names_loaded)
         shared_delivery().delivered.connect(self._on_check_delivered)
+        # The Reveal controls of each keychain name, by name. The clipboard timer clears a copied value after
+        # CLIPBOARD_SECONDS. It holds only a digest of that value, so the check can match the clipboard without the value.
+        self._reveals: dict[str, _Reveal] = {}
+        self._copied_digest: bytes | None = None
+        self._clipboard_timer = QTimer(self)
+        self._clipboard_timer.setObjectName("keys-clipboard-timer")
+        self._clipboard_timer.setSingleShot(True)
+        self._clipboard_timer.setInterval(CLIPBOARD_SECONDS * 1000)
+        self._clipboard_timer.timeout.connect(self._clear_copied_value)
         self._build()
         self._load_names()
 
@@ -499,6 +577,9 @@ class KeysSection(QWidget):
         head.addStretch(1)
         frame_column.addLayout(head)
         frame_column.addWidget(self._runpod_card)
+        reveal_row, reveal = self._make_reveal(frame, slug(RUNPOD_NAME), RUNPOD_NAME)
+        self._reveals[RUNPOD_NAME] = reveal
+        frame_column.addLayout(reveal_row)
         frame_column.addLayout(_action_row(mark))
         self._entry_layout.addWidget(frame)
 
@@ -576,6 +657,9 @@ class KeysSection(QWidget):
         head.addWidget(mark.badge)
         status = _label(frame, f"keys-entry-{key}-status")
         head.addWidget(status, 1)
+        head.addWidget(_label(frame, f"keys-entry-{key}-group", GROUP_TEXT.format(group=self._group_text(name))))
+        subgroup_label = _label(frame, f"keys-entry-{key}-subgroup", self._subgroup_line(name))
+        head.addWidget(subgroup_label)
         toggle = _details_toggle(frame, key)
         head.addWidget(toggle)
         column.addLayout(head)
@@ -601,7 +685,33 @@ class KeysSection(QWidget):
         row.addWidget(save)
         row.addWidget(remove)
         details.addLayout(row)
+        reveal_row, reveal = self._make_reveal(panel, key, name)
+        self._reveals[name] = reveal
+        details.addLayout(reveal_row)
         details.addLayout(_action_row(mark))
+        # The group editor: the owner types a new label and saves it. Only the label is stored.
+        group_row = QHBoxLayout()
+        group_edit = QLineEdit(panel)
+        group_edit.setObjectName(f"keys-entry-{key}-group-edit")
+        group_edit.setPlaceholderText(GROUP_PLACEHOLDER)
+        group_save = QPushButton(GROUP_SAVE_TEXT, panel)
+        group_save.setObjectName(f"keys-entry-{key}-group-save")
+        group_row.addWidget(group_edit, 1)
+        group_row.addWidget(group_save)
+        details.addLayout(group_row)
+        group_save.clicked.connect(lambda *_, n=name: self._on_group_saved(n))
+        # The subgroup editor: the owner types the subgroup this key belongs to, or leaves it empty to clear it. Only the label
+        # is stored.
+        subgroup_row = QHBoxLayout()
+        subgroup_edit = QLineEdit(panel)
+        subgroup_edit.setObjectName(f"keys-entry-{key}-subgroup-edit")
+        subgroup_edit.setPlaceholderText(SUBGROUP_PLACEHOLDER)
+        subgroup_save = QPushButton(SUBGROUP_SAVE_TEXT, panel)
+        subgroup_save.setObjectName(f"keys-entry-{key}-subgroup-save")
+        subgroup_row.addWidget(subgroup_edit, 1)
+        subgroup_row.addWidget(subgroup_save)
+        details.addLayout(subgroup_row)
+        subgroup_save.clicked.connect(lambda *_, n=name: self._on_subgroup_saved(n))
 
         check, check_result = self._check_row(panel, details, key, name, service)
 
@@ -609,7 +719,38 @@ class KeysSection(QWidget):
         value.returnPressed.connect(lambda *_, n=name: self._on_save_value(n))
         remove.clicked.connect(lambda *_, n=name: self._on_remove(n))
         _connect_details(toggle, panel)
-        return _Card(frame, status, value, mark, check, check_result)
+        return _Card(frame, status, value, mark, check, check_result, subgroup=subgroup_label)
+
+    def _make_reveal(self, parent: QFrame, key: str, name: str) -> tuple[QHBoxLayout, _Reveal]:
+        """The Reveal, Hide value and Copy value row of a keychain name, and the field its value is shown in.
+
+        The field is read-only, empty and hidden until Reveal is pressed. Its timer masks it again after REVEAL_SECONDS.
+        """
+        shown = QLineEdit(parent)
+        shown.setObjectName(f"keys-entry-{key}-revealed")
+        shown.setReadOnly(True)
+        shown.setVisible(False)
+        reveal = QPushButton(REVEAL_TEXT, parent)
+        reveal.setObjectName(f"keys-entry-{key}-reveal")
+        hide = QPushButton(HIDE_VALUE_TEXT, parent)
+        hide.setObjectName(f"keys-entry-{key}-hide")
+        hide.setVisible(False)
+        copy = QPushButton(COPY_VALUE_TEXT, parent)
+        copy.setObjectName(f"keys-entry-{key}-copy")
+        timer = QTimer(parent)
+        timer.setObjectName(f"keys-entry-{key}-reveal-timer")
+        timer.setSingleShot(True)
+        timer.setInterval(REVEAL_SECONDS * 1000)
+        row = QHBoxLayout()
+        row.addWidget(reveal)
+        row.addWidget(hide)
+        row.addWidget(copy)
+        row.addWidget(shown, 1)
+        reveal.clicked.connect(lambda *_, n=name: self._on_reveal(n))
+        hide.clicked.connect(lambda *_, n=name: self._mask(n))
+        copy.clicked.connect(lambda *_, n=name: self._on_copy_value(n))
+        timer.timeout.connect(lambda *_, n=name: self._auto_hide(n))
+        return row, _Reveal(shown, hide, timer)
 
     def _make_file_card(self, name: str) -> _Card:
         """The card for a name the keys file lists. It has no value box: the value stays in the file and is read on Check."""
@@ -691,6 +832,8 @@ class KeysSection(QWidget):
         for entry in listed:
             card = self._card_for(entry.name, from_file=False)
             card.status.setText(STATUS_TEXT[entry.status])
+            if card.subgroup is not None:
+                card.subgroup.setText(self._subgroup_line(entry.name))
             if card.mark is not None:
                 _show_mark(card.mark, entry.critical)
         for entry in entries:
@@ -719,6 +862,9 @@ class KeysSection(QWidget):
     def _drop_card(self, name: str) -> None:
         card = self._cards.pop(name)
         self._pending.pop(name, None)  # a check still running for a dropped card has no card to show its result on
+        reveal = self._reveals.pop(name, None)
+        if reveal is not None:
+            reveal.timer.stop()  # a shown value leaves with its card, and its timer does not fire for a gone card
         self._entry_layout.removeWidget(card.frame)
         card.frame.hide()
         card.frame.deleteLater()
@@ -801,18 +947,50 @@ class KeysSection(QWidget):
     def _reorder(self, entries: list[Any]) -> None:
         """Lay the cards out in the order of ``entries``, which lists the critical names first. RunPod sits where its entry is.
 
-        A From file card is not in ``entries``, so it keeps its place after the keychain names.
+        The cards of one subgroup sit together under its heading. A subgroup's block goes where its first card is in
+        ``entries``. Entries list the critical names first, so a block with a critical card comes before the others. A From
+        file card is not in ``entries``, so it keeps its place after the keychain names.
         """
-        frames: list[QFrame] = []
+        blocks: list[list[QWidget]] = []
+        block_of: dict[str, list[QWidget]] = {}
         for entry in entries:
+            frame: QFrame | None
             if entry.built_in:
-                if self._runpod_frame is not None:
-                    frames.append(self._runpod_frame)
+                frame = self._runpod_frame
             elif entry.name in self._cards and not self._cards[entry.name].from_file:
-                frames.append(self._cards[entry.name].frame)
-        for index, frame in enumerate(frames):
-            self._entry_layout.removeWidget(frame)
-            self._entry_layout.insertWidget(index, frame)
+                frame = self._cards[entry.name].frame
+            else:
+                continue
+            if frame is None:
+                continue
+            label = "" if entry.built_in else self._subgroup_text(entry.name)
+            if not label:
+                blocks.append([frame])
+                continue
+            key = _subgroup_key(label)
+            if key not in block_of:
+                block_of[key] = [self._subgroup_heading(key, label)]
+                blocks.append(block_of[key])
+            block_of[key].append(frame)
+        sequence = [widget for block in blocks for widget in block]
+        for index, widget in enumerate(sequence):
+            self._entry_layout.removeWidget(widget)
+            self._entry_layout.insertWidget(index, widget)
+        self._subgroup_in_use = set(block_of)
+        # A heading with no card on the list leaves the layout, and is hidden so that it cannot show loose.
+        for key, heading in self._subgroup_headings.items():
+            if key not in block_of:
+                self._entry_layout.removeWidget(heading)
+                heading.hide()
+
+    def _subgroup_heading(self, key: str, label: str) -> QLabel:
+        """The heading of one subgroup. It is made once and reused, so a subgroup keeps the same widget."""
+        heading = self._subgroup_headings.get(key)
+        if heading is None:
+            heading = _bold(_label(self, f"keys-subgroup-{slug(label)}"))
+            self._subgroup_headings[key] = heading
+        heading.setText(label)
+        return heading
 
     def _show(self, text: str) -> None:
         self._message.setText(text)
@@ -821,14 +999,72 @@ class KeysSection(QWidget):
     # ----------------------------------------------------------- search
 
     @Slot(str)
+    def _group_text(self, name: str) -> str:
+        """The group a listed key is in, or "" for a name that is not listed (a file-only name, or RunPod's card)."""
+        try:
+            return self._keys.group_of(name)
+        except KeyNameError:
+            return ""
+
+    def _subgroup_text(self, name: str) -> str:
+        """The subgroup label a listed key is in, or "" when it has none (a file-only name, or none set)."""
+        try:
+            return self._keys.subgroup_of(name)
+        except KeyNameError:
+            return ""
+
+    def _subgroup_line(self, name: str) -> str:
+        """The line a keychain card shows for its subgroup. A key with no subgroup shows NO_SUBGROUP_TEXT."""
+        return SUBGROUP_TEXT.format(subgroup=self._subgroup_text(name) or NO_SUBGROUP_TEXT)
+
+    def _on_group_saved(self, name: str) -> None:
+        """Save the group label the owner typed for a keychain card, and show it on the card."""
+        key = slug(name)
+        edit = self.findChild(QLineEdit, f"keys-entry-{key}-group-edit")
+        try:
+            group = self._keys.set_group(name, edit.text() if edit is not None else "")
+        except KeyNameError as exc:
+            self._show(str(exc))
+            return
+        except OSError:
+            self._show(NOT_WRITTEN_TEXT)
+            return
+        if edit is not None:
+            edit.clear()
+        label = self.findChild(QLabel, f"keys-entry-{key}-group")
+        if label is not None:
+            label.setText(GROUP_TEXT.format(group=group))
+        self._apply_filter()
+        self._show(GROUP_SAVED_TEXT.format(name=name, group=group))
+
+    def _on_subgroup_saved(self, name: str) -> None:
+        """Save the subgroup the owner typed for a keychain card, or clear it when the box is empty, then lay out again."""
+        key = slug(name)
+        edit = self.findChild(QLineEdit, f"keys-entry-{key}-subgroup-edit")
+        try:
+            subgroup = self._keys.set_subgroup(name, edit.text() if edit is not None else "")
+        except KeyNameError as exc:
+            self._show(str(exc))
+            return
+        except OSError:
+            self._show(NOT_WRITTEN_TEXT)
+            return
+        if edit is not None:
+            edit.clear()
+        # The card moves under its subgroup heading, or out from under one, so the list is laid out again.
+        self.refresh()
+        if subgroup:
+            self._show(SUBGROUP_SAVED_TEXT.format(name=name, subgroup=subgroup))
+        else:
+            self._show(SUBGROUP_CLEARED_TEXT.format(name=name))
+
     def _on_search_changed(self, _text: str) -> None:
         self._apply_filter()
 
     def _apply_filter(self) -> None:
         """Show each card whose name, or the description of its known service, holds the search text, ignoring case.
 
-        Values and statuses are never matched. Groups are not searched yet: keys have no group field until the grouping
-        item is built.
+        Values and statuses are never matched. Group and subgroup labels are matched too.
         """
         query = self._search.text().strip().casefold()
         frames = [(name, card.frame) for name, card in self._cards.items()]
@@ -837,15 +1073,29 @@ class KeysSection(QWidget):
         any_match = False
         # A group heading shows only while one of its From file cards is on screen.
         group_shown = {True: False, False: False}
+        # A subgroup heading shows only while one of its keychain cards is on screen.
+        subgroup_shown: set[str] = set()
         for name, frame in frames:
-            match = not query or query in name.casefold() or query in _service_text(name)
+            card = self._cards.get(name)
+            keychain = card is not None and not card.from_file
+            subgroup = self._subgroup_text(name) if keychain else ""
+            match = (
+                not query
+                or query in name.casefold()
+                or query in _service_text(name)
+                or query in self._group_text(name).casefold()
+                or query in subgroup.casefold()
+            )
             frame.setVisible(match)
             any_match = any_match or match
-            card = self._cards.get(name)
             if match and card is not None and card.from_file:
                 group_shown[is_classified(name)] = True
+            if match and subgroup:
+                subgroup_shown.add(_subgroup_key(subgroup))
         self._classified_heading.setVisible(group_shown[True])
         self._unclassified_heading.setVisible(group_shown[False])
+        for key, heading in self._subgroup_headings.items():
+            heading.setVisible(key in self._subgroup_in_use and key in subgroup_shown)
         # Nothing is said while the names are still being read, because no card exists yet to match against.
         self._search_empty.setVisible(bool(query) and not any_match and not self._loading)
 
@@ -877,6 +1127,75 @@ class KeysSection(QWidget):
         choice = self._new_service.itemText(index)
         if choice != OTHER_CHOICE:
             self._new_name.setText(choice)
+
+    def _on_reveal(self, name: str) -> None:
+        """Show the saved value of one name for REVEAL_SECONDS. A press while it is shown reads it again and restarts the time."""
+        reveal = self._reveals.get(name)
+        if reveal is None:
+            return
+        try:
+            value = self._keys.read_value(name)
+        except KeyNameError as exc:
+            self._mask(name)
+            self._show(str(exc))
+            return
+        except SecretStoreError:
+            self._mask(name)
+            self._show(REVEAL_NOT_READ_TEXT)  # names no step, class or value
+            return
+        if not value:
+            self._mask(name)
+            self._show(REVEAL_NO_VALUE_TEXT.format(name=name))
+            return
+        reveal.shown.setText(value)
+        reveal.shown.setVisible(True)
+        reveal.hide.setVisible(True)
+        reveal.timer.start()  # starting a running timer restarts it, so a second press gives the full time again
+        self._show(REVEAL_SHOWN_TEXT.format(name=name, seconds=REVEAL_SECONDS))
+
+    def _mask(self, name: str) -> None:
+        """Hide the value of one name at once: clear its field, hide the field and Hide value, and stop its timer."""
+        reveal = self._reveals.get(name)
+        if reveal is None:
+            return
+        reveal.timer.stop()
+        reveal.shown.clear()
+        reveal.shown.setVisible(False)
+        reveal.hide.setVisible(False)
+
+    def _auto_hide(self, name: str) -> None:
+        """The timer's handler: mask the value of one name once its time is up, and say so."""
+        if name not in self._reveals:
+            return
+        self._mask(name)
+        self._show(REVEAL_HIDDEN_TEXT.format(name=name))
+
+    def _on_copy_value(self, name: str) -> None:
+        """Copy the saved value of one name to the clipboard. It is cleared CLIPBOARD_SECONDS later if it is still there."""
+        try:
+            value = self._keys.read_value(name)
+        except KeyNameError as exc:
+            self._show(str(exc))
+            return
+        except SecretStoreError:
+            self._show(COPY_NOT_READ_TEXT)
+            return
+        if not value:
+            self._show(COPY_NO_VALUE_TEXT.format(name=name))
+            return
+        _system_clipboard().setText(value)
+        self._copied_digest = _digest(value)
+        self._clipboard_timer.start()  # a later copy restarts the time, for the newest value
+        self._show(COPIED_VALUE_TEXT.format(name=name, seconds=CLIPBOARD_SECONDS))
+
+    def _clear_copied_value(self) -> None:
+        """The clipboard timer's handler: clear the clipboard, but only while it still holds the value this section copied."""
+        digest, self._copied_digest = self._copied_digest, None
+        if digest is None:
+            return
+        clipboard = _system_clipboard()
+        if hmac.compare_digest(_digest(clipboard.text()), digest):
+            clipboard.clear()
 
     def _on_save_value(self, name: str) -> None:
         card = self._cards.get(name)
@@ -953,6 +1272,7 @@ class KeysSection(QWidget):
 
         A check still running is dropped here too, so its result, when it arrives, has no pending token to match.
         """
+        self._mask(name)  # a value shown before the change is no longer the saved one, so it is hidden
         self._pending.pop(name, None)
         card = self._cards.get(name)
         if card is not None and card.check is not None and card.check_result is not None:
@@ -1011,6 +1331,7 @@ class KeysSection(QWidget):
     def _on_remove(self, name: str) -> None:
         if name in BUILT_IN_NAMES:
             return  # RunPod keeps its own Remove key button, on its card
+        self._mask(name)  # a shown value is hidden before the owner is asked, and stays hidden if the removal fails
         card = self._cards.get(name)
         if card is not None and card.from_file:
             # A name from the keys file leaves the list for this session only. The file is never changed by a removal.
@@ -1027,6 +1348,10 @@ class KeysSection(QWidget):
             removed = self._keys.remove(name)
         except KeyNameError as exc:
             self._show(str(exc))
+            return
+        except UserEnvironmentError:
+            # The Windows variable is deleted before the keychain value, so the key is still saved here. Nothing is removed.
+            self._show(NOT_REMOVED_ENV_TEXT)
             return
         except SecretStoreError as exc:
             self._show(NOT_REMOVED_TEXT.format(detail=exc))
