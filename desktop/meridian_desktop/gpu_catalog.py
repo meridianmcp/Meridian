@@ -148,12 +148,79 @@ def fetch_catalog(
     return parse_catalog(payload)
 
 
+TIER_ANY = "any"
+TIER_SECURE = "secure"
+TIER_COMMUNITY = "community"
+
+
+def offered_secure(offer: GpuOffer) -> bool:
+    """RunPod lists a secure-cloud price for this GPU and has not capped it at zero."""
+    return offer.price_secure is not None and offer.max_count_secure != 0
+
+
+def offered_community(offer: GpuOffer) -> bool:
+    """RunPod lists a community-cloud price for this GPU and has not capped it at zero."""
+    return offer.price_community is not None and offer.max_count_community != 0
+
+
+def tier_price(offer: GpuOffer, tier: str) -> float | None:
+    """The price per GPU hour for one tier, or None when the tier does not offer the GPU.
+
+    With TIER_ANY it is the lowest price among the tiers that offer the GPU.
+    """
+    if tier == TIER_SECURE:
+        return offer.price_secure if offered_secure(offer) else None
+    if tier == TIER_COMMUNITY:
+        return offer.price_community if offered_community(offer) else None
+    prices = [p for p in (tier_price(offer, TIER_SECURE), tier_price(offer, TIER_COMMUNITY)) if p is not None]
+    return min(prices) if prices else None
+
+
+def filter_offers(
+    offers: tuple[GpuOffer, ...] | list[GpuOffer],
+    *,
+    text: str = "",
+    min_memory_gb: int = 0,
+    tier: str = TIER_ANY,
+    data_center: str = "",
+    max_price: float = 0.0,
+) -> tuple[GpuOffer, ...]:
+    """The offers that pass every filter, in their order. A zero minimum or price, or an empty text or data
+    center, means no filter on that field."""
+    needle = text.strip().casefold()
+    kept = []
+    for offer in offers:
+        if needle and needle not in " ".join((offer.gpu_id, offer.name, offer.manufacturer)).casefold():
+            continue
+        if min_memory_gb and (offer.memory_gb is None or offer.memory_gb < min_memory_gb):
+            continue
+        if tier == TIER_SECURE and not offered_secure(offer):
+            continue
+        if tier == TIER_COMMUNITY and not offered_community(offer):
+            continue
+        if data_center and not any(dc.id == data_center for dc in offer.data_centers):
+            continue
+        if max_price:
+            price = tier_price(offer, tier)
+            if price is None or price > max_price:
+                continue
+        kept.append(offer)
+    return tuple(kept)
+
+
 __all__ = [
     "CATALOG_QUERY",
     "CATALOG_URL",
     "DataCenterStock",
     "GpuCatalogError",
     "GpuOffer",
+    "TIER_ANY",
+    "TIER_COMMUNITY",
+    "TIER_SECURE",
     "fetch_catalog",
+    "filter_offers",
+    "offered_community",
+    "offered_secure",
     "parse_catalog",
+    "tier_price",
 ]

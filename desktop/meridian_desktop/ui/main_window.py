@@ -73,13 +73,14 @@ from meridian_desktop.data_source import STATE_OK, DataSources, resolve
 from meridian_desktop.hosted_client import Transport
 from meridian_desktop.restart_check import RestartWatch
 from meridian_desktop.runner_client import RunnerClient, RunnerResult
-from meridian_desktop.secret_store import KeyringSecretStore, SecretStore
+from meridian_desktop.secret_store import RUNPOD_ACCOUNT, RUNPOD_SERVICE, KeyringSecretStore, SecretStore
 from meridian_desktop.settings_store import HOSTED_MODE, SettingsStore, SettingsUnreadable
 from meridian_desktop.tools_status import ToolsStatus, read_tools_status
 from meridian_desktop.tunnel_status import BAR_CHECKING_TEXT, DEPENDENCY_TEXT, bar_texts, read_tunnel_status
 from meridian_desktop.ui.connection_bar import ConnectionBar
 from meridian_desktop.ui.delivery import Delivered, shared_delivery
 from meridian_desktop.ui.gpu_jobs_panel import GpuJobsPanel
+from meridian_desktop.ui.gpu_offers_panel import GpuOffersPanel
 from meridian_desktop.ui.home_tab import HomeDeps, HomeTab
 from meridian_desktop.ui.keys_tab import KeysTab
 from meridian_desktop.ui.projects_tab import ProjectsTab, default_sources
@@ -227,6 +228,11 @@ def _save_only_active(store: SettingsStore) -> Callable[[bool], bool]:
         return True
 
     return write
+
+
+def _runpod_key_reader(secrets: SecretStore) -> Callable[[], str | None]:
+    """The RunPod key from the credential store. It is called on a worker thread, never on the UI thread."""
+    return lambda: secrets.get_secret(RUNPOD_SERVICE, RUNPOD_ACCOUNT)
 
 
 def _saved_hosted(store: SettingsStore, secrets: SecretStore) -> Callable[[], tuple[str, str | None]]:
@@ -454,11 +460,17 @@ class MainWindow(QMainWindow):
             elif name == "GPUs":
                 # Nothing is read on build. The first show and the Refresh button read the GPUs. While the tab stays
                 # visible, a 5-second timer reads them again. The saved SSH hosts and the RunPod list are read on the worker thread.
-                page = GpuJobsPanel(
+                jobs = GpuJobsPanel(
                     _saved_gpu_hosts(self._store),
                     _saved_runpod_pods(self._store),
                     parent=self.tabs,
                 )
+                # The RunPod offers list sits above the jobs. Its key is read from the credential store on a worker thread.
+                column = QWidget(self.tabs)
+                stack = QVBoxLayout(column)
+                stack.addWidget(GpuOffersPanel(_runpod_key_reader(self._secrets), parent=column))
+                stack.addWidget(jobs)
+                page = _scroll_page(column, self.tabs)
             elif name == "Tunnel":
                 # The tunnel's status, Start, Stop and Restart (the Home card has its own Start), the lanes, the tool groups and the custom
                 # connectors. Its status is read when the tab is first shown. Settings no longer holds a copy.
