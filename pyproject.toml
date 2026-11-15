@@ -101,6 +101,11 @@ build-backend = "hatchling.build"
 [tool.hatch.build.targets.wheel]
 packages = ["meridian"]
 
+# Core publishes this sdist to PyPI on v-tags. hatchling includes the whole repo in an sdist unless told otherwise, so
+# the desktop app's source and licence files would be published. Keep it out.
+[tool.hatch.build.targets.sdist]
+exclude = ["/desktop"]
+
 [tool.ruff]
 line-length = 120
 

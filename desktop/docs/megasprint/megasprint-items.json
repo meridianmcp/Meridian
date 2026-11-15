@@ -1,0 +1,4136 @@
+{
+  "path_convention": "<core> is the Meridian core repository root. latex-dir is its meridian-latex directory. Paths are written with placeholders so this repository never names the engine path (tools/check_boundary.py).",
+  "version": "desktop-megasprint-v1",
+  "items": [
+    {
+      "slug": "desktop-metadata-requires-python-312",
+      "project": "meridian-desktop",
+      "wave": 0,
+      "title": "desktop metadata requires python 312",
+      "depends_on": [],
+      "files": [],
+      "existing_code": [],
+      "acceptance": [],
+      "tests": [],
+      "risk": "medium",
+      "notes": "Detail lost in the prospect run; minimal record. Owner question, default taken (override if wrong): Set requires-python to >=3.12 to match the pixi environment.",
+      "owner_decision_needed": "",
+      "blocker": "",
+      "collision_group": "",
+      "id": "MS-001"
+    },
+    {
+      "slug": "desktop-boundary-dynamic-qt-imports",
+      "project": "meridian-desktop",
+      "wave": 1,
+      "title": "Flag dynamic Qt imports outside ui (importlib.import_module and __import__)",
+      "depends_on": [
+        "desktop-boundary-mutation-survivors"
+      ],
+      "files": [
+        "tools/check_boundary.py",
+        "tests/test_boundary.py"
+      ],
+      "existing_code": [
+        "tools/check_boundary.py:60-67 _qt_imports reads only ast.Import and ast.ImportFrom",
+        "tests/test_boundary.py:38-44 test_qt_import_outside_ui_fails, the pattern to copy",
+        "tests/test_settings_store.py:132-141 no-Qt test with a qt_roots set, to reuse"
+      ],
+      "acceptance": [
+        "A non-UI file that calls importlib.import_module or __import__ with a string starting with a QT_ROOTS name, such as 'PySide6.QtCore', produces one VIOLATION line that names the file and line.",
+        "Calls with non-Qt names, such as importlib.import_module('json'), produce no violation.",
+        "meridian_desktop/ui/ and tray.py stay exempt.",
+        "test_real_repo_passes still passes."
+      ],
+      "tests": [
+        "tests/test_boundary.py::test_dynamic_qt_import_outside_ui_fails (parametrized over importlib.import_module and __import__)"
+      ],
+      "owner_decision_needed": "",
+      "risk": "low",
+      "notes": "The checker sees only static import statements, so a Qt import built with importlib or __import__ passes today. Best effort: detect string literals only, and document that as a limit. Owner question, default taken (override if wrong): Block dynamic Qt imports outside the ui package.",
+      "blocker": "",
+      "collision_group": "",
+      "id": "MS-002"
+    },
+    {
+      "slug": "desktop-boundary-mutation-survivors",
+      "project": "meridian-desktop",
+      "wave": 1,
+      "title": "Mutation-test check_boundary.py and add tests that kill each survivor",
+      "depends_on": [],
+      "files": [
+        "tests/test_boundary.py",
+        "tests/test_boundary_mutation.py"
+      ],
+      "acceptance": [
+        "Six mutants of a copy of tools/check_boundary.py are each killed: drop PySide2, drop shiboken6, walk only tree.body, drop .lower(), remove the SyntaxError branch, remove build from SKIP_DIRS",
+        "The unmutated checker passes every new test and is not modified",
+        "pixi run test passes before and after; pixi run boundary still prints boundary ok",
+        "Cases added: PySide2, PyQt6 and shiboken2 outside ui fail; import inside a function body fails; uppercase reference fails; SyntaxError fails closed"
+      ],
+      "tests": [
+        "tests/test_boundary_mutation.py::test_every_boundary_mutant_is_killed",
+        "tests/test_boundary.py::test_each_other_qt_root_outside_ui_fails",
+        "tests/test_boundary.py::test_import_inside_function_body_fails",
+        "tests/test_boundary.py::test_uppercase_windows_reference_fails",
+        "tests/test_boundary.py::test_syntax_error_fails_closed"
+      ],
+      "risk": "low",
+      "collision_group": "dsk-boundary",
+      "notes": "No new dependency (no mutmut). Survivors are predicted from reading and must be confirmed by the harness. Same test file as desktop-metadata-drift-docs: run that first.",
+      "blocker": "",
+      "id": "MS-003"
+    },
+    {
+      "slug": "desktop-verifier-leak-scan-tests",
+      "project": "meridian-desktop",
+      "wave": 1,
+      "title": "Add tests that plant a meridian_desktop source copy into a bundle",
+      "depends_on": [],
+      "files": [
+        "tests/test_verify_bundle.py"
+      ],
+      "acceptance": [
+        "A dist tree holding a byte-identical copy of settings_store.py under a neutral name fails with copy of meridian_desktop source in bundle",
+        "A .py path containing meridian_desktop fails",
+        "A directory named meridian_desktop fails",
+        "A dist tree whose only .py is CLEAN_SOURCE passes; packaging/verify_bundle.py is not modified"
+      ],
+      "tests": [
+        "test_planted_source_copy_fails_leak_scan"
+      ],
+      "risk": "low",
+      "collision_group": "dsk-verify-bundle",
+      "notes": "Verified: check_source_leak is at packaging/verify_bundle.py:126 and no test calls it. The embedded PYZ path is not covered by this item.",
+      "blocker": "",
+      "id": "MS-004"
+    },
+    {
+      "slug": "gdocs-chrome-dom-spike",
+      "project": "meridian-desktop",
+      "wave": 1,
+      "title": "DevTools spike: can a Chrome content script read and edit a Google Doc",
+      "depends_on": [],
+      "files": [
+        "PLAN.md"
+      ],
+      "existing_code": [
+        "<core>/latex-dir/extension/manifest.json:8 (Overleaf host pattern; MSL-1.0 code, do not copy)",
+        "extensions/manifest.json:7 (root extension host list has no docs.google.com)"
+      ],
+      "acceptance": [
+        "On a throwaway Doc in the owner's account, a DevTools-run content script reads the body text and reports which editor render path is used (DOM text or canvas).",
+        "The spike inserts one marker string through the editor's own input path and records whether Docs saves it, verified by reloading the Doc.",
+        "The result is recorded in PLAN.md 'Not done / not verified' as a go or no-go for option C (Chrome extension)."
+      ],
+      "tests": [
+        "manual spike: insert a marker into a throwaway Doc and reload; no automated test"
+      ],
+      "owner_decision_needed": "Run only if option C (Chrome extension) stays open after the distribution evaluation. The owner signs in by hand to a throwaway Doc.",
+      "risk": "high",
+      "notes": "PLAN.md:159-161 says whether content scripts can edit the Docs editor is unknown. A no-go does not block the OAuth path. The Overleaf extension is MSL-1.0 (<core>/latex-dir/LICENSE line 1), so its code must not be copied.",
+      "blocker": "manual",
+      "collision_group": "",
+      "id": "MS-005"
+    },
+    {
+      "slug": "gdocs-desktop-pkce-loopback",
+      "project": "meridian-desktop",
+      "wave": 1,
+      "title": "Loopback OAuth PKCE client for Google (127.0.0.1 listener, stdlib only)",
+      "depends_on": [],
+      "files": [
+        "meridian_desktop/google_docs/__init__.py",
+        "meridian_desktop/google_docs/oauth_loopback.py",
+        "tests/test_google_docs_oauth.py"
+      ],
+      "existing_code": [
+        "meridian_desktop/settings_store.py:23-24 (127.0.0.1 URL constants; follow the loopback-only convention)",
+        "meridian/routes/oauth.py:333, 902-904, 949-951 (server-side S256 and verifier-length rules; mirror them, do not import server code)"
+      ],
+      "acceptance": [
+        "code_verifier is 43 to 128 characters from the RFC 7636 unreserved set; code_challenge is base64url(SHA-256(verifier)) with no padding; method is S256.",
+        "The listener binds 127.0.0.1 only, on an ephemeral port; the redirect URI uses 127.0.0.1, not localhost or 0.0.0.0.",
+        "A random state is generated per attempt and compared in constant time; a wrong or reused state is rejected and the listener closes.",
+        "The listener closes after a timeout (default 120 seconds) even if no callback arrives.",
+        "The token exchange POSTs to https://oauth2.googleapis.com/token with code_verifier using only the standard library; no new dependency."
+      ],
+      "tests": [
+        "test_pkce_s256_matches_rfc7636_appendix_b (verifier dBjftJeZ4CVP-mB92K27uhbUJU1p1r_wW1gFWFOEjXk must give challenge E9Melhoa2OwvFrEMTJguCHaoeK1t8URWbuGJSstw-cM)",
+        "behaviour: a callback with the wrong state is rejected and the port is released"
+      ],
+      "owner_decision_needed": "Owner creates a Google Cloud OAuth client of type Desktop app and enters its client ID through desktop settings (not a committed file).",
+      "risk": "medium",
+      "notes": "No PKCE code exists in the desktop repo. pixi.toml:18-20 has no HTTP client, so use urllib. Do not name the module requests.py, since that would shadow the library. The access token must not be persisted.",
+      "blocker": "manual",
+      "collision_group": "",
+      "id": "MS-006"
+    },
+    {
+      "slug": "gdocs-distribution-evaluation",
+      "project": "meridian-desktop",
+      "wave": 1,
+      "title": "Pick a Google Docs distribution path (Docs add-on, Chrome Web Store, hosted web)",
+      "depends_on": [],
+      "files": [
+        "PLAN.md"
+      ],
+      "existing_code": [
+        "PLAN.md:302-320 (distribution options A-D and working recommendation)",
+        "PLAN.md:322-335 (open owner decisions)"
+      ],
+      "acceptance": [
+        "PLAN.md Distribution options gives each option an install path, review gate, permissions needed, and whether it depends on the hosted backend.",
+        "The letters in the Docs approach list (PLAN.md:128-135) and the distribution list (PLAN.md:302-317) are reconciled so no letter means two things.",
+        "Chrome Web Store single-purpose and minimal-permission rules and the Workspace Marketplace add-on review are cited, with the URL and read date."
+      ],
+      "tests": [
+        "none (documentation decision)"
+      ],
+      "owner_decision_needed": "Which distribution path ships first: A desktop only, B Docs add-on, C Chrome Web Store extension, or D hosted web only. Also reconcile the colliding A/B/C letters in PLAN.md:128-135 and A-D in PLAN.md:302-317.",
+      "risk": "low",
+      "notes": "Option letters collide. PLAN.md:128-135 uses A/B/C for the Docs approach (B = OAuth API, the decided approach per PLAN.md:137). PLAN.md:302-317 uses A-D for distribution. Owner should confirm which list an answer refers to. Google's current review rules were not re-verified in this pass.",
+      "blocker": "manual",
+      "collision_group": "",
+      "id": "MS-007"
+    },
+    {
+      "slug": "desktop-client-setup-panel",
+      "project": "meridian-desktop",
+      "wave": 2,
+      "title": "Add a Settings-tab panel that plans Claude Desktop and Codex, with gated apply",
+      "depends_on": [
+        "desktop-client-setup-runner"
+      ],
+      "files": [
+        "meridian_desktop/ui/client_setup_panel.py",
+        "meridian_desktop/ui/main_window.py",
+        "tests/test_client_setup_panel.py"
+      ],
+      "existing_code": [
+        "meridian_desktop/ui/main_window.py (tab table, Settings is wave 2, lines 24-31)",
+        "meridian_desktop/ui/main_window.py (_placeholder_page, lines 47-58)",
+        "tests/test_smoke.py (offscreen Qt test pattern)"
+      ],
+      "acceptance": [
+        "Plan makes no file change: file hashes before and after are equal in the test",
+        "Apply runs only after an explicit confirmation dialog, and then passes --yes",
+        "The panel shows only client ids, change names (added, changed, removed), the backup path and a restart note",
+        "Qt imports stay under meridian_desktop/ui/"
+      ],
+      "tests": [
+        "test_settings_panel_plan_writes_nothing_and_apply_needs_confirmation (new)"
+      ],
+      "owner_decision_needed": "",
+      "risk": "medium",
+      "notes": "The Settings tab is the placeholder at main_window.py:31. The panel calls the runner from desktop-client-setup-runner. Owner question, default taken (override if wrong): Apply for Claude Desktop and Codex in v1; the other clients are plan-only until verified.",
+      "blocker": "",
+      "collision_group": "",
+      "id": "MS-008"
+    },
+    {
+      "slug": "desktop-client-setup-runner",
+      "project": "meridian-desktop",
+      "wave": 2,
+      "title": "Add a Qt-free runner that calls a local core checkout for client-setup plans",
+      "depends_on": [
+        "core-land-client-setup-on-dev",
+        "core-client-setup-plan-without-tools"
+      ],
+      "files": [
+        "meridian_desktop/client_setup_runner.py",
+        "meridian_desktop/settings_store.py",
+        "tests/test_client_setup_runner.py"
+      ],
+      "existing_code": [
+        "meridian_desktop/settings_store.py (Settings and default_settings_path, lines 30-52)",
+        "meridian_desktop/settings_store.py (SettingsStore load, save, set_mode, lines 77-130)",
+        "tests/test_settings_store.py (save-leaves-only-settings.json tests, lines 105 and 120)",
+        "meridian/client_setup.py (JSON output with names and paths only, line 466)"
+      ],
+      "acceptance": [
+        "argv is a list passed without a shell; the command is <core python> -m meridian.client_setup plan --client <id>",
+        "With no core checkout configured, the runner returns a typed 'not configured' result and starts no process",
+        "With a fake subprocess returning plan JSON, the runner returns typed results and never carries 'document' or 'text' fields",
+        "A timeout returns a typed error",
+        "The new module does not import Qt, and tools/check_boundary.py passes"
+      ],
+      "tests": [
+        "test_runner_parses_plan_json_without_env_values (new)"
+      ],
+      "owner_decision_needed": "",
+      "risk": "medium",
+      "notes": "PLAN.md:205-208 puts client setup in desktop wave 2. The settings store is Qt-free, so it can hold the core checkout path. Reuse the SettingsStore temp-file save pattern. Owner question, default taken (override if wrong): Call an installed core checkout as a subprocess; never vendor meridian/client_setup.py (MSL-1.0 is not LGPL).",
+      "blocker": "",
+      "collision_group": "",
+      "id": "MS-009"
+    },
+    {
+      "slug": "desktop-data-source-resolver",
+      "project": "meridian-desktop",
+      "wave": 2,
+      "title": "Resolve which data source Local or Hosted mode uses",
+      "depends_on": [
+        "desktop-local-health-probe-states",
+        "desktop-readonly-sqlite-reader-core",
+        "desktop-hosted-token-store",
+        "desktop-hosted-token-store"
+      ],
+      "files": [
+        "meridian_desktop/data_source.py",
+        "tests/test_data_source.py"
+      ],
+      "existing_code": [
+        "meridian_desktop/settings_store.py:127-132 set_mode, the mode this resolver reads",
+        "meridian_desktop/ui/main_window.py:88 the only current reader of mode"
+      ],
+      "acceptance": [
+        "Local mode returns source 'server' when the probe state is running; otherwise source 'file' when db_path exists; otherwise state 'no_local_data' with a message. It never returns both sources.",
+        "Hosted mode with no stored token returns state 'not_signed_in' and makes no network call.",
+        "Hosted mode with a token returns source 'hosted' from the hosted client.",
+        "Takes the probe, reader and token store as injected callables. Imports no Qt."
+      ],
+      "tests": [
+        "test_local_mode_prefers_running_server_over_file"
+      ],
+      "owner_decision_needed": "",
+      "risk": "low",
+      "notes": "desktop-hosted-projects-client can ship before this item, with the token passed in; this item only wires the pieces together. Owner question, default taken (override if wrong): Prefer a running local server; fall back to the database file (critic's recommendation).",
+      "blocker": "",
+      "collision_group": "",
+      "id": "MS-010"
+    },
+    {
+      "slug": "desktop-hosted-projects-client-core",
+      "project": "meridian-desktop",
+      "wave": 2,
+      "title": "Hosted client: GET /projects with a bearer header and typed auth errors",
+      "depends_on": [],
+      "files": [
+        "meridian_desktop/hosted_client.py",
+        "tests/test_hosted_client.py"
+      ],
+      "acceptance": [
+        "list_projects(base_url, token) sends GET {base}/projects with Authorization: Bearer and returns the parsed list",
+        "An empty token raises NotSignedIn and sends no request",
+        "HTTP 401 raises NotSignedIn; other non-2xx raises HostedError carrying only the status code"
+      ],
+      "tests": [
+        "test_hosted_client_sends_bearer_and_never_leaks_token"
+      ],
+      "risk": "medium",
+      "collision_group": "dsk-hosted-client",
+      "notes": "Split from desktop-hosted-projects-client (6 acceptance criteria). Use obviously fake token values in tests.",
+      "blocker": "",
+      "id": "MS-011"
+    },
+    {
+      "slug": "desktop-hosted-projects-client-guards",
+      "project": "meridian-desktop",
+      "wave": 2,
+      "title": "Hosted client: insecure-URL refusal, token-free errors, timeout",
+      "depends_on": [
+        "desktop-hosted-projects-client-core"
+      ],
+      "files": [
+        "meridian_desktop/hosted_client.py",
+        "tests/test_hosted_client.py"
+      ],
+      "acceptance": [
+        "A non-loopback base URL that is not https raises ValueError before any request",
+        "The token never appears in str or repr of any raised error",
+        "Timeout 10 s, no retries, urllib only"
+      ],
+      "tests": [
+        "test_hosted_client_rejects_insecure_base_and_hides_token"
+      ],
+      "risk": "medium",
+      "collision_group": "dsk-hosted-client",
+      "blocker": "",
+      "id": "MS-012"
+    },
+    {
+      "slug": "desktop-hosted-token-store",
+      "project": "meridian-desktop",
+      "wave": 2,
+      "title": "Store the hosted bearer token outside settings.json",
+      "depends_on": [],
+      "files": [
+        "meridian_desktop/token_store.py",
+        "tests/test_token_store.py"
+      ],
+      "existing_code": [
+        "meridian_desktop/settings_store.py:77-134 settings.json is plain JSON and save() writes the whole Settings dataclass, so a token field there would be stored in clear text",
+        "meridian_desktop/settings_store.py:55-74 unknown keys are dropped on load; this does not protect a field added to Settings"
+      ],
+      "acceptance": [
+        "get_token() returns None when nothing is stored, without raising.",
+        "set_token, get_token and delete_token round-trip with the chosen backend.",
+        "A backend failure makes get_token return None and makes set_token raise a typed error whose message contains no token text.",
+        "After set_token, a scan of the settings directory finds no token text."
+      ],
+      "tests": [
+        "test_token_never_written_to_settings_file"
+      ],
+      "owner_decision_needed": "",
+      "risk": "medium",
+      "notes": "The bearer format is sk_meridian_... (AGENTS.md). Never print or commit a token. Owner question, default taken (override if wrong): OS keychain via the keyring package (MIT); one store for the hosted token and the Google refresh token.",
+      "blocker": "",
+      "collision_group": "",
+      "id": "MS-013"
+    },
+    {
+      "slug": "desktop-latex-probe-panel",
+      "project": "meridian-desktop",
+      "wave": 2,
+      "title": "LaTeX panel: probe /health and /extension-version, show both versions",
+      "depends_on": [],
+      "files": [
+        "meridian_desktop/latex_client.py",
+        "meridian_desktop/ui/latex_panel.py",
+        "meridian_desktop/ui/main_window.py"
+      ],
+      "acceptance": [
+        "Shows connected only when both /health and /extension-version answer",
+        "Shows the engine version and the extension version side by side; no network call at import",
+        "Panel code and docs never name the meridian-latex path (check_boundary passes); section label kept (test_smoke.py:58)"
+      ],
+      "tests": [
+        "test_latex_client_connected_only_when_health_and_extension_version_answer (tests/test_latex_client.py, new)"
+      ],
+      "risk": "low",
+      "collision_group": "dsk-ui",
+      "notes": "Never reads ~/.meridian-latex. Keep Qt out of latex_client.py so the probe is unit-testable.",
+      "blocker": "",
+      "id": "MS-014"
+    },
+    {
+      "slug": "desktop-local-health-probe-loopback",
+      "project": "meridian-desktop",
+      "wave": 2,
+      "title": "Local /health probe: loopback-only host guard and no-secret GET",
+      "depends_on": [
+        "desktop-local-health-probe-states"
+      ],
+      "files": [
+        "meridian_desktop/server_probe.py",
+        "tests/test_server_probe.py"
+      ],
+      "acceptance": [
+        "A host other than 127.0.0.1, localhost or ::1 raises ValueError before any request",
+        "Only a GET is sent, with no settings or secrets in headers",
+        "Uses urllib only and imports no Qt; no new dependency"
+      ],
+      "tests": [
+        "test_probe_refuses_non_loopback_host"
+      ],
+      "risk": "low",
+      "collision_group": "dsk-health-probe",
+      "blocker": "",
+      "id": "MS-015"
+    },
+    {
+      "slug": "desktop-local-health-probe-states",
+      "project": "meridian-desktop",
+      "wave": 2,
+      "title": "Local /health probe: running, not_running, not_meridian and error states",
+      "depends_on": [],
+      "files": [
+        "meridian_desktop/server_probe.py",
+        "tests/test_server_probe.py"
+      ],
+      "acceptance": [
+        "200 JSON with service meridian returns running with version and git_sha",
+        "Connection refused returns not_running without raising",
+        "A different or missing service value returns not_meridian",
+        "A 1 s timeout, non-2xx status or non-JSON body returns error with a short reason"
+      ],
+      "tests": [
+        "test_probe_rejects_non_meridian_listener"
+      ],
+      "risk": "low",
+      "collision_group": "dsk-health-probe",
+      "notes": "Split from desktop-local-health-probe (6 acceptance criteria). Absorbs dropped desk-local-engine-health-probe. Test against a stdlib http.server on 127.0.0.1 ephemeral port.",
+      "blocker": "",
+      "id": "MS-016"
+    },
+    {
+      "slug": "desktop-metadata-drift-docs",
+      "project": "meridian-desktop",
+      "wave": 2,
+      "title": "Correct the stale test docstring and the cross-reference in the package init",
+      "depends_on": [],
+      "files": [
+        "meridian_desktop/__init__.py",
+        "tests/test_boundary.py"
+      ],
+      "acceptance": [
+        "The tests/test_boundary.py docstring describes the current behaviour (real-repo test passes)",
+        "meridian_desktop/__init__.py names only test files that exist (tests/test_manifest.py is absent)",
+        "No code behaviour changes"
+      ],
+      "tests": [
+        "test_real_repo_passes"
+      ],
+      "risk": "low",
+      "collision_group": "dsk-boundary",
+      "notes": "Split from desktop-metadata-drift-cleanup. The requires-python bump is blocked (see blocked_by_owner). Same docstring fix was in boundary-scan-skip-pixi-env; removed there.",
+      "blocker": "",
+      "id": "MS-017"
+    },
+    {
+      "slug": "desktop-mode-selector-revert-on-save-fail",
+      "project": "meridian-desktop",
+      "wave": 2,
+      "title": "Revert the Hosted/Local selector when saving the mode fails",
+      "depends_on": [],
+      "files": [
+        "meridian_desktop/ui/main_window.py",
+        "tests/test_smoke.py"
+      ],
+      "acceptance": [
+        "When SettingsStore.set_mode raises OSError, mode_selector returns to the last saved mode with signals blocked so no second save runs",
+        "The 'could not save mode' warning label is shown and visible",
+        "The settings file bytes are unchanged after the failed save"
+      ],
+      "tests": [
+        "test_failed_mode_save_reverts_selector"
+      ],
+      "risk": "low",
+      "collision_group": "dsk-ui",
+      "notes": "Defect confirmed (main_window.py:101-109, warning text at :106). Fixes committed wave-1 code.",
+      "blocker": "",
+      "id": "MS-018"
+    },
+    {
+      "slug": "desktop-projects-tab-readonly",
+      "project": "meridian-desktop",
+      "wave": 2,
+      "title": "Read-only Projects tab: list and detail",
+      "depends_on": [
+        "desktop-mode-selector-revert-on-save-fail",
+        "desktop-data-source-resolver"
+      ],
+      "files": [
+        "meridian_desktop/ui/projects_tab.py",
+        "meridian_desktop/ui/main_window.py",
+        "tests/test_smoke.py"
+      ],
+      "acceptance": [
+        "Lists resolver rows with name, status, priority and created_at, plus a detail pane for the selected row",
+        "No QPushButton or QLineEdit inside the tab",
+        "Each non-ok resolver state shows its message",
+        "Detail pane never shows executor_config or agent_instructions; TAB_NAMES and order unchanged; Projects placeholder assertion replaced"
+      ],
+      "tests": [
+        "test_projects_tab_lists_rows_and_has_no_write_controls"
+      ],
+      "risk": "low",
+      "collision_group": "dsk-ui",
+      "notes": "Transitively waits on desktop-data-source-resolver (blocked).",
+      "blocker": "",
+      "id": "MS-019"
+    },
+    {
+      "slug": "desktop-readonly-sqlite-reader-core",
+      "project": "meridian-desktop",
+      "wave": 2,
+      "title": "Read-only projects reader: open with mode=ro and select only the listed columns",
+      "depends_on": [
+        "desktop-settings-db-path"
+      ],
+      "files": [
+        "meridian_desktop/projects_reader.py",
+        "tests/test_projects_reader.py"
+      ],
+      "acceptance": [
+        "list_projects(path) and get_project(path, id) open the file with sqlite3 URI mode=ro and run no write statement",
+        "Only id, name, creator_human_id, icon, status, priority, parent_project_id and created_at are selected",
+        "Rows come back newest first by created_at"
+      ],
+      "tests": [
+        "test_reader_selects_only_listed_columns_newest_first"
+      ],
+      "risk": "medium",
+      "collision_group": "dsk-readonly-reader",
+      "notes": "Split from desktop-readonly-sqlite-projects-reader (6 acceptance criteria). Copies SQL text from db/__init__.py:1421-1441; must not call init_db (db/__init__.py:946-972). Spike the clean-shutdown case with no -wal/-shm files first. Must not read .env or meridian.toml.",
+      "blocker": "",
+      "id": "MS-020"
+    },
+    {
+      "slug": "desktop-readonly-sqlite-reader-guards",
+      "project": "meridian-desktop",
+      "wave": 2,
+      "title": "Read-only projects reader: missing-file, WAL and write-refusal guards",
+      "depends_on": [
+        "desktop-readonly-sqlite-reader-core"
+      ],
+      "files": [
+        "meridian_desktop/projects_reader.py",
+        "tests/test_projects_reader.py"
+      ],
+      "acceptance": [
+        "A missing path raises a typed NoDatabase error that names the path, and the file is not created",
+        "A WAL-mode database with -wal and -shm present, with a writer still open, lists its rows",
+        "An INSERT on the reader connection raises sqlite3.OperationalError"
+      ],
+      "tests": [
+        "test_reader_is_read_only_and_never_creates_missing_file"
+      ],
+      "risk": "medium",
+      "collision_group": "dsk-readonly-reader",
+      "blocker": "",
+      "id": "MS-021"
+    },
+    {
+      "slug": "desktop-settings-db-path",
+      "project": "meridian-desktop",
+      "wave": 2,
+      "title": "Add a db_path field to the settings store (no UI)",
+      "depends_on": [],
+      "files": [
+        "meridian_desktop/settings_store.py",
+        "tests/test_settings_store.py"
+      ],
+      "existing_code": [
+        "meridian_desktop/settings_store.py:29-34 Settings dataclass",
+        "meridian_desktop/settings_store.py:55-74 _from_mapping validation pattern",
+        "tests/test_settings_store.py:30-40 round-trip test pattern",
+        "tests/test_settings_store.py:132-141 no-Qt import guard, must keep passing"
+      ],
+      "acceptance": [
+        "Settings has db_path: str or None, defaulting to None, and it round-trips through save and load.",
+        "A blank string or a non-string value loads as None with a warning and does not raise.",
+        "A settings file written before this change loads with db_path None and no warning.",
+        "The saved JSON contains only the keys mode, hosted_url, local_url, engine_url, db_path.",
+        "No token or secret key is accepted or written by this change."
+      ],
+      "tests": [
+        "test_db_path_round_trip_and_blank_is_none"
+      ],
+      "owner_decision_needed": "",
+      "risk": "low",
+      "notes": "Nothing reads the URL settings today. Only main_window.py:88 reads mode, and set_mode is the only writer (settings_store.py:130). Owner question, default taken (override if wrong): Leave unset and make the user pick (critic's recommendation).",
+      "blocker": "",
+      "collision_group": "",
+      "id": "MS-022"
+    },
+    {
+      "slug": "desktop-settings-tab-edit",
+      "project": "meridian-desktop",
+      "wave": 2,
+      "title": "Settings tab: edit local URL and DB path with validation",
+      "depends_on": [
+        "desktop-settings-db-path",
+        "desktop-projects-tab-readonly"
+      ],
+      "files": [
+        "meridian_desktop/ui/settings_tab.py",
+        "meridian_desktop/ui/main_window.py",
+        "tests/test_smoke.py"
+      ],
+      "acceptance": [
+        "Local URL saved through SettingsStore; non-http or non-loopback values are rejected inline and nothing is written",
+        "db_path chosen via a file dialog and shown back",
+        "The hosted token is neither shown nor entered in this tab",
+        "Top-bar selector and this tab show the same saved mode"
+      ],
+      "tests": [
+        "test_settings_tab_rejects_non_loopback_local_url"
+      ],
+      "risk": "low",
+      "collision_group": "dsk-ui",
+      "blocker": "",
+      "id": "MS-023"
+    },
+    {
+      "slug": "gdocs-picker-drive-file-spike",
+      "project": "meridian-desktop",
+      "wave": 2,
+      "title": "BLOCKING spike: Picker-chosen Doc, drive.file token, then documents.batchUpdate",
+      "depends_on": [
+        "gdocs-desktop-pkce-loopback",
+        "desktop-hosted-token-store"
+      ],
+      "files": [
+        "tools/spikes/gdocs_picker_spike.py",
+        "PLAN.md"
+      ],
+      "existing_code": [
+        "meridian_desktop/google_docs/oauth_loopback.py (from gdocs-desktop-pkce-loopback)",
+        "PLAN.md:142-143 (the untested question this spike answers)"
+      ],
+      "acceptance": [
+        "The Picker opens in the system browser on a 127.0.0.1 page and returns the chosen file ID to the loopback listener. An in-app web view is not an option: PLAN.md:175 allows only Qt6Core, Qt6Gui and Qt6Widgets.",
+        "documents.get with the drive.file token returns 200 for the picked Doc.",
+        "documents.batchUpdate with one insertText request returns 200, and the marker text is visible after reloading the Doc.",
+        "Any failure records the HTTP status and error reason verbatim in PLAN.md and marks the write path no-go."
+      ],
+      "tests": [
+        "manual live spike against a throwaway Doc; not run in CI",
+        "the spike script is outside the packaged bundle (confirm with packaging/verify_bundle.py)"
+      ],
+      "owner_decision_needed": "Owner creates the Google Cloud project, Desktop OAuth client and Picker developer key (kept out of git), names a test account, and accepts the 7-day refresh expiry in Testing or moves the consent screen out of Testing.",
+      "risk": "high",
+      "notes": "This is the blocking untested question (PLAN.md:142-143). Do not start gdocs-docs-batchupdate-wrapper until the result is recorded. Whether Picker origin rules allow a 127.0.0.1 page is not verified here. Do not use real documents from another account.",
+      "blocker": "manual",
+      "collision_group": "",
+      "id": "MS-024"
+    },
+    {
+      "slug": "desk-diagnostics-snapshot-copy",
+      "project": "meridian-desktop",
+      "wave": 3,
+      "title": "Copy a redacted diagnostics snapshot for support",
+      "depends_on": [
+        "desk-hosted-diagnostics-client"
+      ],
+      "files": [
+        "meridian_desktop/diagnostics_export.py",
+        "tests/test_diagnostics_export.py"
+      ],
+      "existing_code": [
+        "meridian/routes/tunnel.py:2775-2804 snapshot top-level fields (run_id, generated_at, tunnel_process, connector_manifest, redis)",
+        "meridian/routes/tunnel.py:2501 _diag_redact already redacts server-side"
+      ],
+      "acceptance": [
+        "output is JSON with run_id, generated_at and the slots table",
+        "any key whose name matches token, secret, password, key or authorization is removed, not masked",
+        "hosted URL query strings are stripped",
+        "the module returns a string; the caller copies it, and only on a user click"
+      ],
+      "tests": [
+        "test_diagnostics_export_removes_secret_keys"
+      ],
+      "owner_decision_needed": "",
+      "risk": "low",
+      "notes": "Pure module with no Qt import. The UI button comes later. Owner question, default taken (override if wrong): Clipboard only; a file save can come later.",
+      "blocker": "",
+      "collision_group": "",
+      "id": "MS-025"
+    },
+    {
+      "slug": "desk-hosted-diagnostics-client",
+      "project": "meridian-desktop",
+      "wave": 3,
+      "title": "Fetch hosted tunnel diagnostics with a bearer header, never a URL token",
+      "depends_on": [],
+      "files": [
+        "meridian_desktop/hosted_client.py",
+        "tests/test_hosted_client.py"
+      ],
+      "existing_code": [
+        "meridian/routes/tunnel.py:2939-2958 GET /tunnel/diagnostics/{tenant_id}; hosted callers must be authenticated (2954-2956)",
+        "meridian/routes/tunnel.py:800 _resolve_http_bearer_token reads the Authorization header",
+        "meridian/routes/tunnel.py:2779 'authenticated' flag in the snapshot",
+        "meridian/tunnel_client.py:6287 Authorization: Bearer header pattern",
+        "counter-example, do not copy: meridian/tunnel_client.py:4956 puts the token in ?token= on the WebSocket URL, which the server accepts only as a legacy fallback (routes/tunnel.py:4934-4935 comment)"
+      ],
+      "acceptance": [
+        "the request carries 'Authorization: Bearer <token>' and the token never appears in the URL, query string or logs",
+        "a 401 maps to state auth_required with no retry",
+        "success returns the parsed snapshot unchanged (run_id, generated_at, slots)",
+        "no exception text or returned string contains the token value",
+        "10 s timeout, stdlib urllib only"
+      ],
+      "tests": [
+        "test_hosted_diagnostics_uses_bearer_header_never_query_token"
+      ],
+      "owner_decision_needed": "",
+      "risk": "medium",
+      "notes": "The server resolves the tenant from auth; the path tenant_id is informational (routes/tunnel.py:2947-2949). Never print the token in test output. Owner question, default taken (override if wrong): Read the hosted token from the keychain; never from an environment variable in the UI.",
+      "blocker": "",
+      "collision_group": "",
+      "id": "MS-026"
+    },
+    {
+      "slug": "desk-logs-page",
+      "project": "meridian-desktop",
+      "wave": 3,
+      "title": "Logs tab: redacted tunnel.log tail and runner tail-log, read-only",
+      "depends_on": [
+        "desk-tunnel-log-tail-redacted",
+        "desk-runner-status-readonly-client"
+      ],
+      "files": [
+        "meridian_desktop/ui/logs_page.py",
+        "tests/test_logs_page.py"
+      ],
+      "acceptance": [
+        "Two bounded panes: the tunnel.log tail and the runner tail-log output",
+        "Refresh re-reads; no clear, delete or rotate action",
+        "Missing logs show no log yet; plain text only, no rich text",
+        "Runner output passes the same redaction as tunnel.log"
+      ],
+      "tests": [
+        "test_logs_page_is_read_only_and_plain_text"
+      ],
+      "risk": "medium",
+      "collision_group": "dsk-logs",
+      "notes": "Both dependencies are blocked on owner decisions.",
+      "blocker": "",
+      "id": "MS-027"
+    },
+    {
+      "slug": "desk-runner-status-readonly-client",
+      "project": "meridian-desktop",
+      "wave": 3,
+      "title": "Read runner status and tail-log via the JSON CLI, no mutating verbs",
+      "depends_on": [],
+      "files": [
+        "meridian_desktop/runner_client.py",
+        "tests/test_runner_client.py"
+      ],
+      "existing_code": [
+        "meridian/local_runner.py:1342-1409 argparse; status and tail-log subcommands",
+        "meridian/local_runner.py:1486 prints one JSON object to stdout",
+        "meridian/local_runner.py:1101-1122 status()",
+        "meridian/local_runner.py:1305 tail_log() bounded read",
+        "tests/test_local_runner.py:125 test_status_never_blocks_or_sleeps (pattern to copy)"
+      ],
+      "acceptance": [
+        "the only verbs ever passed to the subprocess are status and tail-log; any other verb raises before spawning",
+        "argv is a list with shell=False and the scope is a single argv element",
+        "a subprocess timeout (for example 10 s) returns an error object, not an exception",
+        "non-JSON stdout returns an error object that includes the exit code",
+        "start, stop, restart, preflight, run-script and doctor are never passed"
+      ],
+      "tests": [
+        "test_runner_client_never_invokes_mutating_verbs"
+      ],
+      "owner_decision_needed": "",
+      "risk": "medium",
+      "notes": "status() can persist a recovered exit code (meridian/local_runner.py:1149), so it is a bounded read with one known write, not a pure read. doctor is excluded until core-doctor-nonwriting-state-check lands, because local_runner.py:1211-1219 writes a probe file. Owner question, default taken (override if wrong): Shell out to python -m meridian.local_runner in the pixi environment (critic's recommendation).",
+      "blocker": "",
+      "collision_group": "",
+      "id": "MS-028"
+    },
+    {
+      "slug": "desk-served-folders-readonly-view",
+      "project": "meridian-desktop",
+      "wave": 3,
+      "title": "Read-only served folders view that separates unauthenticated from empty",
+      "depends_on": [
+        "desk-hosted-diagnostics-client"
+      ],
+      "files": [
+        "meridian_desktop/served_folders.py",
+        "tests/test_served_folders.py"
+      ],
+      "acceptance": [
+        "The client issues GET only",
+        "When the diagnostics snapshot shows authenticated false, the view says not signed in, never no folders",
+        "Shows filesystem_roots, known_repo_paths, serena_repo_path and codebase_code_dirs as read-only lists",
+        "No add, remove or edit control exists"
+      ],
+      "tests": [
+        "test_served_folders_is_read_only_and_flags_unauthenticated"
+      ],
+      "risk": "low",
+      "collision_group": "dsk-served",
+      "blocker": "",
+      "id": "MS-029"
+    },
+    {
+      "slug": "desk-services-status-page",
+      "project": "meridian-desktop",
+      "wave": 3,
+      "title": "Services tab: local server health, runner state and slot-port listening, read-only",
+      "depends_on": [
+        "desktop-local-health-probe-loopback",
+        "desk-runner-status-readonly-client",
+        "desk-slot-port-listening-probe",
+        "desktop-settings-tab-edit"
+      ],
+      "files": [
+        "meridian_desktop/ui/services_page.py",
+        "tests/test_services_page.py"
+      ],
+      "acceptance": [
+        "Shows engine version and git_sha from the health probe, runner child state, and listening state for each of the 14 slot ports",
+        "The probe runs only on a button press, with no timer or background polling",
+        "No button runs start, stop, restart, preflight, doctor or run-script",
+        "Labels come unmodified from the probe and runner outputs"
+      ],
+      "tests": [
+        "test_services_tab_shows_probe_states",
+        "test_services_page_has_no_mutating_controls"
+      ],
+      "risk": "medium",
+      "collision_group": "dsk-services",
+      "notes": "Absorbs dropped desktop-services-local-server-status. Placeholder assertion replacement sits in desk-wave3-tab-wiring. Runner dependency is blocked.",
+      "blocker": "",
+      "id": "MS-030"
+    },
+    {
+      "slug": "desk-slot-port-listening-probe",
+      "project": "meridian-desktop",
+      "wave": 3,
+      "title": "TCP listening check for tunnel slot ports, sending no MCP traffic",
+      "depends_on": [],
+      "files": [
+        "meridian_desktop/slot_ports.py",
+        "tests/test_slot_ports.py"
+      ],
+      "acceptance": [
+        "Returns listening true or false for each of the 14 ports (10 built-ins including retired word, plus p0 to p3)",
+        "Uses socket connect only and sends zero bytes",
+        "0.25 s timeout per port with a bounded total",
+        "Results are labelled listening, never healthy"
+      ],
+      "tests": [
+        "test_slot_port_probe_sends_no_bytes_and_covers_all_ports"
+      ],
+      "risk": "low",
+      "collision_group": "dsk-slot-ports",
+      "notes": "Port table copied from tunnel_plugins.py:53-91; test pins the literal values.",
+      "blocker": "",
+      "id": "MS-031"
+    },
+    {
+      "slug": "desk-tunnel-log-tail-redacted",
+      "project": "meridian-desktop",
+      "wave": 3,
+      "title": "Bounded, redacted tail of tunnel.log for the Logs tab",
+      "depends_on": [],
+      "files": [
+        "meridian_desktop/log_tail.py",
+        "tests/test_log_tail.py"
+      ],
+      "existing_code": [
+        "meridian/tunnel_client.py:159-172 MERIDIAN_TUNNEL_LOG override, default ~/.meridian/tunnel.log",
+        "meridian/tunnel_client.py:163 rotation to tunnel.log.1 at 5 MB",
+        "meridian/local_runner.py:153 DEFAULT_LOG_TAIL_BYTES = 8000",
+        "tests/test_local_runner.py:368 test_tail_log_is_bounded_regardless_of_file_size (pattern to copy)"
+      ],
+      "acceptance": [
+        "reads at most max_bytes (default 65536) from the end regardless of file size",
+        "reads tunnel.log and tunnel.log.1 when the current file is short",
+        "a missing file returns a 'no log yet' result, not an error",
+        "every returned line passes a redaction pass covering ?token=, Bearer and sk_meridian_ shapes",
+        "never writes, truncates or rotates the file"
+      ],
+      "tests": [
+        "test_tunnel_log_tail_is_bounded_and_redacted"
+      ],
+      "owner_decision_needed": "",
+      "risk": "low",
+      "notes": "Honour MERIDIAN_TUNNEL_LOG (a file path, tunnel_client.py:169-171). This redaction is defense in depth; core-tunnel-log-tee-redaction stops the secret reaching the file in the first place. Owner question, default taken (override if wrong): Copy a minimal pattern set into the desktop with a pinning test (critic's recommendation).",
+      "blocker": "",
+      "collision_group": "",
+      "id": "MS-032"
+    },
+    {
+      "slug": "desk-tunnel-slot-rows",
+      "project": "meridian-desktop",
+      "wave": 3,
+      "title": "Tunnel tab: one state row per slot, using only the five server states",
+      "depends_on": [],
+      "files": [
+        "meridian_desktop/tunnel_view.py",
+        "meridian_desktop/ui/tunnel_page.py",
+        "tests/test_tunnel_view.py"
+      ],
+      "acceptance": [
+        "One row per key in the snapshot slots dict",
+        "The state column shows only healthy, stale, degraded, quarantined or restart_required",
+        "The word slot renders as retired"
+      ],
+      "tests": [
+        "test_slot_rows_show_five_states_and_retired_word"
+      ],
+      "risk": "low",
+      "collision_group": "dsk-tunnel-view",
+      "notes": "Split from desk-tunnel-slot-state-view (6 acceptance criteria). Can start from a recorded get_tunnel_diagnostics fixture.",
+      "blocker": "",
+      "id": "MS-033"
+    },
+    {
+      "slug": "desk-tunnel-slot-safety",
+      "project": "meridian-desktop",
+      "wave": 3,
+      "title": "Tunnel tab: saved settings never shown as active, health basis shown, no controls",
+      "depends_on": [
+        "desk-tunnel-slot-rows"
+      ],
+      "files": [
+        "meridian_desktop/tunnel_view.py",
+        "meridian_desktop/ui/tunnel_page.py",
+        "tests/test_tunnel_view.py"
+      ],
+      "acceptance": [
+        "health_basis and health_age_seconds render beside any healthy state",
+        "A slot with dashboard_configured.enabled true and process_active false is never shown as active",
+        "The page has no start, stop or restart button (asserted)"
+      ],
+      "tests": [
+        "test_slot_rows_never_show_saved_setting_as_active"
+      ],
+      "risk": "low",
+      "collision_group": "dsk-tunnel-view",
+      "notes": "Local mode has no slot-state source until core-tunnel-local-status-file lands (blocked).",
+      "blocker": "",
+      "id": "MS-034"
+    },
+    {
+      "slug": "desk-tunnel-start-stop-gated",
+      "project": "meridian-desktop",
+      "wave": 3,
+      "title": "Tunnel and runner start/stop controls, gated by sprint item 84d8fd28",
+      "depends_on": [],
+      "files": [
+        "meridian_desktop/runner_client.py",
+        "meridian_desktop/ui/tunnel_page.py"
+      ],
+      "existing_code": [
+        "meridian/local_runner.py:1362-1376 start, stop and restart subcommands (the mechanism, but start takes a command argument)",
+        "PLAN.md:212 and :364 lock start and stop behind 84d8fd28",
+        "desk-runner-status-readonly-client forbids these verbs until unlocked"
+      ],
+      "acceptance": [
+        "until 84d8fd28 is recorded done, no start, stop or restart control exists in the desktop (asserted by test)",
+        "after unlock, start and stop need an explicit confirmation step and call local_runner with a fixed scope and a fixed command, never a user-typed command",
+        "no shell string is built from user input"
+      ],
+      "tests": [
+        "test_tunnel_page_has_no_start_stop_until_unlocked"
+      ],
+      "owner_decision_needed": "Blocked: sprint item 84d8fd28 (local-trust contract) is not in this repo and its contract must be read and confirmed before any start or stop control.",
+      "risk": "high",
+      "notes": "Owner-gated. This item is a placeholder until the contract is confirmed. Blocked on core sprint item 84d8fd28 (local-trust contract).",
+      "blocker": "manual",
+      "collision_group": "",
+      "id": "MS-035"
+    },
+    {
+      "slug": "desk-wave3-tab-wiring",
+      "project": "meridian-desktop",
+      "wave": 3,
+      "title": "Replace the Tunnel, Services and Logs placeholders in the main window",
+      "depends_on": [
+        "desk-tunnel-slot-rows",
+        "desk-tunnel-slot-safety",
+        "desk-services-status-page",
+        "desk-logs-page"
+      ],
+      "files": [
+        "meridian_desktop/ui/main_window.py",
+        "tests/test_smoke.py"
+      ],
+      "acceptance": [
+        "Tunnel, Services and Logs host their pages; the other tabs keep their current state",
+        "The 'Not built yet (wave 3)' text no longer appears on those three tabs",
+        "Status bar text changes and the test_smoke.py status-bar assertion is updated",
+        "The --smoke path still exits 0"
+      ],
+      "tests": [
+        "test_wave3_tabs_replace_placeholders_and_keep_others"
+      ],
+      "risk": "low",
+      "collision_group": "dsk-ui",
+      "notes": "Only wave-3 item that edits main_window.py; runs last in the wave.",
+      "blocker": "",
+      "id": "MS-036"
+    },
+    {
+      "slug": "desktop-client-guides-hosted-and-ui-only",
+      "project": "meridian-desktop",
+      "wave": 3,
+      "title": "Add copy-only setup guides for ChatGPT, Grok, Zed and Windsurf",
+      "depends_on": [],
+      "files": [
+        "meridian_desktop/client_guides.py",
+        "tests/test_client_guides.py"
+      ],
+      "existing_code": [
+        "docs/browser-connector.md (ChatGPT New App flow to the hosted MCP endpoint, lines 68-71)",
+        "docs/self-hosting.md (remote connectors need public HTTPS, line 148)",
+        "docs/quickstart.md (Windsurf path, lines 163-177)",
+        "meridian/static/dashboard-settings.ts (hosted MCP for Claude or ChatGPT, line 553)"
+      ],
+      "acceptance": [
+        "The guides are plain data, with no Qt import and no network access",
+        "The text contains no sk_meridian_ value and no Bearer literal",
+        "The ChatGPT guide names the public HTTPS MCP endpoint and says tokens are created in the dashboard",
+        "The Zed and Windsurf paths and the Grok connector flow are marked 'confirm on install' until the owner confirms them"
+      ],
+      "tests": [
+        "test_guides_contain_no_token_and_mark_unconfirmed_paths (new)"
+      ],
+      "owner_decision_needed": "",
+      "risk": "low",
+      "notes": "Zed has no writer because its settings.json is JSONC with comments, which the JSON writer cannot round-trip. Grok has no source in the repo at all (only ngrok matches). Grok and ChatGPT get hosted-connector instructions only. Owner question, default taken (override if wrong): Ship the Zed, Windsurf, and Grok guides marked unconfirmed.",
+      "blocker": "",
+      "collision_group": "",
+      "id": "MS-037"
+    },
+    {
+      "slug": "desktop-client-setup-panel-all-clients",
+      "project": "meridian-desktop",
+      "wave": 3,
+      "title": "Extend the Settings client panel to every client the catalog supports",
+      "depends_on": [
+        "desktop-client-setup-panel",
+        "core-client-catalog-single-source",
+        "core-client-setup-cursor-writer"
+      ],
+      "files": [
+        "meridian_desktop/ui/client_setup_panel.py",
+        "meridian_desktop/client_guides.py",
+        "tests/test_client_setup_panel.py"
+      ],
+      "acceptance": [
+        "Rows come from plan --list-clients, not hard-coded lists",
+        "Writer clients show Plan and Apply; ui_only and hosted_instructions clients show guide text; needs_confirmation clients show no Apply"
+      ],
+      "tests": [
+        "test_panel_rows_follow_catalog_status (new)"
+      ],
+      "risk": "low",
+      "collision_group": "dsk-client-panel",
+      "notes": "Transitively waits on three blocked items.",
+      "blocker": "",
+      "id": "MS-038"
+    },
+    {
+      "slug": "desktop-latex-claims-release-panel",
+      "project": "meridian-desktop",
+      "wave": 3,
+      "title": "LaTeX panel: live claims and provenance, with release only after confirmation",
+      "depends_on": [
+        "desktop-latex-probe-panel",
+        "latex-engine-claim-route-tests"
+      ],
+      "files": [
+        "meridian_desktop/latex_client.py",
+        "meridian_desktop/ui/latex_panel.py"
+      ],
+      "existing_code": [
+        "meridian-latex engine/src/server.ts:410 GET /claims (returns holder_token, see claims.ts:354)",
+        "engine/src/server.ts:277 POST /provenance and :313 GET /provenance",
+        "engine/src/server.ts:259 POST /release",
+        "engine/src/claims.ts:323-346 releaseClaims keys on holder_token",
+        "PLAN.md:97-99 release and open-in-Overleaf both need confirmation"
+      ],
+      "acceptance": [
+        "Release sends POST /release only after an explicit confirmation dialog",
+        "The desktop never displays, logs or stores holder_token values",
+        "Claims and provenance are read-only rows otherwise"
+      ],
+      "tests": [
+        "test_release_requires_confirmation_and_never_logs_holder_token (in tests/test_latex_client.py)"
+      ],
+      "owner_decision_needed": "",
+      "risk": "medium",
+      "notes": "Do not start until decision D is settled. Owner question, default taken (override if wrong): Release only the desktop's own claims.",
+      "blocker": "",
+      "collision_group": "",
+      "id": "MS-039"
+    },
+    {
+      "slug": "gdocs-docs-batchupdate-wrapper",
+      "project": "meridian-desktop",
+      "wave": 3,
+      "title": "Docs write layer: documents.get plus batchUpdate with revision control",
+      "depends_on": [
+        "gdocs-picker-drive-file-spike",
+        "gdocs-desktop-pkce-loopback",
+        "desktop-hosted-token-store"
+      ],
+      "files": [
+        "meridian_desktop/google_docs/docs_client.py",
+        "meridian_desktop/google_docs/batch_requests.py",
+        "tests/test_google_docs_requests.py"
+      ],
+      "acceptance": [
+        "Insert and delete indexes computed in UTF-16 code units, tested with an emoji",
+        "Every batchUpdate sends writeControl.requiredRevisionId from a fresh documents.get; a mismatch becomes StaleDocumentError with no silent retry",
+        "In suggestion mode the builder refuses named-range and structural requests before any network call",
+        "DocsWriter interface apply(document_id, requests) so an MCP adapter can replace it later"
+      ],
+      "tests": [
+        "test_insert_index_counts_utf16_code_units_for_emoji",
+        "test_batch_sends_required_revision_id_and_maps_stale_error"
+      ],
+      "risk": "medium",
+      "collision_group": "dsk-gdocs",
+      "notes": "UTF-16 index rule comes from Docs API documentation and is not re-verified; the picker spike must confirm. Token comes from desktop-hosted-token-store (absorbs the dropped Google keychain item).",
+      "blocker": "",
+      "id": "MS-040"
+    },
+    {
+      "slug": "gdocs-docs-mcp-evaluation",
+      "project": "meridian-desktop",
+      "wave": 3,
+      "title": "Evaluate Google's Docs MCP server as a swap-in for the write layer",
+      "depends_on": [
+        "gdocs-docs-batchupdate-wrapper"
+      ],
+      "files": [
+        "PLAN.md",
+        "tests/test_plan_verdict.py"
+      ],
+      "acceptance": [
+        "PLAN.md records whether it runs locally or only hosted, which auth it accepts, whether a drive.file token works, its write path, licence and stability label",
+        "The verdict is adopt, adapter-only or reject, with the reason"
+      ],
+      "tests": [
+        "tests/test_plan_verdict.py::test_gdocs_mcp_verdict_recorded (new)"
+      ],
+      "risk": "low",
+      "collision_group": "dsk-gdocs",
+      "notes": "Research item; do not add the MCP server as a dependency here.",
+      "blocker": "",
+      "id": "MS-041"
+    },
+    {
+      "slug": "desktop-zotero-autostart-owner-gate",
+      "project": "meridian-desktop",
+      "wave": 4,
+      "title": "Zotero tab: autostart plan shown; write only behind the explicit yes gate",
+      "depends_on": [
+        "desktop-zotero-launch-with-confirmation",
+        "zotero-launcher-land-on-dev"
+      ],
+      "files": [
+        "meridian_desktop/zotero_service.py",
+        "meridian_desktop/ui/zotero_tab.py"
+      ],
+      "acceptance": [
+        "The tab shows the path and content from autostart_plan() before any write",
+        "Install and remove are called with confirm=True only after the explicit yes gate; default is plan-only",
+        "With the gate off no file is written under the Startup folder (test uses a temp startup_dir)",
+        "Removal follows the same rule"
+      ],
+      "tests": [
+        "test_autostart_install_requires_explicit_yes"
+      ],
+      "risk": "medium",
+      "collision_group": "dsk-ui",
+      "notes": "The logon entry embeds machine-local absolute paths; it must not be committed or synced.",
+      "blocker": "",
+      "id": "MS-042"
+    },
+    {
+      "slug": "desktop-zotero-citation-lookup",
+      "project": "meridian-desktop",
+      "wave": 4,
+      "title": "Zotero tab: citation lookup via the direct local API, not the engine route",
+      "depends_on": [
+        "desktop-zotero-tab-status-view"
+      ],
+      "files": [
+        "meridian_desktop/zotero_service.py",
+        "meridian_desktop/ui/zotero_tab.py"
+      ],
+      "existing_code": [
+        "meridian/zotero_client.py:275-327 resolve_citation_ref(ref) dispatches doi:, zotero: and citekey refs and never raises. It is async (line 275).",
+        "meridian/zotero_client.py:98-143 _normalize_ref classifies the ref. :245-272 citekey search is fuzzy without Better BibTeX (per its docstring), so DOI and zotero: keys are the reliable inputs.",
+        "meridian/zotero_client.py:146-172 _normalize_item returns zotero_key, doi, title and item_type for the result view.",
+        "PLAN.md:100 names GET /zotero-lookup as the shared lookup path. That engine route auto-starts Zotero (<core>/latex-dir/engine/src/server.ts:347), so the desktop should not call it without the owner's decision."
+      ],
+      "acceptance": [
+        "The result shows zotero_key, title, doi and item_type. Not found and Zotero unreachable show as separate messages.",
+        "The lookup calls the local API directly and does not call the /zotero-lookup engine route.",
+        "The async resolver runs on a worker thread with its own event loop, never asyncio.run on the UI thread (CLAUDE.local.md bans asyncio.run on Windows).",
+        "A citekey result is labelled 'fuzzy' in the UI."
+      ],
+      "tests": [
+        "tests/test_zotero_service.py::test_citation_lookup_uses_direct_local_api_not_engine_route (named, new)"
+      ],
+      "owner_decision_needed": "",
+      "risk": "low",
+      "notes": "No new core code is needed. Do not read or copy the meridian-latex engine's zotero.ts into the desktop (PLAN.md:48-51 bans bundling or copying meridian-latex code). Owner question, default taken (override if wrong): Use the direct local Zotero API, not the engine route that auto-starts Zotero.",
+      "blocker": "",
+      "collision_group": "",
+      "id": "MS-043"
+    },
+    {
+      "slug": "desktop-zotero-launch-with-confirmation",
+      "project": "meridian-desktop",
+      "wave": 4,
+      "title": "Zotero tab: start Zotero only after the user confirms",
+      "depends_on": [
+        "desktop-zotero-tab-status-view"
+      ],
+      "files": [
+        "meridian_desktop/zotero_service.py",
+        "meridian_desktop/ui/zotero_tab.py"
+      ],
+      "acceptance": [
+        "Start opens a modal that names the zotero.exe path; the default button is Cancel",
+        "start_zotero runs only after Start is chosen in that dialog",
+        "Cancel starts no process and writes no file",
+        "The result action and api_ready are shown on the tab"
+      ],
+      "tests": [
+        "test_start_not_called_when_confirmation_declined"
+      ],
+      "risk": "medium",
+      "collision_group": "dsk-ui",
+      "blocker": "",
+      "id": "MS-044"
+    },
+    {
+      "slug": "desktop-zotero-library-search",
+      "project": "meridian-desktop",
+      "wave": 4,
+      "title": "Zotero tab: search the local library off the UI thread",
+      "depends_on": [
+        "zotero-local-library-search-core",
+        "desktop-zotero-tab-status-view"
+      ],
+      "files": [
+        "meridian_desktop/zotero_service.py",
+        "meridian_desktop/ui/zotero_tab.py"
+      ],
+      "acceptance": [
+        "Search runs on Enter or the Search button, not on every keystroke",
+        "Runs on a worker so the window stays responsive",
+        "Results show title, authors, date and zotero_key",
+        "Errors show the returned message with no traceback"
+      ],
+      "tests": [
+        "test_library_search_blank_query_makes_no_request"
+      ],
+      "risk": "low",
+      "collision_group": "dsk-ui",
+      "blocker": "",
+      "id": "MS-045"
+    },
+    {
+      "slug": "desktop-zotero-status-probe",
+      "project": "meridian-desktop",
+      "wave": 4,
+      "title": "Desktop Zotero status probe: installed, process running, API state (no Qt)",
+      "depends_on": [
+        "zotero-launcher-land-on-dev",
+        "zotero-launcher-status-api-disabled"
+      ],
+      "files": [
+        "meridian_desktop/zotero_service.py",
+        "tests/test_zotero_service.py"
+      ],
+      "existing_code": [
+        "meridian/zotero_launcher.py:89-101 is_zotero_process_running, :124-140 zotero_api_alive and :202-210 status(); call or mirror them once items zotero-launcher-land-on-dev and zotero-launcher-status-api-disabled land.",
+        "meridian_desktop/settings_store.py:29-34 Settings has no Zotero URL field; :23-24 DEFAULT_LOCAL_URL and DEFAULT_ENGINE_URL show the default-constant pattern if one is needed.",
+        "tools/check_boundary.py:56-57 and :99-102: Qt imports are allowed only under meridian_desktop/ui/, so zotero_service.py must not import Qt.",
+        "pyproject.toml:15-17 and pixi.toml:14-22 list PySide6 as the only runtime dependency, so use stdlib urllib, not httpx."
+      ],
+      "acceptance": [
+        "zotero_service.status() returns installed, exe, process_running and api_state, and never raises.",
+        "The probe uses a proxy-free opener on 127.0.0.1:23119 with a timeout of 2 seconds or less.",
+        "The function writes no files and launches nothing.",
+        "python tools/check_boundary.py prints boundary ok."
+      ],
+      "tests": [
+        "tests/test_zotero_service.py::test_status_probe_never_raises_and_launches_nothing (named, new)"
+      ],
+      "owner_decision_needed": "",
+      "risk": "low",
+      "notes": "If the owner picks re-implementation, drop the depends_on on zotero-launcher-land-on-dev for this item. Either way the release bundle must still pass verify_bundle.py (PLAN.md:224-226). Owner question, default taken (override if wrong): Re-implement the probe inside the desktop; do not import the core (licence boundary).",
+      "blocker": "",
+      "collision_group": "",
+      "id": "MS-046"
+    },
+    {
+      "slug": "desktop-zotero-tab-status-view",
+      "project": "meridian-desktop",
+      "wave": 4,
+      "title": "Zotero tab: status view replaces the wave-4 placeholder",
+      "depends_on": [
+        "desktop-zotero-status-probe"
+      ],
+      "files": [
+        "meridian_desktop/ui/zotero_tab.py",
+        "meridian_desktop/ui/main_window.py",
+        "tests/test_smoke.py"
+      ],
+      "acceptance": [
+        "Tab shows installed, process running and API state from zotero_service.status()",
+        "A refresh button re-probes; no probe runs at window construction",
+        "Tab names and order still match tests/test_smoke.py",
+        "Qt code stays under meridian_desktop/ui/"
+      ],
+      "tests": [
+        "test_zotero_tab_renders_probe_result"
+      ],
+      "risk": "low",
+      "collision_group": "dsk-ui",
+      "notes": "Transitively waits on desktop-zotero-status-probe (blocked). The Not built yet (wave 4) assertion at test_smoke.py:48-51 changes here.",
+      "blocker": "",
+      "id": "MS-047"
+    },
+    {
+      "slug": "gdocs-desktop-panel",
+      "project": "meridian-desktop",
+      "wave": 4,
+      "title": "Google Docs panel in the Writing tab: not-connected state, connect and disconnect",
+      "depends_on": [
+        "gdocs-desktop-pkce-loopback",
+        "desktop-hosted-token-store",
+        "gdocs-picker-drive-file-spike",
+        "gdocs-docs-batchupdate-wrapper"
+      ],
+      "files": [
+        "meridian_desktop/ui/google_docs_panel.py",
+        "meridian_desktop/ui/main_window.py",
+        "tests/test_google_docs_panel.py"
+      ],
+      "acceptance": [
+        "The stale 'approach not decided' label is replaced; with no token the panel shows Not connected and makes no network call on open",
+        "Connect starts the loopback flow in the system browser; disconnect deletes the token from the keychain",
+        "tools/check_boundary.py passes and the panel does not import QtNetwork",
+        "The panel runs offscreen under pytest-qt"
+      ],
+      "tests": [
+        "test_google_docs_panel_offline_shows_not_connected"
+      ],
+      "risk": "low",
+      "collision_group": "dsk-ui",
+      "blocker": "",
+      "id": "MS-048"
+    },
+    {
+      "slug": "desktop-code-search-panel",
+      "project": "meridian-desktop",
+      "wave": 6,
+      "title": "Code tab: BM25 search box and results, with a not-connected state",
+      "depends_on": [
+        "desktop-research-outputs-tabs",
+        "code-search-overlap-decision"
+      ],
+      "files": [
+        "meridian_desktop/ui/code_panel.py",
+        "meridian_desktop/ui/main_window.py",
+        "tests/test_code_panel.py"
+      ],
+      "acceptance": [
+        "A query returns path, line, score and snippet from the backend chosen by the overlap decision",
+        "Shows not connected when no engine is running; no network call at construction",
+        "An offscreen pytest-qt smoke test passes"
+      ],
+      "tests": [
+        "test_code_panel_shows_not_connected_without_engine"
+      ],
+      "risk": "medium",
+      "collision_group": "dsk-ui",
+      "notes": "Transitively waits on two blocked decisions.",
+      "blocker": "",
+      "id": "MS-049"
+    },
+    {
+      "slug": "desktop-outputs-panel",
+      "project": "meridian-desktop",
+      "wave": 6,
+      "title": "Outputs tab: search and provenance view over the outputs index",
+      "depends_on": [
+        "desktop-research-outputs-tabs",
+        "research-outputs-read-routes"
+      ],
+      "files": [
+        "meridian_desktop/ui/outputs_panel.py",
+        "tests/test_outputs_panel.py"
+      ],
+      "existing_code": [
+        "meridian/outputs_indexer.py:1654 (search_outputs)",
+        "meridian/outputs_indexer.py:2020 (get_outputs_convergence_state)",
+        "extensions/meridian-outputs/meridian_outputs/ (artifact_registry.py, classify.py, fingerprint.py, outputs_local.py)",
+        "meridian/routes/tunnel.py:2009-2021 (outputs MCP route)"
+      ],
+      "acceptance": [
+        "Search returns path, score and convergence state from the routes",
+        "Shows the convergence or degraded state from get_outputs_convergence_state without hiding it",
+        "Read-only; no register, annotate or evict actions"
+      ],
+      "tests": [
+        "test_outputs_panel_is_read_only (new, tests/test_outputs_panel.py)"
+      ],
+      "owner_decision_needed": "",
+      "risk": "medium",
+      "notes": "The meridian-outputs MCP needs /mcp authorization before its tools can be called in this session. Owner question, default taken (override if wrong): Same as research-outputs-read-routes: REST routes on the local server.",
+      "blocker": "",
+      "collision_group": "",
+      "id": "MS-050"
+    },
+    {
+      "slug": "desktop-research-outputs-tabs",
+      "project": "meridian-desktop",
+      "wave": 6,
+      "title": "Add Research and Outputs tabs to the desktop shell",
+      "depends_on": [],
+      "files": [
+        "meridian_desktop/ui/main_window.py",
+        "tests/test_tab_specs.py"
+      ],
+      "existing_code": [
+        "meridian_desktop/ui/main_window.py:23-33 (TAB_SPECS; only Code at wave 6 on line 29)",
+        "meridian_desktop/ui/main_window.py:47-50 (_placeholder_page)",
+        "PLAN.md Waves item 6 (lines 219-223) names Research, outputs, code as one wave"
+      ],
+      "acceptance": [
+        "TAB_SPECS includes Research and Outputs at wave 6; existing tab order unchanged",
+        "Each new tab shows the placeholder until items 7, 9 and 10 land",
+        "No Qt import outside meridian_desktop/ui/ (tools/check_boundary.py clean)"
+      ],
+      "tests": [
+        "test_tab_specs_include_research_and_outputs (new, tests/test_tab_specs.py)"
+      ],
+      "owner_decision_needed": "",
+      "risk": "low",
+      "notes": "Not verified whether desktop tests/ already has a tab test. Owner question, default taken (override if wrong): Put Research and Outputs as sections in the Code tab, matching the eight-tab plan.",
+      "blocker": "",
+      "collision_group": "",
+      "id": "MS-051"
+    },
+    {
+      "slug": "desktop-research-runs-panel",
+      "project": "meridian-desktop",
+      "wave": 6,
+      "title": "Research tab: read-only list of research runs and their states",
+      "depends_on": [
+        "desktop-research-outputs-tabs",
+        "research-outputs-read-routes"
+      ],
+      "files": [
+        "meridian_desktop/ui/research_panel.py",
+        "tests/test_research_panel.py"
+      ],
+      "acceptance": [
+        "Lists runs with state and provider name; no start, cancel or promote control",
+        "Shows not connected when no engine is running",
+        "Offscreen smoke test passes"
+      ],
+      "tests": [
+        "test_research_panel_has_no_submit_control"
+      ],
+      "risk": "low",
+      "collision_group": "dsk-research",
+      "notes": "Scheduler is dry-run only in code; no production submit caller exists.",
+      "blocker": "",
+      "id": "MS-052"
+    },
+    {
+      "slug": "gui-smoke-platform-report-and-packaged-check",
+      "project": "meridian-desktop",
+      "wave": 7,
+      "title": "Record the Qt platform in --smoke and add a packaged-exe GUI check",
+      "depends_on": [],
+      "files": [
+        "meridian_desktop/ui/app.py",
+        "packaging/gui_smoke.py",
+        "tests/test_smoke.py"
+      ],
+      "existing_code": [
+        "meridian_desktop/ui/app.py:18-40 --smoke branch prints 'smoke ok' and returns 0",
+        "tests/conftest.py:7 sets QT_QPA_PLATFORM=offscreen for every pytest run",
+        "tests/test_smoke.py:95-98 test_smoke_flag_returns_zero_and_prints_ok",
+        "pixi.toml:10 smoke task does not set the variable, so dev smoke uses the default platform (Windows) unless the shell sets it",
+        "PLAN.md:172-174 and 189-190 (qoffscreen used by bundle smoke; real Windows path not exercised by the bundle test)"
+      ],
+      "acceptance": [
+        "--smoke prints 'smoke ok platform=<QGuiApplication.platformName()>'.",
+        "--smoke-report <path> writes JSON with platform and visible, so the result does not depend on stdout (a --windowed exe may have no usable console).",
+        "packaging/gui_smoke.py runs dist/MeridianDesktop/MeridianDesktop.exe --smoke with QT_QPA_PLATFORM removed from the child environment, with a timeout, and FAILs unless the report says platform 'windows' and visible true.",
+        "The packaged check is not part of pixi run test; it is a manual or release-step run."
+      ],
+      "tests": [
+        "test_smoke_report_records_platform_name (runs under the offscreen setting from conftest)"
+      ],
+      "owner_decision_needed": "Owner accepts an interactive, logged-in Windows run of the packaged exe as release evidence (cannot run in headless CI). Also the --smoke-report format.",
+      "risk": "medium",
+      "notes": "PLAN.md:14 records 'smoke exits 0' but not which platform ran. This item makes that recorded. Tests can cover the reporting only. The Windows path itself needs the packaged run.",
+      "blocker": "manual",
+      "collision_group": "",
+      "id": "MS-053"
+    },
+    {
+      "slug": "hash-pins-cover-pyside-shiboken-binaries",
+      "project": "meridian-desktop",
+      "wave": 7,
+      "title": "Extend sha256 pins to PySide6 extensions and shiboken6 binaries, not only Qt DLLs",
+      "depends_on": [
+        "lgpl-text-reference-sha256"
+      ],
+      "files": [
+        "packaging/verify_bundle.py",
+        "packaging/lgpl_manifest.toml",
+        "tests/test_verify_bundle.py"
+      ],
+      "existing_code": [
+        "packaging/verify_bundle.py:565-586 check_hashes; target set at line 572 (Qt6 DLLs and PySide6 plugins only)",
+        "packaging/lgpl_manifest.toml:143-151 six pinned files",
+        "Unpinned in dist: PySide6/QtCore.pyd, QtGui.pyd, QtWidgets.pyd, PySide6/pyside6.abi3.dll, shiboken6/shiboken6.abi3.dll, shiboken6/Shiboken.pyd",
+        "packaging/verify_bundle.py:665-672 first-build write path (must not be used to re-pin silently)"
+      ],
+      "acceptance": [
+        "Pins cover PySide6/*.pyd, pyside6.abi3.dll and shiboken6 binaries, as well as the six current entries.",
+        "A changed byte in any pinned file FAILs the sha256 section.",
+        "Re-pinning requires an explicit flag, not the first-build write path."
+      ],
+      "tests": [
+        "test_hash_table_covers_pyside_extensions"
+      ],
+      "owner_decision_needed": "",
+      "risk": "low",
+      "notes": "The LGPL replacement rule (PLAN.md:37) lets users swap Qt DLLs. Pins on the owner's build only detect drift in the owner's build. They do not restrict replacement, and the notes should say so. Owner question, default taken (override if wrong): Pin the PySide6 and shiboken6 binaries; each upgrade re-pins.",
+      "blocker": "",
+      "collision_group": "",
+      "id": "MS-054"
+    },
+    {
+      "slug": "lgpl-text-reference-sha256",
+      "project": "meridian-desktop",
+      "wave": 7,
+      "title": "Pin LICENSES/LGPL-3.0.txt to a reference sha256 and check it at bundle time",
+      "depends_on": [
+        "notice-runtime-components-and-texts"
+      ],
+      "files": [
+        "packaging/verify_bundle.py",
+        "packaging/lgpl_manifest.toml",
+        "tests/test_verify_bundle.py"
+      ],
+      "existing_code": [
+        "packaging/verify_bundle.py:330-335 checks only the LGPL title line, not provenance",
+        "NOTICE.md:16-17 and 38-39 say provenance is not verified",
+        "LICENSES/LGPL-3.0.txt:1-6 header matches the standard FSF text header (seen by reading, not byte-verified)"
+      ],
+      "acceptance": [
+        "lgpl_manifest.toml has a [licence_texts] table with the sha256 of LICENSES/LGPL-3.0.txt.",
+        "check_notices FAILs on any byte difference from that hash.",
+        "The reference hash is recorded with its source (the FSF/gnu.org copy), and the owner or executor confirms it against that copy."
+      ],
+      "tests": [
+        "test_lgpl_text_hash_mismatch_fails"
+      ],
+      "owner_decision_needed": "Supply the reference sha256 from the FSF or gnu.org LGPL-3.0 copy, or approve a one-time download to derive it. Cannot be obtained or verified in this pass.",
+      "risk": "low",
+      "notes": "Do not write a hash until the reference is confirmed. Pinning the current file would only prove it has not changed, not that it is correct.",
+      "blocker": "manual",
+      "collision_group": "",
+      "id": "MS-055"
+    },
+    {
+      "slug": "licence-check-derived-from-bundle",
+      "project": "meridian-desktop",
+      "wave": 7,
+      "title": "Derive the bundled-licence check from the shipped modules, not four fixed names",
+      "depends_on": [
+        "verify-bundle-meridian-latex-leak-check"
+      ],
+      "files": [
+        "packaging/verify_bundle.py",
+        "tests/test_verify_bundle.py"
+      ],
+      "acceptance": [
+        "Distributions come from top-level module names in the PYZ table of contents via packages_distributions(); stdlib modules are listed, not dropped",
+        "A bundled distribution with no licence record or a non-LGPL licence FAILs",
+        "A fake PYZ containing a module from a GPL-licensed distribution FAILs"
+      ],
+      "tests": [
+        "test_licence_check_covers_distributions_whose_modules_ship"
+      ],
+      "risk": "medium",
+      "collision_group": "dsk-verify-bundle",
+      "notes": "The bundle has no *.dist-info, and run_license_inventory (verify_bundle.py:246-275) inspects the dev environment, not the bundle.",
+      "blocker": "",
+      "id": "MS-056"
+    },
+    {
+      "slug": "notice-runtime-components-and-texts",
+      "project": "meridian-desktop",
+      "wave": 7,
+      "title": "Add NOTICE entries and licence texts for each bundled non-Qt runtime component",
+      "depends_on": [
+        "runtime-dll-classification-python-openssl-ucrt"
+      ],
+      "files": [
+        "NOTICE.md",
+        "packaging/verify_bundle.py",
+        "LICENSES/ (new text files, one per runtime licence)"
+      ],
+      "existing_code": [
+        "NOTICE.md:7-23 (the PySide6 section format to copy)",
+        "packaging/verify_bundle.py:316-339 check_notices (add a required-marker check per runtime component)",
+        "packaging/build.py:143-153 copy_notices already copies LICENSES/ into the bundle"
+      ],
+      "acceptance": [
+        "NOTICE.md has one section per runtime table entry, with version, upstream licence, and the LICENSES file name.",
+        "Each licence text is in LICENSES/, copied from upstream and not written from memory, with its upstream source named in NOTICE.md.",
+        "check_notices FAILs when a runtime table entry has no NOTICE section."
+      ],
+      "tests": [
+        "test_notice_names_every_runtime_component"
+      ],
+      "owner_decision_needed": "Approve downloading upstream licence texts (or the owner supplies them); counsel reviews the NOTICE wording.",
+      "risk": "low",
+      "notes": "NOTICE.md:36-41 already lists this as open. Do not add a licence text for a component before item 7 classifies it.",
+      "blocker": "manual",
+      "collision_group": "",
+      "id": "MS-057"
+    },
+    {
+      "slug": "pixi-build-release-tasks-and-doc-drift",
+      "project": "meridian-desktop",
+      "wave": 7,
+      "title": "Add pixi build and release tasks and correct stale wave-1 text",
+      "depends_on": [
+        "qt-translations-policy"
+      ],
+      "files": [
+        "pixi.toml",
+        "packaging/build.py",
+        "README.md"
+      ],
+      "acceptance": [
+        "pixi.toml gains build (python packaging/build.py) and release (build then verify) tasks",
+        "The build.py:27-29 comment describes verify_bundle as a separate step",
+        "README.md:61-64 reflects the built state and names the release task"
+      ],
+      "tests": [
+        "test_pixi_has_build_and_release_tasks"
+      ],
+      "risk": "low",
+      "collision_group": "dsk-verify-bundle",
+      "notes": "Dependency on qt-translations-policy is kept for build.py ordering; the collision group already serialises it. Leave pyproject requires-python alone.",
+      "blocker": "",
+      "id": "MS-058"
+    },
+    {
+      "slug": "plugin-root-files-not-skipped",
+      "project": "meridian-desktop",
+      "wave": 7,
+      "title": "Prune and flag Qt plugin files that sit directly under PySide6/plugins",
+      "depends_on": [
+        "verify-pe-import-scan-every-binary"
+      ],
+      "files": [
+        "packaging/build.py",
+        "packaging/verify_bundle.py",
+        "tests/test_plugin_allowlist.py"
+      ],
+      "acceptance": [
+        "prune_forbidden removes PySide6/plugins/foo.dll and records it in the prune report",
+        "check_qt_modules returns a Qt plugin file not on allowed list problem for PySide6/plugins/foo.dll",
+        "Behaviour for platforms/ and styles/ files is unchanged"
+      ],
+      "tests": [
+        "test_plugin_root_file_is_pruned_and_flagged"
+      ],
+      "risk": "low",
+      "collision_group": "dsk-verify-bundle",
+      "notes": "Guard len(parts) > idx + 2 at build.py:133-136 and verify_bundle.py:227 skips root-level plugin files.",
+      "blocker": "",
+      "id": "MS-059"
+    },
+    {
+      "slug": "qt-translations-policy",
+      "project": "meridian-desktop",
+      "wave": 7,
+      "title": "Set and enforce a policy for Qt translation files, including qt_help_*.qm",
+      "depends_on": [
+        "plugin-root-files-not-skipped"
+      ],
+      "files": [
+        "packaging/build.py",
+        "packaging/lgpl_manifest.toml",
+        "tests/test_prune_bundle.py"
+      ],
+      "existing_code": [
+        "packaging/build.py:30-70 UNUSED_PYSIDE_MODULES includes PySide6.QtHelp (line 52)",
+        "packaging/lgpl_manifest.toml:55 forbids Qt6Help",
+        "packaging/build.py:107-140 prune_forbidden (a translation rule can follow the same pattern)",
+        "dist/MeridianDesktop/_internal/PySide6/translations/ holds qt_*.qm, qtbase_*.qm and qt_help_*.qm"
+      ],
+      "acceptance": [
+        "qt_help_*.qm is absent from the bundle, since QtHelp is excluded.",
+        "Remaining translations follow an explicit allowlist, or an explicit 'ship all' decision recorded in the manifest.",
+        "The prune report lists removed translations."
+      ],
+      "tests": [
+        "test_qt_help_translations_are_pruned"
+      ],
+      "owner_decision_needed": "",
+      "risk": "low",
+      "notes": "Size benefit untested. Help translations ship while QtHelp is forbidden, which is inconsistent with lgpl_manifest.toml:55. Owner question, default taken (override if wrong): Ship no Qt translations.",
+      "blocker": "",
+      "collision_group": "",
+      "id": "MS-060"
+    },
+    {
+      "slug": "runtime-dll-classification-python-openssl-ucrt",
+      "project": "meridian-desktop",
+      "wave": 7,
+      "title": "Classify non-Qt runtime DLLs in the bundle: Python, OpenSSL, zlib, bz2, lzma, UCRT",
+      "depends_on": [
+        "licence-check-derived-from-bundle"
+      ],
+      "files": [
+        "packaging/lgpl_manifest.toml",
+        "packaging/verify_bundle.py",
+        "tests/test_verify_bundle.py"
+      ],
+      "existing_code": [
+        "packaging/lgpl_manifest.toml:99-107 allowed_other_dlls and forbidden_other_dlls, PySide6 folder only",
+        "packaging/verify_bundle.py:56 QT_DLL_RE. Non-Qt DLLs at the bundle root are not checked anywhere.",
+        "NOTICE.md:36-41 'Python runtime and other dependencies: not yet inventoried'",
+        "dist/MeridianDesktop/_internal holds python3.dll, python312.dll, libcrypto-3-x64.dll (byte grep: 'OpenSSL 3.6.5'), libssl-3-x64.dll, zlib.dll, libbz2.dll, liblzma.dll, ucrtbase.dll, api-ms-win-*.dll, and MSVCP140/VCRUNTIME140 copies in _internal, PySide6 and shiboken6"
+      ],
+      "acceptance": [
+        "A new manifest table, separate from the Qt policy, names each runtime DLL with its upstream distribution and SPDX licence.",
+        "Every bundled DLL outside the Qt set is in that table or in allowed_other_dlls. Unlisted DLLs FAIL.",
+        "Every table entry must exist in the bundle, or the check FAILs (no stale entries).",
+        "api-ms-win-* forwarders are classified as Windows-supplied, with a stated reason."
+      ],
+      "tests": [
+        "test_unclassified_runtime_dll_fails_and_entries_must_exist"
+      ],
+      "owner_decision_needed": "Approve which runtime components ship (Python, OpenSSL, zlib, bzip2, xz, UCRT and API-set forwarders, and the duplicated MSVC runtime copies) and their licences; these go in a runtime table, not the Qt allowlists.",
+      "risk": "medium",
+      "notes": "Byte grep only. An OpenSSL 3.6.5 string is in libcrypto-3-x64.dll. No Python version string matched in python312.dll. Versions and licences need upstream metadata, for example the pixi environment's package records, not DLL bytes. The MSVC runtime licence is already unverified (PLAN.md:191).",
+      "blocker": "manual",
+      "collision_group": "",
+      "id": "MS-061"
+    },
+    {
+      "slug": "verify-bundle-meridian-latex-leak-check",
+      "project": "meridian-desktop",
+      "wave": 7,
+      "title": "Fail the bundle if meridian-latex path markers appear in files, names or PYZ code",
+      "depends_on": [
+        "desktop-verifier-leak-scan-tests"
+      ],
+      "files": [
+        "packaging/verify_bundle.py",
+        "tests/test_verify_bundle.py"
+      ],
+      "acceptance": [
+        "A new no meridian-latex references section fails when any FORBIDDEN_REFS string appears in a plain bundle file, a PYZ code constant, or a bundle file or directory name",
+        "The current dist passes; the NOTICE.md prose mention does not match because only path forms are markers",
+        "A test asserts the verifier marker list equals tools/check_boundary.FORBIDDEN_REFS"
+      ],
+      "tests": [
+        "test_bundle_meridian_latex_path_in_pyz_constant_fails"
+      ],
+      "risk": "low",
+      "collision_group": "dsk-verify-bundle",
+      "notes": "Absorbs dropped desktop-meridian-latex-content-leak except its SHA-256 fingerprint list, which needs an owner decision first. Do not use a bare overleaf marker: the planned Open in Overleaf button would trip it.",
+      "blocker": "",
+      "id": "MS-062"
+    },
+    {
+      "slug": "verify-enforce-pyside-shiboken-other-dlls",
+      "project": "meridian-desktop",
+      "wave": 7,
+      "title": "Enforce allowed and forbidden non-Qt DLL lists on PySide6 and shiboken6 folders",
+      "depends_on": [],
+      "files": [
+        "packaging/verify_bundle.py",
+        "packaging/lgpl_manifest.toml",
+        "tests/test_verify_bundle.py"
+      ],
+      "existing_code": [
+        "packaging/verify_bundle.py:187-239 check_qt_modules (model for a non-Qt section, same allowlist style)",
+        "packaging/verify_bundle.py:565-586 check_hashes (hash check, not a classification check; do not reuse for this)",
+        "packaging/lgpl_manifest.toml:99-107 allowed_other_dlls and forbidden_other_dlls (defined but never enforced on the bundle)",
+        "tests/test_qt_dll_classification.py:46-52 test_every_non_qt_dll_is_classified (covers the dev PySide6 folder only, not the bundle)"
+      ],
+      "acceptance": [
+        "A new check scans every .dll directly under PySide6/ and shiboken6/ in the bundle; a stem in neither list is a FAIL line naming the file.",
+        "A stem in forbidden_other_dlls is a FAIL line.",
+        "shiboken6.abi3 is classified in allowed_other_dlls only after owner confirmation; the real dist file dist/MeridianDesktop/_internal/shiboken6/shiboken6.abi3.dll then passes.",
+        "On a fake bundle with an unlisted PySide6/foo.dll, run() prints FAIL and returns 1."
+      ],
+      "tests": [
+        "test_shiboken6_abi3_is_classified_and_scanned (fake bundle: unlisted PySide6/foo.dll FAILs; forbidden stem FAILs)"
+      ],
+      "owner_decision_needed": "",
+      "risk": "low",
+      "notes": "Scope is the PySide6/ and shiboken6/ folders. Root-level _internal runtime DLLs are item 7. A byte grep (a hint, not a PE parse) found no Qt6 name in shiboken6.abi3.dll, only python3.dll and api-ms-win-crt imports. Also update the stale 'verifier does not check these yet' comments at lgpl_manifest.toml:94-98 in the same change. Run pixi run test before and after. Owner question, default taken (override if wrong): Add shiboken6.abi3 to allowed_other_dlls: it is PySide6's own binding.",
+      "blocker": "",
+      "collision_group": "",
+      "id": "MS-063"
+    },
+    {
+      "slug": "verify-pe-import-scan-every-binary",
+      "project": "meridian-desktop",
+      "wave": 7,
+      "title": "Parse PE imports of every bundled binary, not only Qt and PySide6 targets",
+      "depends_on": [
+        "verify-enforce-pyside-shiboken-other-dlls"
+      ],
+      "files": [
+        "packaging/verify_bundle.py",
+        "tests/test_verify_bundle.py"
+      ],
+      "acceptance": [
+        "Every .dll, .pyd and the exe in the bundle is parsed with pefile; a parse error is a FAIL line",
+        "Any import in forbidden_dlls or forbidden_other_dlls from any bundled binary is a FAIL naming importer and import",
+        "Any Qt6 import not in allowed_dlls from any binary is a FAIL",
+        "On the current dist, pyside6.abi3.dll's Qt6Core.dll import passes"
+      ],
+      "tests": [
+        "test_forbidden_import_in_pyside_abi3_dll_fails"
+      ],
+      "risk": "medium",
+      "collision_group": "dsk-verify-bundle",
+      "notes": "Extends check_pe_linkage (verify_bundle.py:489-543), which targets only PySide6 .pyd and Qt DLLs. Byte-grep hints only; not parsed.",
+      "blocker": "",
+      "id": "MS-064"
+    },
+    {
+      "slug": "verify-release-mode-notice-gate",
+      "project": "meridian-desktop",
+      "wave": 7,
+      "title": "Add --release mode that fails on draft EULA, placeholder source URL and TBD text",
+      "depends_on": [
+        "plugin-root-files-not-skipped"
+      ],
+      "files": [
+        "packaging/verify_bundle.py",
+        "tests/test_verify_bundle.py"
+      ],
+      "existing_code": [
+        "packaging/verify_bundle.py:316-339 check_notices",
+        "packaging/verify_bundle.py:338 requires the word DRAFT in EULA.txt, so a final EULA would fail as written",
+        "packaging/verify_bundle.py:337 accepts any https:// string, so the placeholder 'https://TBD-owner-source-host' (OFFER-SOURCE.md:20-21) passes",
+        "packaging/verify_bundle.py:694-701 main() argument parser (add the flag here)",
+        "EULA.txt:1 and 5-6; OFFER-SOURCE.md:1, 14-18, 32-34 (draft markers to detect)"
+      ],
+      "acceptance": [
+        "Default-mode output for the current draft tree is unchanged.",
+        "--release FAILs when EULA.txt or OFFER-SOURCE.md contains DRAFT, TBD or 'not verified' (case-insensitive).",
+        "--release FAILs when the OFFER-SOURCE.md URL host is TBD-owner-source-host or is missing.",
+        "--release does not require the word DRAFT in EULA.txt."
+      ],
+      "tests": [
+        "test_release_mode_rejects_draft_eula_and_placeholder_url"
+      ],
+      "owner_decision_needed": "Counsel and owner approve the final EULA wording, the real source-offer host and URL, and the offer duration (OFFER-SOURCE.md:14-21). The executor cannot invent these.",
+      "risk": "low",
+      "notes": "This is the verifier change a release needs. The wording itself is not an executor task.",
+      "blocker": "manual",
+      "collision_group": "",
+      "id": "MS-065"
+    },
+    {
+      "slug": "boundary-scan-skip-pixi-env",
+      "project": "meridian-desktop",
+      "wave": 8,
+      "title": "Skip the generated .pixi environment in the boundary scan",
+      "depends_on": [],
+      "files": [
+        "tools/check_boundary.py",
+        "tests/test_boundary.py"
+      ],
+      "acceptance": [
+        ".pixi is in SKIP_DIRS and test_real_repo_passes still passes",
+        "A forbidden reference under .pixi is not reported"
+      ],
+      "tests": [
+        "test_pixi_env_is_not_scanned"
+      ],
+      "risk": "low",
+      "collision_group": "dsk-boundary",
+      "notes": "Docstring acceptance removed: it duplicates desktop-metadata-drift-docs.",
+      "blocker": "",
+      "id": "MS-066"
+    },
+    {
+      "slug": "desktop-ci-windows-workflow",
+      "project": "meridian-desktop",
+      "wave": 8,
+      "title": "Add a Windows CI workflow for test, boundary, smoke and bundle verify",
+      "depends_on": [],
+      "files": [
+        ".github/workflows/desktop-test.yml",
+        "tests/test_ci_workflow_contract.py"
+      ],
+      "existing_code": [
+        "meridian-desktop has no .github/ and no git remote (git remote -v is empty).",
+        "pixi.toml:4 platforms = [\"win-64\"], so the jobs must run on windows-latest.",
+        "pixi.toml:7-12 tasks test, boundary, smoke, verify and app.",
+        "pixi.lock pins pytest-qt 4.5.0 and pyinstaller.",
+        "Meridian/repository/.github/workflows/test.yml:1-13 name, dev push trigger and PR-to-main trigger.",
+        "Meridian/repository/.github/workflows/test.yml:35-38 setup-pixi v0.8.1 and pixi-version v0.79.0 pins.",
+        "Meridian/repository/tests/test_f4ab2787_ci_workflow_contract.py is the contract-test precedent."
+      ],
+      "acceptance": [
+        "desktop-test.yml runs on windows-latest, on push to dev and on pull_request to main, with the same setup-pixi and pixi-version pins as core test.yml.",
+        "Job 1 runs pixi install --locked, pixi run test, pixi run boundary and pixi run smoke.",
+        "Job 2, which needs job 1, runs pixi run python packaging/build.py, then pixi run verify, then runs dist/MeridianDesktop/MeridianDesktop.exe --smoke with QT_QPA_PLATFORM unset, so the real qwindows platform runs. Today's bundle smoke uses offscreen (PLAN.md:189-190).",
+        "The workflow name is distinct from core's 'Test (dev branch)', because core's name is a cross-file API (test.yml:3-7).",
+        "tests/test_ci_workflow_contract.py reads the YAML as text, since PyYAML is not in pixi.lock, and fails if a required command, the windows-latest runner or a dev/main trigger is missing."
+      ],
+      "tests": [
+        "tests/test_ci_workflow_contract.py::test_desktop_workflow_runs_test_boundary_smoke_and_verify"
+      ],
+      "owner_decision_needed": "Create a private GitHub remote for meridian-desktop (none configured), choose the CI host, and approve Actions minutes on a Windows runner (pixi.toml targets win-64 only). Confirm trigger branches (dev push and PR to main).",
+      "risk": "medium",
+      "notes": "PLAN.md:227-229 (wave 8) asks for the boundary check in CI. Unverified: pixi install --locked on a runner, and a real window on a headless runner. Desktop has no lint step. Core's blocking ruff correctness check is test.yml:299-300, and the owner may want the same here, which needs ruff as a dev dependency.",
+      "blocker": "manual",
+      "collision_group": "",
+      "id": "MS-067"
+    },
+    {
+      "slug": "desktop-coverage-floor-85",
+      "project": "meridian-desktop",
+      "wave": 8,
+      "title": "Add pytest-cov with an 85 percent floor for meridian_desktop",
+      "depends_on": [
+        "desktop-ci-windows-workflow"
+      ],
+      "files": [
+        "pixi.toml",
+        "pyproject.toml",
+        "tests/test_ci_workflow_contract.py"
+      ],
+      "existing_code": [
+        "pixi.toml:17-22 pypi-dependencies, with no pytest-cov",
+        "pixi.toml:8 test task",
+        "pyproject.toml:19-25 dev extras, with no pytest-cov",
+        "pyproject.toml:33-36 [tool.pytest.ini_options], with no coverage table",
+        "Meridian/repository/pixi.toml:280 test-cov task and its --cov-fail-under pattern",
+        "Meridian/repository/.coveragerc:21 fail_under = 82, a precedent for a floor setting",
+        "AGENTS.md 'Tests & coverage': new code must hold 85% or more"
+      ],
+      "acceptance": [
+        "pytest-cov is pinned as a dev dependency in pixi.toml.",
+        "pyproject.toml gains [tool.coverage.run] with source = ['meridian_desktop'] and omit entries for packaging/ and tools/, plus [tool.coverage.report] fail_under = 85.",
+        "A pixi task test-cov runs pytest with --cov and fails below 85.",
+        "pixi run test still passes. The first measured percentage is recorded from a real run and is not assumed."
+      ],
+      "tests": [
+        "tests/test_ci_workflow_contract.py::test_desktop_test_cov_task_enforces_85_floor"
+      ],
+      "owner_decision_needed": "",
+      "risk": "low",
+      "notes": "Desktop coverage is unmeasured today. ui/ code is reached only by offscreen tests, so the floor may fail until desktop-per-tab-offscreen-smoke lands. Take the first real number from the Windows runner. Owner question, default taken (override if wrong): 85 percent for the whole desktop package.",
+      "blocker": "",
+      "collision_group": "",
+      "id": "MS-068"
+    },
+    {
+      "slug": "desktop-per-tab-offscreen-smoke",
+      "project": "meridian-desktop",
+      "wave": 8,
+      "title": "Parametrize offscreen smoke over all tabs with a no-network guard",
+      "depends_on": [],
+      "files": [
+        "tests/test_tab_smoke.py",
+        "tests/conftest.py"
+      ],
+      "acceptance": [
+        "One case per TAB_NAMES entry",
+        "Each case waits for exposure and asserts the page is visible and its objectName is set (placeholder or built page)",
+        "Each case asserts no modal widget is active",
+        "A conftest fixture patches socket.socket.connect to raise; any connect attempt fails the case"
+      ],
+      "tests": [
+        "tests/test_tab_smoke.py::test_each_tab_renders_offscreen_without_network"
+      ],
+      "risk": "low",
+      "collision_group": "dsk-smoke-conftest",
+      "notes": "An objectName equal to placeholder-<name> would fail once waves 2-6 replace placeholders, so the assertion is loosened here. TAB_SPECS verified at main_window.py:23.",
+      "blocker": "",
+      "id": "MS-069"
+    },
+    {
+      "slug": "gate-overleaf-hosted-tos-check",
+      "project": "meridian-core",
+      "wave": 0,
+      "title": "Gate: check Overleaf terms before any hosted Overleaf session storage",
+      "depends_on": [],
+      "files": [],
+      "existing_code": [],
+      "acceptance": [
+        "Overleaf terms reviewed for server-side session storage and third-party hosting; outcome recorded privately",
+        "Owner records go or no-go for overleaf-hosted-session-vault"
+      ],
+      "tests": [
+        "none (process gate)"
+      ],
+      "owner_decision_needed": "Owner or counsel reads Overleaf terms for server-side session storage and third-party hosting (PLAN.md:107-108 says not done), then records go or no-go. Also confirm the reversal of the engine and desktop no-session rules (overleaf-login.ts:17-21, PLAN.md:101-103) is deliberate.",
+      "risk": "medium",
+      "notes": "PLAN.md:105-108: a hosted engine would hold an Overleaf session, and hosting for third parties may be Competing Use under MSL 3(a).",
+      "blocker": "manual",
+      "collision_group": "",
+      "id": "MS-070"
+    },
+    {
+      "slug": "core-dashboard-claude-desktop-windows-path",
+      "project": "meridian-core",
+      "wave": 1,
+      "title": "Show the Windows APPDATA path for Claude Desktop in the dashboard",
+      "depends_on": [],
+      "files": [
+        "meridian/static/dashboard-settings.ts",
+        "meridian/static/dashboard.bundle.js",
+        "meridian/static/dashboard-settings.test.ts"
+      ],
+      "acceptance": [
+        "On win32 the Claude Desktop row shows %APPDATA% Claude claude_desktop_config.json; macOS and Linux rows keep their paths",
+        "dashboard.bundle.js is rebuilt from the TS source and scripts/smoke_bundle.mjs passes",
+        "The vitest suite for dashboard-settings passes"
+      ],
+      "tests": [
+        "shows the Windows APPDATA path for Claude Desktop (new vitest case in dashboard-settings.test.ts)"
+      ],
+      "risk": "low",
+      "collision_group": "core-dashboard",
+      "notes": "dashboard-settings.ts:1579 hardcodes ~/.config/Claude on every platform. The bundle build command was not found in package.json or scripts/; locate it before editing.",
+      "blocker": "",
+      "id": "MS-071"
+    },
+    {
+      "slug": "core-diff-coverage-gate",
+      "project": "meridian-core",
+      "wave": 1,
+      "title": "Enforce AGENTS.md 85 percent new-code coverage in core CI with diff-cover",
+      "depends_on": [],
+      "files": [
+        ".github/workflows/test.yml",
+        "pixi.toml",
+        "tests/test_f4ab2787_ci_workflow_contract.py"
+      ],
+      "existing_code": [
+        "AGENTS.md 'Tests & coverage': new code must hold 85% or more",
+        "Meridian/repository/.github/workflows/test.yml:73-74 test-core runs --cov-fail-under=82, which is global only",
+        "Meridian/repository/.coveragerc:21 fail_under = 82",
+        "Meridian/repository/pixi.toml:272 test task, which runs no coverage",
+        "Meridian/repository/pixi.toml:280 test-cov task",
+        "Meridian/repository/tests/test_f4ab2787_ci_workflow_contract.py, the contract test to extend",
+        "Meridian/repository/.github/workflows/test.yml:1-7 and 86-101 explain that the whole-run conclusion is the auto-promote gate, so a new blocking job changes promotion"
+      ],
+      "acceptance": [
+        "A step in test-core runs diff-cover against the merge base with dev, using checkout fetch-depth 0, and fails below 85 percent on changed executable lines.",
+        "A PR that changes no executable lines passes with an explicit 'no changed lines' message.",
+        "The step is not continue-on-error. test.yml:86-101 shows what a non-blocking job does to the promotion gate.",
+        "The AGENTS.md coverage line states what the gate measures: changed lines, against the global 82 floor."
+      ],
+      "tests": [
+        "tests/test_f4ab2787_ci_workflow_contract.py::test_diff_coverage_step_is_blocking_at_85"
+      ],
+      "owner_decision_needed": "Approve diff-cover as a new dev dependency; decide whether the step blocks auto-promote (it will if it lives in test.yml); decide whether 85 applies to changed lines (AGENTS wording) or stays the global 82.",
+      "risk": "medium",
+      "notes": "Verified: no diff-cover and no 85 floor anywhere in .github/, pixi.toml, scripts/run_tests.py or .coveragerc. The global floor is 82 (.coveragerc:21). This is not a desktop wave, so it can be scheduled at any time. It does not touch the high-contention files (server.py, dashboard.js, db/__init__.py).",
+      "blocker": "manual",
+      "collision_group": "",
+      "id": "MS-072"
+    },
+    {
+      "slug": "core-docs-cursor-scope-drift",
+      "project": "meridian-core",
+      "wave": 1,
+      "title": "Align the Cursor MCP docs with the chosen config scope",
+      "depends_on": [],
+      "files": [
+        "docs/quickstart.md",
+        "docs/index.md",
+        "tests/test_docs_client_paths.py"
+      ],
+      "existing_code": [
+        "scripts/meridian_connect.py (_cursor_config_path, user-global)",
+        "meridian/static/dashboard-settings.ts (shows ~/.cursor/mcp.json)",
+        ".gitignore (ignores .cursor/mcp.json)"
+      ],
+      "acceptance": [
+        "docs/quickstart.md Cursor section and docs/index.md Cursor tab name the same scope as the writer, or name both scopes and call out the default",
+        "test_cursor_docs_match_writer_scope passes",
+        "No other client sections change in this item"
+      ],
+      "tests": [
+        "test_cursor_docs_match_writer_scope"
+      ],
+      "owner_decision_needed": "",
+      "risk": "low",
+      "notes": "docs/quickstart.md:147-161 and docs/index.md:230-245 say project root. scripts/meridian_connect.py:548-554 deliberately uses the user-global file. .gitignore:287-290 warns that a project .cursor/mcp.json can hold a real bearer token. Owner question, default taken (override if wrong): User-global ~/.cursor/mcp.json, matching the existing writer and dashboard.",
+      "blocker": "",
+      "collision_group": "",
+      "id": "MS-073"
+    },
+    {
+      "slug": "core-land-client-setup-on-dev",
+      "project": "meridian-core",
+      "wave": 1,
+      "title": "Land meridian/client_setup.py and its tests on dev",
+      "depends_on": [
+        "core-land-code-search-on-dev"
+      ],
+      "files": [
+        "meridian/client_setup.py",
+        "tests/test_client_setup.py"
+      ],
+      "acceptance": [
+        "dev tracks both files, copied by path, with no other files in the commit",
+        "pytest tests/test_client_setup.py passes (21 tests)",
+        "pixi run test passes"
+      ],
+      "tests": [
+        "tests/test_client_setup.py (existing 21 tests)"
+      ],
+      "risk": "low",
+      "collision_group": "core-client-setup",
+      "notes": "Verified: client_setup.py is not on dev. Worktree is feat/mcp-client-setup, not dev. Uses uvx and codebase-memory-mcp at run time (see plan-without-tools).",
+      "blocker": "",
+      "id": "MS-074"
+    },
+    {
+      "slug": "core-land-code-search-on-dev",
+      "project": "meridian-core",
+      "wave": 1,
+      "title": "Land meridian/code_search.py and its tests on dev, by path, from the mcp-client-setup worktree",
+      "depends_on": [
+        "code-search-overlap-decision"
+      ],
+      "files": [
+        "meridian/code_search.py",
+        "tests/test_code_search.py"
+      ],
+      "acceptance": [
+        "dev tracks both files, copied by path; the commit adds only those two files",
+        "Commits b51df85b, c4445e5b, 4bfc9293 and ed163a16 are not included; the worktree CLAUDE.md is not staged",
+        "pixi run test passes on dev before and after"
+      ],
+      "tests": [
+        "tests/test_code_search.py (existing 17 tests), including test_secret_binary_and_oversized_files_are_never_indexed"
+      ],
+      "risk": "medium",
+      "collision_group": "core-code-search",
+      "notes": "Absorbs dropped code-search-commit-by-path (same work). Gated on code-search-overlap-decision: client_setup.py refuses to run without code_search.py, so the client-setup chain waits too. Verified: code_search.py is not on dev.",
+      "blocker": "",
+      "id": "MS-075"
+    },
+    {
+      "slug": "core-tenant-crypto-purpose-labels",
+      "project": "meridian-core",
+      "wave": 1,
+      "title": "Add an optional purpose label to derive_tenant_key without changing the default",
+      "depends_on": [],
+      "files": [
+        "meridian/tenant_crypto.py",
+        "tests/test_tenant_crypto.py"
+      ],
+      "acceptance": [
+        "derive_tenant_key(tenant_id, purpose=b'neon_db_url') returns the same bytes as today for the default",
+        "A different purpose gives a different key for the same tenant",
+        "Existing v2 ciphertexts still decrypt unchanged",
+        "With the master secret unset it still raises TenantCryptoError; the new purpose has no legacy fallback"
+      ],
+      "tests": [
+        "test_purpose_label_domain_separates_keys_and_default_keeps_existing_ciphertext"
+      ],
+      "risk": "medium",
+      "collision_group": "core-tenant-crypto",
+      "notes": "Verified: _HKDF_INFO is at tenant_crypto.py:61 and derive_tenant_key at :87. Prerequisite for crypto-tenant-secret-fail-closed (same file).",
+      "blocker": "",
+      "id": "MS-076"
+    },
+    {
+      "slug": "crypto-tenant-secret-fail-closed",
+      "project": "meridian-core",
+      "wave": 1,
+      "title": "Purpose-scoped tenant secret seal that never falls back to plaintext",
+      "depends_on": [
+        "core-tenant-crypto-purpose-labels"
+      ],
+      "files": [
+        "meridian/tenant_crypto.py",
+        "tests/test_tenant_crypto.py"
+      ],
+      "acceptance": [
+        "encrypt_tenant_secret and decrypt_tenant_secret use HKDF info b'meridian-secret:' plus purpose and prefix sv1:, distinct from v2:",
+        "Both raise TenantCryptoError when MERIDIAN_MASTER_SECRET is unset and never call db.encrypt_field",
+        "A value sealed for one purpose or one tenant fails to open for another",
+        "Existing v2 neon_db_url values still decrypt; _HKDF_INFO and the default are unchanged"
+      ],
+      "tests": [
+        "test_tenant_secret_seal_fails_closed_and_is_domain_separated"
+      ],
+      "risk": "low",
+      "collision_group": "core-tenant-crypto",
+      "notes": "The docstring at tenant_crypto.py:23-27 says the master secret was unset in production; writes will refuse until the owner sets it.",
+      "blocker": "",
+      "id": "MS-077"
+    },
+    {
+      "slug": "gdocs-policy-read-verdict",
+      "project": "meridian-core",
+      "wave": 1,
+      "title": "Record the Google Limited Use policy verdict for Docs storage and indexing",
+      "depends_on": [],
+      "files": [],
+      "existing_code": [
+        "Desktop PLAN.md:152-156 and :286-289 state the rules this read must check (no database or permanent copy without a read; encrypt at rest)."
+      ],
+      "acceptance": [
+        "A verdict is pinned with pin_decision for each use: storing Doc body text in the tenant Neon DB, storing a live copy for indexing, sending Doc text to a model provider, and storing OAuth refresh tokens.",
+        "Each verdict cites the policy clause relied on and the date of the policy version read.",
+        "The verdict lists the encryption-at-rest and deletion obligations that later items must implement.",
+        "The pinned decision id is written into the notes of gdocs-hosted-index-ingest before that item starts."
+      ],
+      "tests": [
+        "none (policy read, no code)"
+      ],
+      "owner_decision_needed": "Owner or counsel performs the Google Limited Use policy read and pins a verdict for: Doc body in Neon, live copy for indexing, sending Doc text to a model provider, storing OAuth refresh tokens. Absorbs gate-google-limited-use-policy-read. Gates the whole Google chain.",
+      "risk": "high",
+      "notes": "PLAN.md:152-156 says Limited Use forbids databases and permanent copies of user data and requires encryption at rest. The owner decided hosted storage may happen subject to this read (PLAN.md:286-289). This read is the gate for gdocs-hosted-index-ingest. Not checked in this pass: the current policy text.",
+      "blocker": "manual",
+      "collision_group": "",
+      "id": "MS-078"
+    },
+    {
+      "slug": "google-docs-adapter-land-code",
+      "project": "meridian-core",
+      "wave": 1,
+      "title": "Land the Google Docs adapter MVP code and fixture from codex/google-docs-adapter (commit 1a2ffc49)",
+      "depends_on": [
+        "gdocs-policy-read-verdict"
+      ],
+      "files": [
+        "meridian/google_docs_adapter.py",
+        "tests/test_google_docs_adapter.py",
+        "tests/fixtures/google_docs_document.json"
+      ],
+      "acceptance": [
+        "Cherry-pick of 1a2ffc49 onto a worktree based on dev applies without conflict (cherry-pick the commit, not the branch)",
+        "pixi run test passes with the added tests",
+        "The module imports no network, OAuth or credential code",
+        "No existing file changes"
+      ],
+      "tests": [
+        "tests/test_google_docs_adapter.py"
+      ],
+      "risk": "low",
+      "collision_group": "core-google-adapter",
+      "notes": "Split from google-docs-adapter-land-mvp (4 files). Dependency on the policy verdict is kept conservatively even though the adapter stores nothing.",
+      "blocker": "",
+      "id": "MS-079"
+    },
+    {
+      "slug": "google-docs-adapter-land-doc",
+      "project": "meridian-core",
+      "wave": 1,
+      "title": "Land the Google Docs adapter MVP doc",
+      "depends_on": [
+        "google-docs-adapter-land-code"
+      ],
+      "files": [
+        "docs/google-docs-adapter-mvp.md"
+      ],
+      "acceptance": [
+        "The MVP doc is added alongside the code with no edits to other docs",
+        "The doc's authentication boundary (host owns OAuth, token refresh, account binding) matches the module"
+      ],
+      "tests": [
+        "pixi run test (existing suite passes with the doc added)"
+      ],
+      "risk": "low",
+      "collision_group": "core-google-adapter",
+      "notes": "Split from google-docs-adapter-land-mvp (4 files).",
+      "blocker": "",
+      "id": "MS-080"
+    },
+    {
+      "slug": "npm-msl-distribution-reconcile",
+      "project": "meridian-core",
+      "wave": 1,
+      "title": "Reconcile MSL-1.0 licence fields and the npm publish of latex/ before the next v* tag",
+      "depends_on": [],
+      "files": [
+        "npm/package.json",
+        "<core>/latex-dir/engine/package.json",
+        ".github/workflows/npm-publish.yml"
+      ],
+      "existing_code": [
+        "npm/package.json:12 license MSL-1.0; :19 ./latex export; :22 files includes latex/; :24 prepack runs bundle-latex.mjs",
+        "npm/scripts/bundle-latex.mjs:1-12 says it copies the engine dist into npm/latex",
+        "<core>/latex-dir/engine/package.json:2 name @meridianmcp/latex, :33 license 'SEE LICENSE IN LICENSE'",
+        "PLAN.md:55 repo license TBD-owner",
+        "npm-publish.yml:3-5 publishes on v*.*.* tags; AGENTS.md pre-authorizes release tags"
+      ],
+      "acceptance": [
+        "One licence string is agreed and applied across npm/package.json, engine/package.json and the repo",
+        "The decision is recorded before any v* tag is pushed",
+        "No change to publishing behaviour until the owner decides"
+      ],
+      "tests": [
+        "existing npm/scripts/smoke-test-bundle.mjs must still pass"
+      ],
+      "owner_decision_needed": "Should the engine ship publicly on npm under MSL-1.0, and what licence field should @meridianmcp/mcp carry? Release tags are pre-authorized, so the next v*.*.* tag publishes latex/ automatically.",
+      "risk": "high",
+      "notes": "Not verified: whether any tag has already published latex/. git tags and the npm registry were not queried.",
+      "blocker": "manual",
+      "collision_group": "",
+      "id": "MS-081"
+    },
+    {
+      "slug": "sec-hosted-secret-fail-closed",
+      "project": "meridian-core",
+      "wave": 1,
+      "title": "Refuse the dev session-secret default when hosted mode is on",
+      "depends_on": [],
+      "files": [
+        "meridian/hosted.py"
+      ],
+      "existing_code": [
+        "meridian/hosted.py:62-92 (auth_setup_health reports session_secret_configured but does not block)",
+        "meridian/hosted.py:103-106 (_get_serializer falls back to dev-secret-change-me at line 105)",
+        "meridian/routes/oauth.py:85-86 (pattern: lazy import of server._hosted_mode)",
+        "meridian/server.py:1785-1791 (demo cookie has its own demo-fallback-secret; out of scope, see gaps)"
+      ],
+      "acceptance": [
+        "In hosted mode, with MERIDIAN_SESSION_SECRET and its alias SESSION_SECRET both unset, _get_serializer raises instead of signing with the dev default",
+        "Self-hosted mode behaves exactly as before",
+        "auth_setup_health output keeps the same keys and booleans"
+      ],
+      "tests": [
+        "tests/test_hosted.py::test_session_serializer_fails_closed_in_hosted_mode"
+      ],
+      "owner_decision_needed": "Confirm MERIDIAN_SESSION_SECRET is set in the hosted environment before this lands; if unset, sign-in stops. The repo cannot show env values. Gates the GitHub and Google connect fixes.",
+      "risk": "medium",
+      "notes": "The fixed string at hosted.py:105 is public, so any cookie or state it signs is forgeable while it is the fallback. sec-github-repo-connect-signed-state and google-docs-oauth-pkce-connect depend on this. Hosted-mode detection in hosted.py is not verified; the item assumes a lazy import of server._hosted_mode, as routes/oauth.py does.",
+      "blocker": "manual",
+      "collision_group": "",
+      "id": "MS-082"
+    },
+    {
+      "slug": "core-client-setup-backup-no-clobber",
+      "project": "meridian-core",
+      "wave": 2,
+      "title": "Stop same-second backups from overwriting the original backup",
+      "depends_on": [
+        "core-land-client-setup-on-dev"
+      ],
+      "files": [
+        "meridian/client_setup.py",
+        "tests/test_client_setup.py"
+      ],
+      "acceptance": [
+        "Two writes in the same second produce two backups, and the earlier one holds the bytes from before the first write",
+        "Backup names include microseconds or a counter; the create step never overwrites"
+      ],
+      "tests": [
+        "test_two_writes_in_one_second_keep_both_backups (new)"
+      ],
+      "risk": "medium",
+      "collision_group": "core-client-setup",
+      "notes": "Data-loss path: _backup (client_setup.py:152-158) uses second resolution and copy2.",
+      "blocker": "",
+      "id": "MS-083"
+    },
+    {
+      "slug": "core-client-setup-claude-json-reparse",
+      "project": "meridian-core",
+      "wave": 2,
+      "title": "Re-parse the Claude config before writing and keep its indent and BOM",
+      "depends_on": [
+        "core-land-client-setup-on-dev"
+      ],
+      "files": [
+        "meridian/client_setup.py",
+        "tests/test_client_setup.py"
+      ],
+      "existing_code": [
+        "meridian/client_setup.py (validate_codex, lines 316-340, the pattern to copy)",
+        "scripts/meridian_connect.py (_detect_json_indent, line 631)"
+      ],
+      "acceptance": [
+        "Before writing, the rendered JSON is parsed again, and unowned top-level keys and unowned servers are compared equal to the original, or the write is refused",
+        "The original file's indent is kept, and a UTF-8 BOM is accepted, not refused",
+        "test_claude_apply_keeps_unowned_entries_byte_for_byte (test line 77) either becomes a real byte test or is renamed, because it currently asserts parsed values"
+      ],
+      "tests": [
+        "test_claude_apply_reparses_and_keeps_indent (new)"
+      ],
+      "owner_decision_needed": "",
+      "risk": "medium",
+      "notes": "write_claude_desktop (client_setup.py:212-216) re-serializes the whole document with json.dumps(indent=2) and never re-checks its output, unlike plan_codex and validate_codex. _load_claude_document (line 173) reads utf-8 and fails on a BOM. AGENTS.md requires re-parse before writing for these configs. Owner question, default taken (override if wrong): Value-identical rewrite of the unowned entries (current behaviour).",
+      "blocker": "",
+      "collision_group": "",
+      "id": "MS-084"
+    },
+    {
+      "slug": "core-client-setup-claude-msix-candidates",
+      "project": "meridian-core",
+      "wave": 2,
+      "title": "Report the MSIX Claude Desktop config location in plan output",
+      "depends_on": [
+        "core-land-client-setup-on-dev"
+      ],
+      "files": [
+        "meridian/client_setup.py",
+        "tests/test_client_setup.py"
+      ],
+      "acceptance": [
+        "On win32 plan lists the classic %APPDATA% path and any Packages Claude LocalCache Roaming claude_desktop_config.json that exists, as candidates",
+        "Writes go only to the classic default or the --claude-config path, never the MSIX path"
+      ],
+      "tests": [
+        "test_plan_lists_msix_candidate_without_writing_it (new)"
+      ],
+      "risk": "low",
+      "collision_group": "core-client-setup",
+      "notes": "Classic AppData Roaming Claude path is the live one on this machine (area read; contents not read).",
+      "blocker": "",
+      "id": "MS-085"
+    },
+    {
+      "slug": "core-client-setup-codex-crlf-bom-errors",
+      "project": "meridian-core",
+      "wave": 2,
+      "title": "Keep Codex config line endings and BOM, and turn I/O errors into SetupError",
+      "depends_on": [
+        "core-land-client-setup-on-dev"
+      ],
+      "files": [
+        "meridian/client_setup.py",
+        "tests/test_client_setup.py"
+      ],
+      "acceptance": [
+        "A CRLF config.toml stays CRLF on every line after apply and after remove",
+        "A UTF-8 BOM at the start of config.toml is kept, not refused",
+        "An unreadable config.toml gives the SetupError JSON and exit 1, not a traceback"
+      ],
+      "tests": [
+        "test_codex_apply_preserves_crlf_and_bom (new)"
+      ],
+      "risk": "low",
+      "collision_group": "core-client-setup",
+      "notes": "plan_codex reads with utf-8 (client_setup.py:344) and writes LF, so every apply changes line endings. BOM behaviour should be confirmed by the test.",
+      "blocker": "",
+      "id": "MS-086"
+    },
+    {
+      "slug": "core-client-setup-codex-writer-interop-test",
+      "project": "meridian-core",
+      "wave": 2,
+      "title": "Test that the connect and client_setup Codex writers coexist in config.toml",
+      "depends_on": [
+        "core-land-client-setup-on-dev"
+      ],
+      "files": [
+        "tests/test_client_setup_connect_interop.py"
+      ],
+      "acceptance": [
+        "Applying either writer then the other keeps the hooks table, the connect meridian server table and both managed blocks",
+        "Removing the client_setup block leaves connect output unchanged, and the reverse holds",
+        "Re-running each writer is idempotent"
+      ],
+      "tests": [
+        "test_connect_and_client_setup_codex_writers_coexist_in_either_order (new)"
+      ],
+      "risk": "medium",
+      "collision_group": "core-client-interop",
+      "notes": "Test-only. If a conflict is found, add scripts/meridian_connect.py to files; still within the three-file limit.",
+      "blocker": "",
+      "id": "MS-087"
+    },
+    {
+      "slug": "core-client-setup-plan-without-tools",
+      "project": "meridian-core",
+      "wave": 2,
+      "title": "Let plan run on machines without uvx or codebase-memory-mcp",
+      "depends_on": [
+        "core-land-client-setup-on-dev"
+      ],
+      "files": [
+        "meridian/client_setup.py",
+        "tests/test_client_setup.py"
+      ],
+      "acceptance": [
+        "With uvx and codebase-memory-mcp absent, plan exits 0, writes nothing and reports missing tool names in a new missing_tools field",
+        "apply --yes with the same absence still exits 1 with the SetupError JSON",
+        "test_cli_plan_is_a_dry_run keeps passing"
+      ],
+      "tests": [
+        "test_cli_plan_succeeds_when_tools_are_missing (new)"
+      ],
+      "risk": "low",
+      "collision_group": "core-client-setup",
+      "notes": "main() sets mode to apply for plan (client_setup.py:443), which is why plan currently needs the tools.",
+      "blocker": "",
+      "id": "MS-088"
+    },
+    {
+      "slug": "core-client-setup-primary-meridian-server",
+      "project": "meridian-core",
+      "wave": 2,
+      "title": "Write the primary meridian server entry without overwriting a hosted one",
+      "depends_on": [
+        "core-land-client-setup-on-dev"
+      ],
+      "files": [
+        "meridian/client_setup.py",
+        "tests/test_client_setup.py"
+      ],
+      "existing_code": [
+        "docs/quickstart.md (Claude Desktop snippet, pixi run python -m meridian --mcp)",
+        "pixi.toml (task mcp, line 313)",
+        "scripts/meridian_connect.py (writes a 'meridian' url-plus-headers entry, line 586)"
+      ],
+      "acceptance": [
+        "If a non-owned 'meridian' entry already exists in a client config, apply refuses with SetupError and writes nothing",
+        "Otherwise apply adds 'meridian' that runs the local server with cwd set to the repo root",
+        "remove deletes only the owned 'meridian' entry"
+      ],
+      "tests": [
+        "test_apply_refuses_when_hosted_meridian_entry_exists (new)"
+      ],
+      "owner_decision_needed": "",
+      "risk": "medium",
+      "notes": "client_setup.CLIENT_SERVER_NAMES (lines 33-49) owns no 'meridian' entry, so the primary server is never written. Hosted-tier configs use 'meridian' with a url and bearer header (meridian_connect.py:557-586), so a silent overwrite would replace a working hosted connection. Owner question, default taken (override if wrong): Name it meridian and run pixi run python -m meridian --mcp, as the docs show.",
+      "blocker": "",
+      "collision_group": "",
+      "id": "MS-089"
+    },
+    {
+      "slug": "core-client-setup-serena-token-detection",
+      "project": "meridian-core",
+      "wave": 2,
+      "title": "Make is_serena_command recognise the version-pinned Serena package token",
+      "depends_on": [
+        "core-land-client-setup-on-dev"
+      ],
+      "files": [
+        "meridian/serena_pool.py",
+        "meridian/client_setup.py",
+        "tests/test_serena_pool.py"
+      ],
+      "existing_code": [
+        "meridian/serena_pool.py (is_serena_command, lines 133-148)",
+        "meridian/orphan_reaper.py (substring marker check, lines 542 and 562)",
+        "docs/mcp-tunnel-slots.md (unpinned Serena launch, line 25)"
+      ],
+      "acceptance": [
+        "is_serena_command returns True for a token list containing 'serena-agent==1.5.3' and 'start-mcp-server'",
+        "The Serena launch built by client_setup and the one built by serena_pool.build_serena_command agree on the package spec, or the difference is documented in code",
+        "Existing tests in tests/test_serena_pool.py still pass"
+      ],
+      "tests": [
+        "test_is_serena_command_accepts_version_pinned_package (new)"
+      ],
+      "owner_decision_needed": "",
+      "risk": "medium",
+      "notes": "Client-launched Serena (client_setup.py:30 and :113) is not recognised by the pool's exact-token check (serena_pool.py:148 needs the bare 'serena-agent' token). The orphan reaper's substring check (orphan_reaper.py:562) does match, so the two detectors disagree. The pool itself launches unpinned (serena_pool.py:261). The flags --enable-web-dashboard and --enable-gui-log-window (client_setup.py:115-117) appear nowhere else in the repo, so they are unverified against serena-agent 1.5.3. Owner question, default taken (override if wrong): Pin serena-agent==1.5.3 in both launchers.",
+      "blocker": "",
+      "collision_group": "",
+      "id": "MS-090"
+    },
+    {
+      "slug": "core-desktop-projects-schema-contract",
+      "project": "meridian-core",
+      "wave": 2,
+      "title": "Pin the projects columns the desktop reader depends on",
+      "depends_on": [
+        "desktop-readonly-sqlite-reader-core"
+      ],
+      "files": [
+        "tests/test_desktop_projects_contract.py"
+      ],
+      "acceptance": [
+        "PRAGMA table_info(projects) includes id, name, creator_human_id, icon, status, priority, parent_project_id and created_at",
+        "The test fails if any of those columns is renamed or dropped",
+        "No production code changes"
+      ],
+      "tests": [
+        "test_projects_columns_read_by_desktop_exist"
+      ],
+      "risk": "low",
+      "collision_group": "core-desktop-schema-contract",
+      "notes": "Dependency repointed to the reader core part, which owns the column list.",
+      "blocker": "",
+      "id": "MS-091"
+    },
+    {
+      "slug": "core-overleaf-session-vault",
+      "project": "meridian-core",
+      "wave": 2,
+      "title": "Store per-tenant Overleaf session cookies encrypted at rest, with key version and revoke",
+      "depends_on": [
+        "core-tenant-crypto-purpose-labels"
+      ],
+      "files": [
+        "meridian/overleaf_session_vault.py",
+        "meridian/db/migrations.py",
+        "meridian/db/__init__.py"
+      ],
+      "existing_code": [
+        "meridian/tenant_crypto.py:82 master_secret_is_set",
+        "meridian/tenant_crypto.py:117-120 _tenant_fernet pattern to copy with a new purpose label",
+        "meridian/db/__init__.py and meridian/db/migrations.py are high-contention files and must run sequentially",
+        "No Overleaf vault exists yet (zero matches in meridian/*.py)"
+      ],
+      "acceptance": [
+        "The row stores ciphertext plus a key_version column, and the plaintext cookie never appears in the row",
+        "Put is refused when MERIDIAN_MASTER_SECRET is unset. It fails closed and never uses the legacy global key",
+        "Revoke removes or tombstones the row, and get returns None afterwards",
+        "Ciphertext for tenant A does not decrypt for tenant B"
+      ],
+      "tests": [
+        "test_overleaf_session_vault_encrypts_per_tenant_and_fails_closed (new file tests/test_overleaf_session_vault.py)"
+      ],
+      "owner_decision_needed": "",
+      "risk": "high",
+      "notes": "The owner approved server-side, encrypted-at-rest storage. Keep the vault in core meridian/, not inside meridian-latex, to preserve self-containment (write-back-spec.md:9-18). The DB layer was not read, so the table design is unverified. Owner question, default taken (override if wrong): Re-encrypt rows on master-secret rotation; revoke deletes the stored session. The Overleaf-side session is not logged out automatically.",
+      "blocker": "",
+      "collision_group": "",
+      "id": "MS-092"
+    },
+    {
+      "slug": "ledger-core-persistence",
+      "project": "meridian-core",
+      "wave": 2,
+      "title": "Persist ledger items in a dedicated table on SQLite and Postgres",
+      "depends_on": [
+        "ledger-item-model"
+      ],
+      "files": [
+        "meridian/db/review_ledger.py",
+        "meridian/pg_adapter.py",
+        "meridian/db/__init__.py"
+      ],
+      "existing_code": [
+        "meridian/db/lint_finding.py:152-191 table and index migration (pattern)",
+        "meridian/db/lint_finding.py:208-296 create and get (idempotent insert)",
+        "meridian/db/lint_finding.py:299-336 list with equality filters",
+        "meridian/db/lint_finding.py:339-395 set status, with terminal resolved_at logic",
+        "meridian/pg_adapter.py:3649-3690 Postgres mirror of the lint table",
+        "meridian/pg_adapter.py:5795 migration import list",
+        "meridian/db/__init__.py:1154 migration call",
+        "meridian/db/__init__.py:13755-13769 export block",
+        "meridian/models.py:1283-1366 lint finding models (shape to copy)"
+      ],
+      "acceptance": [
+        "Creates review_ledger_items with project_id FK, document_id, item_key, source_kind, status CHECK in (open, addressed, rebutted, deferred), severity CHECK, evidence JSON, rebuttal and reason columns",
+        "UNIQUE(project_id, item_key) makes re-ingest an upsert that does not reset an existing item's status",
+        "Migration runs twice without error on SQLite, and the Postgres mirror creates the same table",
+        "The lint_findings table and its CHECK constraint are unchanged",
+        "No conn.commit() is added on the Postgres path"
+      ],
+      "tests": [
+        "tests/test_review_ledger_db.py::test_upsert_preserves_status_and_migration_is_idempotent"
+      ],
+      "owner_decision_needed": "",
+      "risk": "medium",
+      "notes": "lint_finding.py uses ? placeholders (lines 292, 315, 327) and db.commit() (lines 191, 392). Both conflict with the written rules (use %s, autocommit=True). Check the pg_adapter path before copying the SQL. meridian/db/__init__.py is sequential-only (high contention). Owner question, default taken (override if wrong): A new review_ledger_items table; do not extend lint_findings.",
+      "blocker": "",
+      "collision_group": "",
+      "id": "MS-093"
+    },
+    {
+      "slug": "privacy-google-drive-disclosure",
+      "project": "meridian-core",
+      "wave": 2,
+      "title": "Disclose Drive scope, storage, retention, and deletion on privacy and terms pages",
+      "depends_on": [
+        "gdocs-policy-read-verdict"
+      ],
+      "files": [
+        "meridian/templates/privacy.html",
+        "meridian/templates/terms.html"
+      ],
+      "existing_code": [
+        "meridian/templates/privacy.html:33 (Google account email and OAuth identifier)",
+        "meridian/templates/privacy.html:47 (Google OAuth described as sign-in only)",
+        "meridian/templates/privacy.html:53-54 (data retention and deletion section)",
+        "meridian/templates/terms.html:44 (retention section)"
+      ],
+      "acceptance": [
+        "Privacy page lists the Drive scope, what is stored (sealed token and any content snapshot), the retention period, and deletion on disconnect",
+        "Terms page is consistent with the privacy page",
+        "Wording is approved by counsel before any Google connect route ships"
+      ],
+      "tests": [
+        "tests/test_privacy_disclosure.py::test_privacy_names_drive_scope_and_deletion"
+      ],
+      "owner_decision_needed": "Counsel approves the public wording on privacy.html and terms.html before any Google connect route ships.",
+      "risk": "low",
+      "notes": "Public legal text: the copy needs human review, not only a string test. The Google connect item depends on this one.",
+      "blocker": "manual",
+      "collision_group": "",
+      "id": "MS-094"
+    },
+    {
+      "slug": "provider-connections-table",
+      "project": "meridian-core",
+      "wave": 2,
+      "title": "provider_connections table with a sealed-only credential column (SQLite and Postgres)",
+      "depends_on": [
+        "crypto-tenant-secret-fail-closed"
+      ],
+      "files": [
+        "meridian/db/migrations.py",
+        "meridian/db/__init__.py",
+        "meridian/pg_adapter.py"
+      ],
+      "acceptance": [
+        "provider_connections(id, tenant_id, provider in google_docs or overleaf, account_ref, scopes, sealed_credential NOT NULL, expires_at, created_at, revoked_at) with UNIQUE(tenant_id, provider, account_ref) and no plaintext token column",
+        "sealed_credential only ever holds sv1 values",
+        "Migrations are idempotent on SQLite and Postgres and create the same table",
+        "No existing table is altered"
+      ],
+      "tests": [
+        "tests/test_provider_connections_schema.py::test_table_idempotent_sqlite_and_postgres"
+      ],
+      "risk": "medium",
+      "collision_group": "core-db-schema",
+      "notes": "Canonical home for sealed Google Docs and Overleaf credentials; absorbs the dropped gdocs-hosted-token-table. db/__init__.py is high-contention: run sequentially. Use %s placeholders, not ?, in new SQL.",
+      "blocker": "",
+      "id": "MS-095"
+    },
+    {
+      "slug": "sec-github-repo-connect-signed-state",
+      "project": "meridian-core",
+      "wave": 2,
+      "title": "Bind GitHub repo-connect state to the session with a signed single-use nonce",
+      "depends_on": [
+        "sec-hosted-secret-fail-closed"
+      ],
+      "files": [
+        "meridian/hosted.py"
+      ],
+      "acceptance": [
+        "Repo-connect issues a signed, timestamped, single-use nonce bound to the tenant session, with its own itsdangerous salt",
+        "The callback rejects state repo:<id> or any unsigned, expired or replayed value with 400 and writes nothing",
+        "A fresh flow from the same session still sets github_repo and github_branch",
+        "The tenant github_pat is unchanged after a rejected callback"
+      ],
+      "tests": [
+        "tests/test_github_repo_connect_state.py::test_repo_callback_rejects_unsigned_state"
+      ],
+      "risk": "medium",
+      "collision_group": "core-hosted-py",
+      "notes": "Verified: hosted.py:949 sets state repo:<id> and the callback reads it at :963-964 with no nonce. The proven risk is login CSRF; a cross-tenant write is NOT proven (callback uses the caller tenant DB). Do not copy this state pattern into the Google flow.",
+      "blocker": "",
+      "id": "MS-096"
+    },
+    {
+      "slug": "core-client-catalog-single-source",
+      "project": "meridian-core",
+      "wave": 3,
+      "title": "Put client ids, paths and writer status in one catalog module",
+      "depends_on": [
+        "core-client-setup-plan-without-tools",
+        "core-dashboard-claude-desktop-windows-path"
+      ],
+      "files": [
+        "meridian/client_catalog.py",
+        "meridian/client_setup.py",
+        "tests/test_client_catalog.py"
+      ],
+      "acceptance": [
+        "Each client has id, label, path resolver, top-level key, entry shape and status (writer, ui_only, hosted_instructions or needs_confirmation)",
+        "client_setup defaults come from the catalog; a test asserts they match",
+        "plan --list-clients prints the catalog ids as JSON for the desktop"
+      ],
+      "tests": [
+        "test_catalog_covers_every_client_and_matches_writer_defaults (new)"
+      ],
+      "risk": "medium",
+      "collision_group": "core-client-setup",
+      "notes": "Client data is duplicated in four places, including dashboard-settings.ts:1577-1585.",
+      "blocker": "",
+      "id": "MS-097"
+    },
+    {
+      "slug": "core-client-setup-cursor-writer",
+      "project": "meridian-core",
+      "wave": 3,
+      "title": "Add a Cursor writer for local stdio servers in ~/.cursor/mcp.json",
+      "depends_on": [
+        "core-client-setup-backup-no-clobber",
+        "core-client-setup-claude-json-reparse"
+      ],
+      "files": [
+        "meridian/client_setup.py",
+        "tests/test_client_setup.py"
+      ],
+      "existing_code": [
+        "meridian/client_setup.py (plan_claude_desktop, lines 185-224, same mcpServers JSON shape)",
+        "scripts/meridian_connect.py (_cursor_config_path and _configure_cursor, lines 548-595, user-global merge with utf-8-sig read)",
+        ".gitignore (ignores .cursor/mcp.json, line 290)"
+      ],
+      "acceptance": [
+        "apply writes owned mcpServers entries to ~/.cursor/mcp.json (overridable with --cursor-config), keeps every other server, and writes no token",
+        "Idempotent; remove restores the unowned content",
+        "An unparseable file gives SetupError and nothing is written"
+      ],
+      "tests": [
+        "test_cursor_apply_merges_mcpServers_and_keeps_other_servers (new)"
+      ],
+      "owner_decision_needed": "",
+      "risk": "low",
+      "notes": "docs/mcp-tunnel-slots.md:25-27 and :83 describe Cursor's .cursor/mcp.json and an _install_mcp_json writer. The path is from repo code and docs and was not re-checked against Cursor's current docs. Owner question, default taken (override if wrong): User-global ~/.cursor/mcp.json.",
+      "blocker": "",
+      "collision_group": "",
+      "id": "MS-098"
+    },
+    {
+      "slug": "core-client-setup-gemini-cli-writer",
+      "project": "meridian-core",
+      "wave": 3,
+      "title": "Add a Gemini CLI writer for ~/.gemini/settings.json, blocked until path confirmed",
+      "depends_on": [
+        "core-client-setup-cursor-writer"
+      ],
+      "files": [
+        "meridian/client_setup.py",
+        "tests/test_client_setup.py"
+      ],
+      "existing_code": [
+        "meridian/client_setup.py (JSON writer, lines 185-224)"
+      ],
+      "acceptance": [
+        "Writes only the mcpServers key in ~/.gemini/settings.json; every other settings key keeps its value",
+        "Does not start until the owner confirms the path and the key"
+      ],
+      "tests": [
+        "test_gemini_writer_preserves_non_mcp_settings (new)"
+      ],
+      "owner_decision_needed": "",
+      "risk": "medium",
+      "notes": "~/.gemini does not exist on this machine (checked by path). No Gemini references exist in the core repo. settings.json holds non-MCP settings, so value-preservation tests matter. Owner question, default taken (override if wrong): ~/.gemini/settings.json; verify the key against current Gemini CLI docs before shipping.",
+      "blocker": "",
+      "collision_group": "",
+      "id": "MS-099"
+    },
+    {
+      "slug": "core-client-setup-vscode-copilot-writer",
+      "project": "meridian-core",
+      "wave": 3,
+      "title": "Add a VS Code Copilot writer that uses the 'servers' key, user profile only",
+      "depends_on": [
+        "core-client-setup-cursor-writer"
+      ],
+      "files": [
+        "meridian/client_setup.py",
+        "tests/test_client_setup.py"
+      ],
+      "existing_code": [
+        "meridian/client_setup.py (JSON writer, lines 185-224; the top-level key needs a parameter)",
+        "AppData/Roaming/Code/User/mcp.json (exists on this machine; only the quoted 'servers' key was counted, contents not read)"
+      ],
+      "acceptance": [
+        "Writes the top-level 'servers' key with type 'stdio' entries, and leaves any 'mcpServers' key in that file alone",
+        "Only the user profile file is written; workspace .vscode/mcp.json is never written",
+        "Idempotent; remove restores the unowned content"
+      ],
+      "tests": [
+        "test_vscode_writer_uses_servers_key_and_type_stdio (new)"
+      ],
+      "owner_decision_needed": "",
+      "risk": "medium",
+      "notes": "The vendor key shape was not verified in this pass. The file's contents were not read because they may hold secrets. Owner question, default taken (override if wrong): User profile only; never the workspace .vscode/mcp.json.",
+      "blocker": "",
+      "collision_group": "",
+      "id": "MS-100"
+    },
+    {
+      "slug": "core-client-setup-windsurf-writer",
+      "project": "meridian-core",
+      "wave": 3,
+      "title": "Add a Windsurf writer, blocked until its config path is confirmed",
+      "depends_on": [
+        "core-client-setup-cursor-writer"
+      ],
+      "files": [
+        "meridian/client_setup.py",
+        "tests/test_client_setup.py"
+      ],
+      "existing_code": [
+        "docs/quickstart.md (~/.codeium/windsurf/mcp_config.json, line 165)",
+        "docs/index.md (same path, line 248)"
+      ],
+      "acceptance": [
+        "Does not start until the owner confirms the path on a machine with Windsurf installed",
+        "Once confirmed, writes only mcpServers in the confirmed file, with other keys unchanged"
+      ],
+      "tests": [
+        "test_windsurf_writer_uses_confirmed_path (new)"
+      ],
+      "owner_decision_needed": "",
+      "risk": "medium",
+      "notes": "~/.codeium/windsurf does not exist on this machine (checked by path). PLAN.md:208 says to confirm the path first. Owner question, default taken (override if wrong): Docs path ~/.codeium/windsurf/mcp_config.json; verify on a machine with Windsurf.",
+      "blocker": "",
+      "collision_group": "",
+      "id": "MS-101"
+    },
+    {
+      "slug": "core-doctor-nonwriting-state-check",
+      "project": "meridian-core",
+      "wave": 3,
+      "title": "Make runner doctor's state-dir check create nothing on disk",
+      "depends_on": [],
+      "files": [
+        "meridian/local_runner.py",
+        "tests/test_local_runner.py"
+      ],
+      "acceptance": [
+        "doctor on an absent state dir creates no directory and no file",
+        "doctor on an existing writable dir reports ok without writing a probe file (use os.access W_OK)",
+        "DoctorCheck names are unchanged; the test at tests/test_local_runner.py:620 is updated with a comment",
+        "pixi run test passes before and after, capped with MERIDIAN_TEST_MAX_WORKERS=3"
+      ],
+      "tests": [
+        "test_doctor_state_dir_check_creates_no_files"
+      ],
+      "risk": "low",
+      "collision_group": "core-local-runner",
+      "notes": "Expected status for an absent state dir (warn fits the executable-warn pattern) is a small call to confirm during the change. local_runner.py:1211-1219 writes a probe file today.",
+      "blocker": "",
+      "id": "MS-102"
+    },
+    {
+      "slug": "core-slot-docs-reconcile",
+      "project": "meridian-core",
+      "wave": 3,
+      "title": "Correct docs/mcp-tunnel-slots.md: ten built-in slots, not three",
+      "depends_on": [],
+      "files": [
+        "docs/mcp-tunnel-slots.md",
+        "tests/test_tunnel_slot_docs.py"
+      ],
+      "existing_code": [
+        "docs/mcp-tunnel-slots.md:3-12 says a fixed 3-slot model (fs, code, extract only)",
+        "meridian/tunnel_plugins.py:51 SLOTS has 10 entries",
+        "meridian/tunnel_plugins.py:242 word is marked retired",
+        "meridian/mcp_tools.py:4440-4445 get_tunnel_diagnostics lists the slots and the five states"
+      ],
+      "acceptance": [
+        "the doc table lists every SLOTS entry with its port and default-enabled state",
+        "word is marked retired",
+        "custom slots p0 to p3 (8814 to 8817) are described",
+        "the test fails if any SLOTS name is missing from the doc"
+      ],
+      "tests": [
+        "test_tunnel_slot_doc_lists_every_builtin_slot"
+      ],
+      "owner_decision_needed": "",
+      "risk": "low",
+      "notes": "Docs are an ordinary file edit (AGENTS.md exception for .md). The test can read tunnel_plugins.SLOTS in pytest. Owner question, default taken (override if wrong): Show all built-in slots plus custom ones.",
+      "blocker": "",
+      "collision_group": "",
+      "id": "MS-103"
+    },
+    {
+      "slug": "core-tunnel-local-status-file",
+      "project": "meridian-core",
+      "wave": 3,
+      "title": "Write a local tunnel slot status file that the desktop can read",
+      "depends_on": [],
+      "files": [
+        "meridian/tunnel_client.py",
+        "tests/test_tunnel_status_file.py"
+      ],
+      "existing_code": [
+        "meridian/tunnel_client.py:4006-4008 per-port claim JSON under the slot-claim dir (local precedent)",
+        "meridian/tunnel_client.py:285-308 log setup under ~/.meridian (same home-directory pattern)",
+        "meridian/tunnel_lifecycle.py, read by local_runner.py:1181-1191 for tunnel readiness",
+        "meridian/tunnel_client.py:2017 a JSON tmp-file write (not traced for atomicity)"
+      ],
+      "acceptance": [
+        "writes ~/.meridian/tunnel_status.json (or a MERIDIAN_TUNNEL_STATUS path) on each slot state change",
+        "contains slot name, port, state, updated_at, pid and last_error after redaction",
+        "contains no token, URL query or header",
+        "a write failure is logged and ignored, and tunnel startup is never blocked"
+      ],
+      "tests": [
+        "test_tunnel_status_file_is_token_free_and_best_effort"
+      ],
+      "owner_decision_needed": "",
+      "risk": "medium",
+      "notes": "The client-side transition point was not traced in this prospect, so the executor must find it. The server-side slot health in routes/tunnel.py:603 is a different state and is not the source here. Owner question, default taken (override if wrong): Approve a local status file under ~/.meridian (tunnel_status.json).",
+      "blocker": "",
+      "collision_group": "",
+      "id": "MS-104"
+    },
+    {
+      "slug": "core-tunnel-log-tee-redaction",
+      "project": "meridian-core",
+      "wave": 3,
+      "title": "Redact secret-shaped text before writing tunnel.log",
+      "depends_on": [],
+      "files": [
+        "meridian/tunnel_client.py",
+        "tests/test_tunnel_log_redaction.py"
+      ],
+      "acceptance": [
+        "A line containing ?token=... or Bearer sk_meridian_... is written to tunnel.log with the value replaced",
+        "The console stream receives the original text unchanged",
+        "A redaction error never blocks the log or console write; _TimestampedLogFile timestamp behaviour is unchanged"
+      ],
+      "tests": [
+        "test_tunnel_log_tee_redacts_secret_shaped_text"
+      ],
+      "risk": "medium",
+      "collision_group": "core-tunnel-client",
+      "notes": "Redact per complete line inside _TimestampedLogFile, not per write: print writes text and newline separately (tunnel_client.py:201-204). Use fake values from secret_redaction examples only.",
+      "blocker": "",
+      "id": "MS-105"
+    },
+    {
+      "slug": "gdocs-hosted-index-ingest",
+      "project": "meridian-core",
+      "wave": 3,
+      "title": "Index Google Doc text into kind='document' notes keyed by Drive file ID",
+      "depends_on": [
+        "gdocs-policy-read-verdict",
+        "provider-connections-table",
+        "google-docs-oauth-pkce-connect"
+      ],
+      "files": [
+        "meridian/google_docs_sync.py",
+        "meridian/routes/notes.py",
+        "tests/test_google_docs_sync.py"
+      ],
+      "existing_code": [
+        "meridian/db/__init__.py:10645-10681 (ingest_document; source-keyed upsert, docstring :10670-10677)",
+        "meridian/routes/notes.py:326-364 (documents/upload: type and size checks; copy the body-cap handling). routes/notes.py already uses a router (:51, :169, :326).",
+        "meridian/db/__init__.py:10666 (DOC_BODY_MAX_CHARS cap via doc_ingest)"
+      ],
+      "acceptance": [
+        "The sync sets source to gdoc:<drive file id>. Syncing the same Doc twice leaves one kind='document' note with the updated body and title.",
+        "Body text is extracted from documents.get body content (paragraphs and table cells). Formatting is not kept, and the note says so.",
+        "The body is capped by DOC_BODY_MAX_CHARS with the existing truncation marker.",
+        "The sync refuses to run when no policy verdict is pinned for this feature (gdocs-policy-read-verdict).",
+        "No Doc text is sent to any model provider or third-party service."
+      ],
+      "tests": [
+        "test_google_doc_sync_upserts_one_note_per_drive_file_id",
+        "test_sync_refuses_without_policy_verdict"
+      ],
+      "owner_decision_needed": "Indexing scope: drive.file (picked files only) or drive.readonly (restricted scope, PLAN.md:157). Rewritten: sync must write sealed snapshots via google-doc-snapshot-store-encrypted, not plaintext kind=document notes through the existing ingest path (db/__init__.py:10645 stores plaintext).",
+      "risk": "high",
+      "notes": "Do not start until gdocs-policy-read-verdict is recorded. This stores a permanent copy in the tenant database, which PLAN.md:152-156 flags.",
+      "blocker": "manual",
+      "collision_group": "",
+      "id": "MS-106"
+    },
+    {
+      "slug": "google-doc-snapshot-store-encrypted",
+      "project": "meridian-core",
+      "wave": 3,
+      "title": "Encrypted, flag-gated Google Doc snapshot store keyed by revision",
+      "depends_on": [
+        "gdocs-policy-read-verdict",
+        "crypto-tenant-secret-fail-closed",
+        "provider-connections-table"
+      ],
+      "files": [
+        "meridian/db/google_doc_snapshots.py",
+        "meridian/db/migrations.py",
+        "meridian/pg_adapter.py"
+      ],
+      "existing_code": [
+        "meridian/db/__init__.py:10507 (add_project_note: plaintext body path; do not reuse for Google content)",
+        "meridian/doc_ingest.py:86 (DOC_BODY_MAX_CHARS = 200_000; a cap would silently truncate a snapshot)",
+        "meridian/db/migrations.py:469-478 (project_notes DDL: body TEXT, plaintext)"
+      ],
+      "acceptance": [
+        "Table google_doc_snapshots(tenant_id, provider_doc_id, revision_id, sealed_body, body_sha256, captured_at, expires_at); body stored only as sv1: ciphertext",
+        "Rows keyed by (tenant_id, provider_doc_id, revision_id); re-capture replaces, does not append",
+        "With MERIDIAN_GOOGLE_DOCS_INDEX unset (the default), no row is written",
+        "No code path sends snapshot content to a model provider or to any non-Google service",
+        "Over-size content is rejected, never silently capped"
+      ],
+      "tests": [
+        "tests/test_google_doc_snapshots.py::test_snapshot_sealed_flagged_and_never_truncated"
+      ],
+      "owner_decision_needed": "Retention period for expires_at, and whether Neon or Postgres storage encryption counts as encryption at rest under Limited Use, or application-level sealing is required (this item assumes sealing).",
+      "risk": "high",
+      "notes": "The existing ingest path (db.ingest_document, db/__init__.py:10645, then add_project_note at 10507) stores plaintext, and no encrypt call was found on that path, so it cannot hold Google content under the owner's encrypt-at-rest decision.",
+      "blocker": "manual",
+      "collision_group": "",
+      "id": "MS-107"
+    },
+    {
+      "slug": "provider-connections-db-helpers",
+      "project": "meridian-core",
+      "wave": 3,
+      "title": "Tenant-bound provider connection helpers that never return sealed credentials",
+      "depends_on": [
+        "provider-connections-table"
+      ],
+      "files": [
+        "meridian/db/provider_connections.py",
+        "tests/test_provider_connections.py"
+      ],
+      "acceptance": [
+        "add, get-secret (server-side open only), list (never includes sealed_credential) and revoke (sets revoked_at, clears sealed_credential) exist",
+        "A sealed value copied to another tenant_id fails to open",
+        "With MERIDIAN_MASTER_SECRET unset, writes raise and store nothing"
+      ],
+      "tests": [
+        "tests/test_provider_connections.py::test_sealed_credential_is_tenant_bound_and_never_listed"
+      ],
+      "risk": "medium",
+      "collision_group": "core-db-helpers",
+      "blocker": "",
+      "id": "MS-108"
+    },
+    {
+      "slug": "google-doc-snapshot-expiry-job",
+      "project": "meridian-core",
+      "wave": 4,
+      "title": "Expire Google Doc snapshots past expires_at on a scheduled cleanup",
+      "depends_on": [
+        "google-doc-snapshot-store-encrypted"
+      ],
+      "files": [
+        "meridian/hosted.py",
+        "meridian/db/google_doc_snapshots.py"
+      ],
+      "acceptance": [
+        "run_google_doc_snapshot_expiry deletes only rows with expires_at in the past and returns a count",
+        "No-op when MERIDIAN_GOOGLE_DOCS_INDEX is unset",
+        "Does not touch provider_connections"
+      ],
+      "tests": [
+        "tests/test_google_doc_snapshot_expiry.py::test_expiry_deletes_only_expired_rows"
+      ],
+      "risk": "low",
+      "collision_group": "core-hosted-py",
+      "notes": "Scheduler wiring in server.py is a separate, sequential follow-up.",
+      "blocker": "",
+      "id": "MS-109"
+    },
+    {
+      "slug": "google-docs-oauth-pkce-connect",
+      "project": "meridian-core",
+      "wave": 4,
+      "title": "Hosted Google Docs connect: PKCE, signed state, drive.file, sealed refresh token",
+      "depends_on": [
+        "gdocs-policy-read-verdict",
+        "sec-hosted-secret-fail-closed",
+        "provider-connections-db-helpers",
+        "privacy-google-drive-disclosure"
+      ],
+      "files": [
+        "meridian/google_docs_oauth.py",
+        "meridian/routes/auth.py",
+        "meridian/hosted_route_gate.py"
+      ],
+      "existing_code": [
+        "meridian/hosted.py:136-143 (login OAuth client, scope openid email profile, callback /auth/callback; do not reuse or widen)",
+        "meridian/hosted.py:151-161 (get_google_auth_url; model only)",
+        "meridian/hosted.py:164-189 (code-to-token exchange via httpx to oauth2.googleapis.com/token; copy the shape but keep the token)",
+        "meridian/hosted.py:103-106 (itsdangerous serializer; use a new salt)",
+        "meridian/hosted_route_gate.py:112-123 and :204-205 (allowlist entries; the gate is default-deny)",
+        "meridian/routes/auth.py:51-63 (route wrapper pattern)"
+      ],
+      "acceptance": [
+        "Connect builds a Google URL with scope https://www.googleapis.com/auth/drive.file only, code_challenge_method S256, and a signed single-use state bound to the tenant session",
+        "The callback rejects missing, forged, expired, or replayed state with 400 and stores nothing",
+        "A successful callback stores the refresh token only through provider_connections, never in logs or in the response",
+        "hosted_route_gate allowlists the connect and callback pair, and an anonymous callback is refused",
+        "The redirect URI is the hosted web callback, not a loopback address"
+      ],
+      "tests": [
+        "tests/test_google_docs_oauth.py::test_connect_callback_pkce_state_and_sealed_storage"
+      ],
+      "owner_decision_needed": "Confirm the hosted redirect URI (web callback with PKCE, registered in the owner Google Cloud project), whether the consent screen leaves Testing (7-day refresh expiry), and that drive.file is enough for Picker-selected documents (untested, PLAN.md:142).",
+      "risk": "high",
+      "notes": "Third-party tokens and a new auth route. A new route without a hosted_route_gate allowlist entry gets a 401. Do not widen the login client's scope (hosted.py:141), because that would widen sign-in.",
+      "blocker": "manual",
+      "collision_group": "",
+      "id": "MS-110"
+    },
+    {
+      "slug": "hosted-overleaf-index-spike",
+      "project": "meridian-core",
+      "wave": 4,
+      "title": "Hosted tunnel-independent Overleaf indexing (blocked on the MSL Competing Use decision)",
+      "depends_on": [
+        "core-overleaf-session-vault",
+        "latex-local-project-index-persist"
+      ],
+      "files": [],
+      "existing_code": [
+        "engine/src/overleaf-ot-client.ts:126 connectToProject with a cookie header (:141)",
+        "engine/src/project-tree.ts:184 listDocPaths",
+        "engine/src/store.ts:39-43 projects table, unchanged by the hosted path"
+      ],
+      "acceptance": [
+        "Do not start until the owner records a decision on MSL 3(a) (LICENSE:105-106)",
+        "If approved: a spike reads the project tree through connectToProject using the vault cookie, in memory only, persisting paths and ids and never document text"
+      ],
+      "tests": [
+        "none until the owner decision; spike test name to be set then"
+      ],
+      "owner_decision_needed": "Is running the engine or an Overleaf session worker for paying users Competing Use under MSL 3(a) (LICENSE:105-106)? If yes, a commercial licence (LICENSE:184-186) or relicense is needed. Also the ToS read.",
+      "risk": "high",
+      "notes": "Files are deliberately empty until the owner decides. Do not put this worker inside meridian-latex, which must stay self-contained.",
+      "blocker": "manual",
+      "collision_group": "",
+      "id": "MS-111"
+    },
+    {
+      "slug": "zotero-launcher-land-on-dev",
+      "project": "meridian-core",
+      "wave": 4,
+      "title": "Land the Zotero launcher module and its tests on dev (cherry-pick d0524345)",
+      "depends_on": [],
+      "files": [
+        "meridian/zotero_launcher.py",
+        "tests/test_zotero_launcher.py"
+      ],
+      "acceptance": [
+        "Cherry-pick of d0524345 onto dev changes only these two files; commit 38cbe6a6 is not included",
+        "pixi run test passes on dev before and after",
+        "python -m meridian.zotero_launcher status prints JSON with installed, exe, process_running and api_ready and exits 0"
+      ],
+      "tests": [
+        "test_main_autostart_install_without_yes_changes_nothing (existing) and the whole tests/test_zotero_launcher.py"
+      ],
+      "risk": "low",
+      "collision_group": "core-zotero-launcher",
+      "notes": "Verified: zotero_launcher.py is not on dev. Source from integrate/zotero-filer-20261013 (blob f47e5f54). Imports zotero_client._DEFAULT_BASE_URL, which exists on dev (verified).",
+      "blocker": "",
+      "id": "MS-112"
+    },
+    {
+      "slug": "zotero-launcher-status-api-disabled",
+      "project": "meridian-core",
+      "wave": 4,
+      "title": "Launcher status distinguishes local API disabled (403) from not running",
+      "depends_on": [
+        "zotero-launcher-land-on-dev"
+      ],
+      "files": [
+        "meridian/zotero_launcher.py",
+        "tests/test_zotero_launcher.py"
+      ],
+      "acceptance": [
+        "status() adds api_state: ready (200), disabled (403), not_running (connection error or timeout), other; existing keys keep names and types",
+        "A 403 with process_running True gives api_state disabled",
+        "zotero_api_alive still returns a bool; start_zotero action values unchanged",
+        "The probe honours MERIDIAN_ZOTERO_API_URL when set"
+      ],
+      "tests": [
+        "test_status_reports_local_api_disabled_on_403"
+      ],
+      "risk": "low",
+      "collision_group": "core-zotero-launcher",
+      "blocker": "",
+      "id": "MS-113"
+    },
+    {
+      "slug": "zotero-local-library-search-core",
+      "project": "meridian-core",
+      "wave": 4,
+      "title": "Local-API library search in zotero_client (127.0.0.1:23119, no key)",
+      "depends_on": [],
+      "files": [
+        "meridian/zotero_client.py",
+        "tests/test_zotero_client.py"
+      ],
+      "acceptance": [
+        "search_local_library(query, limit=10) returns {query, count, results}, the same shape as zotero_search",
+        "A blank query returns an error and makes no request",
+        "403 names Local API is not enabled; a refused connection names Zotero not running; the function never raises",
+        "Base URL from MERIDIAN_ZOTERO_API_URL or the default; user library id 0"
+      ],
+      "tests": [
+        "test_local_search_403_reports_local_api_disabled"
+      ],
+      "risk": "low",
+      "collision_group": "core-zotero-client",
+      "blocker": "",
+      "id": "MS-114"
+    },
+    {
+      "slug": "google-doc-disconnect-purge",
+      "project": "meridian-core",
+      "wave": 5,
+      "title": "Disconnect revokes the Google grant and purges sealed snapshots for it",
+      "depends_on": [
+        "google-doc-snapshot-store-encrypted",
+        "google-docs-oauth-pkce-connect"
+      ],
+      "files": [
+        "meridian/google_docs_oauth.py",
+        "meridian/db/google_doc_snapshots.py",
+        "meridian/routes/auth.py"
+      ],
+      "acceptance": [
+        "Disconnect calls the Google token revocation endpoint, deletes sealed snapshots for that connection and sets revoked_at",
+        "Local deletion still runs when revocation fails",
+        "Purge is idempotent"
+      ],
+      "tests": [
+        "tests/test_google_docs_disconnect_purge.py::test_disconnect_deletes_snapshots_and_tokens"
+      ],
+      "risk": "medium",
+      "collision_group": "core-google-oauth",
+      "blocker": "",
+      "id": "MS-115"
+    },
+    {
+      "slug": "google-docs-transport-server",
+      "project": "meridian-core",
+      "wave": 5,
+      "title": "Server-side Docs transport: refresh from sealed token, batchUpdate with revision guard",
+      "depends_on": [
+        "google-docs-adapter-land-code",
+        "google-docs-oauth-pkce-connect",
+        "provider-connections-db-helpers"
+      ],
+      "files": [
+        "meridian/google_docs_transport.py",
+        "tests/test_google_docs_transport.py"
+      ],
+      "acceptance": [
+        "Implements documents.get with includeTabsContent=true and documents.batchUpdate with writeControl.requiredRevisionId",
+        "Refreshes the access token from the sealed refresh token; the access token is never persisted or logged",
+        "401, 403 and 429 map to typed errors that carry no token material",
+        "No import of routes/tunnel.py or tunnel_lifecycle.py"
+      ],
+      "tests": [
+        "tests/test_google_docs_transport.py::test_transport_refreshes_from_sealed_token_and_guards_revision"
+      ],
+      "risk": "medium",
+      "collision_group": "core-google-transport",
+      "blocker": "",
+      "id": "MS-116"
+    },
+    {
+      "slug": "code-search-content-secret-guard",
+      "project": "meridian-core",
+      "wave": 6,
+      "title": "Skip files whose contents match secret shapes, not only secret file names",
+      "depends_on": [
+        "core-land-code-search-on-dev"
+      ],
+      "files": [
+        "meridian/code_search.py",
+        "tests/test_code_search.py"
+      ],
+      "acceptance": [
+        "A .py or .yaml file whose text contains a token-shaped string is not returned by search",
+        "Fixtures use synthetic strings only",
+        "The existing secret-name test still passes"
+      ],
+      "tests": [
+        "test_content_with_secret_shape_is_not_indexed"
+      ],
+      "risk": "medium",
+      "collision_group": "core-code-search",
+      "blocker": "",
+      "id": "MS-117"
+    },
+    {
+      "slug": "code-search-overlap-decision",
+      "project": "meridian-core",
+      "wave": 6,
+      "title": "Decide whether local code_search.py duplicates search_code_semantic",
+      "depends_on": [],
+      "files": [],
+      "existing_code": [
+        "meridian/code_index.py:1-30 (shim; re-exports meridian_codeindex and keeps search_code_semantic's hosted-mode guard)",
+        "meridian/mcp_tools.py:1715-1730 (search_code_semantic description; hybrid BM25 with pure-BM25 default)",
+        "extensions/meridian-codeindex/meridian_codeindex/bm25_index.py:185 (bm25_fallback_search), :287 (lookup_exact), :378 (refresh_subtree)",
+        "worktree meridian/code_search.py:94-103 (index_dir under LOCALAPPDATA), :250-285 (search, FTS5 bm25())"
+      ],
+      "acceptance": [
+        "Owner records one choice with pin_decision: keep meridian/code_search.py as a separate tool, or drop it and use search_code_semantic or the meridian-codeindex CLI",
+        "The desktop Code tab backend is named in the recorded decision"
+      ],
+      "tests": [
+        "tests/test_bm25_fallback.py stays green (existing, unchanged)"
+      ],
+      "owner_decision_needed": "",
+      "risk": "medium",
+      "notes": "Both paths rank with BM25 over a local tree. The uncommitted module keeps its index outside the repo under LOCALAPPDATA. Blocks items 2, 3, 7. Owner question, default taken (override if wrong): Keep meridian/code_search.py as the stdlib BM25 tool.",
+      "blocker": "",
+      "collision_group": "",
+      "id": "MS-118"
+    },
+    {
+      "slug": "code-search-rename-mcp-tools",
+      "project": "meridian-core",
+      "wave": 6,
+      "title": "Rename the local search MCP tools so they stop shadowing search_code",
+      "depends_on": [
+        "core-land-code-search-on-dev"
+      ],
+      "files": [
+        "meridian/code_search.py",
+        "tests/test_code_search.py"
+      ],
+      "acceptance": [
+        "Local tool names do not equal any tool name the Meridian server exposes (search_code collides with server.py:7702)",
+        "New names are stated in the module docstring"
+      ],
+      "tests": [
+        "test_mcp_server_exposes_the_three_tools (updated to the new names)"
+      ],
+      "risk": "low",
+      "collision_group": "core-code-search",
+      "notes": "Skip if the overlap decision drops the module.",
+      "blocker": "",
+      "id": "MS-119"
+    },
+    {
+      "slug": "code-search-skip-rescan",
+      "project": "meridian-core",
+      "wave": 6,
+      "title": "Record skipped binary files so refresh stops re-reading them",
+      "depends_on": [
+        "core-land-code-search-on-dev"
+      ],
+      "files": [
+        "meridian/code_search.py",
+        "tests/test_code_search.py"
+      ],
+      "acceptance": [
+        "A second refresh over an unchanged tree reads zero binary files (counted in the test)",
+        "RefreshReport.skipped still counts them"
+      ],
+      "tests": [
+        "test_skipped_files_are_not_reread_on_refresh"
+      ],
+      "risk": "low",
+      "collision_group": "core-code-search",
+      "notes": "Performance only.",
+      "blocker": "",
+      "id": "MS-120"
+    },
+    {
+      "slug": "google-docs-mcp-read-tools",
+      "project": "meridian-core",
+      "wave": 6,
+      "title": "Register read-only Google Docs MCP tools (status, outline, read, search)",
+      "depends_on": [
+        "google-docs-transport-server"
+      ],
+      "files": [
+        "meridian/mcp_tools.py",
+        "meridian/mcp/handler.py",
+        "meridian/google_docs_tools.py"
+      ],
+      "acceptance": [
+        "Four tools added to _MCP_TOOLS_LIST, _READ_ONLY_TOOLS, _TOOL_CATEGORY, _TOOL_ROLE_RELEVANCE and the dispatch map",
+        "No tool takes a credential argument",
+        "google_docs_status returns not-connected with no error and no token material",
+        "Descriptions pass the existing tier-tag test"
+      ],
+      "tests": [
+        "tests/test_google_docs_mcp_read.py::test_read_tools_registered_and_credential_free"
+      ],
+      "risk": "medium",
+      "collision_group": "core-mcp-tools",
+      "blocker": "",
+      "id": "MS-121"
+    },
+    {
+      "slug": "research-outputs-read-routes",
+      "project": "meridian-core",
+      "wave": 6,
+      "title": "Read-only research and outputs routes for the desktop engine",
+      "depends_on": [],
+      "files": [
+        "meridian/routes/research.py",
+        "meridian/routes/__init__.py",
+        "tests/test_research_routes.py"
+      ],
+      "existing_code": [
+        "meridian/db/research_runs.py:86 (get_research_run), :93 (list_research_runs)",
+        "meridian/mcp/handlers/research_tools.py (MCP handlers for the same data)",
+        "meridian/outputs_indexer.py:1654 (search_outputs), :1886 (find_outputs_by_source), :2020 (get_outputs_convergence_state)",
+        "meridian/routes/tunnel.py:2009-2021 (existing /outputs/mcp/{tenant_id} route)",
+        "meridian/routes/projects.py (route pattern; the auth dependency was not found by grep)"
+      ],
+      "acceptance": [
+        "GET only; no POST, PUT or DELETE routes; no start, cancel or promote",
+        "Project-scoped, with auth applied the same way as routes/projects.py (to confirm)",
+        "Returns the same fields as the matching MCP tools"
+      ],
+      "tests": [
+        "test_research_read_routes_are_get_only (new, tests/test_research_routes.py)"
+      ],
+      "owner_decision_needed": "",
+      "risk": "medium",
+      "notes": "Route registration point not verified. If mounting needs meridian/server.py, run this sequentially (high-contention file). This item avoids the meridian-outputs MCP, which needs /mcp authorization. Owner question, default taken (override if wrong): Read research and outputs through new REST routes on the local server, not MCP (no /mcp step).",
+      "blocker": "",
+      "collision_group": "",
+      "id": "MS-122"
+    },
+    {
+      "slug": "google-docs-insert-review-gated",
+      "project": "meridian-core",
+      "wave": 7,
+      "title": "Gate Google Docs insert_text behind review approval and a revision guard",
+      "depends_on": [
+        "google-docs-mcp-read-tools"
+      ],
+      "files": [
+        "meridian/google_docs_tools.py",
+        "meridian/mcp_tools.py"
+      ],
+      "existing_code": [
+        "google_docs_adapter.py:31 and :35 on the branch (ReviewRequiredError, StaleAnchorError)",
+        "google_docs_adapter.py insert_text on the branch (from the land item; approval flag and revision-bound anchor)",
+        "meridian/mcp_tools.py:304 (_MCP_TOOLS_LIST)"
+      ],
+      "acceptance": [
+        "google_docs_insert_text requires review_approved=true and a revision-bound anchor",
+        "A stale revision returns StaleAnchorError and makes no batchUpdate call",
+        "No batchUpdate call is made when review_approved is absent",
+        "The tool is not in _READ_ONLY_TOOLS"
+      ],
+      "tests": [
+        "tests/test_google_docs_insert_gate.py::test_insert_requires_review_and_current_revision"
+      ],
+      "owner_decision_needed": "Confirm the desktop review step exists before this write tool ships, and that drive.file can batchUpdate a Picker-selected document (PLAN.md:142, untested).",
+      "risk": "high",
+      "notes": "First write path that changes a user's real document. Ship only after the read tools and the review UI.",
+      "blocker": "manual",
+      "collision_group": "",
+      "id": "MS-123"
+    },
+    {
+      "slug": "google-docs-no-tunnel-proof",
+      "project": "meridian-core",
+      "wave": 7,
+      "title": "Prove Google Docs read and snapshot paths work with no tunnel session",
+      "depends_on": [
+        "google-docs-mcp-read-tools",
+        "google-doc-snapshot-store-encrypted"
+      ],
+      "files": [
+        "tests/test_google_docs_no_tunnel.py"
+      ],
+      "acceptance": [
+        "With no tunnel registered, outline, read, search and snapshot succeed against a fixture transport",
+        "The call path does not import routes/tunnel or tunnel_lifecycle"
+      ],
+      "tests": [
+        "tests/test_google_docs_no_tunnel.py::test_read_and_snapshot_need_no_tunnel"
+      ],
+      "risk": "low",
+      "collision_group": "core-google-tests",
+      "blocker": "",
+      "id": "MS-124"
+    },
+    {
+      "slug": "ledger-pasted-letter-parser-provenance",
+      "project": "meridian-docs",
+      "wave": 0,
+      "title": "ledger pasted letter parser provenance",
+      "depends_on": [],
+      "files": [],
+      "existing_code": [],
+      "acceptance": [],
+      "tests": [],
+      "risk": "medium",
+      "notes": "Detail lost in the prospect run; minimal record.",
+      "owner_decision_needed": "Same decision as ledger-pasted-letter-parser-segment: retention, encryption and rights rules for pasted letters. Split from ledger-pasted-letter-parser (6 acceptance criteria).",
+      "blocker": "manual",
+      "collision_group": "",
+      "id": "MS-125"
+    },
+    {
+      "slug": "ledger-pasted-letter-parser-segment",
+      "project": "meridian-docs",
+      "wave": 0,
+      "title": "ledger pasted letter parser segment",
+      "depends_on": [],
+      "files": [],
+      "existing_code": [],
+      "acceptance": [],
+      "tests": [],
+      "risk": "medium",
+      "notes": "Detail lost in the prospect run; minimal record.",
+      "owner_decision_needed": "Are pasted reviewer letters (confidential peer review) allowed in the ledger, with what retention and encryption-at-rest rules? Does the rights gate apply to third-party text?",
+      "blocker": "manual",
+      "collision_group": "",
+      "id": "MS-126"
+    },
+    {
+      "slug": "ledger-docx-comment-reader",
+      "project": "meridian-docs",
+      "wave": 1,
+      "title": "Read DOCX comments, replies and anchor paragraphs without mutating the file",
+      "depends_on": [],
+      "files": [
+        "extensions/meridian-docs/meridian_docs/review_sources.py"
+      ],
+      "acceptance": [
+        "Returns one record per w:comment with comment_id, author, initials, date, text, anchor_para_id, range_end_para_id, section_path, parent_comment_id and done",
+        "Reply threads resolve through commentsExtended.xml paraIdParent; a missing part gives parent None, not an error",
+        "A comment with no commentRangeStart returns anchor None plus a warning, never a guessed paragraph",
+        "SHA-256 of the input bytes is identical before and after the call",
+        "Malformed comments.xml returns an error dict and does not raise"
+      ],
+      "tests": [
+        "extensions/meridian-docs/tests/test_review_docx_comments.py::test_reads_comments_replies_and_anchor_paragraphs"
+      ],
+      "risk": "medium",
+      "collision_group": "docs-ledger-readers",
+      "notes": "No comment reader exists; reuse _load_docx_xml_stdlib (docs_intel.py:1792) by copying, not importing the writer.",
+      "blocker": "",
+      "id": "MS-127"
+    },
+    {
+      "slug": "ledger-docx-revision-reader",
+      "project": "meridian-docs",
+      "wave": 1,
+      "title": "Enumerate DOCX tracked insertions and deletions with author, date and section",
+      "depends_on": [],
+      "files": [
+        "extensions/meridian-docs/meridian_docs/review_revisions.py"
+      ],
+      "acceptance": [
+        "Enumerates every w:ins and w:del in word/document.xml with revision_id, kind, author, date, text and anchor_para_id",
+        "Paragraph-mark revisions are reported with their kind and no duplicated text",
+        "Each revision carries section_path from the same annotation document_outline uses",
+        "Read-only: input bytes unchanged; w:moveFrom and w:moveTo reported with a move flag"
+      ],
+      "tests": [
+        "extensions/meridian-docs/tests/test_review_revisions.py::test_enumerates_insertions_and_deletions_with_authors"
+      ],
+      "risk": "low",
+      "collision_group": "docs-ledger-readers",
+      "blocker": "",
+      "id": "MS-128"
+    },
+    {
+      "slug": "ledger-item-model",
+      "project": "meridian-docs",
+      "wave": 1,
+      "title": "Define the ledger item model, status vocabulary and completion gate",
+      "depends_on": [],
+      "files": [
+        "extensions/meridian-docs/meridian_docs/review_ledger.py"
+      ],
+      "existing_code": [
+        "meridian/db/lint_finding.py:90-141 closed vocabularies and validators (pattern to copy, do not import)",
+        "meridian/db/lint_finding.py:398-430 check_finding_freshness (fail-open fingerprint staleness pattern)",
+        "extensions/meridian-docs/meridian_docs/docs_intel.py:22029 REVIEW_CATEGORIES",
+        "extensions/meridian-docs/meridian_docs/docs_intel.py:22187-22196 locator contract (section_path, target_para_id, quoted_text, candidates)",
+        "extensions/meridian-docs/meridian_docs/docs_intel.py:1276 _source_fingerprint"
+      ],
+      "acceptance": [
+        "item_key is a deterministic SHA-256 of source_kind, source_ref and normalized text, so re-ingesting the same comment gives the same key",
+        "status accepts exactly open, addressed, rebutted, deferred; any other value raises ValueError",
+        "severity is a closed set (blocker, major, minor, info); the mapping onto lint severities (blocker to error, major to warning, minor and info to info) is documented in the module",
+        "completion(items) returns complete=True only when no item is open and each non-open item has the evidence its status needs: addressed needs at least one evidence record, rebutted needs non-empty rebuttal text, deferred needs a non-empty reason",
+        "An empty ledger returns complete=False with reason 'no items ingested'"
+      ],
+      "tests": [
+        "extensions/meridian-docs/tests/test_review_ledger.py::test_completion_requires_no_open_items_and_evidence_per_item"
+      ],
+      "owner_decision_needed": "",
+      "risk": "low",
+      "notes": "Pure functions with no DB or I/O. Do not reuse lint_findings status values (lint_finding.py:96-98: open, acknowledged, resolved, dismissed); the sets differ. Owner question, default taken (override if wrong): Severity: blocker, major, minor, info. A deferred item needs a recorded reason and does not block completion.",
+      "blocker": "",
+      "collision_group": "",
+      "id": "MS-129"
+    },
+    {
+      "slug": "ledger-anchor-to-section",
+      "project": "meridian-docs",
+      "wave": 2,
+      "title": "Anchor ledger items to sections without guessing on ambiguity",
+      "depends_on": [
+        "ledger-docx-comment-reader",
+        "ledger-docx-revision-reader",
+        "ledger-item-model"
+      ],
+      "files": [
+        "extensions/meridian-docs/meridian_docs/review_anchor.py"
+      ],
+      "acceptance": [
+        "Items with a para_id resolve through _resolve_anchor_query; no second anchor parser",
+        "Quoted text resolves through locate_anchor; an ambiguous result sets anchor_status ambiguous and keeps candidates",
+        "A quote not found sets anchor_status unresolved and never receives a guessed section",
+        "Each result carries the document source_fingerprint so a stale anchor is detectable",
+        "Batch resolution parses the document once per call"
+      ],
+      "tests": [
+        "extensions/meridian-docs/tests/test_review_anchor.py::test_ambiguous_quote_is_reported_not_guessed"
+      ],
+      "risk": "medium",
+      "collision_group": "docs-ledger-readers",
+      "notes": "Transitively waits on ledger-item-model (blocked).",
+      "blocker": "",
+      "id": "MS-130"
+    },
+    {
+      "slug": "ledger-pdf-annotation-reader",
+      "project": "meridian-docs",
+      "wave": 2,
+      "title": "Read PDF review annotations by page with author, date and quoted text",
+      "depends_on": [
+        "ledger-item-model"
+      ],
+      "files": [
+        "extensions/meridian-docs/meridian_docs/review_pdf.py",
+        "extensions/meridian-docs/pyproject.toml"
+      ],
+      "existing_code": [
+        "extensions/meridian-outputs/pyproject.toml:83 pypdf>=4.0 (version to pin)",
+        "extensions/meridian-outputs/meridian_outputs/outputs_local.py:1757-1761 lazy, optional pypdf import (copy this pattern)",
+        "extensions/meridian-docs/pyproject.toml:37 dependencies: mcp, latex2mathml, lxml (no pypdf today)"
+      ],
+      "acceptance": [
+        "Lists /Annots per page with subtype (Text, Highlight, FreeText, Underline, StrikeOut, Squiggly), contents, author, modified date and rect",
+        "Each annotation carries page_index and the nearest extracted text as quoted_text",
+        "If pypdf is not importable, returns {'error': ..., 'reason': 'pypdf-missing'} and does not raise",
+        "Read-only: source file SHA-256 unchanged",
+        "Annotations with empty contents carry an empty_contents flag"
+      ],
+      "tests": [
+        "extensions/meridian-docs/tests/test_review_pdf.py::test_extracts_annotations_by_page_and_degrades_without_pypdf"
+      ],
+      "owner_decision_needed": "",
+      "risk": "high",
+      "notes": "Page-level anchoring only. Mapping a PDF page to a DOCX or LaTeX section is approximate and belongs to ledger-anchor-to-section. No PDF annotation reader exists today. Owner question, default taken (override if wrong): Write a stdlib annotation parser; no new dependency.",
+      "blocker": "",
+      "collision_group": "",
+      "id": "MS-131"
+    },
+    {
+      "slug": "ledger-evidence-binding",
+      "project": "meridian-docs",
+      "wave": 3,
+      "title": "Bind addressed items to current-fingerprint evidence and flag stale proof",
+      "depends_on": [
+        "ledger-item-model",
+        "ledger-anchor-to-section",
+        "ledger-docx-revision-reader"
+      ],
+      "files": [
+        "extensions/meridian-docs/meridian_docs/review_evidence.py"
+      ],
+      "existing_code": [
+        "meridian/db/lint_finding.py:398-430 check_finding_freshness (advisory, fail-open comparison)",
+        "extensions/meridian-docs/meridian_docs/render_gate.py:1326 RenderReceipt",
+        "extensions/meridian-docs/meridian_docs/render_gate.py:1395 list_render_receipts",
+        "extensions/meridian-docs/meridian_docs/render_gate.py:1409 render_with_receipt",
+        "extensions/meridian-docs/meridian_docs/render_gate.py:1210 _sha256_bytes (receipt hash key)",
+        "extensions/meridian-docs/meridian_docs/ooxml_integrity.py:239 validate_docx_package",
+        "extensions/meridian-docs/meridian_docs/docs_intel.py:1276 _source_fingerprint",
+        "extensions/meridian-docs/meridian_docs/docs_intel.py:15254 scan_stale_notes (residual TODO check inside an item's section)",
+        "extensions/meridian-docs/meridian_docs/server.py:2751-2755 flag_for_review note id _MComment<comment_id> (link as evidence)"
+      ],
+      "acceptance": [
+        "Evidence kinds: revision (a w:ins or w:del id touching the anchored paragraph), paragraph_changed (current paragraph hash differs from the comment-time hash), render_receipt (receipt whose document hash equals the current file), flag_note (note id from flag_for_review), rebuttal (text)",
+        "Evidence recorded against a fingerprint that no longer matches the current document is reported as stale, not valid",
+        "An addressed item with no current-fingerprint evidence is reported as missing_evidence",
+        "scan_stale_notes findings inside an item's section are listed as residual_todo and do not change status",
+        "This module never changes a status; it only reports"
+      ],
+      "tests": [
+        "extensions/meridian-docs/tests/test_review_evidence.py::test_addressed_requires_current_fingerprint_evidence"
+      ],
+      "owner_decision_needed": "",
+      "risk": "medium",
+      "notes": "Read-only checker, consistent with lint_finding's human-triage rule. Confirm that render receipts key on the document hash before relying on it (see gaps). Owner question, default taken (override if wrong): Require a render receipt only for layout-affecting changes.",
+      "blocker": "",
+      "collision_group": "",
+      "id": "MS-132"
+    },
+    {
+      "slug": "ledger-rubric-criteria",
+      "project": "meridian-docs",
+      "wave": 3,
+      "title": "Turn application rubric criteria into ledger items gated by section evidence",
+      "depends_on": [
+        "ledger-item-model",
+        "ledger-anchor-to-section",
+        "ledger-evidence-binding"
+      ],
+      "files": [
+        "extensions/meridian-docs/meridian_docs/review_rubric.py"
+      ],
+      "existing_code": [
+        "No rubric code exists in meridian/ or extensions/meridian-docs/meridian_docs (search returned no matches)",
+        "extensions/meridian-docs/meridian_docs/review_ledger.py (item model)",
+        "extensions/meridian-docs/meridian_docs/review_anchor.py (section mapping)"
+      ],
+      "acceptance": [
+        "A user-supplied JSON list of criteria [{criterion_id, text, section_hints}] becomes ledger items with source_kind 'rubric_criterion'",
+        "Duplicate criterion_id values raise ValueError before any item is produced",
+        "A criterion with no resolvable section is kept with anchor_status 'unresolved' and blocks completion",
+        "No criterion is ever marked addressed automatically"
+      ],
+      "tests": [
+        "extensions/meridian-docs/tests/test_review_rubric.py::test_rubric_criteria_become_items_and_block_completion_until_addressed"
+      ],
+      "owner_decision_needed": "",
+      "risk": "high",
+      "notes": "New concept with no precedent in the repo. Keep it a second source_kind on the same ledger, not a separate system. Owner question, default taken (override if wrong): Accept rubric uploads as JSON or pasted text; a rubric criterion can be addressed or deferred, not rebutted.",
+      "blocker": "",
+      "collision_group": "",
+      "id": "MS-133"
+    },
+    {
+      "slug": "ledger-completion-report",
+      "project": "meridian-docs",
+      "wave": 4,
+      "title": "Report completeness: complete only when nothing is open and evidence holds",
+      "depends_on": [
+        "ledger-item-model",
+        "ledger-evidence-binding"
+      ],
+      "files": [
+        "extensions/meridian-docs/meridian_docs/review_report.py"
+      ],
+      "existing_code": [
+        "extensions/meridian-docs/meridian_docs/docs_intel.py:22125 build_document_review (mirror its status and findings_by_* shape)",
+        "extensions/meridian-docs/meridian_docs/docs_intel.py:22029 REVIEW_CATEGORIES (do not change in this item)",
+        "extensions/meridian-docs/meridian_docs/docs_intel.py:22184-22185 ownership category reserved, always 0",
+        "meridian/routes/notes.py:170-233 document_review_endpoint (HTTP consumer pattern)"
+      ],
+      "acceptance": [
+        "complete=True only when open_count is 0 and no item has missing_evidence or stale_evidence",
+        "Lists open item_keys, missing_evidence item_keys, stale_evidence item_keys, and counts by status and by severity",
+        "Uses the findings_by_severity naming that build_document_review uses",
+        "An empty ledger returns complete=False with reason 'no items'"
+      ],
+      "tests": [
+        "extensions/meridian-docs/tests/test_review_report.py::test_report_complete_only_when_nothing_open_and_evidence_current"
+      ],
+      "owner_decision_needed": "",
+      "risk": "low",
+      "notes": "Keep REVIEW_CATEGORIES unchanged in this item. Owner question, default taken (override if wrong): A separate ledger tool; do not change get_document_review's output shape.",
+      "blocker": "",
+      "collision_group": "",
+      "id": "MS-134"
+    },
+    {
+      "slug": "ledger-mcp-sidecar-tools",
+      "project": "meridian-docs",
+      "wave": 4,
+      "title": "Expose ledger ingest, list, status and completion as meridian-docs MCP tools",
+      "depends_on": [
+        "ledger-docx-comment-reader",
+        "ledger-docx-revision-reader",
+        "ledger-pasted-letter-parser-segment",
+        "ledger-anchor-to-section",
+        "ledger-evidence-binding",
+        "ledger-completion-report"
+      ],
+      "files": [
+        "extensions/meridian-docs/meridian_docs/server.py",
+        "extensions/meridian-docs/meridian_docs/review_sidecar.py"
+      ],
+      "existing_code": [
+        "extensions/meridian-docs/meridian_docs/server.py:342 get_document_review (tool pattern, fingerprint and journal args)",
+        "extensions/meridian-docs/meridian_docs/server.py:2705 flag_for_review (index_db_path sidecar convention)",
+        "extensions/meridian-docs/meridian_docs/server.py:2787 list_internal_notes (sidecar read pattern)",
+        "extensions/meridian-docs/meridian_docs/docs_intel.py:781 _connect (sidecar SQLite connection)",
+        "extensions/meridian-docs/meridian_docs/docs_intel.py:870 docx_internal_notes table (sidecar table pattern)",
+        "meridian/batch_read.py:385-390 read-only tool name list (may need the new read tools)",
+        "tests/test_docs_tunnel_region_claims.py:139-140 doc tool name list (may need updating)"
+      ],
+      "acceptance": [
+        "Four tools: ingest_review_sources, list_review_items, set_review_item_status, review_completion; each takes index_db_path",
+        "set_review_item_status returns an {'error': ...} result, not an exception, for a status outside open, addressed, rebutted, deferred",
+        "Re-ingesting unchanged sources creates no new rows and resets no status",
+        "Standalone use with no Meridian core DB works through the sidecar file",
+        "The tool-name lists in batch_read.py and tests/test_docs_tunnel_region_claims.py are updated in the same change"
+      ],
+      "tests": [
+        "extensions/meridian-docs/tests/test_review_sidecar.py::test_ingest_is_idempotent_and_status_moves_persist"
+      ],
+      "owner_decision_needed": "",
+      "risk": "high",
+      "notes": "server.py is shared. Claim it with claim_file before editing, and keep it sequential. The unverified tunnel exposure of docs tools is listed under gaps. Owner question, default taken (override if wrong): Per-document sidecar, so the ledger works offline and standalone.",
+      "blocker": "",
+      "collision_group": "",
+      "id": "MS-135"
+    },
+    {
+      "slug": "latex-engine-self-containment-test",
+      "project": "meridian-latex",
+      "wave": 1,
+      "title": "Add a test that fails if meridian-latex imports meridian-docs or the Meridian server",
+      "depends_on": [],
+      "files": [
+        "<core>/latex-dir/engine/src/self-containment.test.ts"
+      ],
+      "acceptance": [
+        "Scans engine/src/*.ts, excluding *.test.ts, for import and require specifiers",
+        "Fails on any specifier resolving to meridian-docs, to a path outside the engine, or to the Meridian server",
+        "Comment-only mentions do not fail",
+        "Passes on current HEAD"
+      ],
+      "tests": [
+        "self-containment: no runtime import of meridian-docs or the Meridian server"
+      ],
+      "risk": "low",
+      "collision_group": "latex-tests",
+      "blocker": "",
+      "id": "MS-136"
+    },
+    {
+      "slug": "latex-write-back-spec-status-refresh",
+      "project": "meridian-latex",
+      "wave": 1,
+      "title": "Refresh write-back spec status: claims, leases and popup flow are built",
+      "depends_on": [],
+      "files": [
+        "<core>/latex-dir/docs/write-back-spec.md",
+        "tests/test_writeback_spec_status.py"
+      ],
+      "acceptance": [
+        "Line 3 no longer says not yet implemented for routes that exist (claim, lease, release, claims)",
+        "References to engine/src/server.js and outline.js (lines 6 and 95) corrected to .ts",
+        "Section 5 states applyFieldEdit is CLI and extension only, not MCP-exposed",
+        "No business strategy text is added"
+      ],
+      "tests": [
+        "tests/test_writeback_spec_status.py::test_spec_names_no_built_route_as_not_implemented (new)"
+      ],
+      "risk": "low",
+      "collision_group": "latex-docs",
+      "notes": "Added a test because doc-only items still need one. Sprint ids 157ff977 and 0b0ee5b3 were not checked against the board.",
+      "blocker": "",
+      "id": "MS-137"
+    },
+    {
+      "slug": "latex-engine-claim-route-tests",
+      "project": "meridian-latex",
+      "wave": 2,
+      "title": "HTTP tests for /claim, /lease, /release and /claims",
+      "depends_on": [],
+      "files": [
+        "<core>/latex-dir/engine/src/server.ts",
+        "<core>/latex-dir/engine/src/server.test.ts"
+      ],
+      "acceptance": [
+        "A second claim on the same node returns claimed false with holder_token_of_conflict",
+        "A whole-document lease is refused while another holder has a scoped claim",
+        "Release returns the released count and is scoped to holder_token",
+        "The CLI behaves as before after the server is exported as a factory"
+      ],
+      "tests": [
+        "http_claim_lease_release_conflicts_and_holder_scoping"
+      ],
+      "risk": "medium",
+      "collision_group": "latex-engine-server",
+      "notes": "server.ts:433 calls listen at module scope, so export a factory first. In-flight codex/overleaf-engine-wave3 and wave4 branches also touch server.ts; triage before merging.",
+      "blocker": "",
+      "id": "MS-138"
+    },
+    {
+      "slug": "latex-local-project-index-persist",
+      "project": "meridian-latex",
+      "wave": 2,
+      "title": "Persist per-project Overleaf file paths so indexing survives without a live session",
+      "depends_on": [],
+      "files": [
+        "<core>/latex-dir/engine/src/store.ts",
+        "<core>/latex-dir/engine/src/project-tree.ts"
+      ],
+      "acceptance": [
+        "New table project_files(project_id, path, doc_id, indexed_at) created with CREATE TABLE IF NOT EXISTS",
+        "Re-indexing replaces the project's rows so no stale path survives",
+        "Only paths and ids are stored, never document text",
+        "Reading the index needs no network and no cookie"
+      ],
+      "tests": [
+        "reindex_replaces_stale_project_files_and_stores_paths_only (in engine/src/store.test.ts)"
+      ],
+      "risk": "low",
+      "collision_group": "latex-engine-store",
+      "notes": "Index sprint item 157ff977 named in write-back-spec.md was not found in the repo.",
+      "blocker": "",
+      "id": "MS-139"
+    },
+    {
+      "slug": "latex-overleaf-login-status-route",
+      "project": "meridian-latex",
+      "wave": 2,
+      "title": "GET /overleaf-login-status that reports state without ever returning the cookie",
+      "depends_on": [
+        "latex-engine-claim-route-tests"
+      ],
+      "files": [
+        "<core>/latex-dir/engine/src/server.ts",
+        "<core>/latex-dir/engine/src/server.test.ts"
+      ],
+      "acceptance": [
+        "GET /overleaf-login-status returns only loggedIn plus optional savedAt and baseUrl",
+        "The response never contains the cookie value or the cookie file path",
+        "With no cookie file present it returns loggedIn false"
+      ],
+      "tests": [
+        "overleaf_login_status_route_never_returns_cookie_value"
+      ],
+      "risk": "medium",
+      "collision_group": "latex-engine-server",
+      "blocker": "",
+      "id": "MS-140"
+    },
+    {
+      "slug": "latex-engine-loopback-trust",
+      "project": "meridian-latex",
+      "wave": 3,
+      "title": "Decide and implement a loopback trust model for engine write routes, because CORS is not auth",
+      "depends_on": [
+        "latex-engine-claim-route-tests",
+        "latex-overleaf-login-status-route"
+      ],
+      "files": [
+        "<core>/latex-dir/engine/src/server.ts",
+        "<core>/latex-dir/engine/src/claims.ts"
+      ],
+      "existing_code": [
+        "engine/src/server.ts:45-48 CORS comment; :115 history of reflected origins; :129-133 origin pin to the extension id",
+        "engine/src/claims.ts:352-358 LiveClaimEntry includes holder_token",
+        "engine/src/claims.ts:338-343 release keyed on holder_token",
+        "PLAN.md:110-112 says the desktop must not treat CORS as authentication"
+      ],
+      "acceptance": [
+        "Write routes (/claim, /lease, /release, /provenance, /open-overleaf) reject requests that lack the per-install secret",
+        "GET /claims does not return holder_token to callers without the secret",
+        "The extension and the desktop obtain the secret through a setup step, never from a URL"
+      ],
+      "tests": [
+        "write_routes_reject_missing_install_secret (in engine/src/server.test.ts)"
+      ],
+      "owner_decision_needed": "",
+      "risk": "high",
+      "notes": "Gated on decision D. Sequential after the claim-route tests and the login-status route, because it edits server.ts. Owner question, default taken (override if wrong): Pairing: a one-time token shown in the desktop and entered once into the extension.",
+      "blocker": "",
+      "collision_group": "",
+      "id": "MS-141"
+    },
+    {
+      "slug": "meridian-latex-zotero-lookup-autostart-gate",
+      "project": "meridian-latex",
+      "wave": 4,
+      "title": "Gate the engine /zotero-lookup auto-start behind an explicit opt-in",
+      "depends_on": [],
+      "files": [
+        "<core>/latex-dir/engine/src/server.ts",
+        "<core>/latex-dir/engine/src/zotero.test.ts"
+      ],
+      "existing_code": [
+        "<core>/latex-dir/engine/src/server.ts:333-355 is the /zotero-lookup route.",
+        "<core>/latex-dir/engine/src/server.ts:347 calls lookupCitationKey(key, { autoStart: true }), so any lookup with Zotero closed launches it, with no owner gate.",
+        "<core>/latex-dir/engine/src/zotero.ts:229 autoStart defaults to false in the library function; :57-59 records the 2026-09-24 owner request.",
+        "<core>/latex-dir/engine/src/zotero.test.ts:258-272 already tests that autoStart:false never launches."
+      ],
+      "acceptance": [
+        "A /zotero-lookup request without the opt-in returns resolved:null with a reason and never calls execImpl.",
+        "An explicit opt-in (for example a query flag) keeps today's auto-start behaviour.",
+        "The new route-level test runs under the engine's existing test command."
+      ],
+      "tests": [
+        "<core>/latex-dir/engine/src/zotero.test.ts::route does not auto-start without opt-in (named, new; first confirm whether a server test harness exists)"
+      ],
+      "owner_decision_needed": "",
+      "risk": "medium",
+      "notes": "This directory is MSL-1.0 (PLAN.md:42-54). Editing it stays in the core repo; the desktop never bundles it. Only needed if the owner chooses to gate the route. Owner question, default taken (override if wrong): Keep auto-start as the owner requested on 2026-09-24.",
+      "blocker": "",
+      "collision_group": "",
+      "id": "MS-142"
+    }
+  ]
+}

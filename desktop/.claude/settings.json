@@ -1,0 +1,8 @@
+{
+  "permissions": {
+    "deny": [
+      "Read(**/meridian-keys-backup.json)",
+      "Read(//**/meridian-keys-backup.json)"
+    ]
+  }
+}

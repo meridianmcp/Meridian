@@ -1,0 +1,213 @@
+# Native (non-Qt) runtimes in the MeridianDesktop ONEDIR bundle, and the Qt extension binaries.
+#
+# Read by packaging/build.py and packaging/verify_bundle.py. The build writes one section per
+# [[runtime]] into THIRD_PARTY_LICENSES.txt. It fails when a listed file is missing from the
+# bundle, when a bundled copy of a listed file has no digest for its path, and when a native
+# runtime DLL in the bundle is not listed here. A bundled copy whose sha256 differs from the
+# digest declared for its path is reported as RELEASE BLOCKED, and verify_bundle.py reports it
+# as a problem.
+#
+# Each [[runtime]] table has:
+#   name          the name in the section header
+#   version       the version in the section header
+#   spdx          the SPDX identifier in the section header
+#   files         exact file names, without folder parts, as they appear in the bundle
+#   sha256        a [runtime.sha256] table. Each key is the path of one bundled copy, relative
+#                 to the bundle root (dist/MeridianDesktop), for example
+#                 "_internal/python3.dll". Each value is that copy's 64-digit
+#                 lower-case sha256. Every name in files needs at least one key, and every
+#                 bundled copy of a listed name needs its own key. Several keys may share one
+#                 file name. A key's file name must be in files.
+#   notice_url    the upstream licence page (https)
+#   licence_file  optional. A repo-relative licence text that packaging/licenses/SHA256SUMS
+#                 pins. Without it, the text is packaging/licenses/native/<slug of name>.txt.
+#
+# Licence texts for the runtimes are pinned in packaging/licenses/native/ and listed in
+# packaging/licenses/SHA256SUMS. They are the info/licenses files of the same conda packages.
+#
+# Versions: pixi env meridian-desktop-8257345453352236247 (env "default"), conda-meta files,
+# read 2026-10-17. The Qt entry's version is PySide6 6.12.0 from its dist-info METADATA.
+#
+#
+# CPython's extension modules (.pyd) are listed under CPython. No dist-info in the bundle owns them.
+#
+# Not listed here: Qt and its plugins, and the PySide6 and shiboken6 extension modules
+# (QtCore.pyd, QtGui.pyd, QtWidgets.pyd, Shiboken.pyd). packaging/lgpl_manifest.toml covers them.
+# The two extension binaries pyside6.abi3.dll and shiboken6.abi3.dll are listed in the Qt entry.
+
+[[runtime]]
+name = "CPython"
+version = "3.12.15"
+spdx = "PSF-2.0"
+files = [
+    "python312.dll",
+    "python3.dll",
+    "_asyncio.pyd",
+    "_bz2.pyd",
+    "_ctypes.pyd",
+    "_decimal.pyd",
+    "_hashlib.pyd",
+    "_lzma.pyd",
+    "_multiprocessing.pyd",
+    "_overlapped.pyd",
+    "_queue.pyd",
+    "_socket.pyd",
+    "_sqlite3.pyd",
+    "_ssl.pyd",
+    "_uuid.pyd",
+    "_wmi.pyd",
+    "pyexpat.pyd",
+    "select.pyd",
+    "unicodedata.pyd",
+]
+notice_url = "https://docs.python.org/3/license.html"
+
+[runtime.sha256]
+"_internal/python312.dll" = "bd05e1c279e0d95478625c1e891aedd2bf4fa483304365b77ac48a1f0687ce69"
+"_internal/python3.dll" = "da25c8c1244b0a658f4bacb58f2087bca0c17023dcca5b437fd3aca31fe0346f"
+"_internal/_asyncio.pyd" = "3d986cc7e02e3ab82959b68eccd7ed5648cdddd3fb8cc147150cd62e4d56b5f3"
+"_internal/_bz2.pyd" = "158065c3488bf53460a4bec934e5604e52b327414ccfa6e1d33380a74f6c59ad"
+"_internal/_ctypes.pyd" = "28b6d089ba5e0da10f5f7b32bba926ef5fa41bd15c027990d4f4efea5336d194"
+"_internal/_decimal.pyd" = "7ee35f4f98e3451f034d0dc6d0e06ee8fa0f4bd63ea1969be65c49c52d16d1f4"
+"_internal/_hashlib.pyd" = "a7f6cc2f4582fd701ff263dc4929a3df4a9c8929bb783918968e3eaeccb0ca5c"
+"_internal/_lzma.pyd" = "694a0f63e82ec11357ba2351da5f6df73723ce3fe3344029db6ed0520315f0b9"
+"_internal/_multiprocessing.pyd" = "e2cfbccde56c42d72bbcb1ebc728c77f1675cffc847c53d726060296da47ba03"
+"_internal/_overlapped.pyd" = "9953a5c4b90dfa9e29a17c76c6be704cbf76512eb4af29c667806559b206de2b"
+"_internal/_queue.pyd" = "b015f12fcb5d27ade024cc47808e1c3f95d23f80f35e472bf07882ac1ce57554"
+"_internal/_socket.pyd" = "b4047c86ef5facc7a75052c3afc5d6cc766b02a16970ef33b7d5eb56cbec96b8"
+"_internal/_sqlite3.pyd" = "c7b8dfac4ffe7d6e603f1e13dba6b618bcb1bbf863bd4b22d8a347a30908e4e9"
+"_internal/_ssl.pyd" = "53ebf568c64758d71c579c6387ad3d349b0dbaf979ae763ca4971835ade8b609"
+"_internal/_uuid.pyd" = "831476eb7c9e3cbcf7264916268b835c3427b2a88f90e8dcc184fdc629382062"
+"_internal/_wmi.pyd" = "ab9774c4f96297d92e5867d8e0d6da145c336f4d9d415d4ad0408bbdd5f87376"
+"_internal/pyexpat.pyd" = "1beb87913332197d8869623261421f010d46cab789057f6382c91bb715dcfc53"
+"_internal/select.pyd" = "7aa823a1f7ad83c5b94fe86828b155ed7c05f7b521c860914a1be94979bca8ee"
+"_internal/unicodedata.pyd" = "1850e8cb4b4b973d7dd082ddc946e10218e87919d85a29c6a048f5ab0b352ddd"
+
+[[runtime]]
+name = "OpenSSL"
+version = "3.6.5"
+spdx = "Apache-2.0"
+files = [
+    "libcrypto-3-x64.dll",
+    "libssl-3-x64.dll",
+]
+notice_url = "https://openssl-library.org/source/license/index.html"
+
+[runtime.sha256]
+"_internal/libcrypto-3-x64.dll" = "7ff26fb03c914b87e22f55c6abed6eda0bfbfc628f9c1f1fde67993ddf1f8d47"
+"_internal/libssl-3-x64.dll" = "a1b3fd1f6eb95812e4fc3c68106f8ebec6b3f9dad9ff873ce4eebe20582b6f4f"
+
+[[runtime]]
+name = "libffi"
+version = "3.7.0"
+spdx = "MIT"
+files = [
+    "ffi-8.dll",
+]
+notice_url = "https://github.com/libffi/libffi/blob/master/LICENSE"
+
+[runtime.sha256]
+"_internal/ffi-8.dll" = "922fe231d83f412d351e2560714e248d097aae0b44c8410fb1826411e2528e69"
+
+[[runtime]]
+name = "expat"
+version = "2.8.5"
+spdx = "MIT"
+files = [
+    "libexpat.dll",
+]
+notice_url = "https://github.com/libexpat/libexpat/blob/master/expat/COPYING"
+
+[runtime.sha256]
+"_internal/libexpat.dll" = "c6e54dea938a9c62e545554a21723ab054af03ddcfa6389d1abd912c85f64880"
+
+[[runtime]]
+name = "bzip2"
+version = "1.0.8"
+spdx = "bzip2-1.0.6"
+files = [
+    "libbz2.dll",
+]
+notice_url = "https://gitlab.com/bzip2/bzip2"
+
+[runtime.sha256]
+"_internal/libbz2.dll" = "7f3ddbb88b670d79ada028480067ccdf240601319128e40eec8dce1daf4a9238"
+
+[[runtime]]
+name = "XZ Utils"
+version = "5.8.3"
+spdx = "0BSD"
+files = [
+    "liblzma.dll",
+]
+notice_url = "https://github.com/tukaani-project/xz/blob/master/COPYING.0BSD"
+
+[runtime.sha256]
+"_internal/liblzma.dll" = "8439ed3564a8dbbf6355e29c92e88fdf1f6dee096504149fc051104155c868a9"
+
+[[runtime]]
+name = "zlib"
+version = "1.3.2"
+spdx = "Zlib"
+files = [
+    "zlib.dll",
+]
+notice_url = "https://zlib.net/zlib_license.html"
+
+[runtime.sha256]
+"_internal/zlib.dll" = "f4f26ea6300c8449daad4650915e01ac80aafc6ca8b73a50be450f1fb66cdd63"
+
+# SQLite is the library behind the sqlite3 module (_sqlite3.pyd, listed under CPython). Its licence is
+# the SQLite public-domain dedication, which conda-forge records as the SPDX id "blessing". The licence
+# text is the statement at https://www.sqlite.org/copyright.html, pinned as
+# packaging/licenses/native/sqlite.txt. The version 3.54.0 is from conda-meta/libsqlite-3.54.0-hf5d6505_101.json
+# and the DLL's FileVersion.
+[[runtime]]
+name = "SQLite"
+version = "3.54.0"
+spdx = "blessing"
+files = [
+    "sqlite3.dll",
+]
+notice_url = "https://www.sqlite.org/copyright.html"
+
+[runtime.sha256]
+"_internal/sqlite3.dll" = "aa42d12130f9962d81fae4e655d20e760759d2c8551b44817f7c3181a7307cb1"
+
+
+# Microsoft runtime files are not bundled, so they have no entries here. The Visual C++ 2015-2022
+# runtime (MSVCP140*.dll, VCRUNTIME140*.dll) and the Universal CRT (ucrtbase.dll and api-ms-win-*.dll)
+# were removed on purpose. build.py deletes them from the bundle, and verify_bundle.py fails the build
+# when any of them is present. Users install Microsoft's Visual C++ Redistributable (x64) first, from
+# https://aka.ms/vs/17/release/vc_redist.x64.exe. The Universal CRT comes with Windows 10 and later.
+# The names and patterns are in [microsoft_prerequisites] in packaging/lgpl_manifest.toml, and
+# packaging/README.bundle.txt tells the user what to install.
+
+# Qt for Python extension binaries (D4). pyside6.abi3.dll is in _internal/PySide6/ and
+# shiboken6.abi3.dll is in _internal/shiboken6/. Both are pinned by path. Their licence is the
+# elected Qt licence, LGPL-3.0-only (packaging/lgpl_manifest.toml). The gate accepts an
+# LGPL-3.0-only runtime only when every file is under PySide6/ or shiboken6/.
+[[runtime]]
+name = "Qt for Python extension binaries"
+version = "6.12.0"
+spdx = "LGPL-3.0-only"
+files = [
+    "pyside6.abi3.dll",
+    "shiboken6.abi3.dll",
+]
+notice_url = "https://www.qt.io/development/qt-framework/qt-licensing"
+licence_file = "LICENSES/LGPL-3.0.txt"
+
+[runtime.sha256]
+"_internal/PySide6/pyside6.abi3.dll" = "d5b87ccb0a7c305854bd120242b0a75002d0b50a35532d0f6171e4ed0f3cc82a"
+"_internal/shiboken6/shiboken6.abi3.dll" = "07c318c02be5a3a9f1475f5a2d0cd438f4d4ea3288c28e2e10bc5ebbbec8de86"
+
+# PyInstaller (not a [[runtime]] entry). packaging/build.py writes two PyInstaller sections into
+# THIRD_PARTY_LICENSES.txt, taken from PyInstaller's COPYING.txt:
+#   - the bootloader and the boot module (pyiboot*): "GPL-2.0-or-later WITH Bootloader-exception"
+#     (the Bootloader Exception);
+#   - the run-time hooks and fake modules (_pyi_rth_*, pyi_rth_*, pyi_splash*): "Apache-2.0", with
+#     the Apache-2.0 text.
+# The verifier's [pyinstaller_bootloader] and [pyinstaller_runtime_hooks] tables in
+# lgpl_manifest.toml carry the same mapping, and each passes only while NOTICE.md names
+# PyInstaller and its licence.

@@ -1,0 +1,54 @@
+MERIDIAN DESKTOP END USER LICENSE AGREEMENT
+Version 1.0
+
+1. Grant
+You may install and run Meridian Desktop on your own computer. The application's own code is
+licensed under the Meridian Source License 1.0 (MSL-1.0). Its text is in LICENSES/MSL-1.0.txt.
+The third-party components are licensed under their own terms, which are listed in NOTICE.md
+and THIRD_PARTY_LICENSES.txt.
+
+2. Third-party components
+Qt and PySide6 are used under the GNU Lesser General Public License, version 3
+(LGPL-3.0-only). The LGPL text is in LICENSES/LGPL-3.0.txt, and the GPL-3.0 text it refers to
+is in LICENSES/GPL-3.0.txt. The Qt libraries are separate DLL files in the application folder.
+You may replace them with a compatible build of the same Qt version. OFFER-SOURCE.md gives the
+written offer for the corresponding source of these components.
+
+3. Modification and debugging of the LGPL components
+You may modify the LGPL components, and you may reverse engineer them for the purpose of
+debugging those modifications. This is permitted by the LGPL-3.0. Nothing in this agreement
+restricts a right that the LGPL-3.0 or the GPL-3.0 gives you.
+
+4. Source offer
+The source code for the LGPL components is offered in OFFER-SOURCE.md.
+
+5. Warranty
+The software is provided as is, without warranty of any kind, to the extent the law allows.
+The third-party components are provided under their own licences, which may contain their
+own warranty terms.
+
+6. Liability
+To the extent the law allows, the owner of Meridian Desktop is not liable for indirect,
+incidental or consequential damages arising from the use of the software.
+
+7. Requirements
+Meridian Desktop needs the Microsoft Visual C++ 2015-2022 Redistributable (x64) installed on this
+computer before it runs. The redistributable is not included in the application folder. Install it
+from Microsoft at https://aka.ms/vs/17/release/vc_redist.x64.exe. Microsoft's own licence governs that
+download and its use. The Universal CRT comes with Windows 10 and later, so it needs no install.
+
+8. Network use
+Meridian Desktop sends network requests to two places.
+(a) A Meridian server on this computer. Its address comes from the local_url setting and must be http on 127.0.0.1,
+localhost or ::1. The desktop checks it with a request to its /health path, and reads RunPod status through it.
+(b) The Meridian hosted service, at the hosted_url setting (https://usemeridian.us by default). This happens only in
+Hosted mode. Hosted mode is used when you choose it, or when a hosted sign-in token is saved on this computer. In
+Hosted mode the desktop sends requests there to check your account and to list your projects and sessions, using that
+sign-in token.
+The desktop has no RunPod address of its own. The RunPod key stays in the operating system credential store on this
+computer. The Meridian server and the hosted service are separate programs, and this section does not cover their
+network use.
+
+9. Termination
+Your rights under this agreement end if you break its terms. The rights the LGPL-3.0 and the
+GPL-3.0 give you for the LGPL components are not limited by this section.
