@@ -2,7 +2,7 @@
 
 The vault is keys-vault.json, beside settings.json. Its file holds only a format version, the scrypt salt and parameters,
 a fresh nonce for each save, and the ciphertext. The plaintext is one JSON object of name to value, and it is never written
-to disk. The key is scrypt(password, salt), 32 bytes, from the standard library. AES-256-GCM encrypts the plaintext, and
+to disk. The key is scrypt(password, salt, cost), 32 bytes, from the standard library. The cost is written in the file, and only the two costs this module writes are accepted. AES-256-GCM encrypts the plaintext, and
 the header (version, scrypt parameters and salt) is the authenticated data, so changing the header fails the same way as
 changing the ciphertext.
 
@@ -32,10 +32,13 @@ from cryptography.hazmat.primitives.ciphers.aead import AESGCM
 VAULT_FILE_NAME = "keys-vault.json"
 VERSION = 1
 MIN_PASSWORD_LENGTH = 12
-SCRYPT_N = 2**15
+# The cost new vault files are written with. Existing files keep the cost they were written with.
+SCRYPT_N = 2**17
 SCRYPT_R = 8
 SCRYPT_P = 1
-SCRYPT_MAXMEM = 64 * 1024 * 1024
+SCRYPT_MAXMEM = 2**28
+# The only scrypt costs a vault file may record: the cost of files written before 2**17, and the cost above.
+KNOWN_SCRYPT_N = (2**15, 2**17)
 KEY_BYTES = 32
 SALT_BYTES = 16
 NONCE_BYTES = 12
@@ -60,9 +63,10 @@ class Vault:
     """An open vault. The derived key and the entries live only in memory. ``lock`` drops both."""
 
     path: Path
-    _salt: bytes
-    _key: bytes | None
-    _entries: dict[str, str] = field(default_factory=dict)
+    _salt: bytes = field(repr=False)
+    _key: bytes | None = field(repr=False)
+    _kdf: dict[str, Any]
+    _entries: dict[str, str] = field(default_factory=dict, repr=False)
 
     @property
     def is_open(self) -> bool:
@@ -90,7 +94,7 @@ class Vault:
         """Write the open vault to its file with a fresh nonce, atomically."""
         self._require_open()
         try:
-            _write(self.path, self._salt, self._key, self._entries)
+            _write(self.path, self._salt, self._key, self._kdf, self._entries)
         except OSError as exc:
             raise VaultError(SAVE_FAILED_TEXT) from exc
 
@@ -114,10 +118,11 @@ def create(path: Path, password: str) -> Vault:
         raise VaultError(ALREADY_EXISTS_TEXT)
     _check_password(password)
     salt = secrets.token_bytes(SALT_BYTES)
-    key = _derive_key(password, salt)
-    vault = Vault(path=path, _salt=salt, _key=key, _entries={})
+    kdf = _new_kdf_block()
+    key = _derive_key(password, salt, kdf)
+    vault = Vault(path=path, _salt=salt, _key=key, _kdf=kdf, _entries={})
     try:
-        _write(path, salt, key, {})
+        _write(path, salt, key, kdf, {})
     except OSError as exc:
         raise VaultError(SAVE_FAILED_TEXT) from exc
     return vault
@@ -128,19 +133,20 @@ def unlock(path: Path, password: str) -> Vault:
     if not exists(path):
         raise VaultError(NOT_FOUND_TEXT)
     document = _read_document(path)
+    kdf = _known_kdf_block(document.get("kdf"))
     salt = _decode(document, "salt")
     nonce = _decode(document, "nonce")
     ciphertext = _decode(document, "ciphertext")
     if len(salt) != SALT_BYTES or len(nonce) != NONCE_BYTES:
         raise VaultError(DAMAGED_TEXT)
-    key = _derive_key(password, salt)
-    header = _header_bytes(document["kdf"], salt)
+    key = _derive_key(password, salt, kdf)
+    header = _header_bytes(kdf, salt)
     try:
         plaintext = AESGCM(key).decrypt(nonce, ciphertext, header)
     except (InvalidTag, ValueError) as exc:
         raise VaultError(WRONG_PASSWORD_TEXT) from exc
     entries = _parse_entries(plaintext)
-    return Vault(path=path, _salt=salt, _key=key, _entries=entries)
+    return Vault(path=path, _salt=salt, _key=key, _kdf=kdf, _entries=entries)
 
 
 def _check_password(password: str) -> None:
@@ -148,20 +154,34 @@ def _check_password(password: str) -> None:
         raise VaultError(SHORT_PASSWORD_TEXT)
 
 
-def _derive_key(password: str, salt: bytes) -> bytes:
+def _derive_key(password: str, salt: bytes, kdf: Mapping[str, Any]) -> bytes:
+    """The key at the cost in ``kdf``. ``kdf`` must be a block that ``_known_kdf_block`` returned."""
     return hashlib.scrypt(
         password.encode("utf-8"),
         salt=salt,
-        n=SCRYPT_N,
-        r=SCRYPT_R,
-        p=SCRYPT_P,
+        n=kdf["n"],
+        r=kdf["r"],
+        p=kdf["p"],
         maxmem=SCRYPT_MAXMEM,
         dklen=KEY_BYTES,
     )
 
 
-def _kdf_block() -> dict[str, Any]:
+def _new_kdf_block() -> dict[str, Any]:
+    """The scrypt block a new vault is written with."""
     return {"name": "scrypt", "n": SCRYPT_N, "r": SCRYPT_R, "p": SCRYPT_P}
+
+
+def _known_kdf_block(kdf: Any) -> dict[str, Any]:
+    """The file's scrypt block, checked before any key is derived. Only the two costs this module writes pass, with r = 8 and p = 1. Anything else is damaged."""
+    if not isinstance(kdf, dict) or set(kdf) != {"name", "n", "r", "p"} or kdf["name"] != "scrypt":
+        raise VaultError(DAMAGED_TEXT)
+    n, r, p = kdf["n"], kdf["r"], kdf["p"]
+    if not all(type(value) is int for value in (n, r, p)):
+        raise VaultError(DAMAGED_TEXT)
+    if n not in KNOWN_SCRYPT_N or r != SCRYPT_R or p != SCRYPT_P:
+        raise VaultError(DAMAGED_TEXT)
+    return {"name": "scrypt", "n": n, "r": r, "p": p}
 
 
 def _header_bytes(kdf: Mapping[str, Any], salt: bytes) -> bytes:
@@ -173,10 +193,9 @@ def _header_bytes(kdf: Mapping[str, Any], salt: bytes) -> bytes:
     ).encode("utf-8")
 
 
-def _write(path: Path, salt: bytes, key: bytes | None, entries: Mapping[str, str]) -> None:
+def _write(path: Path, salt: bytes, key: bytes | None, kdf: Mapping[str, Any], entries: Mapping[str, str]) -> None:
     if key is None:
         raise VaultError(WRONG_PASSWORD_TEXT)
-    kdf = _kdf_block()
     nonce = secrets.token_bytes(NONCE_BYTES)
     plaintext = json.dumps(dict(entries), sort_keys=True, ensure_ascii=False).encode("utf-8")
     ciphertext = AESGCM(key).encrypt(nonce, plaintext, _header_bytes(kdf, salt))
@@ -202,9 +221,6 @@ def _read_document(path: Path) -> dict[str, Any]:
     except (OSError, ValueError) as exc:
         raise VaultError(DAMAGED_TEXT) from exc
     if not isinstance(document, dict) or document.get("version") != VERSION:
-        raise VaultError(DAMAGED_TEXT)
-    kdf = document.get("kdf")
-    if not isinstance(kdf, dict) or kdf != _kdf_block():
         raise VaultError(DAMAGED_TEXT)
     for field_name in ("salt", "nonce", "ciphertext"):
         if not isinstance(document.get(field_name), str):

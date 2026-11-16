@@ -331,15 +331,14 @@ class ApiKeys:
         return new_name
 
     def remove(self, name: str) -> bool:
-        """Remove the saved value. A custom name also leaves the list. Return True when a value was removed.
+        """Remove the saved keychain value. A custom name also leaves the list. Return True when a value was removed.
 
-        A built-in name (RunPod) stays listed, so its card is always there. Raise KeyNameError when the name is not listed.
+        A built-in name (RunPod) stays listed, so its card is always there. A Windows user variable this key was set as is
+        never touched here, and it stays until the owner removes it in Windows. Raise KeyNameError when the name is not listed.
         """
         listed = self._listed(clean_name(name))
         if listed is None:
             raise KeyNameError("That key name is not listed.")
-        # The Windows variable goes first. If it cannot be deleted, the keychain value stays, so the owner can try again.
-        self._remove_user_variable(listed)
         removed = bool(self._secrets.delete_secret(KEY_SERVICE, account_for(listed)))
         if listed not in BUILT_IN_NAMES:
             # A custom name that leaves the list also loses its critical mark, so no stale mark is left behind.
@@ -353,21 +352,6 @@ class ApiKeys:
             if groups != current.key_groups or subgroups != current.key_subgroups:
                 self._settings.save(replace(current, key_groups=groups, key_subgroups=subgroups))
         return removed
-
-    def _remove_user_variable(self, listed: str) -> None:
-        """Delete the Windows user variable this key was set as, but only when it holds this key's saved value.
-
-        A variable of the same name that holds some other text, or that another program set, is left alone. With no
-        saved value there is nothing to compare, so nothing is deleted. Errors come from the registry as
-        UserEnvironmentError, and the message names the step and the class only, never the value.
-        """
-        variable = environment_name(listed)
-        saved = self._secrets.get_secret(KEY_SERVICE, account_for(listed))
-        if not saved:
-            return
-        if self._user_environment.read(variable) != saved:
-            return
-        self._user_environment.delete(variable)
 
     def _listed(self, name: str) -> str | None:
         """The listed name with the same slug as ``name``, or None when there is none."""

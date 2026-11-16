@@ -278,11 +278,16 @@ class KeyVaultBox(QWidget):
         if not value:
             self.refresh(NO_KEYCHAIN_TEXT.format(name=name))
             return
+        # The value this copy replaces, if the name had one. A failed save puts it back, so it is not lost from memory.
+        previous = self._vault.get(name)
         self._vault.put(name, value)
         try:
             self._vault.save()
         except VaultError as exc:
-            self._vault.remove(name)
+            if previous is None:
+                self._vault.remove(name)
+            else:
+                self._vault.put(name, previous)
             self.refresh(str(exc))
             return
         self.refresh(COPIED_TEXT.format(name=name))

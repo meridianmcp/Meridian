@@ -227,3 +227,40 @@ def test_each_key_is_one_line_and_its_details_open_with_the_details_button(qtbot
     assert not details.isHidden()
     assert toggle.text() == "Hide"
     assert section.findChild(QLineEdit, "keys-entry-openai-value") is not None
+
+
+# ----------------------------------------------------------------- a failed copy keeps what the vault held
+
+
+def _failing_write(*_args, **_kwargs):
+    raise OSError("the vault file could not be written")
+
+
+def test_a_failed_copy_over_an_existing_vault_value_puts_the_earlier_value_back(qtbot, folder, monkeypatch):
+    keychain = {"OpenAI": VALUE}
+    box = _box(qtbot, folder, keychain=keychain)
+    _create(box)
+    _button(box, "keyvault-copy-openai").click()
+    _button(box, "keyvault-lock").click()
+    _field_set(box, "keyvault-password", PASSWORD)
+    _button(box, "keyvault-unlock").click()
+    keychain["OpenAI"] = "FAKE-VALUE-DELTA-0004"
+    monkeypatch.setattr(key_vault, "_write", _failing_write)
+
+    box._on_copy("OpenAI")
+
+    assert _status(box) == key_vault.SAVE_FAILED_TEXT
+    _button(box, "keyvault-reveal-openai").click()
+    assert _field(box, "keyvault-value-openai").text() == VALUE, "the value the vault held before the copy is kept"
+
+
+def test_a_failed_copy_of_a_new_name_leaves_no_value_in_memory(qtbot, folder, monkeypatch):
+    box = _box(qtbot, folder)
+    _create(box)
+    monkeypatch.setattr(key_vault, "_write", _failing_write)
+
+    _button(box, "keyvault-copy-openai").click()
+
+    assert _status(box) == key_vault.SAVE_FAILED_TEXT
+    assert box.findChild(QPushButton, "keyvault-reveal-openai") is None, "the name is not in the vault"
+    assert not _button(box, "keyvault-copy-openai").isHidden(), "the copy can be tried again"

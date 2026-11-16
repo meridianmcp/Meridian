@@ -17,9 +17,15 @@ No value is read at startup or into a list. A status is read only to test whethe
 unreadable. Remove asks first, because the saved value is deleted from the keychain.
 
 A keys file the owner chose lists more names (keys_file.py). Each one is a card marked From file, with no value box: its
-value stays in the file and is read only when its Check is pressed. The app never writes the file. Remove on such a name
-only takes it off the list for this session, and says the file is unchanged. A name that the keychain also holds shows
-once, as the keychain name. Each other imported name is set automatically: critical when it is a known service or a built-in name, non-critical otherwise. The list groups them under those two headings, and a critical name shows the Critical badge. No mark is saved for an imported name.
+value stays in the file. Each refresh opens the file and reads every entry, value included, to check it. Those values are
+held only for that check and then dropped: only the names are kept and listed. A value is sent only when its Check is
+pressed, for that one request. The app never writes the file. Remove on
+such a name only takes it off the list for this session, and says the file is unchanged. A name that the keychain also holds
+shows once, as the keychain
+name. Each other imported name is set automatically: critical when it is a known service or a built-in name, non-critical
+otherwise. The list groups them under those two headings, and a critical name shows the Critical badge. A known-service or
+built-in name that is imported is marked critical in settings at the import, so its keychain card keeps the badge its file
+card showed. Any other imported name is not marked.
 
 A name that matches a known service (key_services) also shows what its key is for and where it is made. When that
 service has a check, its card has a Check button. The check runs only when the owner presses it, on the thread pool,
@@ -75,7 +81,9 @@ from meridian_desktop.key_services import (
 from meridian_desktop.key_vault import VAULT_FILE_NAME
 from meridian_desktop.keys_export import write_names_export
 from meridian_desktop.keys_file import (
+    NOT_SUPPORTED_TEXT,
     FileNames,
+    file_format,
     is_classified,
     log_listing,
     read_names,
@@ -88,6 +96,12 @@ from meridian_desktop.ui.confirm import ask_yes_no
 from meridian_desktop.ui.delivery import Delivered, shared_delivery
 from meridian_desktop.ui.key_export_dialog import KeyExportDialog, PathChooser
 from meridian_desktop.ui.key_import_dialog import KeyImportDialog
+from meridian_desktop.ui.key_import_plain_dialog import (
+    PLAIN_QUESTION_TEXT,
+    PLAIN_QUESTION_TITLE,
+    KeyPlainImportDialog,
+    ask_plain_import,
+)
 from meridian_desktop.ui.key_vault_box import REVEAL_TEXT, KeyVaultBox
 from meridian_desktop.ui.runner_actions import submit
 from meridian_desktop.projects_backup import BACKUP_DIR_NAME, utc_now
@@ -110,8 +124,8 @@ SAVE_VALUE_TEXT = "Save value"
 REMOVE_TEXT = "Remove"
 REMOVE_TITLE = "Remove this key?"
 REMOVE_BODY = (
-    "The saved value for {name} is deleted from the keychain. If Meridian set a Windows user variable for it that still "
-    "holds this value, that variable is deleted too. {listing} This cannot be undone."
+    "The saved value for {name} is deleted from the keychain. A Windows user variable set for it is not changed, "
+    "and it stays until you remove it in Windows environment settings. {listing} This cannot be undone."
 )
 REMOVE_LISTING = "The name also leaves the list."
 CANCELLED_TEXT = "Cancelled. Nothing was removed."
@@ -128,8 +142,6 @@ REMOVED_NO_VALUE_TEXT = "Removed {name} from the list. No value was saved for it
 NOT_REMOVED_TEXT = "Not removed. {detail}"
 # A removal that failed on the disk or in the keychain. The message names no path and no value.
 NOT_REMOVED_OS_TEXT = "Not removed. The key could not be deleted or its name could not be written. Try again."
-# The Windows user variable could not be deleted. The keychain value is not touched, so the key is still saved.
-NOT_REMOVED_ENV_TEXT = "Not removed. The Windows user variable could not be deleted, so the key is still saved. Try again."
 # The group label on each keychain card, and the editor that changes it. A label is text the owner typed, never a value.
 GROUP_TEXT = "Group: {group}"
 GROUP_PLACEHOLDER = "Group, for example AI"
@@ -180,8 +192,10 @@ CHECKING_TEXT = "Checking {service}..."
 FILE_HEADING_TEXT = "Load keys from a file"
 FILE_INTRO_TEXT = (
     "Pick a .json, .env or secrets file. A .json file holds each key as a name and its value, for example "
-    '{"OpenAI": "..."}. A .env file holds one NAME=value line for each key. The values stay in that file. They are not '
-    "copied to the keychain or to settings, the app never writes the file, and a value is read only when you press Check."
+    '{"OpenAI": "..."}. A .env file holds one NAME=value line for each key. The values stay in that file. Showing the names '
+    "here never copies a value to the keychain or to settings, and the app never writes the file. Each refresh opens the file "
+    "and reads every entry, value included, but keeps only the names. A value is sent only when you press Check on its card, "
+    "for that one request."
 )
 CHOOSE_FILE_TEXT = "Choose file"
 STOP_FILE_TEXT = "Stop using this file"
@@ -214,6 +228,18 @@ IMPORT_CHOOSER_TITLE = "Choose a vault file to import"
 IMPORT_CHOOSER_FILTER = "Key vault files (*.json);;All files (*)"
 IMPORTED_SECTION_ONE_TEXT = "Imported 1 key from the vault file into the keychain. Windows user variables were not changed."
 IMPORTED_SECTION_MANY_TEXT = "Imported {count} keys from the vault file into the keychain. Windows user variables were not changed."
+# Import keys from a plain file: the button, its file picker, the Yes or No question before a file is read, and what the list says
+# after an import. The dialog itself is ui/key_import_plain_dialog.py. A plain file is never written, and no Windows user variable
+# is written by this import.
+IMPORT_PLAIN_TEXT = "Import keys from a plain file"
+IMPORT_PLAIN_CHOOSER_TITLE = "Choose a keys file to import"
+PLAIN_CANCELLED_TEXT = "Cancelled. Nothing was read or written."
+IMPORTED_PLAIN_ONE_TEXT = (
+    "Imported 1 key from the keys file into the keychain. The file and the Windows user variables were not changed."
+)
+IMPORTED_PLAIN_MANY_TEXT = (
+    "Imported {count} keys from the keys file into the keychain. The file and the Windows user variables were not changed."
+)
 # The Export keys control: an encrypted vault file (the default) or a plaintext file, written only to a path the owner picks.
 # The dialog is ui/key_export_dialog.py. Nothing is exported from the list or at startup.
 EXPORT_KEYS_TEXT = "Export keys"
@@ -353,6 +379,14 @@ def _ask_vault_file(parent: QWidget) -> str:
     return path
 
 
+def _ask_plain_file(parent: QWidget) -> str:
+    """The file dialog that picks a keys file to import once. It offers the kinds keys_file reads. "" means it was cancelled."""
+    path, _filter = QFileDialog.getOpenFileName(
+        parent, IMPORT_PLAIN_CHOOSER_TITLE, str(Path.home()), FILE_CHOOSER_FILTER
+    )
+    return path
+
+
 def _listed_text(total: int) -> str:
     """What the file status says about the names the file lists."""
     if total == 1:
@@ -424,6 +458,9 @@ class KeysSection(QWidget):
         choose_vault: FileChooser | None = None,
         choose_export_path: PathChooser | None = None,
         confirm_export: Confirm | None = None,
+        choose_plain: FileChooser | None = None,
+        confirm_plain: Confirm | None = None,
+        confirm_plain_env: Confirm | None = None,
     ) -> None:
         super().__init__(parent)
         self.setObjectName("keys-section")
@@ -447,6 +484,11 @@ class KeysSection(QWidget):
         self._export_dialog: KeyExportDialog | None = None
         self._choose_export_path = choose_export_path
         self._confirm_export = confirm_export
+        # The plain keys file picker, and the Yes or No question asked before a plain file is read. None means the real ones.
+        self._choose_plain = choose_plain if choose_plain is not None else _ask_plain_file
+        self._confirm_plain = confirm_plain if confirm_plain is not None else ask_plain_import
+        self._confirm_plain_env = confirm_plain_env
+        self._plain_dialog: KeyPlainImportDialog | None = None
         # The names a From file card was removed for, by slug. This session keeps them, and the file is never changed.
         self._hidden_file_slugs: set[str] = set()
         self._cards: dict[str, _Card] = {}
@@ -591,10 +633,14 @@ class KeysSection(QWidget):
         self._import_button = QPushButton(IMPORT_VAULT_TEXT, self)
         self._import_button.setObjectName("keys-import-vault")
         export_row.addWidget(self._import_button)
+        self._import_plain_button = QPushButton(IMPORT_PLAIN_TEXT, self)
+        self._import_plain_button.setObjectName("keys-import-plain")
+        export_row.addWidget(self._import_plain_button)
         export_row.addStretch(1)
         column.addLayout(export_row)
         self._export_button.clicked.connect(self._on_export_names)
         self._import_button.clicked.connect(self._on_import_vault)
+        self._import_plain_button.clicked.connect(self._on_import_plain)
         self._export_keys_button.clicked.connect(self._on_export_keys)
 
         self._add_button.clicked.connect(self._on_add_clicked)
@@ -1387,10 +1433,6 @@ class KeysSection(QWidget):
         except KeyNameError as exc:
             self._show(str(exc))
             return
-        except UserEnvironmentError:
-            # The Windows variable is deleted before the keychain value, so the key is still saved here. Nothing is removed.
-            self._show(NOT_REMOVED_ENV_TEXT)
-            return
         except SecretStoreError as exc:
             self._show(NOT_REMOVED_TEXT.format(detail=exc))
             return
@@ -1470,6 +1512,38 @@ class KeysSection(QWidget):
         """Show the imported names in the list, and say how many keys came in. The Windows user variables are not touched."""
         self.refresh()
         self._show(IMPORTED_SECTION_ONE_TEXT if count == 1 else IMPORTED_SECTION_MANY_TEXT.format(count=count))
+
+    @Slot()
+    def _on_import_plain(self) -> None:
+        """Choose a keys file, then ask the Yes or No question. Only a Yes reads the file's names, into the plain import dialog.
+
+        A name the file's extension does not show as a keys file is refused before the file is opened. No value is read before
+        the owner answers Yes, and a No or Escape reads nothing and writes nothing.
+        """
+        chosen = self._choose_plain(self)
+        if not chosen:
+            return  # the owner cancelled the file dialog, so nothing was read
+        path = Path(chosen)
+        if file_format(path) is None:
+            self._show(NOT_SUPPORTED_TEXT)  # decided by the file name alone, so the file is not opened
+            return
+        if not self._confirm_plain(self, PLAIN_QUESTION_TITLE, PLAIN_QUESTION_TEXT.format(name=path.name)):
+            self._show(PLAIN_CANCELLED_TEXT)
+            return
+        listing = read_names(path)
+        previous = self._plain_dialog
+        if previous is not None:
+            previous.deleteLater()
+        dialog = KeyPlainImportDialog(path, listing, self._keys, self, confirm_environment=self._confirm_plain_env)
+        dialog.imported.connect(self._on_plain_imported)
+        self._plain_dialog = dialog
+        dialog.open()
+
+    @Slot(int)
+    def _on_plain_imported(self, count: int) -> None:
+        """Show the imported names in the list and say how many keys came in. The file and user variables are untouched."""
+        self.refresh()
+        self._show(IMPORTED_PLAIN_ONE_TEXT if count == 1 else IMPORTED_PLAIN_MANY_TEXT.format(count=count))
 
     @Slot()
     def _on_export_keys(self) -> None:
