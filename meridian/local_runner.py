@@ -1085,7 +1085,7 @@ class LocalRunner:
         # kill_on_job_close=not detached (d397bb71): see this method's own
         # `detached` docstring above.
         self._backend = backend or process_lifecycle.get_default_backend(
-            ensure_console_for_graceful_shutdown=True,
+            ensure_console_for_graceful_shutdown=not detached,
             kill_on_job_close=not detached,
         )
         self._broker = process_registry.get_broker() if broker is _UNSET else broker

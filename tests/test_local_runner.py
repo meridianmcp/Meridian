@@ -315,6 +315,25 @@ def test_detached_true_requests_kill_on_job_close_disabled(state_dir, monkeypatc
     assert runner.detached is True
 
 
+def test_detached_start_gives_the_child_no_console_of_its_own(state_dir, monkeypatch):
+    """A bare CLI start must not allocate a console for the child. The child inherits the CLI's console, and when the
+    CLI exits Windows closes that console: the child gets CTRL_CLOSE_EVENT and is terminated a few seconds later.
+    Observed on this machine: the tunnel printed its first line, reported as started, and was gone within ~25 s. With
+    no console of its own it stayed up for 30 s after the start command returned. A normal (non-detached) runner keeps
+    the console for graceful shutdown."""
+    captured = {}
+
+    def fake_get_default_backend(**kwargs):
+        captured.update(kwargs)
+        return process_lifecycle.PosixProcessGroupBackend()
+
+    monkeypatch.setattr(process_lifecycle, "get_default_backend", fake_get_default_backend)
+    lr.LocalRunner("detached-console-scope", None, state_dir=state_dir, broker=None, detached=True)
+    assert captured["ensure_console_for_graceful_shutdown"] is False
+    lr.LocalRunner("attached-console-scope", None, state_dir=state_dir, broker=None, detached=False)
+    assert captured["ensure_console_for_graceful_shutdown"] is True
+
+
 def test_detached_ignored_when_explicit_backend_supplied(state_dir):
     """An explicitly-supplied backend (every test in this file, and any
     caller with its own lifecycle backend) is never second-guessed by
