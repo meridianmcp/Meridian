@@ -642,6 +642,10 @@ class SettingsTab(QWidget):
         self._client_setup.coreChanged.connect(self._runner.refresh_flags)
         self._actions.coreChanged.connect(self._on_core_changed)
 
+    def after_local_action(self) -> None:
+        """A local Start, Stop or Restart finished outside Settings (the restart notice): read the local state again."""
+        self._runner.after_local_action()
+
     def refresh(self) -> None:
         """Show the saved mode, the database file and whether a hosted token is set.
 

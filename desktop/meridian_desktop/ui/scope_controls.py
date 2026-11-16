@@ -135,9 +135,13 @@ class ScopeControls(QWidget):
 
     ``actionFinished`` is emitted on the GUI thread after each finished call. The owner connects to it, so the owner
     can read the state again. A signal, not a callback, keeps this widget from holding its owner in memory.
+
+    ``busyChanged`` carries scope_busy() each time it changes: True while this widget's own action is in flight (from the
+    first submitted call to the end of the whole action, a restart's start included) or another control holds the scope.
     """
 
     actionFinished = Signal()
+    busyChanged = Signal(bool)
 
     def __init__(
         self,
@@ -159,6 +163,9 @@ class ScopeControls(QWidget):
         # Stop's own gate, for a card whose Stop stays on when Start is off (the Tunnel tab in Local mode). None: Stop uses gate.
         self._stop_gate = stop_gate
         self._busy = False
+        # True from the scope claim to the end of the whole action, so it also covers a restart's start question.
+        self._holding = False
+        self._last_busy = False
         self._enabled_by_gate = False
         self._stop_enabled_by_gate = False
         # The button that turns the controls on, when the gate is off: FIX_CHOOSE_CORE, FIX_TURN_ON_TUNNEL, or None.
@@ -225,6 +232,14 @@ class ScopeControls(QWidget):
         self._fix.setText(fix[1] if fix else "")
         self._set_buttons()
 
+    def in_flight(self) -> bool:
+        """True while this widget's own action runs, from its first call to the end of the whole action."""
+        return self._holding or self._busy
+
+    def scope_busy(self) -> bool:
+        """True while this widget's action runs or another control holds this scope's call."""
+        return self.in_flight() or self._actions.scope_busy_by_other(self._scope, self._owner)
+
     def _set_buttons(self) -> None:
         free = not self._busy and not self._actions.scope_busy_by_other(self._scope, self._owner)
         for kind, button in self._buttons.items():
@@ -232,6 +247,10 @@ class ScopeControls(QWidget):
             button.setEnabled(gate_on and free)
         self._fix.setVisible(self._fix_kind is not None)
         self._fix.setEnabled(self._fix_kind is not None and not self._busy)
+        busy = self.scope_busy()
+        if busy != self._last_busy:
+            self._last_busy = busy
+            self.busyChanged.emit(busy)
 
     def _show(self, text: str) -> None:
         self._result.setText(text)
@@ -239,6 +258,7 @@ class ScopeControls(QWidget):
 
     def _finish(self) -> None:
         # The whole action is over, so this widget gives the scope back. A restart kept it through its start too.
+        self._holding = False
         self._actions.end_scope_call(self._scope, self._owner)
         self._set_buttons()
         self.actionFinished.emit()
@@ -318,6 +338,7 @@ class ScopeControls(QWidget):
             self._show(BUSY_OTHER_TEXT.format(label=self._label))
             self._finish()
             return
+        self._holding = True
         self._busy = True
         self._pending = (python, cwd, then)
         self._generation += 1

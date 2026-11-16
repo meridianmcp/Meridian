@@ -168,6 +168,10 @@ class RunnerSection(QWidget):
         self._reading = False
         self.refresh_local_state()
 
+    def after_local_action(self) -> None:
+        """The same read, for a local action that finished outside this block, such as the restart notice's Restart."""
+        self._after_local_action()
+
     @Slot()
     def _on_core_changed(self) -> None:
         """The core setup changed. The switches are read again, and the local state too once the search has finished.

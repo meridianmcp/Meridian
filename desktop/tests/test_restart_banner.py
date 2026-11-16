@@ -8,15 +8,18 @@ import json
 import os
 import subprocess
 import sys
+import threading
 from types import ModuleType
 
 import pytest
 from PySide6.QtCore import Qt
 from PySide6.QtWidgets import QLabel, QPushButton
 
+from meridian_desktop import app_relaunch
 from meridian_desktop import runner_controls as rc
 from meridian_desktop.restart_check import GONE, Restart, RestartWatch, banner_text
 from meridian_desktop.settings_store import Settings, SettingsStore
+from meridian_desktop.ui import main_window as main_window_module
 from meridian_desktop.ui.main_window import MainWindow
 from meridian_desktop.ui.restart_banner import CHECK_INTERVAL_MS, RestartBanner
 from meridian_desktop.ui.runner_actions import RunnerActions
@@ -272,3 +275,210 @@ def test_a_control_without_set_on_started_is_refused_when_a_hook_is_set(qtbot, s
 def test_without_a_hook_a_control_without_set_on_started_is_returned_as_it_is(qtbot, settings_path):
     actions = RunnerActions(SettingsStore(settings_path), make_control=lambda python, cwd: _UnhookedControl())
     assert isinstance(actions.control("python", "core"), _UnhookedControl)
+
+
+# ----------------------------------------------------------- Restart app and the strip's local Restart in the window
+
+REAL_STARTUP_WATCH = app_relaunch.StartupWatch
+REAL_START_NEW_COPY = app_relaunch.start_new_copy
+
+
+class _WindowWatch(FakeWatch):
+    """A FakeWatch the window can hand a confirmed start to. The start is recorded and the check stays as the test sets it."""
+
+    def __init__(self):
+        super().__init__()
+        self.started = []
+
+    def note_server_started(self, pid, cwd):
+        self.started.append(pid)
+
+
+class _GatedSpawn:
+    """Stands in for subprocess.run. A stop waits for the gate, so a test can look at the window mid-action."""
+
+    def __init__(self, gate):
+        self.gate = gate
+        self.calls = []
+        self._lock = threading.Lock()
+
+    def __call__(self, argv, **kwargs):
+        with self._lock:
+            self.calls.append(list(argv))
+        if "stop" in argv:
+            self.gate.wait(5)
+            return _done({"scope": "local", "child": {"state": "stopped"}})
+        return _done({"scope": "local", "child": {"state": "running", "pid": 4321}})
+
+    def verbs(self):
+        with self._lock:
+            return [argv[3] for argv in self.calls]
+
+
+class _AnswersInOrder:
+    """Stands in for the runner confirmation dialog. It answers in order, then No."""
+
+    def __init__(self, *answers):
+        self.answers = list(answers)
+
+    def __call__(self, parent, title, body, confirm_text):
+        return self.answers.pop(0) if self.answers else False
+
+
+class _Child:
+    """Stands in for the new copy's Popen object."""
+
+    def __init__(self, code):
+        self.code = code
+
+    def poll(self):
+        return self.code
+
+
+def _restart_app_fakes(monkeypatch, *, answer, child=None, failure=None):
+    """Fakes the confirm helper, the popen call, the warning and the quit. Returns what each one saw."""
+    seen = {"asked": [], "popen": [], "warnings": [], "quit": 0}
+
+    def fake_ask(parent, title, text):
+        seen["asked"].append((title, text))
+        return answer
+
+    def fake_popen(argv, **kwargs):
+        seen["popen"].append(list(argv))
+        if failure is not None:
+            raise failure
+        return child
+
+    def fake_quit():
+        seen["quit"] += 1
+
+    monkeypatch.setattr(main_window_module, "ask_yes_no", fake_ask)
+    monkeypatch.setattr(
+        app_relaunch, "start_new_copy", lambda plan: REAL_START_NEW_COPY(plan, popen=fake_popen, platform="win32")
+    )
+    # A short hold keeps the test quick. The window still polls it on its timer.
+    monkeypatch.setattr(app_relaunch, "StartupWatch", lambda c: REAL_STARTUP_WATCH(c, hold_seconds=0.2))
+    monkeypatch.setattr(
+        main_window_module.QMessageBox, "warning", lambda parent, title, text: seen["warnings"].append(text)
+    )
+    monkeypatch.setattr(main_window_module.QApplication, "quit", fake_quit)
+    return seen
+
+
+def _plain_window(qtbot, settings_path):
+    window = MainWindow(SettingsStore(settings_path), restart_watch=_WindowWatch())
+    qtbot.addWidget(window)
+    return window
+
+
+def test_restart_app_no_starts_nothing_and_the_question_names_the_launch_starts(qtbot, settings_path, monkeypatch):
+    window = _plain_window(qtbot, settings_path)
+    seen = _restart_app_fakes(monkeypatch, answer=False, child=_Child(None))
+    window._restart_app()
+    assert len(seen["asked"]) == 1
+    title, text = seen["asked"][0]
+    assert title == main_window_module.RESTART_APP_TITLE
+    for name in ("Zotero", "local server", "hosted tunnel"):
+        assert name in text
+    assert seen["popen"] == []
+    assert seen["quit"] == 0
+
+
+def test_restart_app_asks_through_the_confirm_helper_whose_default_is_no():
+    from meridian_desktop.ui import confirm
+
+    assert main_window_module.ask_yes_no is confirm.ask_yes_no
+
+
+def test_restart_app_yes_quits_only_after_the_new_copy_stayed_running(qtbot, settings_path, monkeypatch):
+    window = _plain_window(qtbot, settings_path)
+    seen = _restart_app_fakes(monkeypatch, answer=True, child=_Child(None))
+    window._restart_app()
+    assert len(seen["popen"]) == 1
+    assert seen["quit"] == 0  # the window is still open right after the start
+    # A second press while the new copy is being checked starts nothing more.
+    window._restart_app()
+    assert len(seen["popen"]) == 1
+    qtbot.waitUntil(lambda: seen["quit"] == 1, timeout=3000)
+    assert seen["warnings"] == []
+
+
+def test_restart_app_waits_to_quit_until_the_local_scope_is_not_busy(qtbot, settings_path, monkeypatch):
+    window = _plain_window(qtbot, settings_path)
+    seen = _restart_app_fakes(monkeypatch, answer=True, child=_Child(None))
+    busy = {"on": True}
+    monkeypatch.setattr(window._restart_banner_local, "scope_busy", lambda: busy["on"])
+    window._restart_app()
+    assert len(seen["popen"]) == 1
+    # The hold passes while a local action is busy: the window stays open and keeps polling.
+    qtbot.wait(600)
+    assert seen["quit"] == 0
+    assert window._relaunch_timer.isActive()
+    window._restart_app()  # a second press during the wait starts no second copy
+    assert len(seen["popen"]) == 1
+    busy["on"] = False
+    qtbot.waitUntil(lambda: seen["quit"] == 1, timeout=3000)
+    qtbot.wait(300)
+    assert seen["quit"] == 1
+    assert not window._relaunch_timer.isActive()
+    assert len(seen["popen"]) == 1
+    assert seen["warnings"] == []
+
+
+def test_restart_app_keeps_the_window_open_when_the_new_copy_exits(qtbot, settings_path, monkeypatch):
+    window = _plain_window(qtbot, settings_path)
+    seen = _restart_app_fakes(monkeypatch, answer=True, child=_Child(1))
+    window._restart_app()
+    qtbot.waitUntil(lambda: bool(seen["warnings"]), timeout=3000)
+    assert seen["warnings"] == [app_relaunch.EXITED_TEXT.format(1)]
+    assert seen["quit"] == 0
+
+
+def test_restart_app_warns_without_a_path_when_the_start_fails(qtbot, settings_path, monkeypatch):
+    window = _plain_window(qtbot, settings_path)
+    seen = _restart_app_fakes(monkeypatch, answer=True, failure=OSError("C:/secret/place"))
+    window._restart_app()
+    assert seen["warnings"] == [app_relaunch.FAILED_START_TEXT.format("OSError")]
+    assert "secret" not in seen["warnings"][0]
+    assert seen["quit"] == 0
+
+
+def test_sign_in_from_bar_is_a_slot_and_restart_app_is_not():
+    meta = MainWindow.staticMetaObject
+    assert meta.indexOfMethod("_sign_in_from_bar()") >= 0
+    assert meta.indexOfMethod("_restart_app()") < 0
+
+
+def test_a_strip_restart_keeps_the_strip_disables_restart_app_and_refreshes_settings(qtbot, settings_path, tmp_path):
+    gate = threading.Event()
+    spawn = _GatedSpawn(gate)
+    store = SettingsStore(settings_path)
+    store.save(Settings(mode="local", core_checkout=str(tmp_path / "core"), core_python=sys.executable))
+    # Yes to the stop, No to the start: the restart ends after its stop.
+    actions = RunnerActions(store, spawn=spawn, log_path=tmp_path / "control.log", confirm=_AnswersInOrder(True, False))
+    watch = _WindowWatch()
+    watch.next = Restart(code=("core.py",), server=True)
+    window = MainWindow(store, runner_actions=actions, restart_watch=watch)
+    qtbot.addWidget(window)
+    banner = window.findChild(RestartBanner)
+    banner.check_now()
+    restart_app = banner.findChild(QPushButton, "restart-banner-app")
+    controls = window._restart_banner_local
+    assert restart_app.isEnabled()
+
+    banner.findChild(QPushButton, "restart-banner-local-restart").click()
+    qtbot.waitUntil(lambda: "stop" in spawn.verbs(), timeout=3000)
+    assert not restart_app.isEnabled()
+    # The server record clears when the server stops, so the next check reports nothing. The strip stays.
+    watch.next = Restart()
+    banner.check_now()
+    assert not banner.isHidden()
+    assert not controls.isHidden()
+    statuses_before = spawn.verbs().count("status")
+
+    gate.set()
+    qtbot.waitUntil(lambda: not controls.in_flight(), timeout=3000)
+    assert restart_app.isEnabled()
+    assert controls.findChild(QLabel, "restart-banner-local-control-result").text()
+    # The Settings local state is read again after the strip's action, as after a Settings action.
+    qtbot.waitUntil(lambda: spawn.verbs().count("status") > statuses_before, timeout=3000)
