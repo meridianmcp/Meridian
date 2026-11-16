@@ -522,6 +522,15 @@ def test_the_probe_accepts_only_the_checkouts_own_package(tmp_path):
     assert kwargs["timeout"] == core_locator.PROBE_TIMEOUT_SECONDS
 
 
+def test_the_probe_program_imports_the_core_packages_before_anything_else():
+    # A Python can import meridian's source without its packages (they load lazily), and the tunnel then crashed on
+    # its first auth error. The probe must fail for such a Python, so the imports come first and name every package.
+    first = PROBE_PROGRAM.split(";")[0]
+    assert first.startswith("import aiosqlite")
+    names = {part.strip() for part in first.replace("import", "", 1).split(",")}
+    assert names == {"aiosqlite", "fastapi", "httpx", "pydantic", "uvicorn", "websockets"}
+
+
 def test_the_probe_refuses_a_python_that_imports_another_checkout(tmp_path):
     checkout = make_checkout(tmp_path / "checkout")
     other = make_checkout(tmp_path / "other")

@@ -59,9 +59,13 @@ REPOSITORY_FOLDER = "repository"
 DOCUMENTS_FOLDER = "Documents"
 PIXI_FOLDER = ".pixi"
 WORKSPACE_ENVS_FOLDER = "workspace-envs"
-# One fixed program. It prints the file the checkout's meridian package was imported from, then whether the runner
-# module is there. Only the checkout's own package is accepted.
+# One fixed program. It first imports the packages the tunnel and the local server need, so a Python that has
+# meridian's source but not its packages fails the probe. (``import meridian`` alone succeeds without them, because the
+# packages load lazily, and the tunnel then crashed on its first auth error.) Then it prints the file the checkout's
+# meridian package was imported from, and whether the runner module is there. Only the checkout's own package is
+# accepted.
 PROBE_PROGRAM = (
+    "import aiosqlite, fastapi, httpx, pydantic, uvicorn, websockets; "
     "import importlib.util as u, os, meridian as m; "
     "print(os.path.normcase(os.path.abspath(m.__file__))); "
     "print(u.find_spec('meridian.local_runner') is not None)"
