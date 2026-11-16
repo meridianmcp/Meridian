@@ -32,6 +32,10 @@ extensions/*
 # here without a matching `!packages/docparse` + `!packages/docparse/**` pair;
 # tests/test_c11c5117_dockerfile_docparse.py pins this.
 npm/
+# desktop/ is the Windows desktop app (its own version line and release
+# tags). It is not part of the hosted server image, so keep it out of the
+# build context. Its release zip is built outside Docker.
+desktop/
 # scripts/* (not "scripts/") + explicit negation below: same directory-vs-entry
 # exclusion distinction as extensions/* above. meridian/routes/hooks.py serves
 # these specific scripts to installer clients by reading them from disk at

@@ -1,0 +1,16 @@
+.venv/
+build/
+dist/
+__pycache__/
+*.pyc
+.pytest_cache/
+# pixi environments
+.pixi/*
+!.pixi/config.toml
+# local Claude Code state and the owner's local handoff notes (not part of the source tree)
+# .claude/settings.json is the one tracked file under .claude/: it carries the read lock every checkout needs.
+.claude/*
+!.claude/settings.json
+docs/handoffs/
+# The owner's signed Zotero bridge is copied into dist/ by packaging/build.py and is never committed.
+*.xpi

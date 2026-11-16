@@ -1,0 +1,83 @@
+MERIDIAN DESKTOP END USER LICENSE AGREEMENT
+Version 1.0
+
+1. Grant
+You may install and run Meridian Desktop on your own computer. The application's own code is
+licensed under the Meridian Source License 1.0 (MSL-1.0). Its text is in LICENSES/MSL-1.0.txt.
+The third-party components are licensed under their own terms, which are listed in NOTICE.md
+and THIRD_PARTY_LICENSES.txt.
+
+2. Third-party components
+Qt and PySide6 are used under the GNU Lesser General Public License, version 3
+(LGPL-3.0-only). The LGPL text is in LICENSES/LGPL-3.0.txt, and the GPL-3.0 text it refers to
+is in LICENSES/GPL-3.0.txt. The Qt libraries are separate DLL files in the application folder.
+You may replace them with a compatible build of the same Qt version. OFFER-SOURCE.md gives the
+written offer for the corresponding source of these components.
+
+3. Modification and debugging of the LGPL components
+You may modify the LGPL components, and you may reverse engineer them for the purpose of
+debugging those modifications. This is permitted by the LGPL-3.0. Nothing in this agreement
+restricts a right that the LGPL-3.0 or the GPL-3.0 gives you.
+
+4. Source offer
+The source code for the LGPL components is offered in OFFER-SOURCE.md.
+
+5. Warranty
+The software is provided as is, without warranty of any kind, to the extent the law allows.
+The third-party components are provided under their own licences, which may contain their
+own warranty terms.
+
+6. Liability
+To the extent the law allows, the owner of Meridian Desktop is not liable for indirect,
+incidental or consequential damages arising from the use of the software.
+
+7. Requirements
+Meridian Desktop needs the Microsoft Visual C++ 2015-2022 Redistributable (x64) installed on this
+computer before it runs. The redistributable is not included in the application folder. Install it
+from Microsoft at https://aka.ms/vs/17/release/vc_redist.x64.exe. Microsoft's own licence governs that
+download and its use. The Universal CRT comes with Windows 10 and later, so it needs no install.
+
+8. Network use
+Meridian Desktop contacts only the destinations listed below, and only for the reason shown beside each one.
+(a) A Meridian server on this computer, at the local_url setting, which must be http on 127.0.0.1, localhost or ::1.
+The desktop uses it for a health check, and for local data and status, including RunPod status.
+(b) The Meridian hosted service, at the hosted_url setting (https://usemeridian.us by default). In Hosted mode the desktop
+uses it, with your sign-in token, to check your account, to renew your sign-in when it is close to expiry, and to list your
+projects and sessions. Sign in with browser in Settings uses it to sign you in. In Local mode the connection bar sends no
+request to it and offers no sign-in. In Local mode the Projects tab reads the local server or a local database file, and
+the Sessions tab reads only the local server. Sign in with browser, Test connection and Try again in Settings still reach
+the hosted service in Local mode when you press them.
+Once the hosted tunnel is started, its process connects to the Meridian hosted service, as the core's tunnel client does. The
+desktop runs the Meridian core's runner command with the core's Python, in the core checkout set in Settings, using a fixed
+argument list. It adds no hosted URL and no token to that
+command. Start, Stop and Restart on the Tunnel tab, and Start on the Home tunnel card, each ask you first. A launch-time
+start runs only after you have turned its switch on in Settings. In Local mode the Home tunnel card's Start and the Tunnel
+tab's Start and Restart are off, and no launch-time start runs, so neither can start or restart the hosted tunnel. The
+Tunnel tab's Stop stays on in Local mode. It runs the core's stop command for the tunnel, which ends only the tunnel process
+the runner started on this computer, and it sends no request to the hosted URL.
+(c) The GitHub releases service, to check for a newer version of this app and to download a release file.
+(d) The OpenAI and Anthropic API services, and the GitHub API, only when you press Check on a saved key. The key is
+sent in the request to that one service, to test it.
+(e) SSH hosts you have saved, using ssh.exe, to read GPU information for GPU jobs.
+(f) The npm and PyPI package services, through the AI clients. The desktop writes the commands for Meridian's local servers
+into the Claude Desktop and Codex configs, in a client setup and in its local cache at a real start. It does not run those
+commands. When an AI client starts one of those servers, npx fetches the npm packages it names, and uvx fetches
+serena-agent from PyPI, with the other Python packages those servers need. If no Python 3.12 is installed, uvx also
+downloads a managed Python 3.12 build from GitHub when it starts Serena.
+(g) Services on 127.0.0.1 only: the LaTeX engine, the Zotero local API, and the slot ports, which the desktop checks with a
+connect-only probe.
+(h) RunPod's API, at https://api.runpod.io. The desktop sends it one request to list GPU types, prices and stock. Your
+RunPod key is read from the operating system credential store on this computer and sent in that request's
+Authorization header, and to no other place. The desktop sends RunPod nothing else.
+Your saved keys are kept in the operating system credential store on this computer. A key you mark as critical can also be
+copied into an encrypted vault file, keys-vault.json, which is kept beside settings.json on this computer. The vault is
+encrypted with a passphrase that you choose. Copying a key into the vault leaves its keychain copy in place. The "Set as
+Windows user variable" button copies one key, in plain text, into the Windows user environment, where other programs can
+read it, until you remove it in Windows settings. The app asks you to confirm first. The export feature writes a file you
+choose, and anyone who can open a plaintext export can read every key in it.
+The Meridian server, the tunnel process that the core starts, and the hosted service are separate programs, and this section
+does not cover their network use.
+
+9. Termination
+Your rights under this agreement end if you break its terms. The rights the LGPL-3.0 and the
+GPL-3.0 give you for the LGPL components are not limited by this section.

@@ -1,0 +1,33 @@
+# Desktop tests. Runs only when desktop/ changes.
+#
+# Deliberately NOT named "Test (dev branch)". deploy.yml gates auto-promotion to main on that name, so a failing desktop
+# test here never blocks a server deploy. Tests/test_febd27ec_desktop_move.py pins both facts.
+name: Desktop tests
+
+on:
+  push:
+    branches: [dev]
+    paths:
+      - "desktop/**"
+      - ".github/workflows/desktop-test.yml"
+  pull_request:
+    branches: [main]
+    paths:
+      - "desktop/**"
+      - ".github/workflows/desktop-test.yml"
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    runs-on: windows-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: prefix-dev/setup-pixi@ba3bb36eb2066252b2363392b7739741bb777659 # v0.8.1
+        with:
+          pixi-version: v0.79.0
+          cache: false
+      - run: pixi install --manifest-path desktop/pixi.toml
+      - run: pixi run --manifest-path desktop/pixi.toml test
