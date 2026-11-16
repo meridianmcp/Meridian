@@ -6,7 +6,7 @@ minutes while Home is showing, and when Check now is pressed. No button starts t
 
 The checks read only, with two exceptions the owner confirms first: Launch Zotero asks in the same confirmation dialog
 the Zotero panel uses, and the tunnel card's Start asks in the same dialog the Tunnel tab uses (ScopeControls, gated the
-same way). The tunnel card has no Stop or Restart. Its other button switches to the Tunnel tab, where the Tunnel panel
+same way and also off in Local mode). The tunnel card has no Stop or Restart. Its other button switches to the Tunnel tab, where the Tunnel panel
 (ui/tunnel_panel.py) holds Stop and Restart as well. The other buttons only switch tabs.
 
 Every check runs on the thread pool through runner_actions.submit, so the window stays responsive, and no check holds
@@ -69,7 +69,7 @@ from meridian_desktop.tools_status import ToolsStatus
 from meridian_desktop.tunnel_status import read_tunnel_status
 from meridian_desktop.ui.delivery import Delivered, shared_delivery
 from meridian_desktop.ui.runner_actions import RunnerActions, submit
-from meridian_desktop.ui.scope_controls import ScopeControls, tunnel_gate
+from meridian_desktop.ui.scope_controls import ScopeControls, home_tunnel_gate
 from meridian_desktop.ui.services_page import probe_engine_status
 from meridian_desktop.ui.text import (
     BlockLine,
@@ -570,6 +570,8 @@ class HomeTab(QWidget):
         self._deps = deps
         self._last_run: float | None = None
         self._zotero_status: Any = None
+        # The tunnel card's Start, when the window gave the tab its actions (see _controls_row).
+        self._tunnel_start: ScopeControls | None = None
         self.setStyleSheet(CARD_STYLE)
 
         self._timer = QTimer(self)
@@ -680,12 +682,13 @@ class HomeTab(QWidget):
         self._refresh_updates()
 
     def _controls_row(self) -> None:
-        """The Tunnel card's controls: Start, which asks first and is off while the tunnel switch or the core is not set (the
-        same gate and dialog as the Tunnel tab), and a button that opens the Tunnel tab, where Stop and Restart are."""
+        """The Tunnel card's controls: Start, which asks first and is off in Local mode, while the tunnel switch is off, or
+        while the core is not set (home_tunnel_gate: the Local mode check, then the tunnel gate, which the Tunnel tab uses
+        too), and a button that opens the Tunnel tab, where Stop and Restart are."""
         deps = self._deps
         if deps.actions is not None:
             self._tunnel_start = ScopeControls(
-                SCOPE_TUNNEL, deps.actions, tunnel_gate, prefix="home-tunnel", offered=(START,), parent=self._tunnel,
+                SCOPE_TUNNEL, deps.actions, home_tunnel_gate, prefix="home-tunnel", offered=(START,), parent=self._tunnel,
             )
             self._tunnel_start.actionFinished.connect(self._on_tunnel_action_finished)
             self._tunnel.add_body(self._tunnel_start)
@@ -719,9 +722,16 @@ class HomeTab(QWidget):
     def check_all(self) -> None:
         """Run every card's check now. The Updates card reads the one startup check, so it makes no request."""
         self._last_run = time.monotonic()
+        self.refresh_tunnel_start()
         for card in (self._local, self._tunnel, self._services, self._zotero, self._tools):
             card.check()
         self._refresh_updates()
+
+    def refresh_tunnel_start(self) -> None:
+        """Read the tunnel Start's gate again now, so a change of mode or core shows on Home at once. The window calls this
+        after a mode change, since a mode change emits no coreChanged. Starts nothing."""
+        if self._tunnel_start is not None:
+            self._tunnel_start.refresh_enabled()
 
     def _refresh_updates(self) -> None:
         deps = self._deps
@@ -786,6 +796,7 @@ class HomeTab(QWidget):
 
     def showEvent(self, event: QShowEvent) -> None:  # noqa: N802 - Qt naming
         super().showEvent(event)
+        self.refresh_tunnel_start()
         self._timer.start()
         stale = self._last_run is None or time.monotonic() - self._last_run >= CHECK_INTERVAL_SECONDS
         if stale:

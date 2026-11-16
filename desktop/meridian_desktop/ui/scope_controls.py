@@ -9,7 +9,10 @@ Restart is a stop, then a start, and the owner is asked before each one (rule 9)
 ends the restart, so nothing is started after a stop the runner did not confirm.
 
 The buttons are enabled only when the gate says so. For the tunnel the gate also needs tunnel_control_enabled
-(rule 10). Both gates need the Meridian core checkout and its Python to be set. The core is looked for at start, and
+(rule 10). The Home card's Start and the Tunnel tab's Start and Restart also need Hosted mode, since the hosted tunnel
+does not start in Local mode. The Tunnel tab's Stop has its own gate (tunnel_stop_gate), without the mode check, since
+Stop sends no hosted request and stays on in Local mode. Both gates need the Meridian core checkout and its Python to
+be set. The core is looked for at start, and
 again by "Find it again" in Settings. The gate's text is shown when the buttons are off, so the owner sees why, and a
 button next to the text does the one thing that turns them on: Choose the Meridian core folder, or Turn on the tunnel
 controls. The buttons read the setup again whenever RunnerActions.coreChanged is emitted. After each finished call,
@@ -23,6 +26,7 @@ from collections.abc import Callable
 from PySide6.QtCore import Qt, Signal, Slot
 from PySide6.QtWidgets import QHBoxLayout, QLabel, QPushButton, QVBoxLayout, QWidget
 
+from meridian_desktop.launch_starts import TUNNEL_MODES
 from meridian_desktop.runner_controls import (
     SCOPE_LABELS,
     START,
@@ -44,6 +48,11 @@ TUNNEL_OFF_TEXT = (
 CORE_NOT_SET_TEXT = (
     "The Meridian core was not found on this computer, so these buttons are off. "
     "Choose the Meridian core folder, and the desktop finds its Python."
+)
+# The reason the hosted tunnel's Start and Restart are off in Local mode, on the Home card and the Tunnel tab. Stop is not
+# named here, because it stays on. No button fixes it here: the mode is changed at the top bar.
+TUNNEL_LOCAL_MODE_TEXT = (
+    "The hosted tunnel's Start and Restart are off in Local mode. Switch to Hosted mode to start or restart it."
 )
 # The button that does the one thing that turns the controls on, for each gate note that has one.
 CHOOSE_CORE_BUTTON = "Choose the Meridian core folder"
@@ -86,6 +95,26 @@ def tunnel_gate(core: CoreSetup) -> tuple[bool, str]:
     return True, ""
 
 
+def home_tunnel_gate(core: CoreSetup) -> tuple[bool, str]:
+    """The gate for the hosted tunnel's Start and Restart: off in Local mode, where the hosted tunnel does not start, and
+    otherwise the tunnel gate. The Home card's Start and the Tunnel tab's Start and Restart both use it. The Tunnel tab's
+    Stop does not: it uses tunnel_stop_gate, which stays on in Local mode.
+
+    The mode is checked first, so the reason shown in Local mode is the mode, whatever the core setup. The name is kept
+    from when only the Home card used it. tunnel_gate alone does not look at the mode.
+    """
+    if core.mode not in TUNNEL_MODES:
+        return False, TUNNEL_LOCAL_MODE_TEXT
+    return tunnel_gate(core)
+
+
+def tunnel_stop_gate(core: CoreSetup) -> tuple[bool, str]:
+    """The gate for the hosted tunnel's Stop on the Tunnel tab. Stop sends no hosted request: it ends only the tunnel process
+    the runner started on this computer. So Local mode does not turn it off. It needs the same switch and core setup as Start.
+    """
+    return tunnel_gate(core)
+
+
 def local_gate(core: CoreSetup) -> tuple[bool, str]:
     """The local buttons are on only when the core checkout and its Python are set."""
     if not core.core_ready:
@@ -119,6 +148,7 @@ class ScopeControls(QWidget):
         prefix: str,
         parent: QWidget | None = None,
         offered: tuple[str, ...] = ALL_CONTROLS,
+        stop_gate: Gate | None = None,
     ) -> None:
         super().__init__(parent)
         self.setObjectName(f"{prefix}-controls")
@@ -126,8 +156,11 @@ class ScopeControls(QWidget):
         self._label = SCOPE_LABELS[scope]
         self._actions = actions
         self._gate = gate
+        # Stop's own gate, for a card whose Stop stays on when Start is off (the Tunnel tab in Local mode). None: Stop uses gate.
+        self._stop_gate = stop_gate
         self._busy = False
         self._enabled_by_gate = False
+        self._stop_enabled_by_gate = False
         # The button that turns the controls on, when the gate is off: FIX_CHOOSE_CORE, FIX_TURN_ON_TUNNEL, or None.
         self._fix_kind: str | None = None
         # The call in flight: (python, working folder, "start" when a restart still has its start to do, or None).
@@ -174,20 +207,29 @@ class ScopeControls(QWidget):
     # ----------------------------------------------------------- state
 
     def refresh_enabled(self) -> None:
-        """Read the saved setup again and set the buttons, the gate note and the fix button. Starts nothing."""
-        enabled, note = self._gate(self._actions.core())
+        """Read the saved setup again and set the buttons, the gate note and the fix button. Starts nothing.
+
+        When Start and Restart are off but Stop is on, the note gives the reason for Start and Restart. When Stop is off
+        as well, the note gives Stop's reason if it has one, since that is the reason the owner can act on.
+        """
+        core = self._actions.core()
+        enabled, note = self._gate(core)
+        stop_enabled, stop_note = self._stop_gate(core) if self._stop_gate is not None else (enabled, note)
         self._enabled_by_gate = enabled
-        self._note.setText(note)
-        self._note.setVisible(bool(note))
-        fix = FIX_BY_NOTE.get(note) if not enabled else None
+        self._stop_enabled_by_gate = stop_enabled
+        shown = note if (enabled or stop_enabled or not stop_note) else stop_note
+        self._note.setText(shown)
+        self._note.setVisible(bool(shown))
+        fix = FIX_BY_NOTE.get(shown) if not enabled else None
         self._fix_kind = fix[0] if fix else None
         self._fix.setText(fix[1] if fix else "")
         self._set_buttons()
 
     def _set_buttons(self) -> None:
-        on = self._enabled_by_gate and not self._busy and not self._actions.scope_busy_by_other(self._scope, self._owner)
-        for button in self._buttons.values():
-            button.setEnabled(on)
+        free = not self._busy and not self._actions.scope_busy_by_other(self._scope, self._owner)
+        for kind, button in self._buttons.items():
+            gate_on = self._stop_enabled_by_gate if kind == STOP else self._enabled_by_gate
+            button.setEnabled(gate_on and free)
         self._fix.setVisible(self._fix_kind is not None)
         self._fix.setEnabled(self._fix_kind is not None and not self._busy)
 
@@ -246,7 +288,9 @@ class ScopeControls(QWidget):
         if self._busy:
             return
         core = self._actions.core()
-        enabled, _note = self._gate(core)
+        # A plain Stop uses Stop's own gate when there is one. A restart also starts, so it uses the Start gate.
+        gate = self._stop_gate if (subcommand == STOP and not restart and self._stop_gate is not None) else self._gate
+        enabled, _note = gate(core)
         if not enabled:
             # The buttons are off, so nothing is asked and nothing runs. The gate note already says why.
             self.refresh_enabled()
@@ -332,8 +376,11 @@ class ScopeControls(QWidget):
 __all__ = [
     "CORE_NOT_SET_TEXT",
     "RESTART",
+    "TUNNEL_LOCAL_MODE_TEXT",
     "TUNNEL_OFF_TEXT",
     "ScopeControls",
+    "home_tunnel_gate",
     "local_gate",
     "tunnel_gate",
+    "tunnel_stop_gate",
 ]

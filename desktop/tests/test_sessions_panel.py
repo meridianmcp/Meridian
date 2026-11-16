@@ -442,10 +442,10 @@ def test_local_not_running_without_a_token_does_not_touch_hosted(qtbot):
     assert hosted.calls == []
 
 
-def test_local_not_running_with_a_token_reads_hosted_and_names_the_source(qtbot):
+def test_hosted_mode_with_local_not_running_reads_hosted_and_names_the_source(qtbot):
     local = FakeLocal(error=LocalClientError("not_running", "x"))
     hosted = FakeHosted(body=body_of([session(name="from-hosted")]))
-    panel, hosted = make_panel(qtbot, local=local, hosted=hosted, hosted_value=(HOSTED, SENTINEL_TOKEN))
+    panel, hosted = make_panel(qtbot, local=local, hosted=hosted, hosted_value=(HOSTED, SENTINEL_TOKEN), mode="hosted")
     panel.show()
     settle(qtbot, panel)
     assert len(hosted.calls) == 1
@@ -459,16 +459,26 @@ def test_local_not_running_with_a_token_reads_hosted_and_names_the_source(qtbot)
 def test_the_token_is_never_shown_in_any_visible_text(qtbot):
     local = FakeLocal(error=LocalClientError("not_running", "x"))
     hosted = FakeHosted(body=body_of([session()]))
-    panel, _hosted = make_panel(qtbot, local=local, hosted=hosted, hosted_value=(HOSTED, SENTINEL_TOKEN))
+    panel, _hosted = make_panel(qtbot, local=local, hosted=hosted, hosted_value=(HOSTED, SENTINEL_TOKEN), mode="hosted")
     panel.show()
     settle(qtbot, panel)
     assert SENTINEL_TOKEN not in all_visible_text(panel)
 
 
+def test_local_mode_with_local_not_running_sends_no_hosted_request_even_with_a_token(qtbot):
+    local = FakeLocal(error=LocalClientError("not_running", "x"))
+    hosted = FakeHosted(body=body_of([session(name="from-hosted")]))
+    panel, hosted = make_panel(qtbot, local=local, hosted=hosted, hosted_value=(HOSTED, SENTINEL_TOKEN), mode="local")
+    panel.show()
+    settle(qtbot, panel)
+    assert hosted.calls == [], "Local mode must not reach the hosted service, even when the local server is not running"
+    assert "from-hosted" not in all_visible_text(panel)
+
+
 def test_the_token_is_not_shown_when_hosted_refuses_it(qtbot):
     local = FakeLocal(error=LocalClientError("not_running", "x"))
     hosted = FakeHosted(status=401)
-    panel, _hosted = make_panel(qtbot, local=local, hosted=hosted, hosted_value=(HOSTED, SENTINEL_TOKEN))
+    panel, _hosted = make_panel(qtbot, local=local, hosted=hosted, hosted_value=(HOSTED, SENTINEL_TOKEN), mode="hosted")
     panel.show()
     settle(qtbot, panel)
     assert "did not accept" in status_of(panel)
@@ -512,7 +522,7 @@ def test_a_failed_sessions_read_says_so_in_plain_words_and_names_no_class(qtbot)
         raise KeychainError("token store locked")
 
     local = FakeLocal(error=LocalClientError("not_running", "x"))
-    panel, _counts = build_panel(qtbot, local=local, hosted=FakeHosted(), hosted_provider=broken_hosted)
+    panel, _counts = build_panel(qtbot, local=local, hosted=FakeHosted(), hosted_provider=broken_hosted, mode="hosted")
     panel.show()
     settle(qtbot, panel)
     assert status_of(panel).startswith(READ_FAILED_TEXT)
@@ -526,7 +536,7 @@ def test_a_failed_sessions_read_says_so_in_plain_words_and_names_no_class(qtbot)
 def test_a_show_makes_one_project_read_and_one_sessions_read(qtbot):
     local = FakeLocal(error=LocalClientError("not_running", "x"))
     hosted = FakeHosted(body=body_of([session(name="from-hosted")]))
-    panel, counts = build_panel(qtbot, local=local, hosted=hosted, hosted_value=(HOSTED, SENTINEL_TOKEN))
+    panel, counts = build_panel(qtbot, local=local, hosted=hosted, hosted_value=(HOSTED, SENTINEL_TOKEN), mode="hosted")
     panel.show()
     settle(qtbot, panel)
     assert counts.projects == 1

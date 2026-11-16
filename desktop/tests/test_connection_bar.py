@@ -62,8 +62,9 @@ def _secrets():
     return KeyringSecretStore(backend=MemoryKeyring())
 
 
-def _bar(qtbot, settings_path, secrets, transport, *, probe=_not_running, clock=None) -> ConnectionBar:
-    SettingsStore(settings_path).save(Settings(hosted_url=HOSTED))
+def _bar(qtbot, settings_path, secrets, transport, *, probe=_not_running, clock=None, mode="hosted") -> ConnectionBar:
+    # Hosted mode by default: the bar's checks reach the hosted service. The Local mode tests pass mode="local".
+    SettingsStore(settings_path).save(Settings(hosted_url=HOSTED, mode=mode))
     bar = ConnectionBar(
         settings_store=SettingsStore(settings_path),
         secrets=secrets,
@@ -202,6 +203,7 @@ def test_signing_in_and_checking_again_updates_the_bar(qtbot, settings_path):
 
 def test_the_main_window_puts_the_connection_bar_first_and_checks_again_after_a_settings_sign_in(qtbot, settings_path):
     secrets = _secrets()
+    SettingsStore(settings_path).save(Settings(hosted_url=HOSTED, mode="hosted"))
     transport = ScriptedTransport({"/me": [_me_ok()]})
     sources = DataSources(
         probe=_not_running,
@@ -228,3 +230,76 @@ def test_the_main_window_puts_the_connection_bar_first_and_checks_again_after_a_
     window._settings_tab.signedInChanged.emit()
 
     qtbot.waitUntil(lambda: _text(bar, "connection-bar-headline").startswith("Signed in: "), timeout=5000)
+
+
+# ----------------------------------------------------------- Local mode
+
+LOCAL_MODE_LINE = "Local mode: hosted sign-in is off. Switch to Hosted mode to sign in."
+
+
+def test_local_mode_says_hosted_sign_in_is_off_and_offers_no_sign_in_control_even_with_a_saved_token(qtbot, settings_path):
+    secrets = _secrets()
+    _save_session(secrets)
+    transport = ScriptedTransport({"/me": [_me_ok()]})
+    bar = _bar(qtbot, settings_path, secrets, transport, mode="local")
+
+    bar.start()
+
+    qtbot.waitUntil(lambda: _text(bar, "connection-bar-headline") == LOCAL_MODE_LINE, timeout=5000)
+    assert bar.property("state") == "not_connected"
+    assert _text(bar, "connection-bar-hosted") == "Not connected: Hosted (usemeridian.us)."
+    assert bar.findChild(QPushButton, "connection-bar-sign-in").isHidden()
+    assert all(button.isHidden() for button in bar.findChildren(QPushButton)), "no sign-in control is offered in Local mode"
+
+
+def test_local_mode_with_no_token_shows_the_local_line_offers_no_sign_in_and_sends_nothing(qtbot, settings_path):
+    transport = ScriptedTransport({})
+    bar = _bar(qtbot, settings_path, _secrets(), transport, mode="local")
+
+    bar.start()
+
+    qtbot.waitUntil(lambda: _text(bar, "connection-bar-headline") == LOCAL_MODE_LINE, timeout=5000)
+    assert all(button.isHidden() for button in bar.findChildren(QPushButton))
+    assert transport.requests == []
+
+
+def test_local_mode_the_timer_tick_and_check_send_no_hosted_request_but_still_probe_the_local_server(qtbot, settings_path):
+    secrets = _secrets()
+    _save_session(secrets)
+    transport = ScriptedTransport({"/me": [_me_ok()]})
+    probes: list[str] = []
+
+    def probe(url: str) -> str:
+        probes.append(url)
+        return local_client.HEALTH_RUNNING
+
+    bar = _bar(qtbot, settings_path, secrets, transport, probe=probe, mode="local")
+    bar.start()
+    qtbot.waitUntil(lambda: _text(bar, "connection-bar-headline") == LOCAL_MODE_LINE, timeout=5000)
+    assert len(probes) == 1  # the first check probed the local server once
+
+    bar._timer.timeout.emit()  # noqa: SLF001 - the five-minute tick, through the timer's own connection
+    qtbot.waitUntil(lambda: len(probes) == 2, timeout=5000)
+    bar.refresh()  # Check: the slot the main window calls after a sign-in or sign-out
+    qtbot.waitUntil(lambda: len(probes) == 3, timeout=5000)
+
+    # Each check probed the local server, so the three checks did run, and none of them reached the hosted host.
+    assert transport.requests == [], "the timer and Check sent nothing to the hosted host in Local mode"
+    assert _text(bar, "connection-bar-local") == "Local: Meridian server at 127.0.0.1:7878 (live)."
+
+
+def test_hosted_mode_the_same_timer_tick_and_check_do_reach_the_hosted_host(qtbot, settings_path):
+    """The control for the Local mode test: the same tick and Check, in Hosted mode, do call the hosted host."""
+    secrets = _secrets()
+    _save_session(secrets)
+    transport = ScriptedTransport({"/me": [_me_ok()]})
+    bar = _bar(qtbot, settings_path, secrets, transport, probe=_running, mode="hosted")
+    bar.start()
+    qtbot.waitUntil(lambda: bar.property("state") == "connected", timeout=5000)
+    assert len(transport.requests) == 1
+
+    bar._timer.timeout.emit()  # noqa: SLF001 - the five-minute tick, through the timer's own connection
+    qtbot.waitUntil(lambda: len(transport.requests) == 2, timeout=5000)
+    bar.refresh()
+    qtbot.waitUntil(lambda: len(transport.requests) == 3, timeout=5000)
+    assert transport.paths() == ["/me", "/me", "/me"]

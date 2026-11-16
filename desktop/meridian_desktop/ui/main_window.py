@@ -665,7 +665,18 @@ class MainWindow(QMainWindow):
         self._settings_tab.refresh()
         # The Projects tab reads from the source the new mode names.
         self._projects.refresh()
+        # The hosted tunnel's controls depend on the mode, so the Home card and the Tunnel tab read it again now.
+        self._refresh_tunnel_controls()
         self._apply_mode_view(mode)
+
+    def _refresh_tunnel_controls(self) -> None:
+        """Read the tunnel gate again on the Home card's Start and on the Tunnel tab, so a mode change shows on both at once.
+
+        A mode change emits no coreChanged, so without this the buttons keep the mode they were last read in, until a show,
+        a Check or a save. Starts, stops and restarts nothing.
+        """
+        self._home_page.refresh_tunnel_start()
+        self._tunnel_panel.refresh()
 
     def _apply_mode_view(self, mode: str) -> None:
         """Show the description of ``mode``, and the tunnel lines only in Hosted mode.

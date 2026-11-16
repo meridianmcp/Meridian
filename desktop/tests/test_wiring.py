@@ -19,6 +19,7 @@ from PySide6.QtWidgets import QComboBox, QFrame, QLabel, QPushButton, QTableWidg
 
 from _fakes import MemoryKeyring
 from _shared_delivery import recording_deliveries, visible_state
+from test_home_tab import _deps as _home_deps, _shown as _show_home_tab
 from meridian_desktop import sessions_client, updater
 from meridian_desktop.data_source import DataSources
 from meridian_desktop.local_client import HEALTH_NOT_RUNNING
@@ -28,6 +29,14 @@ from meridian_desktop.token_store import HOSTED_TOKEN_ACCOUNT, TOKEN_SERVICE
 from meridian_desktop.tools_status import ENTRY_IN_PLACE_TEXT, UNCHECKED, YES, ToolRow, ToolsStatus
 from meridian_desktop.ui import sessions_panel
 from meridian_desktop.ui.main_window import MainWindow
+from meridian_desktop.ui.runner_actions import CoreSetup
+from meridian_desktop.ui.scope_controls import (
+    CORE_NOT_SET_TEXT,
+    TUNNEL_LOCAL_MODE_TEXT,
+    TUNNEL_OFF_TEXT,
+    home_tunnel_gate,
+    tunnel_gate,
+)
 from meridian_desktop.ui.sessions_panel import SessionsPanel
 from meridian_desktop.ui.tools_panel import ToolsPanel
 from meridian_desktop.ui.update_notice import UpdateNoticeBar, downloading_text, ready_text
@@ -168,6 +177,7 @@ def test_sessions_sits_after_projects_and_tools_is_no_longer_a_tab(qtbot, settin
 def test_sessions_tab_uses_its_providers_and_never_shows_the_token(qtbot, settings_path, tmp_path, monkeypatch):
     db = tmp_path / "meridian.db"
     db.write_bytes(b"")
+    # Local mode: the Sessions tab reads the local server only, and sends nothing to the hosted service.
     SettingsStore(settings_path).save(Settings(mode="local", local_url=LOCAL, hosted_url=HOSTED, db_path=str(db)))
     secrets = KeyringSecretStore(backend=MemoryKeyring())
     secrets.set_secret(TOKEN_SERVICE, HOSTED_TOKEN_ACCOUNT, FAKE_TOKEN)
@@ -197,20 +207,19 @@ def test_sessions_tab_uses_its_providers_and_never_shows_the_token(qtbot, settin
 
     _select(window, "Sessions")
     page = _page(window, "Sessions")
-    table = page.findChild(QTableWidget, "sessions-table")
-    # One project header row, then the one session row.
-    qtbot.waitUntil(lambda: table.rowCount() == 2, timeout=5000)
+    # Local mode: the local server answers "not running", and the Sessions tab reads nothing from the hosted service.
+    # The read is finished when the panel clears its in-flight marker. That happens only after the worker has run every
+    # call the read makes, so a hosted fallback that ran right after the local call is already recorded when this passes.
+    qtbot.waitUntil(lambda: len(local_calls) >= 1 and page._in_flight is None, timeout=5000)  # noqa: SLF001
 
     # The local URL comes from Settings, and the project id from the Projects resolver. The hosted fallback
     # gets the Settings URL and the token from the store. The list may refresh while the test runs, so
     # every recorded call must match.
     assert set(local_calls) == {(LOCAL, PID)}
-    assert set(hosted_calls) == {(HOSTED, PID, FAKE_TOKEN)}
+    assert hosted_calls == [], "Local mode sends no request to the hosted service, token or not"
     picker = page.findChild(QComboBox, "sessions-project-picker")
     assert picker.itemText(0) == "Alpha"
     assert picker.itemData(0) == PID
-    assert table.item(1, 0).text() == "auth-refactor"  # row 0 is the project header
-    assert page.findChild(QLabel, "sessions-status").text().startswith("1 session(s) from hosted Meridian.")
 
     # The token reaches the client only. No label, picker entry or table cell shows it, and no project field
     # the Projects tab never shows reaches the page either.
@@ -581,4 +590,69 @@ def test_a_check_still_running_when_its_bar_is_deleted_does_not_keep_the_bar(qtb
     finally:
         gate.set()
         gc.enable()
+
+
+# ----------------------------------------------------------- Home tunnel Start in Local mode
+
+
+def _core(mode: str, *, switch: bool = True, core_set: bool = True) -> CoreSetup:
+    return CoreSetup(
+        python="C:/Meridian/python.exe" if core_set else "",
+        cwd="C:/Meridian/core" if core_set else "",
+        local_url=LOCAL,
+        tunnel_control_enabled=switch,
+        zotero_autostart=False,
+        local_server_autostart=False,
+        mode=mode,
+    )
+
+
+def test_the_home_tunnel_gate_is_off_in_local_mode_even_with_the_core_and_the_switch_set():
+    local = _core("local")
+
+    # The Tunnel tab keeps tunnel_gate, which does not look at the mode, so its controls are unchanged.
+    assert tunnel_gate(local) == (True, "")
+    assert home_tunnel_gate(local) == (False, TUNNEL_LOCAL_MODE_TEXT)
+    # The mode is checked first, so the reason is the mode even when the core is not set.
+    assert home_tunnel_gate(_core("local", core_set=False)) == (False, TUNNEL_LOCAL_MODE_TEXT)
+
+
+def test_the_home_tunnel_gate_is_the_tunnel_gate_in_hosted_mode():
+    hosted = _core("hosted")
+
+    assert home_tunnel_gate(hosted) == (True, "")
+    assert home_tunnel_gate(_core("hosted", switch=False)) == (False, TUNNEL_OFF_TEXT)
+    assert home_tunnel_gate(_core("hosted", core_set=False)) == (False, CORE_NOT_SET_TEXT)
+
+
+def test_the_home_tunnel_start_is_off_in_local_mode_and_gives_the_reason_with_no_fix_button(qtbot, settings_path):
+    # No saved mode and no token: the run starts in Local mode.
+    window = _window(qtbot, settings_path)
+
+    start = window.findChild(QPushButton, "home-tunnel-start")
+    assert start is not None
+    assert start.isEnabled() is False
+    assert window.findChild(QLabel, "home-tunnel-control-note").text() == TUNNEL_LOCAL_MODE_TEXT
+    # Switching the mode is the top bar's job, so no fix button on Home offers to do it here.
+    assert window.findChild(QPushButton, "home-tunnel-fix").isHidden()
+
+
+def test_the_home_start_follows_a_mode_change_at_the_next_check(qtbot, tmp_path):
+    store = SettingsStore(tmp_path / "settings.json")
+    core = {
+        "core_python": str(tmp_path / "python.exe"),
+        "core_checkout": str(tmp_path / "core"),
+        "tunnel_control_enabled": True,
+    }
+    store.save(Settings(mode="local", **core))
+    tab = _show_home_tab(qtbot, _home_deps(tmp_path))
+    start = tab.findChild(QPushButton, "home-tunnel-start")
+    assert start.isEnabled() is False
+    assert tab.findChild(QLabel, "home-tunnel-control-note").text() == TUNNEL_LOCAL_MODE_TEXT
+
+    store.save(Settings(mode="hosted", **core))
+    tab.check_all()  # Check now: the Start gate is read again before the cards run
+
+    assert start.isEnabled() is True
+    assert tab.findChild(QLabel, "home-tunnel-control-note").text() == ""
 

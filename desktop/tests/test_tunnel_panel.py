@@ -19,11 +19,11 @@ from meridian_desktop import log_tail, slot_ports
 from meridian_desktop import tunnel_panel_model as model
 from meridian_desktop.log_tail import LogTail
 from meridian_desktop.runner_client import RunnerResult
-from meridian_desktop.runner_controls import RunnerControl
+from meridian_desktop.runner_controls import RunnerControl, build_argv
 from meridian_desktop.settings_store import Settings, SettingsStore
 from meridian_desktop.tunnel_status import NOT_RUNNING, RUNNING, UNKNOWN, TunnelStatus
 from meridian_desktop.ui.runner_actions import RunnerActions
-from meridian_desktop.ui.scope_controls import TUNNEL_OFF_TEXT
+from meridian_desktop.ui.scope_controls import TUNNEL_LOCAL_MODE_TEXT, TUNNEL_OFF_TEXT
 from meridian_desktop.ui.delivery import Delivered, shared_delivery
 from meridian_desktop.ui import tunnel_panel
 from meridian_desktop.ui.tunnel_check import TunnelReadJob
@@ -85,7 +85,8 @@ def _status(state: str, reason: str = "The runner reports the tunnel process as 
 
 
 def _settings(settings_path, **overrides):
-    values = dict(core_python=PY, core_checkout=CWD, tunnel_control_enabled=True)
+    # Hosted mode by default, the one mode the tunnel controls are on in. A test that wants Local mode says so.
+    values = dict(core_python=PY, core_checkout=CWD, tunnel_control_enabled=True, mode="hosted")
     values.update(overrides)
     SettingsStore(settings_path).save(Settings(**values))
 
@@ -247,6 +248,36 @@ def test_start_stop_and_restart_are_the_tunnel_controls(qtbot, settings_path, tm
         assert _button(panel, name).isHidden() is False, name
 
 
+def test_in_local_mode_start_and_restart_are_off_and_stop_stays_on_while_a_tunnel_runs(qtbot, settings_path, tmp_path):
+    # The core is set and the tunnel switch is on, so Local mode is the only reason Start and Restart are off.
+    _settings(settings_path, mode="local")
+    panel, spawn, confirm = _panel(qtbot, settings_path, tmp_path, status_call=runner_reply("running"), confirm=Confirm(True))
+    _check_and_wait(qtbot, panel, model.RUNNING_HEADLINE)
+    assert _button(panel, "tunnel-start").isEnabled() is False
+    assert _button(panel, "tunnel-restart").isEnabled() is False
+    assert _button(panel, "tunnel-stop").isEnabled() is True
+    assert _label(panel, "tunnel-control-note").text() == TUNNEL_LOCAL_MODE_TEXT
+
+    # A click on Start or Restart does nothing: no question is asked and no runner call is made.
+    _button(panel, "tunnel-start").click()
+    _button(panel, "tunnel-restart").click()
+    assert confirm.asked == [] and spawn.calls == []
+
+    # Stop asks first, then runs the runner's stop command for the tunnel, and nothing else.
+    _button(panel, "tunnel-stop").click()
+    qtbot.waitUntil(lambda: len(spawn.calls) == 1 and _button(panel, "tunnel-stop").isEnabled(), timeout=5000)
+    assert len(confirm.asked) == 1 and confirm.asked[0][2] == "Stop"
+    assert spawn.calls == [build_argv(PY, "stop", "tunnel")]
+
+
+def test_the_tunnel_tab_controls_are_on_in_hosted_mode_with_the_core_and_the_switch_on(qtbot, settings_path, tmp_path):
+    _settings(settings_path, mode="hosted")
+    panel, _spawn, _confirm = _panel(qtbot, settings_path, tmp_path)
+    for name in ("tunnel-start", "tunnel-stop", "tunnel-restart"):
+        assert _button(panel, name).isEnabled() is True, name
+    assert _label(panel, "tunnel-control-note").text() == ""
+
+
 def test_the_tunnel_controls_are_the_only_start_and_stop_buttons_in_the_panel(qtbot, settings_path, tmp_path):
     panel, _spawn, _confirm = _panel(qtbot, settings_path, tmp_path)
     controls = [b for b in panel.findChildren(QPushButton) if b.text().split()[:1] in (["Start"], ["Stop"], ["Restart"])]
@@ -308,6 +339,38 @@ def test_no_connectors_line_shows_when_none_are_saved(qtbot, settings_path, tmp_
     panel, _spawn, _confirm = _panel(qtbot, settings_path, tmp_path)
     assert _label(panel, "tunnelpanel-connectors-empty").isHidden() is False
     assert _label(panel, "tunnelpanel-connectors-empty").text() == model.NO_CONNECTORS_TEXT
+
+
+def test_an_unsaved_connector_checkbox_survives_a_mode_change(qtbot, settings_path, tmp_path):
+    _settings(settings_path, custom_connectors=(CONNECTOR,))
+    panel, _spawn, _confirm = _panel(qtbot, settings_path, tmp_path)
+    box = _box(panel, "tunnelpanel-connector-0-exposed")
+    assert box.isChecked() is False
+    # The owner ticks the box, and the tick is not saved, so the file still holds False.
+    box.blockSignals(True)
+    box.setChecked(True)
+    box.blockSignals(False)
+
+    # The mode changes on the top bar: the mode is saved, and the window refreshes the panel.
+    SettingsStore(settings_path).set_mode("local")
+    panel.refresh()
+
+    assert _box(panel, "tunnelpanel-connector-0-exposed").isChecked() is True
+    assert SettingsStore(settings_path).load().settings.custom_connectors[0]["tunnel_exposed"] is False
+    # The tunnel controls were read again in the same refresh: Local mode turns Start off.
+    assert _button(panel, "tunnel-start").isEnabled() is False
+
+
+def test_a_refused_save_shows_the_saved_opt_in_again(qtbot, settings_path, tmp_path):
+    # A settings file with a problem refuses every save, so the box the owner ticked goes back to the saved choice.
+    settings_path.parent.mkdir(parents=True, exist_ok=True)
+    settings_path.write_text("{not json", encoding="utf-8")
+    panel, _spawn, _confirm = _panel(qtbot, settings_path, tmp_path)
+
+    _box(panel, "tunnelpanel-opt-in").click()
+
+    assert _label(panel, "tunnelpanel-message").text() == PROBLEM_TEXT
+    assert _box(panel, "tunnelpanel-opt-in").isChecked() is False
 
 
 def test_a_settings_file_with_a_problem_is_not_written_over(qtbot, settings_path, tmp_path):

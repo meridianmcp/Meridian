@@ -6,7 +6,8 @@ URL only when a token is saved. It renews the session only when a refresh token 
 remain. It probes the local server on loopback. It starts, stops and changes nothing.
 
 States: connected, warning (connected with fewer than WARN_DAYS left), reconnecting (the hosted server could not be
-reached), not_connected (no token, a rejected token, an expired session, or a failed renewal), and checking.
+reached), not_connected (no token, a rejected token, an expired session, a failed renewal, or Local mode, where hosted
+sign-in is off), and checking.
 """
 
 from __future__ import annotations
@@ -31,6 +32,7 @@ WARN_DAYS = 14
 DAY_SECONDS = 86400
 UNCONFIRMED_ACCOUNT = "account not confirmed yet"
 NOT_CONNECTED_HEADLINE = "Not connected: sign in again."
+LOCAL_MODE_HEADLINE = "Local mode: hosted sign-in is off. Switch to Hosted mode to sign in."
 CHECKING_HEADLINE = "Checking the connection..."
 RETRY_NOTE = "It is tried again in five minutes."
 
@@ -53,12 +55,17 @@ class HostedStatus:
 
 @dataclass(frozen=True)
 class ConnectionSnapshot:
-    """One check's result. ``local_netloc`` is host:port of a live local server, or None. Times are epoch seconds."""
+    """One check's result. ``local_netloc`` is host:port of a live local server, or None. Times are epoch seconds.
+
+    ``hosted_checked`` is False in Local mode: the hosted service was not contacted, so the view shows no account and
+    offers no sign-in.
+    """
 
     hosted: HostedStatus
     signed_in: bool
     local_netloc: str | None
     checked_at: float
+    hosted_checked: bool = True
 
 
 @dataclass(frozen=True)
@@ -116,6 +123,14 @@ def _read_local(local_url: str, probe: Callable[[str], str]) -> str | None:
     return urllib.parse.urlsplit(local_url).netloc or None
 
 
+def _not_checked(secrets: SecretStore) -> tuple[HostedStatus, bool]:
+    """Local mode: the hosted service is not contacted. Only whether a sign-in token is saved on this computer is read."""
+    saved = hosted_session.load_saved(secrets)
+    if saved is None:
+        return HostedStatus(STATE_NOT_CONNECTED), False
+    return HostedStatus(STATE_NOT_CONNECTED, saved.session.account, saved.session.expires_at), True
+
+
 def read_connection(
     *,
     hosted_url: str,
@@ -124,15 +139,23 @@ def read_connection(
     transport: Transport | None,
     probe: Callable[[str], str],
     clock: Callable[[], float] = time.time,
+    hosted_checks: bool = True,
 ) -> ConnectionSnapshot:
-    """One check of the hosted session and the local server. Raises only for a keychain or URL fault the caller reports."""
+    """One check of the hosted session and the local server. Raises only for a keychain or URL fault the caller reports.
+
+    ``hosted_checks`` False (Local mode) means no request goes to the hosted service at all.
+    """
     now = clock()
-    hosted, signed_in = _read_hosted(hosted_url, secrets, transport, now)
+    if hosted_checks:
+        hosted, signed_in = _read_hosted(hosted_url, secrets, transport, now)
+    else:
+        hosted, signed_in = _not_checked(secrets)
     return ConnectionSnapshot(
         hosted=hosted,
         signed_in=signed_in,
         local_netloc=_read_local(local_url, probe),
         checked_at=now,
+        hosted_checked=hosted_checks,
     )
 
 
@@ -157,6 +180,9 @@ def connection_view(snapshot: ConnectionSnapshot, *, hosted_url: str) -> Connect
     """The bar's three lines for one check. The state word in each line says the state in plain words, too."""
     host = _host_label(hosted_url)
     local = _local_line(snapshot.local_netloc)
+    if not snapshot.hosted_checked:
+        # Local mode: the hosted service is not contacted, so no account is shown and no sign-in button is offered.
+        return ConnectionView(STATE_NOT_CONNECTED, LOCAL_MODE_HEADLINE, f"Not connected: {host}.", local)
     if not snapshot.signed_in:
         return ConnectionView(
             STATE_NOT_CONNECTED, "", f"Not connected: {host}.", local,

@@ -6,8 +6,10 @@ It shows, top to bottom:
   panel is first shown, and again when Check now is pressed or a Start or Stop has finished. The pass reads the status
   call and then the tail of the tunnel log.
 - Start, Stop and Restart: the existing tunnel commands, through ScopeControls. Each one asks the owner first, in the same
-  dialog as the rest of the runner controls, and the gate (tunnel_control_enabled and the core setup) turns them off with
-  the reason shown. The Home tunnel card has a Start of its own, through the same ScopeControls; Stop and Restart are only here.
+  dialog as the rest of the runner controls, and the gate turns them off with the reason shown. The gate is the Home card's
+  (home_tunnel_gate): in Local mode Start and Restart are off. Stop has its own gate (tunnel_stop_gate), which Local mode
+  does not turn off, because Stop sends no hosted request. Otherwise tunnel_control_enabled and the core setup decide. The
+  Home tunnel card has a Start of its own, through the same ScopeControls; Stop and Restart are only here.
 - Lanes: the direct lane and the tunnel lane. The tunnel lane shows whether it is live, and each lane gets one line on
   what it needs.
 - Slots: the tunnel's slot ports, one row each, with the plugin each serves and the last connect-only port check on
@@ -51,7 +53,7 @@ from meridian_desktop.settings_store import SettingsStore
 from meridian_desktop.tunnel_status import TunnelStatus, read_tunnel_status
 from meridian_desktop.ui.delivery import Delivered, shared_delivery
 from meridian_desktop.ui.runner_actions import RunnerActions
-from meridian_desktop.ui.scope_controls import ScopeControls, tunnel_gate
+from meridian_desktop.ui.scope_controls import ScopeControls, home_tunnel_gate, tunnel_stop_gate
 from meridian_desktop.ui.text import enable_table_copy, make_selectable
 from meridian_desktop.slot_ports import SlotPortResult, probe_slot_ports
 from meridian_desktop.ui.tunnel_check import TunnelReadJob
@@ -134,6 +136,8 @@ class TunnelPanel(QWidget):
         # Identifies this panel's checks. A plain object, so a job can hold it without holding the panel.
         self._owner = object()
         self._state: str | None = None
+        # The opt-in and connector choices the rows were last built from. None until the first refresh builds them.
+        self._rendered_choices: tuple | None = None
         shared_delivery().delivered.connect(self._on_delivered)
 
         heading = _heading(self, "tunnelpanel-heading", model.PANEL_TITLE)
@@ -151,7 +155,11 @@ class TunnelPanel(QWidget):
         status_row.addStretch(1)
 
         # Start, Stop and Restart reuse the existing tunnel commands. ScopeControls asks first, as the runner controls do.
-        self._controls = ScopeControls(SCOPE_TUNNEL, actions, tunnel_gate, prefix="tunnel", parent=self)
+        # The gate is the Home card's, so Local mode turns Start and Restart off. Stop uses tunnel_stop_gate, which Local
+        # mode does not turn off: Stop sends no hosted request.
+        self._controls = ScopeControls(
+            SCOPE_TUNNEL, actions, home_tunnel_gate, prefix="tunnel", parent=self, stop_gate=tunnel_stop_gate,
+        )
         self._controls.actionFinished.connect(self.check)
 
         # Lanes.
@@ -302,12 +310,24 @@ class TunnelPanel(QWidget):
     # ----------------------------------------------------------- showing the saved choices
 
     def refresh(self) -> None:
-        """Show the saved choices again. Showing them saves nothing, and reads no status."""
+        """Show the saved choices again, and read the tunnel controls' gate again. Showing them saves nothing and reads no
+        status.
+
+        The opt-in and the connector rows are built again only when their saved state differs from the state they were
+        last built from. So a refresh that finds nothing changed in them, such as the one after a mode change, keeps an
+        unsaved checkbox change as it is. A save that is refused builds them again from the saved state (_show_saved).
+        """
+        self._show_saved(force=False)
+
+    def _show_saved(self, *, force: bool) -> None:
         settings = self._store.load().settings
-        self._opt_in.blockSignals(True)
-        self._opt_in.setChecked(settings.custom_tunnel_opt_in)
-        self._opt_in.blockSignals(False)
-        self._render_connectors(settings.custom_connectors, settings.custom_tunnel_opt_in)
+        choices = (settings.custom_tunnel_opt_in, settings.custom_connectors)
+        if force or choices != self._rendered_choices:
+            self._opt_in.blockSignals(True)
+            self._opt_in.setChecked(settings.custom_tunnel_opt_in)
+            self._opt_in.blockSignals(False)
+            self._render_connectors(settings.custom_connectors, settings.custom_tunnel_opt_in)
+            self._rendered_choices = choices
         self._controls.refresh_enabled()
 
     def _render_connectors(self, raw: tuple, opt_in: bool) -> None:
@@ -351,13 +371,13 @@ class TunnelPanel(QWidget):
         result = self._store.load()
         if result.warning is not None:
             self._show(PROBLEM_TEXT)
-            self.refresh()
+            self._show_saved(force=True)
             return False
         try:
             self._store.save(replace(result.settings, **changes))
         except OSError:
             self._show(NOT_SAVED_TEXT)
-            self.refresh()
+            self._show_saved(force=True)
             return False
         self._show(SAVED_TEXT)
         self.refresh()
@@ -372,7 +392,7 @@ class TunnelPanel(QWidget):
             updated = custom_connectors.set_tunnel_exposed(raw, index, checked)
         except ConnectorError as exc:
             self._show(str(exc))
-            self.refresh()
+            self._show_saved(force=True)
             return
         self._save_changes(custom_connectors=updated)
 
