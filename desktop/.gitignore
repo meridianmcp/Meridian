@@ -12,3 +12,5 @@ __pycache__/
 .claude/*
 !.claude/settings.json
 docs/handoffs/
+# The owner's signed Zotero bridge is copied into dist/ by packaging/build.py and is never committed.
+*.xpi

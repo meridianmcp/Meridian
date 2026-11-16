@@ -473,7 +473,12 @@ class MainWindow(QMainWindow):
                 # Zotero is a tab of its own: the library search, the save bridge, and the project folder.
                 page = _page_with_label(
                     ZOTERO_SECTION,
-                    ZoteroPanel(client=self._zotero, projects=_zotero_projects(self._store, self._sources), parent=self.tabs),
+                    ZoteroPanel(
+                        client=self._zotero,
+                        projects=_zotero_projects(self._store, self._sources),
+                        settings=self._store,
+                        parent=self.tabs,
+                    ),
                     self.tabs,
                 )
             elif name == "LaTeX":

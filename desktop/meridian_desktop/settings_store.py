@@ -191,10 +191,41 @@ class Settings:
     # The keys file the owner chose for the Keys block (keys_file.py). Only its path is stored, never a value. "" means no
     # file is chosen. save() writes the key only when a path is set, so a file that never chose one keeps no such key.
     keys_file_path: str = ""
+    # Whether the owner has read the Meridian Zotero bridge's licence notice and accepted it on the Zotero tab. Off by
+    # default, and save() writes the key only when it is on. Nothing is installed without it (zotero_bridge_install.py).
+    licence_accepted: bool = False
+    # The SHA-256 (lowercase hex) of the licence notice text the owner accepted. It is written beside licence_accepted and
+    # only then, so an older file has none. An acceptance counts only while this matches the notice shown now
+    # (licence_accepted_for). A file that has licence_accepted but no digest, or an older digest, asks the owner again.
+    licence_notice_sha256: str = ""
+    # Whether the owner allowed a forced close of Zotero when a bridge install finds Zotero still running after the normal close
+    # window (zotero_bridge_install.py, allow_force_close). Off by default, and save() writes the key only when it is on. The
+    # owner turns it on by ticking "Force close next time" in the force-close question on the Zotero tab.
+    zotero_force_close_allowed: bool = False
+    # Whether Meridian checks the installed Zotero bridge against the bundled one when it starts and when the Zotero tab is
+    # first opened. Off by default, and save() writes the key only when it is on. The check is local: it reads the installed
+    # version and installs nothing, and it makes no network call.
+    zotero_update_checks: bool = False
 
 
 # The default of each switch, read from Settings so the two can never drift apart.
 CONTROL_FLAG_DEFAULTS = {key: getattr(Settings(), key) for key in CONTROL_FLAG_KEYS}
+
+_HEX_DIGITS = frozenset("0123456789abcdef")
+
+
+def is_sha256_hex(text: object) -> bool:
+    """True for exactly 64 lowercase hex characters, the form of a SHA-256 digest. Pure."""
+    return isinstance(text, str) and len(text) == 64 and all(ch in _HEX_DIGITS for ch in text)
+
+
+def licence_accepted_for(settings: Settings, notice_sha256: str) -> bool:
+    """True only when the licence is accepted AND the digest stored with that acceptance is the digest of the notice shown now.
+
+    An acceptance with no digest, or with the digest of an older notice text, is not accepted: the owner is asked again.
+    """
+    stored = settings.licence_notice_sha256
+    return bool(settings.licence_accepted) and is_sha256_hex(stored) and stored == notice_sha256
 
 
 class SettingsUnreadable(Exception):
@@ -377,6 +408,33 @@ def _from_mapping(data: Mapping) -> tuple[Settings, list[str]]:
             values["keys_file_path"] = value.strip()
         else:
             problems.append("keys_file_path must be a path as text or empty; using empty")
+
+    # licence_accepted: an absent key means not accepted, with no warning. Only a real true or false is accepted.
+    if "licence_accepted" in data:
+        value = data["licence_accepted"]
+        if isinstance(value, bool):
+            values["licence_accepted"] = value
+        else:
+            problems.append("licence_accepted must be true or false; using false")
+
+    # licence_notice_sha256: an absent key means no digest, with no warning. Only text is kept, and it is compared with the
+    # notice shown now, never trusted on its own (licence_accepted_for). Anything else is ignored with a warning.
+    if "licence_notice_sha256" in data:
+        value = data["licence_notice_sha256"]
+        if isinstance(value, str):
+            values["licence_notice_sha256"] = value.strip()
+        else:
+            problems.append("licence_notice_sha256 must be text; ignoring it")
+
+    # zotero_force_close_allowed and zotero_update_checks: an absent key means off, with no warning. Only a real true or false
+    # is accepted, and any other value is ignored with a warning, so the default holds.
+    for key in ("zotero_force_close_allowed", "zotero_update_checks"):
+        if key in data:
+            value = data[key]
+            if isinstance(value, bool):
+                values[key] = value
+            else:
+                problems.append(f"{key} must be true or false; using false")
 
     # disabled_tools: an absent key means every tool is on, with no warning. Only a list of non-empty text is accepted.
     # A value that is not such a list is ignored with a warning, so no tool is switched off by a bad file.
@@ -624,6 +682,18 @@ class SettingsStore:
         if not settings.keys_file_path:
             # No file chosen is the default, so a file that never chose a keys file has no such key.
             del data["keys_file_path"]
+        if not settings.licence_accepted:
+            # Not accepted is the default, so a file whose owner never accepted the bridge licence has no such key.
+            del data["licence_accepted"]
+        if not settings.licence_accepted or not settings.licence_notice_sha256:
+            # The notice digest is written only beside an acceptance, so a file with no acceptance has no such key.
+            data.pop("licence_notice_sha256", None)
+        if not settings.zotero_force_close_allowed:
+            # Off is the default, so the force-close opt-in is written only once the owner ticks "Force close next time".
+            del data["zotero_force_close_allowed"]
+        if not settings.zotero_update_checks:
+            # Off is the default, so the Zotero update-check switch is written only once the owner turns it on.
+            del data["zotero_update_checks"]
         if settings.check_updates:
             # On is the default, so a file that never turned the update check off has no such key.
             del data["check_updates"]
@@ -798,3 +868,48 @@ class SettingsStore:
         updated = replace(self.load().settings, limit_approval_enabled=value)
         self.save(updated)
         return updated
+
+    def set_licence_accepted(self, value: bool, *, notice_sha256: str = "") -> Settings:
+        """Save the acceptance of the Zotero bridge licence notice, with the SHA-256 of the notice text the owner read.
+
+        An acceptance (True) must carry that digest, so a later change to the notice text is not taken as accepted. Clearing
+        it (False) also clears the digest. Every other field in the file is kept.
+
+        Raises ValueError for a value that is not true or false, or for an acceptance without a SHA-256 hex digest, and
+        SettingsUnreadable like set_limit.
+        """
+        if not isinstance(value, bool):
+            raise ValueError("licence_accepted must be true or false.")
+        if value and not is_sha256_hex(notice_sha256):
+            raise ValueError("the licence notice must be accepted with its SHA-256 digest.")
+        if self.is_unreadable():
+            copied = self._keep_copy()
+            raise SettingsUnreadable(SETTINGS_UNREADABLE_TEXT if copied else SETTINGS_UNREADABLE_NO_COPY_TEXT)
+        self.keep_unreadable_copy()
+        digest = notice_sha256 if value else ""
+        updated = replace(self.load().settings, licence_accepted=value, licence_notice_sha256=digest)
+        self.save(updated)
+        return updated
+
+    def _set_bool_field(self, key: str, value: bool) -> Settings:
+        """Save one true-or-false field. Every other field in the file is kept.
+
+        Raises ValueError for a value that is not true or false, and SettingsUnreadable like set_limit.
+        """
+        if not isinstance(value, bool):
+            raise ValueError(f"{key} must be true or false.")
+        if self.is_unreadable():
+            copied = self._keep_copy()
+            raise SettingsUnreadable(SETTINGS_UNREADABLE_TEXT if copied else SETTINGS_UNREADABLE_NO_COPY_TEXT)
+        self.keep_unreadable_copy()
+        updated = replace(self.load().settings, **{key: value})
+        self.save(updated)
+        return updated
+
+    def set_zotero_force_close_allowed(self, value: bool) -> Settings:
+        """Save the owner's opt-in to a forced close of Zotero by a bridge install. False clears it."""
+        return self._set_bool_field("zotero_force_close_allowed", value)
+
+    def set_zotero_update_checks(self, value: bool) -> Settings:
+        """Save the Zotero tab's bridge update-check switch. False clears it."""
+        return self._set_bool_field("zotero_update_checks", value)

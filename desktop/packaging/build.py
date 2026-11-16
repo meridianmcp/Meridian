@@ -47,12 +47,15 @@ import argparse
 import fnmatch
 import hashlib
 import importlib.metadata
+import io
+import json
 import os
 import re
 import shutil
 import subprocess
 import sys
 import tomllib
+import zipfile
 from pathlib import Path, PurePosixPath
 
 REPO = Path(__file__).resolve().parents[1]
@@ -69,6 +72,15 @@ RUNTIMES = REPO / "packaging" / "native_runtimes.toml"
 SHA256SUMS = REPO / "packaging" / "licenses" / "SHA256SUMS"
 NATIVE_TEXTS = REPO / "packaging" / "licenses" / "native"
 THIRD_PARTY = BUNDLE_DIR / "THIRD_PARTY_LICENSES.txt"
+
+# The Zotero bridge is bundled only when the owner passes the signed .xpi, by this variable or by --zotero-signed-xpi.
+# It is never committed. The bundle gets zotero_bridge/<file>.xpi and zotero_bridge/bridge.json, which zotero_bridge_install reads.
+ZOTERO_SIGNED_XPI_ENV = "MERIDIAN_ZOTERO_SIGNED_XPI"
+ZOTERO_ADDON_ID = "meridian-zotero@usemeridian.us"
+ZOTERO_XPI_NAME = "meridian-zotero@usemeridian.us.xpi"
+ZOTERO_BRIDGE_SUBDIR = "zotero_bridge"
+ZOTERO_RECORD_NAME = "bridge.json"
+_PLAIN_VERSION = re.compile(r"[0-9]+(?:\.[0-9]+)*")
 
 RELEASE_MARKER = "DRAFT - NOT FOR RELEASE"
 LGPL_ELECTED = "LGPL-3.0-only"
@@ -771,12 +783,99 @@ def write_third_party(manifest: dict, runtimes: list[dict]) -> list[str]:
     return runtime_copy_problems(runtimes)
 
 
+def _xpi_identity(payload: bytes) -> tuple[str | None, str | None]:
+    """The add-on id and version from the .xpi's own manifest.json. Raises SystemExit when it is not a readable .xpi."""
+    try:
+        with zipfile.ZipFile(io.BytesIO(payload)) as archive:
+            manifest = json.loads(archive.read("manifest.json").decode("utf-8"))
+    except (KeyError, OSError, ValueError, zipfile.BadZipFile) as exc:
+        raise SystemExit(f"signed Zotero bridge is not a readable .xpi ({exc.__class__.__name__}) (fail closed)")
+    if not isinstance(manifest, dict):
+        raise SystemExit("signed Zotero bridge manifest.json is not an object (fail closed)")
+    version = manifest.get("version")
+    version = version if isinstance(version, str) else None
+    for block in ("applications", "browser_specific_settings"):
+        section = manifest.get(block)
+        if not isinstance(section, dict):
+            continue
+        for host in ("zotero", "gecko"):
+            inner = section.get(host)
+            if isinstance(inner, dict) and isinstance(inner.get("id"), str):
+                return inner["id"], version
+    return None, version
+
+
+_XPI_SIGNATURE_ENTRIES = ("META-INF/mozilla.rsa", "META-INF/mozilla.sf")
+
+
+def _xpi_has_signature_entries(payload: bytes) -> bool:
+    """True when the .xpi archive holds both Mozilla signature entries, META-INF/mozilla.rsa and META-INF/mozilla.sf.
+
+    This is a PRESENCE check only. It does not verify the signature, and it does not check the certificate or the
+    signed digests. A real signed artifact also holds cose.sig and cose.manifest, which this check does not require.
+    """
+    try:
+        with zipfile.ZipFile(io.BytesIO(payload)) as archive:
+            names = set(archive.namelist())
+    except (OSError, ValueError, zipfile.BadZipFile) as exc:
+        raise SystemExit(f"signed Zotero bridge is not a readable .xpi ({exc.__class__.__name__}) (fail closed)")
+    return all(entry in names for entry in _XPI_SIGNATURE_ENTRIES)
+
+
+def bundle_zotero_bridge(signed_xpi: Path | None, bundle_dir: Path) -> str:
+    """Copy the owner's signed Zotero bridge into the bundle, with its record. Returns ``none`` or ``bundled``.
+
+    With no path the build still succeeds and carries no bridge: the desktop then says "No bundled bridge in this build".
+    A path that does not exist, is empty, is not a readable .xpi, is not this add-on, or has no Mozilla signature entries
+    (META-INF/mozilla.rsa and META-INF/mozilla.sf) stops the build (fail closed). The signature entries are checked for
+    presence only; this build does not verify the signature itself.
+    """
+    if signed_xpi is None:
+        print("No bundled bridge in this build: MERIDIAN_ZOTERO_SIGNED_XPI is not set.")
+        return "none"
+    source = Path(signed_xpi)
+    if not source.is_file():
+        raise SystemExit(f"signed Zotero bridge not found: {source} (fail closed)")
+    size = source.stat().st_size
+    if size == 0:
+        raise SystemExit(f"signed Zotero bridge is empty: {source} (fail closed)")
+    payload = source.read_bytes()
+    addon_id, version = _xpi_identity(payload)
+    if addon_id != ZOTERO_ADDON_ID:
+        raise SystemExit(f"signed Zotero bridge has add-on id {addon_id!r}, not {ZOTERO_ADDON_ID!r} (fail closed)")
+    if version is None or _PLAIN_VERSION.fullmatch(version) is None:
+        raise SystemExit("signed Zotero bridge has no plain version in its manifest (fail closed)")
+    if not _xpi_has_signature_entries(payload):
+        raise SystemExit(
+            "signed Zotero bridge has no META-INF/mozilla.rsa and META-INF/mozilla.sf, so it is not a signed .xpi (fail closed)"
+        )
+    digest = hashlib.sha256(payload).hexdigest()
+    folder = bundle_dir / ZOTERO_BRIDGE_SUBDIR
+    folder.mkdir(parents=True, exist_ok=True)
+    temp = folder / (ZOTERO_XPI_NAME + ".tmp")
+    temp.write_bytes(payload)
+    os.replace(temp, folder / ZOTERO_XPI_NAME)
+    record = {"addon_id": ZOTERO_ADDON_ID, "file": ZOTERO_XPI_NAME, "sha256": digest, "version": version}
+    record_temp = folder / (ZOTERO_RECORD_NAME + ".tmp")
+    record_temp.write_text(json.dumps(record, indent=2, sort_keys=True) + "\n", encoding="utf-8", newline="\n")
+    os.replace(record_temp, folder / ZOTERO_RECORD_NAME)
+    if sha256_file(folder / ZOTERO_XPI_NAME) != digest:
+        raise SystemExit("the bundled Zotero bridge does not match its sha256 after the copy (fail closed)")
+    print(f"bundled the Zotero bridge {version} ({size} bytes, sha256 {digest}) into {ZOTERO_BRIDGE_SUBDIR}/")
+    return "bundled"
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description="Build the MeridianDesktop ONEDIR bundle.")
     parser.add_argument(
         "--release",
         action="store_true",
         help="fail while EULA.txt or OFFER-SOURCE.md carries the legal-review marker or TBD text",
+    )
+    parser.add_argument(
+        "--zotero-signed-xpi",
+        default=None,
+        help=f"the owner's signed Zotero bridge .xpi to bundle (default: the {ZOTERO_SIGNED_XPI_ENV} variable; none bundles nothing)",
     )
     args = parser.parse_args(argv)
     if not ENTRY.is_file():
@@ -811,6 +910,8 @@ def main(argv: list[str] | None = None) -> int:
     print(f"removed {len(removed_microsoft)} Microsoft runtime files: the bundle does not ship them")
     write_bundle_readme()
     copy_notices()
+    xpi_text = (args.zotero_signed_xpi or os.environ.get(ZOTERO_SIGNED_XPI_ENV) or "").strip()
+    bundle_zotero_bridge(Path(xpi_text) if xpi_text else None, BUNDLE_DIR)
     copy_problems = write_third_party(manifest, runtimes)
     for problem in copy_problems:
         print(f"RELEASE BLOCKED: {problem}")
