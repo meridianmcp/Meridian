@@ -17,7 +17,7 @@ import shutil
 import tempfile
 import time
 from collections.abc import Callable
-from dataclasses import asdict, dataclass, replace
+from dataclasses import asdict, dataclass, field, replace
 from pathlib import Path
 from typing import Mapping
 
@@ -176,6 +176,12 @@ class Settings:
     # The Sessions tab's "Only projects with active sessions" switch (meridian_desktop/ui/sessions_panel.py). Off by
     # default. save() writes the key only when it is on, so a file that never turned it on keeps the keys it had.
     sessions_only_active_projects: bool = False
+    # The GPUs tab's auto-refresh interval in seconds: 0 is off. Every 5 minutes (300) is the default, so save() writes
+    # the key only when the owner picks another interval.
+    gpu_refresh_seconds: int = 300
+    # The GPUs tab's offer filters and sort as the owner last left them (name, memory, tier, center, maker, in stock,
+    # sort, max price). An empty dict is the default, so save() writes the key only when there is something to keep.
+    gpu_offer_filters: dict[str, object] = field(default_factory=dict)
     # The file-size note switch on the Limits group. On is the default. Off means the total-size note never shows. A
     # download is never asked about or blocked in either state, and virus scanning always applies.
     limit_approval_enabled: bool = True
@@ -226,6 +232,49 @@ def licence_accepted_for(settings: Settings, notice_sha256: str) -> bool:
     """
     stored = settings.licence_notice_sha256
     return bool(settings.licence_accepted) and is_sha256_hex(stored) and stored == notice_sha256
+
+
+# The GPUs tab's auto-refresh choices, in seconds. 0 is off.
+GPU_REFRESH_CHOICES = (0, 60, 300, 900)
+
+# The GPUs tab's saved offer filters: each known key and the type it must have. Any other key is dropped.
+# The free-text name box is not saved: a key pasted into it by mistake must never reach settings.json in plain text.
+# A "name" an older build saved is dropped on load and is gone from the file after the next filter save.
+OFFER_FILTER_TYPES: dict[str, type] = {
+    "memory_gb": int,
+    "tier": str,
+    "center": str,
+    "maker": str,
+    "in_stock": bool,
+    "sort": str,
+    "max_price": float,
+}
+
+
+def _clean_offer_filters(value: object, problems: list[str]) -> dict[str, object]:
+    """Keep the GPUs tab's saved filters that have the right type. A key with the wrong type is noted and dropped."""
+    if not isinstance(value, dict):
+        problems.append("gpu_offer_filters must be an object; using the defaults")
+        return {}
+    kept: dict[str, object] = {}
+    for key, kind in OFFER_FILTER_TYPES.items():
+        if key not in value:
+            continue
+        item = value[key]
+        if kind is bool:
+            ok = isinstance(item, bool)
+        elif kind is int:
+            ok = isinstance(item, int) and not isinstance(item, bool)
+        elif kind is float:
+            ok = isinstance(item, (int, float)) and not isinstance(item, bool)
+        else:
+            ok = isinstance(item, str)
+        if ok:
+            kept[key] = float(item) if kind is float else item
+        else:
+            problems.append(f"gpu_offer_filters.{key} is not valid; using its default")
+    return kept
+DEFAULT_GPU_REFRESH_SECONDS = 300
 
 
 class SettingsUnreadable(Exception):
@@ -479,6 +528,18 @@ def _from_mapping(data: Mapping) -> tuple[Settings, list[str]]:
         else:
             problems.append("sessions_only_active_projects must be true or false; using false")
 
+    # gpu_refresh_seconds: an absent key means 300 (every 5 minutes), with no warning. Only a listed interval is accepted.
+    if "gpu_refresh_seconds" in data:
+        value = data["gpu_refresh_seconds"]
+        if isinstance(value, int) and not isinstance(value, bool) and value in GPU_REFRESH_CHOICES:
+            values["gpu_refresh_seconds"] = value
+        else:
+            problems.append("gpu_refresh_seconds must be 0, 60, 300 or 900; using 300")
+
+    # gpu_offer_filters: an absent key means nothing saved, so the tab opens with its defaults.
+    if "gpu_offer_filters" in data:
+        values["gpu_offer_filters"] = _clean_offer_filters(data["gpu_offer_filters"], problems)
+
     # limit_approval_enabled: an absent key means on, with no warning. Only a real true or false is accepted.
     if "limit_approval_enabled" in data:
         value = data["limit_approval_enabled"]
@@ -676,6 +737,12 @@ class SettingsStore:
         if not settings.sessions_only_active_projects:
             # Off is the default, so the Sessions tab's switch is written only once the owner turns it on.
             del data["sessions_only_active_projects"]
+        if settings.gpu_refresh_seconds == DEFAULT_GPU_REFRESH_SECONDS:
+            # Every 5 minutes is the default, so the key is written only once the owner picks another interval.
+            data.pop("gpu_refresh_seconds", None)
+        if not settings.gpu_offer_filters:
+            # Nothing kept is the default, so the key is written only when the owner has filters to keep.
+            data.pop("gpu_offer_filters", None)
         if settings.limit_approval_enabled:
             # On is the default, so the file-size note switch is written only once the owner turns it off.
             del data["limit_approval_enabled"]
@@ -782,6 +849,39 @@ class SettingsStore:
         # A readable file with one bad value is copied aside before the write, as the other writers do.
         self.keep_unreadable_copy()
         updated = replace(self.load().settings, gpu_hosts=hosts)
+        self.save(updated)
+        return updated
+
+    def set_gpu_refresh_seconds(self, value: int) -> Settings:
+        """Save the GPUs tab's auto-refresh interval (0 is off). Every other setting this build knows is kept. A top-level
+        key this build does not know is dropped on write, as save() does for every setter, so a token-like key is never
+        written back.
+
+        An interval that is not listed raises ValueError. An unreadable file is handled as the other setters handle it.
+        """
+        if value not in GPU_REFRESH_CHOICES:
+            raise ValueError("the GPU refresh interval must be 0, 60, 300 or 900 seconds")
+        if self.is_unreadable():
+            copied = self._keep_copy()
+            raise SettingsUnreadable(SETTINGS_UNREADABLE_TEXT if copied else SETTINGS_UNREADABLE_NO_COPY_TEXT)
+        self.keep_unreadable_copy()
+        updated = replace(self.load().settings, gpu_refresh_seconds=int(value))
+        self.save(updated)
+        return updated
+
+    def set_gpu_offer_filters(self, filters: dict[str, object]) -> Settings:
+        """Save the GPUs tab's offer filters and sort. Every other setting this build knows is kept, and a top-level key
+        this build does not know is dropped on write, as save() does for every setter.
+
+        Filter keys this build does not know are dropped, and a value with the wrong type is dropped too. An unreadable file is
+        handled as the other setters handle it.
+        """
+        if self.is_unreadable():
+            copied = self._keep_copy()
+            raise SettingsUnreadable(SETTINGS_UNREADABLE_TEXT if copied else SETTINGS_UNREADABLE_NO_COPY_TEXT)
+        self.keep_unreadable_copy()
+        cleaned = _clean_offer_filters(filters, [])
+        updated = replace(self.load().settings, gpu_offer_filters=cleaned)
         self.save(updated)
         return updated
 

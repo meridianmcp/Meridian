@@ -40,8 +40,7 @@ download and its use. The Universal CRT comes with Windows 10 and later, so it n
 8. Network use
 Meridian Desktop contacts only the destinations listed below, and only for the reason shown beside each one.
 (a) A Meridian server on this computer, at the local_url setting, which must be http on 127.0.0.1, localhost or ::1.
-The desktop uses it for a health check, and for local data and status, including RunPod status. The desktop has no
-RunPod address of its own.
+The desktop uses it for a health check, and for local data and status, including RunPod status.
 (b) The Meridian hosted service, at the hosted_url setting (https://usemeridian.us by default). In Hosted mode the desktop
 uses it, with your sign-in token, to check your account, to renew your sign-in when it is close to expiry, and to list your
 projects and sessions. Sign in with browser in Settings uses it to sign you in. In Local mode the connection bar sends no
@@ -67,6 +66,9 @@ serena-agent from PyPI, with the other Python packages those servers need. If no
 downloads a managed Python 3.12 build from GitHub when it starts Serena.
 (g) Services on 127.0.0.1 only: the LaTeX engine, the Zotero local API, and the slot ports, which the desktop checks with a
 connect-only probe.
+(h) RunPod's API, at https://api.runpod.io. The desktop sends it one request to list GPU types, prices and stock. Your
+RunPod key is read from the operating system credential store on this computer and sent in that request's
+Authorization header, and to no other place. The desktop sends RunPod nothing else.
 Your saved keys are kept in the operating system credential store on this computer. A key you mark as critical can also be
 copied into an encrypted vault file, keys-vault.json, which is kept beside settings.json on this computer. The vault is
 encrypted with a passphrase that you choose. Copying a key into the vault leaves its keychain copy in place. The "Set as
