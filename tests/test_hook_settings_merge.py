@@ -210,7 +210,7 @@ def test_explicit_timeouts(scope, shell, tmp_path):
         assert events == ["PreToolUse", "PostToolUse", "SessionStart", "SubagentStart"]
     else:
         assert events == ["PreToolUse", "SessionStart", "SubagentStart"]
-    assert hsm.TIMEOUTS["PreToolUse"] == hsm.TIMEOUTS["PostToolUse"] == 3
+    assert hsm.TIMEOUTS["PreToolUse"] == hsm.TIMEOUTS["PostToolUse"] == 10
     assert hsm.TIMEOUTS["SessionStart"] == hsm.TIMEOUTS["SubagentStart"] == 10
 
 

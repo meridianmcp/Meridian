@@ -76,8 +76,8 @@ def test_settings_guard_registration_shape():
     sub = _group_for("SubagentStart", "meridian_guard_brief.ps1")
     assert [len(pre), len(post), len(start), len(sub)] == [1, 1, 1, 1]
     for group, timeout, script in (
-        (pre, 3, "meridian_guard.ps1"),
-        (post, 3, "meridian_guard_post.ps1"),
+        (pre, 10, "meridian_guard.ps1"),
+        (post, 10, "meridian_guard_post.ps1"),
         (start, 10, "meridian_guard_brief.ps1"),
         (sub, 10, "meridian_guard_brief.ps1"),
     ):

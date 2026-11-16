@@ -23,8 +23,8 @@ such an entry changes, and every rewrite is listed in the plan.
 ``autoMemoryEnabled`` is never written (item 81f403aa owns that switch, and
 only after an owner-approved memory import).
 
-Registered entries (explicit timeouts: 3 s Pre/PostToolUse, 10 s
-SessionStart/SubagentStart -- the Claude Code default is 60 s):
+Registered entries (explicit timeouts: 10 s on every guard hook -- see TIMEOUTS
+for why it is not 3 s; the Claude Code default is 60 s):
 
 * project scope -- one PreToolUse dispatcher (G1-G11 matchers, never matches
   ``Read``), one PostToolUse entry (G12-G14), SessionStart + SubagentStart
@@ -119,9 +119,13 @@ SHELLS = ("powershell", "bash")
 MARKER_SCHEMA = "meridian.guard.install/v1"
 CONFIG_SCHEMA = "meridian.guard.config/v1"
 
+# Hook timeouts in seconds. The guard shims are PowerShell 5.1 and parse a ~3,100-line script on every call: about
+# 0.5 s warm, 1.2-1.7 s on the Grep path, and more when the machine is busy. At 3 s a busy machine killed the
+# PreToolUse check. Claude Code kills a hook that overruns its timeout, and a killed hook writes no audit line, so the
+# shims' fail-open path never records it. The check was skipped silently. 10 s leaves room for that load.
 TIMEOUTS: dict[str, int] = {
-    "PreToolUse": 3,
-    "PostToolUse": 3,
+    "PreToolUse": 10,
+    "PostToolUse": 10,
     "SessionStart": 10,
     "SubagentStart": 10,
 }
