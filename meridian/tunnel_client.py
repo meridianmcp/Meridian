@@ -7744,6 +7744,7 @@ async def run_tunnel(
         resolve_plugins, resolve_custom_plugins, detect_office_binaries,
         expand_command, SERENA_EXTRACT_COMMAND,
         DEFAULT_OUTPUTS_PORT, DEFAULT_DEBUG_PORT, DEFAULT_LATEX_PORT,
+        DEFAULT_INVENTREE_PORT, enforce_slot_env,
     )
     # Auto-enable Office slots whose launcher is installed on this machine, unless
     # the user explicitly configured them. Resolve locally from the raw config
@@ -7771,6 +7772,8 @@ async def run_tunnel(
     outputs_plugin = by_slot.get("outputs") or {}
     debug_plugin = by_slot.get("debug") or {}
     latex_plugin = by_slot.get("latex") or {}
+    # 225861b8 — the read-only InvenTree slot (see tunnel_plugins.DEFAULT_INVENTREE_PORT).
+    inventree_plugin = by_slot.get("inventree") or {}
     # Per-slot effective ports (override > the run_tunnel arg default).
     fs_port = int(fs_plugin.get("port") or port)
     code_port = int(code_plugin.get("port") or code_port)
@@ -7790,6 +7793,7 @@ async def run_tunnel(
     outputs_port = int(outputs_plugin.get("port") or DEFAULT_OUTPUTS_PORT)
     debug_port = int(debug_plugin.get("port") or DEFAULT_DEBUG_PORT)
     latex_port = int(latex_plugin.get("port") or DEFAULT_LATEX_PORT)
+    inventree_port = int(inventree_plugin.get("port") or DEFAULT_INVENTREE_PORT)
 
     # Filesystem connector roots (executor_config.filesystem_roots, unioned across
     # the tenant's projects). Empty → fall back to the home dir (repo_path).
@@ -7917,7 +7921,7 @@ async def run_tunnel(
                     # 12afe021 — outputs/debug now share the office-family lazy-spawn
                     # + reconnect-loop wiring below instead of being silently dropped.
                     "outputs": outputs_port, "debug": debug_port,
-                    "latex": latex_port}
+                    "latex": latex_port, "inventree": inventree_port}
     # 4ea1b9d5 — slots whose session_mode is "persistent" (e.g. Desktop
     # Commander): they keep a stateful inner process, so they skip the
     # idle-killer that would otherwise tear the session down after 30min.
@@ -8125,7 +8129,8 @@ async def run_tunnel(
                                 ("zotero", zotero_plugin, "zotero-mcp"),
                                 ("outputs", outputs_plugin, "meridian-outputs"),
                                 ("debug", debug_plugin, "mcp-debugger"),
-                                ("latex", latex_plugin, "meridian-latex")):
+                                ("latex", latex_plugin, "meridian-latex"),
+                                ("inventree", inventree_plugin, "meridian-inventree")):
         if not plugin.get("enabled", False):
             continue
         cmd = _office_slot_command(slot, plugin)
@@ -8149,6 +8154,10 @@ async def run_tunnel(
             if slot == "zotero"
             else _office_slot_spawn_env(plugin.get("env"))
         )
+        # 225861b8 — the InvenTree slot is read-only over the tunnel whatever the stored config
+        # says: the enforced flag is applied last, so a saved override cannot turn write
+        # planning back on. The rest of the process environment is kept (the token is there).
+        spawn_env = enforce_slot_env(slot, spawn_env)
         # 4ea1b9d5 — persistent slots omit --stateless so their inner process
         # keeps state across requests (DC terminal sessions).
         _persistent = plugin.get("session_mode") == "persistent"
@@ -8336,7 +8345,7 @@ async def run_tunnel(
     slot_prefixes = {
         s: (by_slot.get(s) or {}).get("prefix")
         for s in ("fs", "code", "extract", "ppt", "word", "dc", "docs", "zotero",
-                   "outputs", "debug", "latex")
+                   "outputs", "debug", "latex", "inventree")
     }
     ws_fs = _ws_url(base_url, tenant_id, token)
     ws_code = _ws_code_url(base_url, tenant_id, token)

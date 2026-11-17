@@ -51,7 +51,9 @@ def test_latex_is_a_fixed_builtin_slot_with_mcp_entrypoint():
     assert plugin["url_prefix"] == "/latex"
     assert plugin["enabled"] is False
     assert DEFAULT_LATEX_PORT in _BUILTIN_DEFAULT_PORTS
-    assert _CUSTOM_PORT_START == DEFAULT_LATEX_PORT + 1
+    # 225861b8 added the InvenTree slot after LaTeX, so the custom start now sits after InvenTree.
+    assert _CUSTOM_PORT_START == tunnel_plugins.DEFAULT_INVENTREE_PORT + 1
+    assert DEFAULT_LATEX_PORT < tunnel_plugins.DEFAULT_INVENTREE_PORT
     assert plugin["command"] == [
         "npx", "-y", "--package", "@meridianmcp/mcp", "meridian-latex", "mcp",
     ]

@@ -46,6 +46,7 @@ EXPECTED_SLOT_PORTS = (
     ("outputs", 8820),
     ("debug", 8821),
     ("latex", 8822),
+    ("inventree", 8823),
 )
 
 # Attribute names a socket would need for sending or reading. The probe module uses none.
@@ -130,7 +131,7 @@ class _RecordingListener:
 def test_slot_port_probe_sends_no_bytes_and_covers_all_ports():
     # The table holds the core's literal ports: eleven built-ins (word included, LaTeX last) and p0 to p3.
     assert SLOT_PORTS == EXPECTED_SLOT_PORTS
-    assert len(SLOT_PORTS) == 15
+    assert len(SLOT_PORTS) == 16
 
     # One check per port, in table order, each on 127.0.0.1 with the 0.25 second timeout.
     seen: list[tuple[str, int, float]] = []

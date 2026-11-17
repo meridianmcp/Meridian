@@ -46,6 +46,7 @@ SLOT_PORTS: tuple[tuple[str, int], ...] = (
     ("outputs", 8820),
     ("debug", 8821),
     ("latex", 8822),
+    ("inventree", 8823),
 )
 
 # check(host, port, timeout) -> True when something accepts a connection on host:port.

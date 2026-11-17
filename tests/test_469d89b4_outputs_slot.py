@@ -24,8 +24,8 @@ def test_outputs_port_no_collision_with_other_builtins():
 
 
 def test_outputs_custom_port_start_above_outputs_port():
-    # 8822 is now reserved for the built-in LaTeX MCP slot.
-    assert tp._CUSTOM_PORT_START == 8823
+    # 8822 is now reserved for the built-in LaTeX MCP slot; 8823 for InvenTree (225861b8).
+    assert tp._CUSTOM_PORT_START == 8824
     assert tp.DEFAULT_OUTPUTS_PORT < tp._CUSTOM_PORT_START
 
 

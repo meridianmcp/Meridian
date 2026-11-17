@@ -21,6 +21,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
 from pathlib import Path
 from typing import Any
 
@@ -49,6 +50,7 @@ _MERIDIAN_EXTENSION_GIT_URL = "git+https://github.com/meridianmcp/Meridian.git"
 _MERIDIAN_EXTENSION_ENTRYPOINTS = {
     "meridian-docs": "meridian-docs-mcp",
     "meridian-outputs": "meridian-outputs-mcp",
+    "meridian-inventree": "meridian-inventree-mcp",
 }
 
 
@@ -72,7 +74,7 @@ def extension_uvx_command(extension: str, *, repo_root: Path | None = None) -> l
 # slot = the fixed server transport a plugin rides on. Each built-in owns one
 # slot; that mapping is immutable (a config override can't move a built-in to
 # another slot, which would collide with the server routes).
-SLOTS = ("fs", "code", "extract", "ppt", "word", "dc", "docs", "zotero", "outputs", "debug", "latex")
+SLOTS = ("fs", "code", "extract", "ppt", "word", "dc", "docs", "zotero", "outputs", "debug", "latex", "inventree")
 
 DEFAULT_FS_PORT = 8808
 DEFAULT_CODE_PORT = 8809
@@ -111,6 +113,26 @@ DEFAULT_DEBUG_PORT = 8821
 # LaTeX helper slot. The npm package is published from the Meridian monorepo;
 # its MCP server is started with the explicit mcp subcommand.
 DEFAULT_LATEX_PORT = 8822
+
+# 225861b8 — InvenTree inventory slot. Runs the meridian-inventree extension from the local
+# checkout (uvx --from <local-path>). The tunnel exposes read tools only: the spawn
+# environment forces INVENTREE_ENFORCED_ENV on every spawn, so a stored override that drops
+# the flag cannot re-enable write planning.
+DEFAULT_INVENTREE_PORT = 8823
+INVENTREE_ENFORCED_ENV: dict[str, str] = {"MERIDIAN_INVENTREE_READ_ONLY": "1"}
+
+
+def enforce_slot_env(slot: str, env: "dict[str, str] | None") -> "dict[str, str] | None":
+    """Return the spawn environment with the slot's mandatory values applied last.
+
+    Only the InvenTree slot has one: read-only mode. The values win over any stored override.
+    For that slot the process environment is kept (the token arrives there, not in config).
+    Every other slot gets ``env`` back unchanged.
+    """
+    if slot != "inventree":
+        return env
+    base = env if env is not None else dict(os.environ)
+    return {**base, **INVENTREE_ENFORCED_ENV}
 
 # 8fb69d54 — 4 pre-allocated custom slots (p0-p3) on ports 8814-8817 so a custom
 # plugin bound to a slot gets a real server route (/tunnel-p0 … /tunnel-p3) and
@@ -554,6 +576,26 @@ BUILTIN_PLUGINS: list[dict[str, Any]] = [
         "description": "Local LaTeX and Overleaf workflows (meridian-latex)",
         "description_overrides": {},
     },
+    {
+        # 225861b8 — read-only InvenTree slot. Open-source InvenTree (MIT) runs as its own
+        # instance; this slot reaches its REST API through the meridian-inventree extension.
+        # Only the read tools are exposed (INVENTREE_ENFORCED_ENV is applied at spawn).
+        "name": "meridian-inventree",
+        "slot": "inventree",
+        "port": DEFAULT_INVENTREE_PORT,
+        "url_prefix": "/inventree",
+        "enabled": False,
+        "builtin": True,
+        "core": False,
+        # A local checkout, so --no-cache rebuilds the venv on every spawn (see the
+        # matching comment on the meridian-outputs entry).
+        "command": extension_uvx_command("meridian-inventree"),
+        "env": {"INVENTREE_URL": "http://127.0.0.1:8000", **INVENTREE_ENFORCED_ENV},
+        "prefix": None,
+        "session_mode": "stateless",
+        "description": "InvenTree inventory, read-only (meridian-inventree): parts, stock and locations",
+        "description_overrides": {},
+    },
 ]
 
 # Editable per-slot fields that a tenant override may set.
@@ -771,6 +813,20 @@ KNOWN_PLUGIN_TOOLS: list[dict[str, Any]] = [
         ),
     },
     {
+        # 225861b8 — read-only InvenTree slot (see the built-in entry above).
+        "name": "meridian-inventree",
+        "package": "meridian-inventree",
+        "runtime": "uvx",
+        "slot": "inventree",
+        "bundled": True,
+        "owner_item": None,
+        "description": (
+            "Read-only InvenTree inventory: search_parts, get_part, list_categories, "
+            "search_stock, get_stock_item, list_locations, roles, check_version, "
+            "plan_status. Writes are not exposed through the tunnel."
+        ),
+    },
+    {
         # 88dbb675 — Context7 (by Upstash): general-purpose library/framework docs MCP.
         # Indexes React, Tailwind, Next.js, and thousands of other libraries so agents
         # get up-to-date API docs without web search. Complements paper_search (academic)
@@ -908,12 +964,18 @@ def _iter_plugin_items(raw: Any) -> list[dict]:
     return items
 
 
-def sanitize_plugin_config_secrets(raw_config: Any) -> Any:
-    """Copy plugin config while stripping Zotero keys from every env mapping.
+# Env keys that hold credentials. They are dropped from every stored or returned plugin env.
+# A Zotero key belongs in the local OS vault. An InvenTree token belongs in the environment of
+# the tunnel process, so the hosted side never holds it (225861b8).
+SECRET_ENV_KEYS: frozenset[str] = frozenset({"zotero_api_key", "inventree_token"})
 
-    The server accepts workstation plugin settings over its hosted API. A
-    Zotero API key belongs in the local OS vault, so scrub both new config and
-    legacy config before it is returned to any client.
+
+def sanitize_plugin_config_secrets(raw_config: Any) -> Any:
+    """Copy plugin config while stripping credential keys from every env mapping.
+
+    The server accepts workstation plugin settings over its hosted API, so any
+    key in SECRET_ENV_KEYS is removed from new config and legacy config before it
+    is returned to any client.
     """
     if isinstance(raw_config, list):
         return [sanitize_plugin_config_secrets(value) for value in raw_config]
@@ -925,7 +987,7 @@ def sanitize_plugin_config_secrets(raw_config: Any) -> Any:
             cleaned[key] = {
                 env_key: env_value
                 for env_key, env_value in value.items()
-                if str(env_key).casefold() != "zotero_api_key"
+                if str(env_key).casefold() not in SECRET_ENV_KEYS
             }
         elif isinstance(value, (dict, list)):
             cleaned[key] = sanitize_plugin_config_secrets(value)
@@ -966,7 +1028,7 @@ def normalize_plugins_config(raw: Any) -> dict[str, dict]:
         if isinstance(env, dict):
             ov["env"] = {
                 str(k): str(v) for k, v in env.items()
-                if str(k) and str(k).casefold() != "zotero_api_key"
+                if str(k) and str(k).casefold() not in SECRET_ENV_KEYS
             }
         # 39aae23f — per-slot elastic-pool override. Accept an int ("pool up to N
         # copies" shorthand) or a {"enabled"?, "min"/"min_copies", "max"/
@@ -1120,7 +1182,7 @@ _BUILTIN_DEFAULT_PORTS = frozenset({
     DEFAULT_FS_PORT, DEFAULT_CODE_PORT, DEFAULT_EXTRACT_PORT,
     DEFAULT_PPT_PORT, DEFAULT_WORD_PORT, DEFAULT_DC_PORT, DEFAULT_DOCS_PORT,
     DEFAULT_ZOTERO_PORT, DEFAULT_OUTPUTS_PORT, DEFAULT_DEBUG_PORT,
-    DEFAULT_LATEX_PORT,
+    DEFAULT_LATEX_PORT, DEFAULT_INVENTREE_PORT,
 })
 
 # 9811d04c — first port a freshly-added custom plugin (from the browse "Add"
@@ -1130,7 +1192,8 @@ _BUILTIN_DEFAULT_PORTS = frozenset({
 # auto-assigned port never collides with a built-in slot.
 # 469d89b4 — bumped from 8820 to 8821 to make room for DEFAULT_OUTPUTS_PORT.
 # 121e6a27 — bumped from 8821 to 8822 to make room for DEFAULT_DEBUG_PORT.
-_CUSTOM_PORT_START = 8823
+# 225861b8 — bumped from 8823 to 8824 to make room for DEFAULT_INVENTREE_PORT.
+_CUSTOM_PORT_START = 8824
 
 # 9811d04c — the built-in *slot* names (fs/code/extract/ppt/word/dc). A custom
 # plugin's name must not collide with a built-in slot name (task rule) nor with a

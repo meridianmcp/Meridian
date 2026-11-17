@@ -80,17 +80,24 @@ def test_local_path_plugins_force_uvx_cache_bust():
     ]
     assert outputs_cmd[0] == "uvx" and outputs_cmd[1] == "--no-cache" and outputs_cmd[2] == "--from"
 
-    # Every other builtin's command must NOT gain "--no-cache" — this fix is scoped
-    # to ONLY the two local-path `--from` entries.
+    # 225861b8 — meridian-inventree is also a locally edited checkout (extensions/meridian-inventree),
+    # so it takes the same cache-busting form. Its edits must reach the next spawn.
+    inventree_cmd = by_name["meridian-inventree"]["command"]
+    assert inventree_cmd[:3] == ["uvx", "--no-cache", "--from"]
+    assert inventree_cmd[-1] == "meridian-inventree-mcp"
+
+    # Every other builtin's command must NOT gain "--no-cache" — the fix is scoped to the
+    # local-path `--from` entries only.
+    local_path_plugins = ("meridian-docs", "meridian-outputs", "meridian-inventree")
     for plugin in tp.BUILTIN_PLUGINS:
-        if plugin["name"] in ("meridian-docs", "meridian-outputs"):
+        if plugin["name"] in local_path_plugins:
             continue
         cmd = plugin["command"]
         if cmd is None:
             continue
         assert "--no-cache" not in cmd, (
             f"{plugin['name']!r} command unexpectedly carries --no-cache: {cmd!r} "
-            "(the cache-busting fix is scoped to the two local-path plugins only)"
+            "(the cache-busting fix is scoped to the local-path plugins only)"
         )
 
     # Same invariant must hold after resolve_plugins() merges in an empty/absent
@@ -98,8 +105,9 @@ def test_local_path_plugins_force_uvx_cache_bust():
     resolved_by_name = {p["name"]: p for p in tp.resolve_plugins(None)}
     assert resolved_by_name["meridian-docs"]["command"] == docs_cmd
     assert resolved_by_name["meridian-outputs"]["command"] == outputs_cmd
+    assert resolved_by_name["meridian-inventree"]["command"] == inventree_cmd
     for name, plugin in resolved_by_name.items():
-        if name in ("meridian-docs", "meridian-outputs"):
+        if name in local_path_plugins:
             continue
         cmd = plugin["command"]
         if cmd is None:

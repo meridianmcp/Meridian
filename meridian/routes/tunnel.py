@@ -186,6 +186,8 @@ _tunnel_outputs_sockets: dict[str, WebSocket] = {}
 # 121e6a27 — mcp-debugger slot (7-language DAP debugger via @debugmcp/mcp-debugger).
 _tunnel_debug_sockets: dict[str, WebSocket] = {}
 _tunnel_latex_sockets: dict[str, WebSocket] = {}
+# 225861b8 — read-only InvenTree slot (meridian-inventree, read tools only).
+_tunnel_inventree_sockets: dict[str, WebSocket] = {}
 
 # e37187f3 — per-host coexistence bookkeeping: (tenant_id, slot_label) ->
 # {host_id: WebSocket}. Keyed by (tenant_id, slot_label) rather than bare
@@ -287,6 +289,7 @@ _pending_zotero_reqs: dict[str, asyncio.Future[dict]] = {}
 _pending_outputs_reqs: dict[str, asyncio.Future[dict]] = {}
 _pending_debug_reqs: dict[str, asyncio.Future[dict]] = {}
 _pending_latex_reqs: dict[str, asyncio.Future[dict]] = {}
+_pending_inventree_reqs: dict[str, asyncio.Future[dict]] = {}
 
 # ab956c80 follow-up — Streamable HTTP MCP servers such as persistent
 # ``mcp-proxy`` require initialize/initialized before real tools traffic. Keep
@@ -1299,6 +1302,12 @@ async def tunnel_latex_ws(ws: WebSocket, tenant_id: str) -> None:
     await _serve_tunnel_ws(ws, tenant_id, _tunnel_latex_sockets, _pending_latex_reqs, "latex")
 
 
+@router.websocket("/tunnel-inventree/{tenant_id}")
+async def tunnel_inventree_ws(ws: WebSocket, tenant_id: str) -> None:
+    """225861b8 — Hold open a WebSocket for one tenant's read-only meridian-inventree proxy."""
+    await _serve_tunnel_ws(ws, tenant_id, _tunnel_inventree_sockets, _pending_inventree_reqs, "inventree")
+
+
 # 8fb69d54 — register the 4 custom-slot WebSocket routes (/tunnel-p0 … /tunnel-p3)
 # so a custom plugin bound to a slot gets a real server route.
 def _make_custom_slot_ws(_slot: str):
@@ -2059,6 +2068,26 @@ async def latex_mcp_proxy_subpath(tenant_id: str, rest: str, request: Request) -
                                _tunnel_latex_sockets, _pending_latex_reqs, "latex")
 
 
+@router.get("/inventree/mcp/{tenant_id}")
+@router.post("/inventree/mcp/{tenant_id}")
+@router.options("/inventree/mcp/{tenant_id}")
+async def inventree_mcp_proxy(tenant_id: str, request: Request) -> Response:
+    """225861b8 — Proxy requests to the tenant's read-only meridian-inventree server."""
+    prefix = f"/inventree/mcp/{tenant_id}"
+    local_path = request.url.path[len(prefix):] or "/"
+    return await _office_proxy(tenant_id, local_path, request,
+                               _tunnel_inventree_sockets, _pending_inventree_reqs, "inventree")
+
+
+@router.get("/inventree/mcp/{tenant_id}/{rest:path}")
+@router.post("/inventree/mcp/{tenant_id}/{rest:path}")
+@router.options("/inventree/mcp/{tenant_id}/{rest:path}")
+async def inventree_mcp_proxy_subpath(tenant_id: str, rest: str, request: Request) -> Response:
+    """Proxy sub-path requests to the tenant's read-only meridian-inventree server."""
+    return await _office_proxy(tenant_id, "/" + rest, request,
+                               _tunnel_inventree_sockets, _pending_inventree_reqs, "inventree")
+
+
 @router.get("/debug/mcp/{tenant_id}")
 @router.post("/debug/mcp/{tenant_id}")
 @router.options("/debug/mcp/{tenant_id}")
@@ -2159,6 +2188,7 @@ async def tunnel_status(tenant_id: str, request: Request = None) -> dict:  # typ
         "outputs_active": tenant_id in _tunnel_outputs_sockets,
         "debug_active": tenant_id in _tunnel_debug_sockets,
         "latex_active": tenant_id in _tunnel_latex_sockets,
+        "inventree_active": tenant_id in _tunnel_inventree_sockets,
         # d71ba2e7 — slots the client reported unhealthy (pre-flight tools/list
         # failed / watchdog gave up). Absent slot ⇒ assumed healthy. Dashboard
         # renders these as a degraded status dot.
@@ -2360,6 +2390,7 @@ async def get_tunnel_plugins(request: Request) -> Response:
             "outputs": tid in _tunnel_outputs_sockets,
             "debug": tid in _tunnel_debug_sockets,
             "latex": tid in _tunnel_latex_sockets,
+            "inventree": tid in _tunnel_inventree_sockets,
             **{s: tid in _tunnel_custom_sockets[s] for s in _CUSTOM_SLOTS},
         },
         # The tunnel (and thus this section) is Pro/admin-only; the dashboard
@@ -3883,7 +3914,7 @@ async def remove_tunnel_filesystem_root(request: Request) -> Response:
 # so a stateless ``tools/call`` can find the owning tunnel without re-listing.
 # Cold/missing entries trigger a one-shot re-discovery via ``list_tunnel_tools``.
 
-_TUNNEL_LABELS = ("fs", "code", "extract", "ppt", "word", "dc", "docs", "zotero", "outputs", "debug", "latex") + _CUSTOM_SLOTS
+_TUNNEL_LABELS = ("fs", "code", "extract", "ppt", "word", "dc", "docs", "zotero", "outputs", "debug", "latex", "inventree") + _CUSTOM_SLOTS
 
 # Human-readable connector prefix shown to Claude in tool names (e.g.
 # "filesystem:read_file" instead of "fs:read_file"). The routing cache still
@@ -3903,6 +3934,8 @@ SLOT_DISPLAY_NAMES = {
     # 121e6a27 — debug slot: tools namespaced as "mcp-debugger__set_breakpoint" etc.
     "debug": "mcp-debugger",
     "latex": "meridian-latex",
+    # 225861b8 — read-only InvenTree slot: tools namespaced as "meridian-inventree__inventree_search_parts".
+    "inventree": "meridian-inventree",
     "p0": "custom-p0",
     "p1": "custom-p1",
     "p2": "custom-p2",
@@ -4110,6 +4143,8 @@ def _label_maps(label: str) -> "tuple[dict[str, WebSocket], dict[str, asyncio.Fu
         return _tunnel_debug_sockets, _pending_debug_reqs
     if label == "latex":
         return _tunnel_latex_sockets, _pending_latex_reqs
+    if label == "inventree":
+        return _tunnel_inventree_sockets, _pending_inventree_reqs
     if label in _tunnel_custom_sockets:  # 8fb69d54 — custom slots p0-p3
         return _tunnel_custom_sockets[label], _pending_custom_reqs[label]
     return _tunnel_extract_sockets, _pending_extract_reqs
@@ -4129,6 +4164,7 @@ def has_active_tunnel(tenant_id: str) -> bool:
         or tenant_id in _tunnel_outputs_sockets
         or tenant_id in _tunnel_debug_sockets
         or tenant_id in _tunnel_latex_sockets
+        or tenant_id in _tunnel_inventree_sockets
         or any(tenant_id in s for s in _tunnel_custom_sockets.values())
     )
 
@@ -4316,6 +4352,7 @@ def active_tunnel_tenant_ids() -> "set[str]":
     ids.update(_tunnel_outputs_sockets)
     ids.update(_tunnel_debug_sockets)
     ids.update(_tunnel_latex_sockets)
+    ids.update(_tunnel_inventree_sockets)
     for s in _tunnel_custom_sockets.values():
         ids.update(s)
     return ids
