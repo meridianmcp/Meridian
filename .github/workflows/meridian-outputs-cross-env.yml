@@ -35,6 +35,11 @@ on:
 env:
   PYTHONDONTWRITEBYTECODE: 1
 
+# Least privilege (CodeQL actions/missing-workflow-permissions): every job
+# inherits read-only contents unless it declares broader scopes itself.
+permissions:
+  contents: read
+
 jobs:
   cross-env-qualification:
     runs-on: ubuntu-latest
