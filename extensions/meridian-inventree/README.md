@@ -24,7 +24,11 @@ A missing `INVENTREE_URL` or `INVENTREE_TOKEN` prints one line to stderr and exi
 
 Set `MERIDIAN_INVENTREE_READ_ONLY=1` for any host that exposes this server to a remote agent, such as the Meridian tunnel. The tool list then has nine tools, all of them reads or local plan-status reads. The startup line says `read-only mode, no write planning`. The non-secret settings (`INVENTREE_URL` and the mode flag) can sit in the host's plugin configuration. `INVENTREE_TOKEN` must not: it belongs in the environment of the process that starts the server.
 
+The nine tools are `inventree_search_parts`, `inventree_get_part`, `inventree_list_categories`, `inventree_search_stock`, `inventree_get_stock_item`, `inventree_list_locations`, `inventree_roles`, `inventree_check_version` and `inventree_plan_status`. The last one reads only the local plan store.
+
 `inventree_roles` reports `is_superuser`. A superuser token can change anything the instance allows, so check that flag before connecting a token to a tunnel.
+
+**Live check, InvenTree 1.7.2 (API version 570), 2026-11-16.** Over stdio, with a read-only user (view rules on part, part category, stock and stock location, no add, change or delete). Default mode lists 10 tools, and `inventree_propose` is refused with `version_unsupported`. Read-only mode lists 9 tools. `GET /api/user/roles/` returns the role object described in the client, not a list, and the read tools return data. A raw `POST /api/part/` with the read-only token returns 403.
 
 ## Run
 
