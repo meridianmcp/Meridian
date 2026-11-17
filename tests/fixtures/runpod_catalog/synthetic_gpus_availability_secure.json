@@ -1,0 +1,38 @@
+{
+  "_synthetic": "Synthetic. Documented availability shape. Not recorded from RunPod (spec D21, F20).",
+  "gpus": [
+    {
+      "id": "NVIDIA H100 80GB HBM3",
+      "availability": "LOW",
+      "dataCenters": [
+        {"id": "US-TX-3", "name": "US-TX-3", "availability": "LOW"},
+        {"id": "EU-RO-1", "name": "EU-RO-1", "availability": "NONE"}
+      ]
+    },
+    {
+      "id": "NVIDIA H100 PCIe",
+      "availability": "LOW",
+      "dataCenters": []
+    },
+    {
+      "id": "NVIDIA A100 80GB PCIe",
+      "availability": "HIGH",
+      "dataCenters": [{"id": "US-KS-2", "name": "US-KS-2", "availability": "HIGH"}]
+    },
+    {
+      "id": "NVIDIA A100-SXM4-80GB",
+      "availability": "MEDIUM",
+      "dataCenters": [{"id": "US-GA-1", "name": "US-GA-1", "availability": "MEDIUM"}]
+    },
+    {
+      "id": "NVIDIA L40S",
+      "availability": "NONE",
+      "dataCenters": []
+    },
+    {
+      "id": "NVIDIA RTX A6000",
+      "availability": "HIGH",
+      "dataCenters": [{"id": "US-TX-3", "name": "US-TX-3", "availability": "HIGH"}]
+    }
+  ]
+}

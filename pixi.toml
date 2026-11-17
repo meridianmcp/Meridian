@@ -191,6 +191,11 @@ pylatexenc = ">=2.10, <3"
 # this does NOT use Microsoft's MML2OMML.XSL stylesheet).
 latex2mathml = ">=3.77"
 
+# macOS only: pystray's macOS backend imports AppKit, and AppKit comes from PyObjC. Without it the
+# tray tests fail on macOS with "No module named 'AppKit'" (test-macos, run 40752226869).
+[target.osx.pypi-dependencies]
+pyobjc-framework-cocoa = ">=10.0"
+
 # Dev/build-only deps — not installed on Fly (Dockerfile uses pyproject.toml via uv).
 # Use `pixi run -e dev <task>` for docs, exe builds, and media scripts.
 [feature.dev.dependencies]

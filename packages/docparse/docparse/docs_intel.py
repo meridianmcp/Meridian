@@ -670,7 +670,9 @@ def _fields_in_paragraph(p: ET.Element) -> list[dict[str, Any]]:
     return fields
 
 
-def parse_docx(source: str | bytes | bytearray) -> list[dict[str, Any]]:
+def parse_docx(
+    source: str | bytes | bytearray, *, include_runs: bool = False
+) -> list[dict[str, Any]]:
     """Parse a .docx (path or raw bytes) into ordered paragraph records.
 
     Each record is ``{index, para_id, style, text, kind, fields}``. ``para_id``
@@ -681,6 +683,10 @@ def parse_docx(source: str | bytes | bytearray) -> list[dict[str, Any]]:
     PAGEREF etc. — each ``{kind: "field", field_type, instruction, needs_refresh}``
     (empty list when the paragraph has none). Returns an empty list for a
     document with no body.
+
+    ``include_runs=True`` (keyword-only, opt-in) adds a ``runs`` key to every
+    record: the ordered run list ``{text, bold, italic, field}`` built by
+    :func:`_paragraph_runs`. The default output is unchanged.
     """
     if isinstance(source, (bytes, bytearray)):
         zf = zipfile.ZipFile(io.BytesIO(bytes(source)))
@@ -701,16 +707,17 @@ def parse_docx(source: str | bytes | bytearray) -> list[dict[str, Any]]:
         para_id = p.get(_q(_W14, "paraId")) or synth_map.get(id(p)) or f"p{index}"
         style = _paragraph_style(p)
         text = _paragraph_text(p)
-        paragraphs.append(
-            {
-                "index": index,
-                "para_id": para_id,
-                "style": style,
-                "text": text,
-                "kind": "heading" if _is_heading(style) else "paragraph",
-                "fields": _fields_in_paragraph(p),
-            }
-        )
+        record: dict[str, Any] = {
+            "index": index,
+            "para_id": para_id,
+            "style": style,
+            "text": text,
+            "kind": "heading" if _is_heading(style) else "paragraph",
+            "fields": _fields_in_paragraph(p),
+        }
+        if include_runs:
+            record["runs"] = _paragraph_runs(p)
+        paragraphs.append(record)
     return paragraphs
 
 
@@ -814,6 +821,104 @@ def _paragraph_text(p: ET.Element) -> str:
         elif child.tag in (_BR_TAG, _CR_TAG):
             parts.append("\n")
     return "".join(parts)
+
+
+# Run-level helpers for ``parse_docx(include_runs=True)`` (draft-docparse-run-model).
+_R_TAG = _q(_W, "r")
+_RPR_TAG = _q(_W, "rPr")
+_B_TAG = _q(_W, "b")
+_I_TAG = _q(_W, "i")
+_FLD_SIMPLE_TAG = _q(_W, "fldSimple")
+_FLD_CHAR_TAG = _q(_W, "fldChar")
+_FLD_CHAR_TYPE_ATTR = _q(_W, "fldCharType")
+_VAL_ATTR = _q(_W, "val")
+# OOXML false values for an on/off run property. "0", "false" and "none" match
+# the meridian-docs ``_run_is_bold`` rule; "off" is the remaining ST_OnOff false.
+_OFF_VALUES = frozenset({"0", "false", "off", "none"})
+
+
+def _run_text(r: ET.Element) -> str:
+    """Text of one ``<w:r>``, built with the same rule as :func:`_paragraph_text`.
+
+    Walks the run's subtree in document order: ``<w:t>`` contributes its text,
+    ``<w:tab/>`` a tab and ``<w:br/>`` / ``<w:cr/>`` a newline. Applying the
+    paragraph rule per run is what keeps the run texts concatenating to the
+    paragraph text.
+    """
+    parts: list[str] = []
+    for child in r.iter():
+        if child.tag == _T_TAG:
+            parts.append(child.text or "")
+        elif child.tag == _TAB_TAG:
+            parts.append("\t")
+        elif child.tag in (_BR_TAG, _CR_TAG):
+            parts.append("\n")
+    return "".join(parts)
+
+
+def _run_formatting(r: ET.Element, tag: str) -> bool:
+    """True when run ``r`` has direct ``<w:rPr>`` formatting ``tag`` (``w:b``/``w:i``).
+
+    Presence means on unless the element's ``w:val`` is an OOXML false value.
+    Style inheritance is not resolved, the same limit as ``_run_is_bold``.
+    """
+    rpr = r.find(_RPR_TAG)
+    if rpr is None:
+        return False
+    flag = rpr.find(tag)
+    if flag is None:
+        return False
+    return flag.get(_VAL_ATTR) not in _OFF_VALUES
+
+
+def _paragraph_runs(p: ET.Element) -> list[dict[str, Any]]:
+    """Ordered run records for one ``<w:p>``: ``{text, bold, italic, field}``.
+
+    One record per ``<w:r>`` that carries text. Runs holding only field codes,
+    bookmarks or drawings are omitted, so the run texts concatenate to the
+    :func:`_paragraph_text` output. ``bold`` and ``italic`` follow the run's
+    direct ``w:b`` / ``w:i``. ``field`` is True when the run is inside a simple
+    field (``w:fldSimple``) or between a complex field's ``begin`` and ``end``
+    markers. Its ``text`` is the displayed result (the text after ``separate``
+    for a complex field), never the instruction, which sits in ``w:instrText``
+    and carries no text.
+
+    The paragraph is walked in document order. A ``<w:r>`` is read whole and not
+    descended into, so text nested inside a run (a text box, say) is counted
+    once, as :func:`_paragraph_text` counts it.
+    """
+    runs: list[dict[str, Any]] = []
+    open_fields = 0
+
+    def visit(node: ET.Element, in_simple: bool) -> None:
+        nonlocal open_fields
+        for child in node:
+            if child.tag == _R_TAG:
+                in_field = in_simple or open_fields > 0
+                for ctrl in child:
+                    if ctrl.tag == _FLD_CHAR_TAG:
+                        kind = ctrl.get(_FLD_CHAR_TYPE_ATTR)
+                        if kind == "begin":
+                            open_fields += 1
+                        elif kind == "end" and open_fields > 0:
+                            open_fields -= 1
+                text = _run_text(child)
+                if text:
+                    runs.append(
+                        {
+                            "text": text,
+                            "bold": _run_formatting(child, _B_TAG),
+                            "italic": _run_formatting(child, _I_TAG),
+                            "field": in_field,
+                        }
+                    )
+            elif child.tag == _FLD_SIMPLE_TAG:
+                visit(child, True)
+            else:
+                visit(child, in_simple)
+
+    visit(p, False)
+    return runs
 
 
 def _build_synth_id_map(body: ET.Element) -> dict[int, str]:

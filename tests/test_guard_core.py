@@ -247,6 +247,20 @@ def test_g12_reminder_at_most_once_per_15_minutes_and_capture_silences_it():
     assert r3["decision"] == "allow"
 
 
+@pytest.mark.parametrize("host, path, research", [
+    # PubMed on the NCBI host is research, and so are its subdomains.
+    ("ncbi.nlm.nih.gov", "/pubmed/123", True),
+    ("www.ncbi.nlm.nih.gov", "/pubmed", True),
+    ("pubmed.ncbi.nlm.nih.gov", "/", True),
+    ("ncbi.nlm.nih.gov", "/books", False),
+    # The NCBI rule is dot-bounded: a host that only ends in the same letters is not NCBI.
+    ("xncbi.nlm.nih.gov", "/pubmed", False),
+    ("evilncbi.nlm.nih.gov", "/pubmed", False),
+])
+def test_research_domain_ncbi_match_is_dot_bounded(host, path, research):
+    assert gc._research_domain(host, path) is research
+
+
 def test_g11_research_receipt_lifecycle():
     ps = _eval(_post("mcp__meridian__paper_search", {"query": "sae"}, "{\"results\": [1]}"), event="PostToolUse")
     q = _pre("WebSearch", {"query": "papers on sparse autoencoders"})

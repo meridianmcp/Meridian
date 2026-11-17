@@ -60,6 +60,15 @@ def test_account_socket_hears_a_delete_and_a_rename(client):
         assert client.post(f"/projects/{p['id']}/rename", json={"name": "account-ws-renamed"}).status_code == 200
         renamed = json.loads(ws.receive_text())
         assert client.delete(f"/projects/{p['id']}").status_code == 204
+        if callable(getattr(client.app.state.db, "add_after_commit_callback", None)):
+            # The Postgres TestClient owns an ambient transaction that is rolled back
+            # at teardown, so the delete is announced only on a commit that never
+            # happens (see test_8a665a03_project_and_sweep_events.py). A marker change
+            # made after the delete must therefore be the next frame on the socket.
+            assert renamed["change"] == "renamed"
+            client.post("/projects", json={"name": "account-ws-marker"})
+            assert json.loads(ws.receive_text())["change"] == "created"
+            return
         changes = [renamed["change"], json.loads(ws.receive_text())["change"]]
     assert changes == ["renamed", "deleted"]
 

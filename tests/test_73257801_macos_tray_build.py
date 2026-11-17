@@ -193,10 +193,10 @@ def test_build_tray_mac_job_exists_and_mirrors_the_mac_arm64_runner_choice() -> 
     jobs = _load_release_workflow()["jobs"]
     assert "build-tray-mac" in jobs
     job = jobs["build-tray-mac"]
-    # macos-14 matches build-mac-arm64's existing precedent (Apple Silicon
+    # macos-15 matches build-mac-arm64's existing precedent (Apple Silicon
     # only -- macos-13/Intel is effectively unavailable per decision
     # 80f1d4bc, already accepted for the slim client build).
-    assert job["runs-on"] == jobs["build-mac-arm64"]["runs-on"] == "macos-14"
+    assert job["runs-on"] == jobs["build-mac-arm64"]["runs-on"] == "macos-15"
 
 
 def test_build_tray_mac_job_builds_via_the_shared_pixi_task() -> None:

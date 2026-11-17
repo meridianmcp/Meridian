@@ -23,11 +23,14 @@ from __future__ import annotations
 import asyncio
 import json
 import os
+import re
 from typing import Any
+from urllib.parse import urlsplit
 
 import meridian.server as _server
 from meridian import db as db_module
 from meridian._deps import validate_input_size, _MANUAL_NOTE_LINT
+from meridian.finding_identity import _ARXIV_DOI_RE, finding_identity
 # 867317f6 — not re-exported through meridian.db's explicit named import
 # list (meridian/db/__init__.py is a high-contention file outside this
 # sprint item's declared scope), so import the new proposal error type
@@ -2232,6 +2235,181 @@ async def handle_save_finding(
         return {"error": str(exc)}
 
 
+# fe0b0331 (doi / pmid args) — a bare DOI, ``doi:``-prefixed, or doi.org form.
+# re.ASCII is required: without it IGNORECASE matches U+0131 to "i" and U+017F to "s".
+_CAPTURE_DOI_PREFIX_RE = re.compile(
+    r"doi[ \t\r\n]*:[ \t\r\n]*|(?:https?://)?(?:dx\.)?doi\.org/", re.IGNORECASE | re.ASCII,
+)
+# The only characters trimmed from the edges of a doi argument. str.strip() is not
+# used because it also removes NBSP and other Unicode spaces, which must be refused.
+_CAPTURE_DOI_EDGE_WS = " \t\r\n"
+# The only characters a DOI may hold after its 10.NNNN/ prefix: ASCII letters, digits and
+# . _ ; ( ) / : -. Both letter cases are listed, so no IGNORECASE is needed; IGNORECASE
+# would also match U+212A KELVIN SIGN to k and U+017F to s. Everything else is refused:
+# % (no escape is decoded), ? # & < > and quotes, [ ] { } \ ^ | backtick, whitespace and
+# all non-ASCII. finding_identity drops ? # & and never keeps < > or quotes only in a
+# doi.org URL, which is the form its identity check reads. A bare or doi:-prefixed DOI
+# keeps them, so for those forms this allowlist is what refuses them.
+_CAPTURE_DOI_OUTSIDE_RE = re.compile(r"[^A-Za-z0-9._;()/:\-]")
+_CAPTURE_DOI_SHAPE_RE = re.compile(r"10\.[0-9]{4,9}/")
+_CAPTURE_PMID_RE = re.compile(r"^\s*[0-9]{1,9}\s*$")
+_DOI_ERROR = "capture_research_finding doi must be a DOI such as 10.1145/3292500.3330701"
+# A refused doi.org or dx.doi.org url gets this prefix, so the caller sees that its url was
+# the input at fault, not a doi argument.
+_URL_DOI_ERROR = (
+    "capture_research_finding url must carry a DOI such as https://doi.org/10.1145/3292500.3330701"
+)
+
+
+def _doi_char_name(ch: str) -> str:
+    """Name one character for a refusal reason: its repr if in ``!`` to ``~``, else U+XXXX.
+
+    The space is outside that range, so it is named U+0020 and not repr.
+    """
+    return repr(ch) if "!" <= ch <= "~" else f"U+{ord(ch):04X}"
+
+
+def _normalise_capture_doi(raw: str) -> tuple[str | None, str | None]:
+    """Return ``(doi, None)`` when ``raw`` may be stored, else ``(None, reason)``.
+
+    ``raw`` is the text after the DOI prefix. For a doi argument, that is the value after
+    ``_capture_source_url`` has trimmed its ASCII edge whitespace and removed any
+    ``doi:`` / ``doi.org/`` prefix. For a doi.org url, it is the text after the host (see
+    ``_doi_url_rest``). Rules, in order:
+
+    1. A ``%`` is refused. No percent escape is decoded, because decoding stored
+       malformed URLs (``%25`` became a bare ``%``).
+    2. The value must start ``10.NNNN/``, or the reason names the shape.
+    3. Every suffix character must be on the allowlist (``_CAPTURE_DOI_OUTSIDE_RE``).
+       The reason names the first character outside it.
+    4. One trailing period is dropped as prose. A trailing ``; : ( )`` or ``..`` is
+       ambiguous and refused, and the suffix must not be empty.
+    5. No suffix segment may be ``.`` or ``..``. A URL parser resolves those, so the
+       stored URL would name a different target. The check reads the raw suffix, so the
+       trailing period that rule 4 drops is still seen and ``x/.`` is refused. Only a
+       whole segment counts, so ``...`` and ``a..b`` are accepted.
+    6. The arXiv-issued form that fully matches ``_ARXIV_DOI_RE`` is accepted and keys
+       to ``arxiv:<id>``, the same key as its arxiv.org URL. It is the only case that
+       skips rule 7.
+    7. Every other DOI must have the identity key ``doi:`` + the DOI lowercased, so the
+       stored DOI is the one whose dedupe key was checked. Only ASCII reaches this
+       point, so ``lower`` and ``casefold`` agree and ``lower`` is compared.
+
+    The caller stores ``https://doi.org/<doi>`` and nothing else.
+    """
+    if "%" in raw:
+        return None, "percent escapes are not accepted; give the plain DOI"
+    if _CAPTURE_DOI_SHAPE_RE.match(raw) is None:
+        return None, "it is not of the form 10.NNNN/suffix"
+    # The 10.NNNN/ prefix is ASCII digits by now, so a hit here is in the suffix.
+    outside = _CAPTURE_DOI_OUTSIDE_RE.search(raw)
+    if outside is not None:
+        return None, f"{_doi_char_name(outside.group())} is not an allowed DOI character"
+    if raw.endswith(".."):
+        return None, "ambiguous trailing character"
+    doi = raw[:-1] if raw.endswith(".") else raw
+    if doi.endswith((";", ":", "(", ")")):
+        return None, "ambiguous trailing character"
+    if not doi.partition("/")[2]:
+        return None, "no suffix after the DOI prefix"
+    # The raw suffix is read, because the trailing period dropped above would hide the
+    # segment in "x/.". Only a whole segment is refused, so "..." and "a..b" pass.
+    if any(segment in (".", "..") for segment in raw.partition("/")[2].split("/")):
+        return None, 'a path segment of "." or ".." would resolve to a different URL'
+    if _ARXIV_DOI_RE.fullmatch(doi):  # ASCII only by the rules above, so no Unicode digit
+        return doi, None
+    if finding_identity(f"https://doi.org/{doi}") != f"doi:{doi.lower()}":
+        return None, "its dedupe key would not be the DOI itself"
+    return doi, None
+
+
+# An http or https url (scheme optional) whose host is doi.org or dx.doi.org is a DOI link: the
+# text after the host is read as the DOI and stored as _CAPTURE_DOI_ORG_PREFIX + the normalised
+# DOI. Any other scheme, such as ftp://, is not read and is stored as given.
+_CAPTURE_DOI_HOSTS = ("doi.org", "dx.doi.org")
+_CAPTURE_DOI_ORG_PREFIX = "https://doi.org/"
+# An optional scheme, any run of slashes or backslashes, then the authority. The authority
+# ends at the first / \ ? or #, so the host is never read past a backslash.
+_CAPTURE_URL_HEAD_RE = re.compile(
+    r"(?:(?P<scheme>[A-Za-z][A-Za-z0-9+.\-]*):)?[/\\]*(?P<authority>[^/\\?#]*)"
+)
+
+
+def _doi_url_rest(url: str) -> str | None:
+    """Return the text after the host if ``url`` is an http(s) doi.org URL, else None.
+
+    The scheme is optional. The host comes from urlsplit, so a userinfo or a port is
+    skipped and the host compares case-insensitively. The rest is the raw text, not
+    urlsplit's parts, so no character is dropped before ``_normalise_capture_doi`` sees
+    it. A tab, a query or a fragment there is refused by the DOI rules, not removed.
+    """
+    _head = _CAPTURE_URL_HEAD_RE.match(url)
+    if _head is None:
+        return None
+    try:
+        _host = urlsplit("//" + _head.group("authority")).hostname or ""
+    except ValueError:
+        return None
+    _scheme = (_head.group("scheme") or "https").lower()
+    if _scheme not in ("http", "https") or _host not in _CAPTURE_DOI_HOSTS:
+        return None
+    return url[_head.end():]
+
+
+def _capture_source_type(source_url: str) -> str:
+    """Return ``arxiv`` or ``web`` for a URL that ``_capture_source_url`` resolved.
+
+    A stored doi.org URL is always a DOI, so it is tagged ``arxiv`` only when the DOI is
+    arXiv-issued (10.48550/arXiv.<id>). The arxiv.org substring rule is not applied to a
+    DOI, so a DOI that merely contains that text stays ``web``. Any other URL keeps the
+    arxiv.org substring rule unchanged.
+    """
+    if source_url.startswith(_CAPTURE_DOI_ORG_PREFIX):
+        doi = source_url[len(_CAPTURE_DOI_ORG_PREFIX):]
+        return "arxiv" if _ARXIV_DOI_RE.fullmatch(doi) else "web"
+    return "arxiv" if "arxiv.org" in source_url.lower() else "web"
+
+
+def _capture_source_url(args: dict[str, Any]) -> tuple[str | None, str | None]:
+    """Resolve the provenance URL capture_research_finding stores.
+
+    Precedence: an explicit ``url`` wins; otherwise a ``doi`` is stored as its
+    https doi.org form; otherwise a ``pmid`` is stored as its PubMed URL. An http or
+    https url (scheme optional) whose host is doi.org or dx.doi.org is read as a DOI and
+    held to the same rules as the doi argument, so it is stored as its https doi.org form
+    too. Any other url, including one with another scheme such as ftp://, is stored
+    exactly as given. A DOI that fails the rules in ``_normalise_capture_doi`` is refused
+    with the doi error plus the reason in parentheses, or with the url error when it came
+    from a doi.org url. The stored DOI is the normalised one. Its dedupe key is checked
+    for every DOI except an arXiv-issued one, which is exempt from that check and keys to
+    ``arxiv:<id>``. Returns ``(source_url, error)``. ``(None, None)`` means no identifier
+    was given.
+    """
+    _url = (args.get("url") or "").strip()
+    if _url:
+        _rest = _doi_url_rest(_url)
+        if _rest is None:
+            return _url, None
+        _norm, _why = _normalise_capture_doi(_rest[1:] if _rest.startswith("/") else _rest)
+        if _why is not None:
+            return None, f"{_URL_DOI_ERROR} ({_why})"
+        return f"{_CAPTURE_DOI_ORG_PREFIX}{_norm}", None
+    # Only ASCII blank means no doi. An NBSP-only value is a value, so it is refused.
+    _doi = str(args.get("doi") or "").strip(_CAPTURE_DOI_EDGE_WS)
+    if _doi:
+        _prefix = _CAPTURE_DOI_PREFIX_RE.match(_doi)
+        _norm, _why = _normalise_capture_doi(_doi[_prefix.end():] if _prefix else _doi)
+        if _why is not None:
+            return None, f"{_DOI_ERROR} ({_why})"
+        return f"{_CAPTURE_DOI_ORG_PREFIX}{_norm}", None
+    _pmid = str(args.get("pmid") or "").strip()
+    if _pmid:
+        if _CAPTURE_PMID_RE.match(_pmid) is None:
+            return None, "capture_research_finding pmid must be a numeric PubMed id"
+        return f"https://pubmed.ncbi.nlm.nih.gov/{int(_pmid)}/", None
+    return None, None
+
+
 async def handle_capture_research_finding(
     args: dict[str, Any],
     db: Any,
@@ -2241,25 +2419,38 @@ async def handle_capture_research_finding(
 ) -> Any:
     """MCP tool: capture_research_finding.
 
-    b1d36e93 — web/paper-shaped wrapper over save_finding; arXiv URLs are
-    auto-tagged source_type=arxiv.
+    b1d36e93 — web/paper-shaped wrapper over save_finding; arXiv URLs and
+    arXiv-issued DOIs are auto-tagged source_type=arxiv.
 
     fe0b0331 — same in-project dedupe as save_finding: the same paper (matched
     by case-folded DOI / arXiv id without version / PMID / normalised URL)
     returns ``existing_note_id`` instead of a copy; ``force_new=true`` escapes.
+
+    fe0b0331 (doi / pmid args) — ``doi`` or ``pmid`` may stand in for ``url``.
+    With no url, a doi is stored as ``https://doi.org/<doi>`` and a pmid as its
+    PubMed URL, so the same paper captured by DOI and by publisher URL dedupes.
+    An explicit url still takes precedence over doi and pmid. An http or https url
+    (scheme optional) whose host is doi.org or dx.doi.org is read as a DOI, held to the
+    doi rules and stored as ``https://doi.org/<doi>``; any other url, including one with
+    another scheme such as ftp://, is stored as given. A refused DOI returns the doi
+    error with its reason, and a refused doi.org url returns the url error with its
+    reason. With none of the three the existing error text is returned.
     """
     validate_input_size(args.get("summary"), "finding summary", 1_000_000)
     validate_input_size(args.get("url"), "url", 2_000)
-    _url = (args.get("url") or "").strip()
-    if not _url:
+    validate_input_size(args.get("doi"), "doi", 2_000)
+    _source, _err = _capture_source_url(args)
+    if _err is not None:
+        return {"error": _err}
+    if _source is None:
         return {"error": "capture_research_finding requires a url"}
     if not (args.get("summary") or "").strip():
         return {"error": "capture_research_finding requires a non-empty summary"}
-    _st = "arxiv" if "arxiv.org" in _url.lower() else "web"
+    _st = _capture_source_type(_source)
     try:
         return await db_module.save_finding(
             db, args["project_id"], args.get("summary") or "",
-            source_url=_url, source_type=_st,
+            source_url=_source, source_type=_st,
             decision_id=args.get("related_decision_id"),
             force_new=_flag(args.get("force_new")),
         )

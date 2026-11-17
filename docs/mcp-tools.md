@@ -1,6 +1,6 @@
 # MCP Tool Reference
 
-Meridian exposes **245 tools** over MCP.
+Meridian exposes **263 tools** over MCP.
 
 They fall into two usage patterns:
 
@@ -778,10 +778,157 @@ read_note(project_id="abc-123", slug="deploy-note")
 
 ---
 
+## Compute
+
+### `runpod_check_key`
+[SUPPORT] RunPod key check. Resolves a RunPod API key on this machine and confirms it works with two read-only calls to the RunPod API: one billing call and one pod listing. Returns ok, credential_source (the source kind only: env, keyring or runpodctl), pod_count (pods on the first page, up to 1000), billing_available and error. The key itself is never returned, logged or echoed. Omit credential_ref to try env:RUNPOD_API_KEY, then keyring:meridian-desktop/runpod-api-key, then runpodctl:default. Pass credential_ref to use one reference only; store a reference, never the key. Local only: refused on hosted Meridian.
+
+| Parameter | Type | Required | Description |
+|-----------|------|----------|-------------|
+| `credential_ref` | string | optional | Optional credential reference: env:NAME, keyring:SERVICE/ACCOUNT or runpodctl:default. Give a reference, never the key itself; a raw key is rejected without being echoed. |
+
+**Example:**
+```
+runpod_check_key(credential_ref="env:RUNPOD_API_KEY")
+```
+
+---
+
+
+### `runpod_list_pods`
+[SUPPORT] RunPod pod list. Resolves a RunPod API key on this machine (the same sources as runpod_check_key) and lists one page (up to 1000) of the account's pods as summaries. Each summary has these keys, all always present, with null for a value RunPod does not supply: id (Pod.id); name (Pod.name); status (Pod.status: PROVISIONING, STARTING, RUNNING, EXITED, ERROR or TERMINATED); gpu (Pod.gpu as {id, count}, or null for a CPU pod); costPerHour (Pod.cost, the current cost in USD per hour, 0 when EXITED or TERMINATED); uptimeSeconds (Pod.runtime.uptime, seconds since the container started, null unless the pod is RUNNING). Cluster member pods are not listed: RunPod's includeClusterPods parameter defaults to false and this client never sends it. has_more_pods is true when more pods exist. Raw pod payloads are never returned, so pod environment variables are not exposed. Reads only: it does not create, stop or terminate a pod. Local only: refused on hosted Meridian.
+
+| Parameter | Type | Required | Description |
+|-----------|------|----------|-------------|
+| `credential_ref` | string | optional | Optional credential reference: env:NAME, keyring:SERVICE/ACCOUNT or runpodctl:default. Give a reference, never the key itself; a raw key is rejected without being echoed. |
+
+**Example:**
+```
+runpod_list_pods(credential_ref="keyring:meridian-desktop/runpod-api-key")
+```
+
+---
+
+## Zotero bridge (local only)
+
+### `zotero_create_collection`
+[MAINTENANCE] Creates a collection named `name` in the local Zotero library, under `parent_key` when it is given and at the top level when it is not. Returns the new collection key. Writes to the Zotero library on this machine only, through the Zotero Bridge plugin. Writes need only the bridge token: no Zotero prompt appears. Local only: refused on hosted Meridian. Persistent-state disclosure: on hosted Meridian, supplied text and project/session metadata -- including task log entries, pinned decisions, sprint items, notes, handoff/goal state, and HITL queue items -- are sent to and stored in Meridian's service, in an isolated per-tenant Postgres database (Neon); self-hosted deployments keep the same categories in the configured local SQLite/Postgres database. This data is visible in the dashboard and API, and may resurface in later project context or handoffs. Notes and pinned decisions can be deleted individually; task log entries and sprint items can be deleted via the dashboard/API (not exposed as an agent-facing tool); HITL queue items and handoff state have no per-record delete. Full removal of any of this data is available via project or account deletion, using the documented controls. Do not include secrets.
+
+| Parameter | Type | Required | Description |
+|-----------|------|----------|-------------|
+| `name` | string | required | Name of the new collection. Must not be blank. |
+| `parent_key` | string | optional | Optional. The 8-character key of the collection to create this one under. Omit it to create the collection at the top level. |
+
+**Example:**
+```
+zotero_create_collection(name="Reading list", parent_key="ABCD1234")
+```
+
+---
+
+
+### `zotero_move_collection`
+[MAINTENANCE] Moves the collection `key` under `parent_key`. Omit `parent_key` or pass null to move it to the top level. Writes to the Zotero library on this machine only, through the Zotero Bridge plugin. Writes need only the bridge token: no Zotero prompt appears. Local only: refused on hosted Meridian. Persistent-state disclosure: on hosted Meridian, supplied text and project/session metadata -- including task log entries, pinned decisions, sprint items, notes, handoff/goal state, and HITL queue items -- are sent to and stored in Meridian's service, in an isolated per-tenant Postgres database (Neon); self-hosted deployments keep the same categories in the configured local SQLite/Postgres database. This data is visible in the dashboard and API, and may resurface in later project context or handoffs. Notes and pinned decisions can be deleted individually; task log entries and sprint items can be deleted via the dashboard/API (not exposed as an agent-facing tool); HITL queue items and handoff state have no per-record delete. Full removal of any of this data is available via project or account deletion, using the documented controls. Do not include secrets.
+
+| Parameter | Type | Required | Description |
+|-----------|------|----------|-------------|
+| `key` | string | required | The 8-character key of the collection to move. |
+| `parent_key` | ['string', 'null'] | optional | Optional. The 8-character key of the new parent collection. Omit it or pass null to move the collection to the top level. |
+
+**Example:**
+```
+zotero_move_collection(key="ABCD1234", parent_key=null)
+```
+
+---
+
+
+### `zotero_move_item`
+[MAINTENANCE] Adds a Zotero item to the collections in `add_collections` and removes it from the collections in `remove_collections`. Give at least one collection in either list. A collection cannot be in both lists. Writes to the Zotero library on this machine only, through the Zotero Bridge plugin. Writes need only the bridge token: no Zotero prompt appears. Local only: refused on hosted Meridian. Persistent-state disclosure: on hosted Meridian, supplied text and project/session metadata -- including task log entries, pinned decisions, sprint items, notes, handoff/goal state, and HITL queue items -- are sent to and stored in Meridian's service, in an isolated per-tenant Postgres database (Neon); self-hosted deployments keep the same categories in the configured local SQLite/Postgres database. This data is visible in the dashboard and API, and may resurface in later project context or handoffs. Notes and pinned decisions can be deleted individually; task log entries and sprint items can be deleted via the dashboard/API (not exposed as an agent-facing tool); HITL queue items and handoff state have no per-record delete. Full removal of any of this data is available via project or account deletion, using the documented controls. Do not include secrets.
+
+| Parameter | Type | Required | Description |
+|-----------|------|----------|-------------|
+| `item_key` | string | required | The 8-character key of the item to move. |
+| `add_collections` | array | optional | Optional. Keys of the collections to add the item to. |
+| `remove_collections` | array | optional | Optional. Keys of the collections to remove the item from. |
+
+**Example:**
+```
+zotero_move_item(item_key="WXYZ5678", add_collections=["ABCD1234"], remove_collections=["EFGH5678"])
+```
+
+---
+
+
+### `zotero_create_webpage`
+[MAINTENANCE] Creates a webpage item in the local Zotero library with the given title and absolute http or https URL. With `collection_keys`, the item is added to those collections. Returns the new item key. Writes to the Zotero library on this machine only, through the Zotero Bridge plugin. Writes need only the bridge token: no Zotero prompt appears. Local only: refused on hosted Meridian. Persistent-state disclosure: on hosted Meridian, supplied text and project/session metadata -- including task log entries, pinned decisions, sprint items, notes, handoff/goal state, and HITL queue items -- are sent to and stored in Meridian's service, in an isolated per-tenant Postgres database (Neon); self-hosted deployments keep the same categories in the configured local SQLite/Postgres database. This data is visible in the dashboard and API, and may resurface in later project context or handoffs. Notes and pinned decisions can be deleted individually; task log entries and sprint items can be deleted via the dashboard/API (not exposed as an agent-facing tool); HITL queue items and handoff state have no per-record delete. Full removal of any of this data is available via project or account deletion, using the documented controls. Do not include secrets.
+
+| Parameter | Type | Required | Description |
+|-----------|------|----------|-------------|
+| `title` | string | required | Title of the webpage item. Must not be blank. |
+| `url` | string | required | Absolute http or https URL of the page. It must not contain spaces. |
+| `collection_keys` | array | optional | Optional. Keys of the collections to add the item to. |
+
+**Example:**
+```
+zotero_create_webpage(title="Pricing page", url="https://example.com/pricing", collection_keys=["ABCD1234"])
+```
+
+---
+
+
+### `zotero_attach_pdf`
+[MAINTENANCE] Attaches the PDF at `path` to the Zotero item `item_key` as a child attachment. `path` must be an absolute path to a file that starts with %PDF-. Files of 24 MiB or less are imported into Zotero. Larger files are linked by path, and the bridge decides whether it may link them. Returns status already_attached, with nothing written, when the item already has a PDF attachment. Writes to the Zotero library on this machine only, through the Zotero Bridge plugin. Writes need only the bridge token: no Zotero prompt appears. Local only: refused on hosted Meridian. Persistent-state disclosure: on hosted Meridian, supplied text and project/session metadata -- including task log entries, pinned decisions, sprint items, notes, handoff/goal state, and HITL queue items -- are sent to and stored in Meridian's service, in an isolated per-tenant Postgres database (Neon); self-hosted deployments keep the same categories in the configured local SQLite/Postgres database. This data is visible in the dashboard and API, and may resurface in later project context or handoffs. Notes and pinned decisions can be deleted individually; task log entries and sprint items can be deleted via the dashboard/API (not exposed as an agent-facing tool); HITL queue items and handoff state have no per-record delete. Full removal of any of this data is available via project or account deletion, using the documented controls. Do not include secrets.
+
+| Parameter | Type | Required | Description |
+|-----------|------|----------|-------------|
+| `item_key` | string | required | The 8-character key of the parent item. |
+| `path` | string | required | Absolute path to the PDF file on this machine. |
+| `title` | string | optional | Optional title for the attachment. |
+
+**Example:**
+```
+zotero_attach_pdf(item_key="WXYZ5678", path="C:/papers/smith2025.pdf", title="Full text")
+```
+
+---
+
+
+### `zotero_add_child_note`
+[MAINTENANCE] Adds a child note holding `html` to the Zotero item `parent_key`. The note carries `dedup_marker`, which must be 8 to 128 letters, digits, dots, underscores or hyphens. If a child note of that item already carries the marker, nothing is written and the result is status already_present. Writes to the Zotero library on this machine only, through the Zotero Bridge plugin. Writes need only the bridge token: no Zotero prompt appears. Local only: refused on hosted Meridian. Persistent-state disclosure: on hosted Meridian, supplied text and project/session metadata -- including task log entries, pinned decisions, sprint items, notes, handoff/goal state, and HITL queue items -- are sent to and stored in Meridian's service, in an isolated per-tenant Postgres database (Neon); self-hosted deployments keep the same categories in the configured local SQLite/Postgres database. This data is visible in the dashboard and API, and may resurface in later project context or handoffs. Notes and pinned decisions can be deleted individually; task log entries and sprint items can be deleted via the dashboard/API (not exposed as an agent-facing tool); HITL queue items and handoff state have no per-record delete. Full removal of any of this data is available via project or account deletion, using the documented controls. Do not include secrets.
+
+| Parameter | Type | Required | Description |
+|-----------|------|----------|-------------|
+| `parent_key` | string | required | The 8-character key of the parent item. |
+| `html` | string | required | HTML content of the note. |
+| `dedup_marker` | string | required | Marker stored in the note, used to detect an existing copy. 8 to 128 letters, digits, dots, underscores or hyphens. |
+
+**Example:**
+```
+zotero_add_child_note(parent_key="WXYZ5678", html="<p>Summary</p>", dedup_marker="meridian-summary-v1")
+```
+
+---
+
+
+### `zotero_batch`
+[MAINTENANCE] Runs 1 to 200 Zotero bridge write operations in one bridge transaction. Each operation is an object with `method`, `path` and an optional object `body`. Only these routes can be batched: POST /v1/items; PATCH /v1/items/<key>; POST /v1/items/<key>/trash and /restore; POST /v1/items/<key>/notes; PATCH /v1/notes/<key>; POST and DELETE /v1/items/<key>/relations; POST /v1/collections; PATCH /v1/collections/<key>; POST /v1/collections/<key>/trash and /restore; POST and DELETE /v1/collections/<key>/items. Every other route or method is refused before anything is sent, including grant routes, the status route, attachments, tag renames and BibTeX imports (attach a PDF with zotero_attach_pdf). All operations apply or none do. Writes to the Zotero library on this machine only, through the Zotero Bridge plugin. Writes need only the bridge token: no Zotero prompt appears. Local only: refused on hosted Meridian. Persistent-state disclosure: on hosted Meridian, supplied text and project/session metadata -- including task log entries, pinned decisions, sprint items, notes, handoff/goal state, and HITL queue items -- are sent to and stored in Meridian's service, in an isolated per-tenant Postgres database (Neon); self-hosted deployments keep the same categories in the configured local SQLite/Postgres database. This data is visible in the dashboard and API, and may resurface in later project context or handoffs. Notes and pinned decisions can be deleted individually; task log entries and sprint items can be deleted via the dashboard/API (not exposed as an agent-facing tool); HITL queue items and handoff state have no per-record delete. Full removal of any of this data is available via project or account deletion, using the documented controls. Do not include secrets.
+
+| Parameter | Type | Required | Description |
+|-----------|------|----------|-------------|
+| `operations` | array | required | The operations to run, in order. |
+
+**Example:**
+```
+zotero_batch(operations=[{"method": "PATCH", "path": "/v1/items/WXYZ5678", "body": {"add_collections": ["ABCD1234"]}}])
+```
+
+---
+
 ## Projects
 
-### `create_project`
-[MAINTENANCE] Create a new Meridian project. Persistent-state disclosure: on hosted Meridian, supplied text and project/session metadata -- including task log entries, pinned decisions, sprint items, notes, handoff/goal state, and HITL queue items -- are sent to and stored in Meridian's service, in an isolated per-tenant Postgres database (Neon); self-hosted deployments keep the same categories in the configured local SQLite/Postgres database. This data is visible in the dashboard and API, and may resurface in later project context or handoffs. Notes and pinned decisions can be deleted individually; task log entries and sprint items can be deleted via the dashboard/API (not exposed as an agent-facing tool); HITL queue items and handoff state have no per-record delete. Full removal of any of this data is available via project or account deletion, using the documented controls. Do not include secrets.
+### `meridian_project_create`
+[MAINTENANCE] Create a new Meridian project. Use `meridian_project_create` as the canonical Meridian tool name. Persistent-state disclosure: on hosted Meridian, supplied text and project/session metadata -- including task log entries, pinned decisions, sprint items, notes, handoff/goal state, and HITL queue items -- are sent to and stored in Meridian's service, in an isolated per-tenant Postgres database (Neon); self-hosted deployments keep the same categories in the configured local SQLite/Postgres database. This data is visible in the dashboard and API, and may resurface in later project context or handoffs. Notes and pinned decisions can be deleted individually; task log entries and sprint items can be deleted via the dashboard/API (not exposed as an agent-facing tool); HITL queue items and handoff state have no per-record delete. Full removal of any of this data is available via project or account deletion, using the documented controls. Do not include secrets.
 
 | Parameter | Type | Required | Description |
 |-----------|------|----------|-------------|
@@ -791,7 +938,18 @@ read_note(project_id="abc-123", slug="deploy-note")
 
 **Example:**
 ```
-create_project(name="my-app")
+meridian_project_create(name="my-app")
+```
+
+---
+
+
+### `meridian_project_list`
+[MAINTENANCE] Read-only: List all projects — find, browse, or look up your projects and their IDs. Call this first when you have a project name but need its project_id, or to discover which projects exist. Returns [{id, name, sprint, created_at}] newest first. Use `meridian_project_list` as the canonical Meridian tool name.
+
+**Example:**
+```
+meridian_project_list()
 ```
 
 ---
@@ -814,6 +972,24 @@ merge_project(source_project_id="dup-uuid", target_project_id="keep-uuid")
 ---
 
 ## Legacy
+
+### `create_project`
+[MAINTENANCE] DEPRECATED: use `meridian_project_create`. This legacy alias remains supported during the migration window. Create a new Meridian project. Persistent-state disclosure: on hosted Meridian, supplied text and project/session metadata -- including task log entries, pinned decisions, sprint items, notes, handoff/goal state, and HITL queue items -- are sent to and stored in Meridian's service, in an isolated per-tenant Postgres database (Neon); self-hosted deployments keep the same categories in the configured local SQLite/Postgres database. This data is visible in the dashboard and API, and may resurface in later project context or handoffs. Notes and pinned decisions can be deleted individually; task log entries and sprint items can be deleted via the dashboard/API (not exposed as an agent-facing tool); HITL queue items and handoff state have no per-record delete. Full removal of any of this data is available via project or account deletion, using the documented controls. Do not include secrets.
+
+| Parameter | Type | Required | Description |
+|-----------|------|----------|-------------|
+| `name` | string | required |  |
+| `execution_mode` | string | optional | Executor posture for sessions on this project. 'autonomous' (default) claims and runs sprint items immediately without asking; 'interactive' asks for direction first. Editable later in dashboard Settings. |
+| `parent_project_id` | string | optional | Optional parent project id — makes this a subproject that inherits the parent's north_star when it has none of its own. Subprojects are one level deep: the parent must exist and must not itself be a subproject. |
+
+---
+
+
+### `list_projects`
+[MAINTENANCE] DEPRECATED: use `meridian_project_list`. This legacy alias remains supported during the migration window. Read-only: List all projects — find, browse, or look up your projects and their IDs. Call this first when you have a project name but need its project_id, or to discover which projects exist. Returns [{id, name, sprint, created_at}] newest first.
+
+---
+
 
 ### `register_session`
 !!! note "Deprecated"

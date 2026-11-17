@@ -1271,6 +1271,7 @@ async def init_db(db_path: str) -> aiosqlite.Connection:
     await _migrate_code_intel(db)
     await _migrate_tunnel_plugins(db)
     await _migrate_tunnel_plugins_by_host(db)
+    await _migrate_tunnel_tool_filter(db)
     await _migrate_notes_priority(db)
     await _migrate_task_log_kind(db)
     await _migrate_note_slug(db)
@@ -1386,6 +1387,8 @@ async def init_db(db_path: str) -> aiosqlite.Connection:
     await _migrate_experiment_registry_runs(db)
     # 32d3d5de -- W1-E Durable Remote Task primitive v1.
     await _migrate_remote_tasks(db)
+    # Guidestones: named, append-only research waypoints (meridian/db/guidestones.py).
+    await _migrate_guidestones(db)
     # W1-G (G1) -- projects.repo_identity: canonical repo binding.
     await _migrate_repo_identity(db)
     # W1-K -- derivative-document (DOCX) provenance tracking.
@@ -2091,6 +2094,7 @@ _MERGE_PROJECT_TABLES: tuple[str, ...] = (
     "session_graph_snapshots",
     "sprint_item_pointers",
     "proposal_evidence_links",
+    "guidestones",
 )
 
 
@@ -3120,6 +3124,9 @@ async def _delete_project_data(
         (f"DELETE FROM codebase_graph_entities WHERE project_id IN ({placeholders})", ids_params),
         # sprint_version_descriptions: FK → projects(id) ON DELETE CASCADE.
         (f"DELETE FROM sprint_version_descriptions WHERE project_id IN ({placeholders})", ids_params),
+        # guidestones: project_id TEXT with ON DELETE CASCADE, listed explicitly so a
+        # project delete never leaves frozen research snapshots behind.
+        (f"DELETE FROM guidestones WHERE project_id IN ({placeholders})", ids_params),
         # --- project row(s) itself ---
         (f"DELETE FROM projects WHERE id IN ({placeholders})", ids_params),
     ]
@@ -4627,12 +4634,21 @@ async def get_project_owner(
     return row["creator_human_id"]
 
 
+# m4 -- every liveness bump (heartbeat, tool call, keepalive, tunnel touch) is
+# proof the session is working, so it also returns an 'idle' session to 'active'.
+# Before this, a session swept to 'idle' by expire_idle_sessions stayed 'idle'
+# after its next tool call, and the dashboard (isLiveSession needs status 'active')
+# kept rendering a live session as idle. 'closed' and 'archived' are never touched.
+_REVIVE_IDLE_STATUS_SQL = "status = CASE WHEN status = 'idle' THEN 'active' ELSE status END"
+
+
 async def update_session_seen(
     db: aiosqlite.Connection, session_id: str
 ) -> None:
-    """Bump a session's last_seen timestamp to now."""
+    """Bump a session's last_seen timestamp to now, reactivating an idle session."""
     await db.execute(
-        "UPDATE sessions SET last_seen = datetime('now') WHERE id = ?",
+        f"UPDATE sessions SET last_seen = datetime('now'), {_REVIVE_IDLE_STATUS_SQL} "
+        "WHERE id = ?",
         (session_id,),
     )
     await db.commit()
@@ -4662,25 +4678,28 @@ async def heartbeat_session(
     call ``log_task`` often enough to keep the 30 minute TTL fresh.
 
     Optimization: if ``last_seen`` is within 5 minutes (e.g. because a
-    tool call already updated it), skip the write — the session is fresh."""
+    tool call already updated it) and the session is already 'active', skip
+    the write — the session is fresh. An 'idle' session is always written, so
+    the heartbeat also returns it to 'active' (m4)."""
     from datetime import datetime, timezone
     async with db.execute(
-        "SELECT id, last_seen FROM sessions WHERE id = ? AND status != 'closed'",
+        "SELECT id, last_seen, status FROM sessions WHERE id = ? AND status != 'closed'",
         (session_id,),
     ) as cur:
         row = await cur.fetchone()
     if not row:
         return False
     last_seen = (row["last_seen"] if isinstance(row, dict) else row[1]) or ""
+    status = (row["status"] if isinstance(row, dict) else row[2]) or ""
     try:
         ls_dt = datetime.fromisoformat(last_seen.replace(" ", "T")).replace(tzinfo=timezone.utc)
         age_s = (datetime.now(timezone.utc) - ls_dt).total_seconds()
-        if age_s < 300:
-            return True  # fresh from a recent tool call — no-op
+        if age_s < 300 and status != "idle":
+            return True  # fresh from a recent tool call and already active -- no-op
     except (ValueError, AttributeError):
         pass
     cursor = await db.execute(
-        "UPDATE sessions SET last_seen = datetime('now') "
+        f"UPDATE sessions SET last_seen = datetime('now'), {_REVIVE_IDLE_STATUS_SQL} "
         "WHERE id = ? AND status != 'closed'",
         (session_id,),
     )
@@ -4696,12 +4715,13 @@ async def keepalive_sessions(
     Driven by the server's keepalive loop so a session busy on non-MCP work
     (git/bash/file ops) — and therefore making no tool calls — doesn't drift
     past the live window and get mistaken for dead by a coordinating session.
-    Closed/archived rows are skipped. Returns the number of rows refreshed."""
+    An 'idle' session in the batch is returned to 'active' (m4). Closed/archived
+    rows are skipped. Returns the number of rows refreshed."""
     if not session_ids:
         return 0
     placeholders = ", ".join("?" for _ in session_ids)
     cursor = await db.execute(
-        f"UPDATE sessions SET last_seen = datetime('now') "
+        f"UPDATE sessions SET last_seen = datetime('now'), {_REVIVE_IDLE_STATUS_SQL} "
         f"WHERE id IN ({placeholders}) AND status NOT IN ('closed', 'archived')",
         tuple(session_ids),
     )
@@ -4812,7 +4832,8 @@ async def touch_latest_active_session(
     if eligible:
         placeholders = ", ".join("?" for _ in eligible)
         await db.execute(
-            f"UPDATE sessions SET last_seen = datetime('now') WHERE id IN ({placeholders})",
+            f"UPDATE sessions SET last_seen = datetime('now'), {_REVIVE_IDLE_STATUS_SQL} "
+            f"WHERE id IN ({placeholders})",
             tuple(eligible),
         )
         await db.commit()
@@ -8539,6 +8560,7 @@ async def update_tenant(
         "overage_reset_at", "compute_throttled_at",
         "trial_started_at", "inactivity_expires_at",
         "github_pat", "tunnel_active", "tunnel_plugins", "tunnel_plugins_by_host",
+        "tunnel_tool_filter",
         "redis_commands_used", "redis_overage_cap_usd",
     }
     updates = {k: v for k, v in fields.items() if k in allowed}
@@ -15211,6 +15233,17 @@ from .paper_strategy_graph import (  # noqa: F401
     supersede_strategy_node,
     create_strategy_edge,
     get_strategy_edges_for_node,
+)
+
+# Guidestones -- named, append-only research waypoints. Imported LAST: the module
+# depends only on meridian.experiment, meridian.research_run and
+# meridian.secret_redaction at import time. See meridian/db/guidestones.py for the
+# freeze-once contract and the 32 KB state cap.
+from .guidestones import (  # noqa: F401
+    _migrate_guidestones,
+    create_guidestone,
+    list_guidestones,
+    load_guidestone,
 )
 
 # d2539453 — lint_finding: structured, version-pinned paper/manuscript audit

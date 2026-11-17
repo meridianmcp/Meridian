@@ -1,0 +1,59 @@
+name: Test platforms (non-gating)
+
+# Cross-platform signal for macOS and Windows, split out of test.yml (f4ab2787).
+# test.yml is the canonical gate and must keep every job blocking, because
+# deploy.yml's workflow_run trigger reads only the "Test (dev branch)" workflow.
+# This file has a different name, so nothing here can stop or start an
+# auto-promote. Both jobs keep continue-on-error: true on purpose. Making them
+# gating is an owner decision and is not part of this file.
+
+on:
+  push:
+    branches: [dev]
+  pull_request:
+    branches: [main]
+
+env:
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
+  PYTHONDONTWRITEBYTECODE: 1
+
+jobs:
+  test-macos:
+    runs-on: macos-15   # Apple Silicon; pinned so macos-latest cannot move under us
+    continue-on-error: true
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: prefix-dev/setup-pixi@ad1da6449d9e506fd127fd67ab2d054a769f6a94 # v0.11.2
+        with:
+          pixi-version: v0.79.0
+          cache: false
+      - run: pixi install
+      - name: Desktop (tray, local runner, macOS tray build)
+        run: pixi run python scripts/run_tests.py tests/test_tray_main.py tests/test_local_runner.py tests/test_73257801_macos_tray_build.py -q --tb=short
+      - name: Full cross-platform suite
+        if: always()
+        run: pixi run python scripts/run_tests.py tests/ -q --tb=short --ignore=tests/test_demo_ux.py --ignore=tests/test_rate_limit_serial.py
+      - name: Serial rate-limit tests
+        if: always()
+        run: pixi run python scripts/run_tests.py --serial tests/test_rate_limit_serial.py -q --tb=short
+
+  test-windows:
+    runs-on: windows-latest
+    continue-on-error: true
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: prefix-dev/setup-pixi@ad1da6449d9e506fd127fd67ab2d054a769f6a94 # v0.11.2
+        with:
+          pixi-version: v0.79.0
+          cache: false
+      - run: pixi install
+      - name: Desktop (tray, local runner, macOS tray build)
+        run: pixi run python scripts/run_tests.py tests/test_tray_main.py tests/test_local_runner.py tests/test_73257801_macos_tray_build.py -q --tb=short
+      - name: Full cross-platform suite
+        if: always()
+        run: pixi run python scripts/run_tests.py tests/ -q --tb=short --ignore=tests/test_demo_ux.py --ignore=tests/test_rate_limit_serial.py
+      - name: Serial rate-limit tests
+        if: always()
+        run: pixi run python scripts/run_tests.py --serial tests/test_rate_limit_serial.py -q --tb=short

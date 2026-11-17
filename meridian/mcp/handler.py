@@ -39,6 +39,7 @@ from . import scope_guard
 # defined next to their single use below, unchanged.
 _GITHUB_TOOL_HTTP_TIMEOUT_S = 15.0  # _dispatch_github_tool's httpx client timeout
 _TUNNEL_TOOLS_LIST_TIMEOUT_S = 5.0  # tools/list's outer bound on the tunnel-tools fetch
+_CUSTOM_TOOLS_LIST_TIMEOUT_S = 4.0  # tools/list's outer bound on the owner's custom connectors
 _GIT_DIFF_SUBPROCESS_TIMEOUT_S = 5.0  # `git diff --name-only` (staged + unstaged) in _unclaimed_file_warnings
 _GITHUB_COMMITS_FETCH_TIMEOUT_S = 8.0  # GitHub REST commits fetch in _fetch_recent_commits_uncached
 _GIT_LOG_SUBPROCESS_TIMEOUT_S = 5  # local `git log` fallback in _fetch_recent_commits_uncached
@@ -1617,6 +1618,11 @@ async def _handle_mcp_request(
         # native + GitHub names so the merged list has no duplicates.
         if tenant and tenant.get("id"):
             from ..routes import tunnel as _tunnel_mod  # noqa: PLC0415
+            # feat/mcp-tool-groups — per-tenant enable flags for tunnel connector
+            # groups and individual tools (tenants.tunnel_tool_filter). Native and
+            # GitHub tools are never filtered.
+            from .tool_groups import parse_tool_filter as _parse_tool_filter  # noqa: PLC0415
+            _tool_filter = _parse_tool_filter(tenant.get("tunnel_tool_filter"))
             if not _tunnel_mod.has_active_tunnel(tenant["id"]) and \
                     _tunnel_mod.tunnel_cross_instance_miss(tenant):
                 # a19538fe — DB says the tunnel is active but its socket is on a
@@ -1662,7 +1668,9 @@ async def _handle_mcp_request(
                                 "retry, or check the `meridian --tunnel` process."
                             ),
                         }
-                    tools = tools + tunnel_tools
+                    # The degraded checks above use the unfiltered fetch, so a
+                    # tenant who switches tools off never sees a false "0 tools".
+                    tools = tools + _tool_filter.filter_tools(tunnel_tools)
                     if not tunnel_tools and tunnel_health is None:
                         # Tunnel is up but advertised nothing (and it wasn't our new
                         # 5s outer timeout above, which already set its own specific
@@ -1694,6 +1702,30 @@ async def _handle_mcp_request(
                         ),
                         "detail": str(exc)[:200],
                     }
+        # The owner's opted-in custom connectors (custom_connectors.py). Listed only
+        # when the owner opted in and the tunnel is up, behind the same tool-group
+        # filter as the tunnel tools. A failure here never breaks native tools/list.
+        if tenant and tenant.get("id"):
+            from ..routes import tunnel as _custom_tunnel_mod  # noqa: PLC0415
+            from .tool_groups import parse_tool_filter as _parse_custom_filter  # noqa: PLC0415
+            import asyncio as _custom_asyncio  # noqa: PLC0415
+            if _custom_tunnel_mod.has_active_tunnel(tenant["id"]):
+                try:
+                    _custom_reserved = {t.get("name") for t in tools} | set(_server._GITHUB_TOOL_NAMES)
+                    _custom_tools = await _custom_asyncio.wait_for(
+                        _custom_tunnel_mod.list_custom_connector_tools(tenant["id"], _custom_reserved),
+                        timeout=_CUSTOM_TOOLS_LIST_TIMEOUT_S,
+                    )
+                    tools = tools + _parse_custom_filter(
+                        tenant.get("tunnel_tool_filter"),
+                    ).filter_tools(_custom_tools)
+                except Exception as exc:  # noqa: BLE001
+                    import sys as _custom_sys  # noqa: PLC0415
+                    print(
+                        f"tools/list: custom connector fetch failed for tenant "
+                        f"{tenant.get('id')}: {type(exc).__name__}",
+                        file=_custom_sys.stderr, flush=True,
+                    )
         from ..tool_manifest import build_tool_manifest  # noqa: PLC0415
         # A named public profile is an actual transport boundary, not merely
         # advisory role metadata.  Filter after native/GitHub/tunnel assembly
@@ -1771,6 +1803,14 @@ async def _handle_mcp_request(
                 -32601,
                 f"tool '{name}' is not available on this MCP profile",
             )
+        # feat/mcp-tool-groups — a tunnel tool the tenant has switched off (or whose
+        # group is off) is refused here, before scope checks or tunnel forwarding.
+        # Native and GitHub tools are excluded, so they can never be refused by it.
+        if tenant and name not in _meridian_tool_names() and name not in _server._GITHUB_TOOL_NAMES:
+            from .tool_groups import parse_tool_filter as _parse_tool_filter  # noqa: PLC0415
+            _disabled_reason = _parse_tool_filter(tenant.get("tunnel_tool_filter")).disabled_reason(name)
+            if _disabled_reason:
+                return _server._jsonrpc_err(req_id, -32603, _disabled_reason)
         if token_type == "readonly" and name not in _server._mcp_readonly_tools:
             return _server._jsonrpc_err(req_id, -32603, f"tool '{name}' not allowed for read-only tokens")
         # 95499c3e / decision 6fe5210c — scope and member-capability checks must
@@ -1820,6 +1860,25 @@ async def _handle_mcp_request(
                     f"workspace role '{enforce_role}' is read-only; tool '{name}' denied",
                 )
         try:
+            # The owner's opted-in custom connector tools (custom_connectors.py). Routed
+            # only for a name shaped like one that is not a native or GitHub name, so a
+            # custom tool can never shadow a native one. A disabled custom tool was
+            # already refused above by the tool-group filter.
+            from ..custom_connectors import is_custom_connector_tool_name as _is_custom_name  # noqa: PLC0415
+            if (
+                tenant and tenant.get("id")
+                and name not in _meridian_tool_names()
+                and name not in _server._GITHUB_TOOL_NAMES
+                and _is_custom_name(name)
+            ):
+                from ..routes import tunnel as _custom_call_mod  # noqa: PLC0415
+                try:
+                    _custom_result = await _custom_call_mod.call_custom_connector_tool(
+                        tenant["id"], name, args,
+                    )
+                except _custom_call_mod.CustomConnectorUnavailable as exc:
+                    return _server._jsonrpc_err(req_id, -32603, str(exc))
+                return _server._jsonrpc_ok(req_id, _custom_result)
             _is_github = bool(name in _server._GITHUB_TOOL_NAMES and tenant)
             # Single-connector bridge: a tool that is neither a native Meridian tool
             # nor a GitHub tool may belong to an active tunnel (fs/code/extractor).
@@ -3418,7 +3477,7 @@ async def _handle_project_tools(
     _mcp_tenant_id: Any,
 ) -> Any:
     """Dispatch group: create_project, set_parent_project, rename_project,
-    set_project_execution_mode, set_project_use_mode, register_session, start_session, list_projects, get_project_by_name,
+    set_project_execution_mode, set_project_use_mode, check_image_rights, register_session, start_session, list_projects, get_project_by_name,
     get_goal, set_goal, set_north_star, merge_project, add_custom_hook,
     get_custom_hooks, delete_custom_hook, get_capability_manifest,
     set_capability_manifest, set_capability_profile, clear_capability_profile,
@@ -3443,6 +3502,7 @@ async def _handle_project_tools(
         handle_rename_project,
         handle_set_project_execution_mode,
         handle_set_project_use_mode,
+        handle_check_image_rights,
         handle_register_session,
         handle_start_session,
         handle_list_projects,
@@ -3477,6 +3537,7 @@ async def _handle_project_tools(
         "rename_project": handle_rename_project,
         "set_project_execution_mode": handle_set_project_execution_mode,
         "set_project_use_mode": handle_set_project_use_mode,
+        "check_image_rights": handle_check_image_rights,
         "register_session": handle_register_session,
         "list_projects": handle_list_projects,
         "get_project_by_name": handle_get_project_by_name,
@@ -4317,6 +4378,21 @@ async def _handle_task_tools(
         # a new deterministic revision in this SAME call.
         from .. import handoff as handoff_module_local  # noqa: PLC0415
         _pid = args["project_id"]
+        # CodeQL py/path-injection: an output_dir override that cannot name a
+        # directory is refused before anything is written (correction row,
+        # ai_log event, handoff file). Containment itself is a pending decision.
+        _out_dir = None
+        if args.get("regenerate"):
+            try:
+                _out_dir = handoff_module_local.resolve_output_dir_override(
+                    args.get("output_dir"), data_dir,
+                )
+            except ValueError:
+                return {
+                    "regenerated": False,
+                    "error": "HANDOFF_OUTPUT_DIR_INVALID",
+                    "message": "output_dir must be a string path without NUL bytes",
+                }
         try:
             _correction = await handoff_module_local.record_handoff_correction(
                 db, _pid,
@@ -4359,7 +4435,6 @@ async def _handle_task_tools(
         )
         if not args.get("regenerate"):
             return {"correction": _correction, "regenerated": False}
-        _out_dir = args.get("output_dir") or data_dir
         try:
             _regen_result = await handoff_module_local.regenerate_handoff_correction(
                 db, _pid, _correction["id"], _out_dir,
@@ -5121,6 +5196,14 @@ async def _handle_hitl_tools(
         if result is None:
             raise ValueError("hitl request not found")
         return result
+    if name == "list_decisions":
+        # Open decisions only: pending questions with answer options, most urgent first.
+        from ..decisions_view import open_decisions
+
+        rows = await db_module.list_hitl_requests(
+            db, args.get("project_id"), status="pending", limit=args.get("limit", 200),
+        )
+        return open_decisions(rows)
     if name == "list_hitl_requests":
         # dcf1e428 — default 'recent' (pending + answered last 24h) so dismissed HITLs
         # don't give false "no pending HITLs" confidence to planning sessions.
@@ -5244,6 +5327,7 @@ async def _handle_session_tools(
         handle_get_session_brief,
         handle_get_project_state_milestones,
     )
+    from .handlers.prose_tools import handle_prose_check  # noqa: PLC0415
     from .handlers.research_tools import (  # noqa: PLC0415
         handle_github_search,
         # a5343387 — bounded ephemeral research runs, siblings of
@@ -5303,6 +5387,8 @@ async def _handle_session_tools(
         "social_search": handle_social_search,
         "zotero_search": handle_zotero_search,
         "github_search": handle_github_search,
+        # prose_check — local flags for a text, owner-scoped presets and rule file.
+        "prose_check": handle_prose_check,
         # a5343387 — bounded ephemeral research runs.
         "start_research_run": handle_start_research_run,
         "complete_research_run": handle_complete_research_run,
@@ -7475,6 +7561,76 @@ async def _handle_paper_contract_tools(
     return _MISS
 
 
+async def _handle_guidestone_tools(
+    name: str,
+    args: dict[str, Any],
+    db: Any,
+    data_dir: str,
+    tenant: dict[str, Any] | None,
+    _mcp_tenant_id: Any,
+) -> Any:
+    """Dispatch group: guidestones -- create_guidestone, list_guidestones and
+    load_guidestone, the impromptu research waypoints. Own module and group
+    function, matching _handle_paper_contract_tools; see
+    meridian/mcp/handlers/guidestone_tools.py and meridian/db/guidestones.py."""
+    from .handlers.guidestone_tools import (  # noqa: PLC0415
+        handle_create_guidestone,
+        handle_list_guidestones,
+        handle_load_guidestone,
+    )
+
+    _standard_dispatch: dict[str, Any] = {
+        "create_guidestone": handle_create_guidestone,
+        "list_guidestones": handle_list_guidestones,
+        "load_guidestone": handle_load_guidestone,
+    }
+    if name in _standard_dispatch:
+        return await _standard_dispatch[name](args, db, data_dir, tenant, _mcp_tenant_id)
+    return _MISS
+
+
+async def _handle_runpod_tools(
+    name: str,
+    args: dict[str, Any],
+    db: Any,
+    data_dir: str,
+    tenant: dict[str, Any] | None,
+    _mcp_tenant_id: Any,
+) -> Any:
+    """Dispatch group: runpod_check_key and runpod_list_pods, the local-only RunPod key
+    check and pod listing (meridian/mcp/handlers/runpod_tools.py). They resolve their own
+    credential and take no project, so the database, tenant and data dir are unused."""
+    from .handlers.runpod_tools import (  # noqa: PLC0415
+        handle_runpod_check_key,
+        handle_runpod_list_pods,
+    )
+
+    if name == "runpod_check_key":
+        return await handle_runpod_check_key(args)
+    if name == "runpod_list_pods":
+        return await handle_runpod_list_pods(args)
+    return _MISS
+
+
+async def _handle_zotero_bridge_tools(
+    name: str,
+    args: dict[str, Any],
+    db: Any,
+    data_dir: str,
+    tenant: dict[str, Any] | None,
+    _mcp_tenant_id: Any,
+) -> Any:
+    """Dispatch group: the seven local-only Zotero bridge write tools (meridian/mcp/handlers/zotero_bridge_tools.py).
+    They write to the caller's own Zotero library through the bridge and take no project, so the database, tenant and
+    data dir are unused. Hosted Meridian refuses them inside the handlers."""
+    from .handlers.zotero_bridge_tools import ZOTERO_BRIDGE_HANDLERS  # noqa: PLC0415
+
+    handler = ZOTERO_BRIDGE_HANDLERS.get(name)
+    if handler is None:
+        return _MISS
+    return await handler(args)
+
+
 # a2a027cf — bounded dispatch-level budget for complete_sprint_item,
 # comfortably under the ~60s client-side timeouts observed in the field
 # (HTTP, stdio, and connector/mcp-remote transports all funnel through this
@@ -7875,6 +8031,9 @@ async def _dispatch_mcp_tool(
         _handle_experiment_tools,
         _handle_docx_derivative_tools,
         _handle_paper_contract_tools,
+        _handle_guidestone_tools,
+        _handle_runpod_tools,
+        _handle_zotero_bridge_tools,
     )
     # a2a027cf — complete_sprint_item timeout-safety at the dispatch layer.
     # Repeated live reports: an MCP client (HTTP/stdio/connector — this

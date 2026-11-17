@@ -653,7 +653,9 @@ def _sg_run_sh(payload: str, *, meridian_url: str) -> subprocess.CompletedProces
         input=payload.encode("utf-8"),
         cwd=str(_SG_REPO),
         capture_output=True,
-        timeout=30,
+        # A cold Git Bash start on a loaded Windows machine takes 15-20 s, so 30 s was too tight. The hook's own curl
+        # calls are bounded to 1-5 s, so a real hang still stops here.
+        timeout=90,
     )
     return subprocess.CompletedProcess(
         r.args, r.returncode,

@@ -3154,16 +3154,18 @@ def test_run_tunnel_code_and_extract_popen_raise_are_warned(monkeypatch, tmp_pat
 
 def test_tunnel_mcp_entries_includes_custom_local_proxies():
     """Custom plugins get a LOCAL http://127.0.0.1:<port>/mcp connector entry,
-    alongside the three built-in relay entries (which keep the hosted URL)."""
+    alongside the single hosted 'meridian' entry (Task 1: no per-slot relay entries)."""
     entries = tc._tunnel_mcp_entries(
         "https://usemeridian.us", "tid-x",
         custom=[{"name": "fetch", "port": 8901}, {"name": "git", "port": 8902}],
     )
-    # Built-ins still point at the hosted relay (ef162c28 — new plugin-derived key).
-    assert entries["filesystem"]["url"].startswith("https://usemeridian.us/fs/mcp/")
+    # The hosted entry points at /mcp, which aggregates the built-in slot tools.
+    assert entries["meridian"] == {"type": "http", "url": "https://usemeridian.us/mcp"}
+    assert "filesystem" not in entries
     # Custom ones point at the local proxy, NOT the hosted server.
     assert entries["meridian-custom-fetch"] == {"type": "http", "url": "http://127.0.0.1:8901/mcp"}
     assert entries["meridian-custom-git"] == {"type": "http", "url": "http://127.0.0.1:8902/mcp"}
+
 
 
 def test_run_tunnel_spawns_custom_plugin_locally_and_writes_mcp_json(monkeypatch, tmp_path):

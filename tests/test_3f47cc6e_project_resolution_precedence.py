@@ -363,14 +363,10 @@ def test_get_project_by_name_tool_descriptions_do_not_promise_substring_match():
     stdio_src = (REPO_ROOT / "meridian" / "mcp" / "stdio_handler.py").read_text(
         encoding="utf-8"
     )
-    # The stdio Tool(name="get_project_by_name") declaration and its `name`
-    # parameter text no longer advertise substring matching.
-    start = stdio_src.index('name="get_project_by_name"')
-    block = stdio_src[start:start + 1200]
-    assert "case-insensitive substring" not in block
-    assert "Full or partial" not in block
-    assert "not a substring search" in block
-    assert "no partial" in block
+    # #3 — the stdio server takes this tool from the shared registry, so the description it serves is the one
+    # asserted above. The stdio source must not carry a hand-written copy that could drift.
+    assert '_shared_tool("get_project_by_name")' in stdio_src
+    assert 'name="get_project_by_name"' not in stdio_src
 
 
 # ---------------------------------------------------------------------------

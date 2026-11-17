@@ -14,6 +14,8 @@ Covers:
 """
 from __future__ import annotations
 
+from pathlib import Path
+
 import pytest
 
 from meridian import tool_routing as tr
@@ -564,3 +566,38 @@ def test_authorize_mutation_tool_in_inventory_authorized():
 def test_authorize_mutation_never_checks_inventory_when_omitted():
     ok, reason = tr.authorize_mutation(_decision(tool="anything"), tool_inventory=None)
     assert ok is True
+
+
+# ---------------------------------------------------------------------------
+# Part 6 — the checked-in .meridian/tool-routing.toml (owner rules, 2026-11-02)
+# ---------------------------------------------------------------------------
+
+_REPO_ROUTING_TOML = Path(__file__).resolve().parents[1] / ".meridian" / "tool-routing.toml"
+
+
+def test_checked_in_routing_toml_loads_and_validates():
+    cfg = tr.load_routing_config(_REPO_ROUTING_TOML)
+    # None would mean the file is absent, e.g. git-ignored and never committed.
+    assert cfg is not None
+    ids = [r["id"] for r in cfg["rules"]]
+    assert "neon-database" in ids
+    # The code-read rule is disabled (commented out) until the owner picks a tool.
+    assert "code-reads" not in ids
+
+
+def test_checked_in_routing_toml_neon_rule_answers_database_questions():
+    cfg = tr.load_routing_config(_REPO_ROUTING_TOML)
+    decision = tr.route("how many rows does the Postgres table have?", routing_config=cfg)
+    assert decision.stage == "explicit_rule"
+    assert decision.tool == "neon"
+    assert decision.reason == "explicit_rule_match:neon-database"
+
+
+def test_checked_in_routing_toml_does_not_capture_docx_or_code_requests():
+    cfg = tr.load_routing_config(_REPO_ROUTING_TOML)
+    docx = tr.route("insert a figure into the thesis docx", routing_config=cfg)
+    assert docx.stage == "category_match"
+    assert "docx" in docx.category
+    code = tr.route("search the codebase for the symbol", routing_config=cfg)
+    assert code.stage == "category_match"
+    assert "code-intel" in code.category

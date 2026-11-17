@@ -3,7 +3,37 @@
 from __future__ import annotations
 
 import re
+from copy import deepcopy
 from typing import Any
+
+
+# Public MCP names that are unambiguous in multi-server clients. Keep the
+# legacy names as deprecated aliases during the migration window; the call
+# transports normalize canonical names back to the existing internal routes.
+NATIVE_CANONICAL_TOOL_NAMES: dict[str, str] = {
+    "create_project": "meridian_project_create",
+    "list_projects": "meridian_project_list",
+}
+GITHUB_CANONICAL_TOOL_NAMES: dict[str, str] = {
+    "search_code": "meridian_github_search_code",
+    "get_commit": "meridian_github_get_commit",
+    "search_commits": "meridian_github_search_commits",
+    "list_branches": "meridian_github_list_branches",
+    "list_issues": "meridian_github_list_issues",
+    "create_issue": "meridian_github_create_issue",
+}
+PUBLIC_TOOL_NAME_TO_INTERNAL: dict[str, str] = {
+    canonical: legacy
+    for names in (NATIVE_CANONICAL_TOOL_NAMES, GITHUB_CANONICAL_TOOL_NAMES)
+    for legacy, canonical in names.items()
+}
+
+
+def normalize_public_tool_name(name: str) -> str:
+    """Normalize the accepted server prefix and public alias to an internal name."""
+    if name.startswith("meridian."):
+        name = name.removeprefix("meridian.")
+    return PUBLIC_TOOL_NAME_TO_INTERNAL.get(name, name)
 
 
 _TOOL_EXAMPLES: dict[str, str] = {
@@ -12,6 +42,7 @@ _TOOL_EXAMPLES: dict[str, str] = {
     "rename_project": 'rename_project(project_name="old-name", new_name="new-name")',
     "set_project_execution_mode": 'set_project_execution_mode(project_name="my-project", execution_mode="autonomous")',
     "set_project_use_mode": 'set_project_use_mode(project_name="my-project", use_mode="standard_publication")',
+    "check_image_rights": 'check_image_rights(project_name="my-project", license="CC BY-NC 4.0")',
     "merge_project": 'merge_project(source_project_id="dup-uuid", target_project_id="keep-uuid")',
     "start_session": 'start_session(project_name="my-project", session_name="feature-x", human_id="alice", role="executor")',
     "register_session": 'register_session(project_id="abc-123", session_name="feature-x", human_id="alice")',
@@ -44,6 +75,18 @@ _TOOL_EXAMPLES: dict[str, str] = {
     "start_remote_task": 'start_remote_task(project_id="abc-123", session_id="session-uuid", host="gpu-pod-1", command="python train.py")',
     "get_remote_task_status": 'get_remote_task_status(project_id="abc-123", job_id="job-uuid")',
     "list_remote_tasks": 'list_remote_tasks(project_id="abc-123")',
+    "create_guidestone": 'create_guidestone(project_id="abc-123", name="after watchlist sweep", question="Which sources support claim X?")',
+    "list_guidestones": 'list_guidestones(project_id="abc-123")',
+    "load_guidestone": 'load_guidestone(project_id="abc-123")',
+    "runpod_check_key": 'runpod_check_key(credential_ref="env:RUNPOD_API_KEY")',
+    "runpod_list_pods": 'runpod_list_pods(credential_ref="keyring:meridian-desktop/runpod-api-key")',
+    "zotero_create_collection": 'zotero_create_collection(name="Reading list", parent_key="ABCD1234")',
+    "zotero_move_collection": 'zotero_move_collection(key="ABCD1234", parent_key=null)',
+    "zotero_move_item": 'zotero_move_item(item_key="WXYZ5678", add_collections=["ABCD1234"], remove_collections=["EFGH5678"])',
+    "zotero_create_webpage": 'zotero_create_webpage(title="Pricing page", url="https://example.com/pricing", collection_keys=["ABCD1234"])',
+    "zotero_attach_pdf": 'zotero_attach_pdf(item_key="WXYZ5678", path="C:/papers/smith2025.pdf", title="Full text")',
+    "zotero_add_child_note": 'zotero_add_child_note(parent_key="WXYZ5678", html="<p>Summary</p>", dedup_marker="meridian-summary-v1")',
+    "zotero_batch": 'zotero_batch(operations=[{"method": "PATCH", "path": "/v1/items/WXYZ5678", "body": {"add_collections": ["ABCD1234"]}}])',
     "register_session_recovery": 'register_session_recovery(project_id="abc-123", session_id="session-uuid", transport="remote_control", client_type="claude-code", local_identity={"local_session_id": "conv-1", "environment_id": "env-9"})',
     "list_resumable_sessions": 'list_resumable_sessions(project_id="abc-123")',
     "get_session_recovery": 'get_session_recovery(project_id="abc-123", session_id="session-uuid")',
@@ -361,6 +404,22 @@ _MCP_TOOLS_LIST: list[dict[str, Any]] = [
          "use_mode": {"type": "string", "enum": ["standard_publication", "commercialized"], "description": "The new use mode."},
          "reason": {"type": "string", "description": "Optional reason recorded in the audit row."}},
          "required": ["use_mode"]}},
+    {"name": "check_image_rights", "description":
+        "Read-only preview of the image-storage rights policy for ONE source image in a "
+        "project. Pass the source's license (a canonical id such as 'cc-by-nc', a license "
+        "string, or a creativecommons.org URL), and whether the stored figure is a derivative "
+        "of the source (derived) or a redrawn or cropped copy (redrawn). Returns the tier "
+        "(STORE_IMAGE, STORE_UNMODIFIED or LINK_ONLY), the flags (for example requires_credit "
+        "and needs_review), the project's use mode, and override_required: true when image "
+        "bytes would be refused without a human-approved override. A missing or unknown "
+        "license is LINK_ONLY. This tool grants nothing: it writes no row, no audit entry and "
+        "no approval request. Returns {error} for an unknown project.",
+     "inputSchema": {"type": "object", "properties": {
+         "project_id": {"type": "string"},
+         "project_name": {"type": "string", "description": "Project name — an alternative to project_id; resolved to the id internally. project_id wins if both are given."},
+         "license": {"type": "string", "description": "The source's license: a canonical id, a license string, or a creativecommons.org URL. Omit or leave blank when unknown; that is treated as LINK_ONLY."},
+         "derived": {"type": "boolean", "description": "True when the stored figure is a derivative of the source image."},
+         "redrawn": {"type": "boolean", "description": "True when the derivative is a redrawn or cropped copy of the source image."}}}},
     {"name": "merge_project", "description":
         "d6bd60e0 — merge a phantom-duplicate project INTO another. Re-parents EVERY "
         "child row of the source project (sprint items, tasks, decisions, insights, "
@@ -1080,11 +1139,14 @@ _MCP_TOOLS_LIST: list[dict[str, Any]] = [
         "32d3d5de — Launch a long-running job on a remote host (e.g. a rented GPU "
         "pod) over a short-lived SSH connection used ONLY to start it, never held "
         "open: the command runs fully detached (nohup+setsid), so it survives the "
-        "launching connection dropping for any reason. Returns quickly (a few "
-        "hundred ms) with a job_id regardless of how long the underlying job "
-        "takes — poll get_remote_task_status separately to check on it. Do not "
-        "include credentials in command; use env vars already set on the remote "
-        "host instead.",
+        "launching connection dropping for any reason. A launch that starts returns "
+        "within seconds with a job_id, regardless of how long the underlying job "
+        "takes — poll get_remote_task_status separately to check on it. A launch "
+        "that cannot confirm within about 15 seconds is recorded as status "
+        "launch_unconfirmed and may still be running on the host: confirm "
+        "it with get_remote_task_status before relaunching, because relaunching "
+        "can start a second, possibly paid, job. Do not include credentials in "
+        "command; use env vars already set on the remote host instead.",
      "inputSchema": {"type": "object", "properties": {
          "project_id": {"type": "string"},
          "project_name": {"type": "string", "description": "Project name — an alternative to project_id; resolved to the id internally. project_id wins if both are given."},
@@ -1100,8 +1162,13 @@ _MCP_TOOLS_LIST: list[dict[str, Any]] = [
         "code), still running (PID alive), terminated-unexpectedly (PID gone, no "
         "exit code — often OOM-kill or a host reset), connection-lost-but-"
         "possibly-still-running (the SSH connection itself could not be "
-        "established, explicitly distinct from a failure), or unknown. Includes "
-        "a bounded log tail and elapsed time.",
+        "established, explicitly distinct from a failure), or unknown. A "
+        "successful status check (one that connects to the host) re-checks the row, "
+        "including a launch_unconfirmed one, and replaces its status with the one "
+        "observed there, except that an observed unknown never replaces an already-terminal "
+        "status. A check that connects but finds no pid file (NOPID) returns unknown and cannot "
+        "tell 'never started' from 'started, pid not yet written', so do not relaunch on unknown "
+        "alone. Includes a bounded log tail and elapsed time.",
      "inputSchema": {"type": "object", "properties": {
          "project_id": {"type": "string"},
          "project_name": {"type": "string", "description": "Project name — an alternative to project_id; resolved to the id internally. project_id wins if both are given."},
@@ -2471,20 +2538,24 @@ _MCP_TOOLS_LIST: list[dict[str, Any]] = [
         "Inline capture for web/paper research during planning: save a finding "
         "from a URL as an addressable note with the source link, optionally linked "
         "to a decision. A research-shaped wrapper over save_finding — arXiv URLs "
-        "are tagged source_type=arxiv automatically, everything else as web. Turns "
+        "and arXiv-issued DOIs are tagged source_type=arxiv automatically; "
+        "everything else as web. Turns "
         "web-search results into durable Meridian artifacts instead of evaporating. "
         "In-project dedupe: if this project already has a finding for the same "
         "paper/page (case-folded DOI, arXiv id without version, PMID, or "
         "normalised URL) nothing is created and the result carries "
         "existing_note_id (a soft result, not an error); pass force_new=true to "
-        "save a separate copy.",
+        "save a separate copy. Identify the paper by url, or by doi / pmid when "
+        "no url is available (a doi is stored as its https doi.org form).",
      "inputSchema": {"type": "object", "properties": {
          "project_id": {"type": "string"}, "project_name": {"type": "string", "description": "Project name — an alternative to project_id; resolved to the id internally. project_id wins if both are given."},
-         "url": {"type": "string", "description": "Source URL of the web page or paper."},
+         "url": {"type": "string", "description": "Source URL of the web page or paper. A doi.org or dx.doi.org url (http, https or no scheme) is read as a DOI: it is refused if the DOI is not in the allowed form (for example one with a query string, fragment, percent escape, dot path segment or non-ASCII character), and it is stored as https://doi.org/<doi>. Takes precedence over doi and pmid when several are given."},
+         "doi": {"type": "string", "description": "DOI of the paper (e.g. 10.1145/3292500.3330701, or doi:/doi.org form). Used as the source, stored as https://doi.org/<doi>, when no url is given."},
+         "pmid": {"type": "string", "description": "PubMed id of the paper. Used as the source, stored as its PubMed URL, when neither url nor doi is given."},
          "summary": {"type": "string", "description": "Your summary of the finding (markdown)."},
          "related_decision_id": {"type": "string", "description": "Optional pinned-decision id to link the finding to."},
          "force_new": {"type": "boolean", "description": "Default false. true skips the in-project duplicate check and always creates a new finding note."}},
-         "required": ["url", "summary"]}},
+         "required": ["summary"]}},
     {"name": "get_notes", "description":
         "Read-only: List project notes (newest first), LIGHTWEIGHT by default — "
         "each item is id/slug/title/tags/kind/priority/timestamps with NO body, "
@@ -2922,6 +2993,15 @@ _MCP_TOOLS_LIST: list[dict[str, Any]] = [
          "status": {"type": "string",
                     "description": "Filter: omit for pending+recent-answered (default), 'pending', 'answered', 'dismissed', or 'all'."},
          "limit": {"type": "integer", "description": "Max results, default 50."}},
+         "required": []}},
+    {"name": "list_decisions", "description":
+        "Read-only: list open human decisions for a project: pending HITL questions that carry "
+        "answer options. Each entry has its numbered options, the recommended option, the urgency, "
+        "and whether a human must answer (require_human). Answer one with answer_hitl.",
+     "inputSchema": {"type": "object", "properties": {
+         "project_id": {"type": "string"},
+         "project_name": {"type": "string", "description": "Project name — an alternative to project_id; resolved to the id internally. project_id wins if both are given."},
+         "limit": {"type": "integer", "description": "Max decisions, default 200."}},
          "required": []}},
     {"name": "answer_hitl", "description":
         "Answer a pending HITL request programmatically. Marks it answered so "
@@ -3801,6 +3881,43 @@ _MCP_TOOLS_LIST: list[dict[str, Any]] = [
          "include_terminal": {"type": "boolean"},
          "status": {"type": "string", "enum": ["active", "completed", "failed", "abandoned", "expired"]},
          "limit": {"type": "integer", "minimum": 1, "maximum": 500}},
+         "required": []}},
+    {"name": "create_guidestone", "description":
+        "Freeze a project's current research state into a named, append-only guidestone: "
+        "an impromptu milestone a cold session can resume from. Gathers the findings captured "
+        "so far (newest first) with their sources, the pinned decisions they cite, open scratch "
+        "and experiment runs, and open sprint items, then returns guidestone_id to keep. "
+        "Project-scoped: findings from every session in the project are included. Writes only "
+        "the guidestones table; never touches handoffs, pending_goal, /goal tokens or repo files. "
+        "The copies persist until the project is deleted: there is no per-snapshot delete, so do not "
+        "put anything in a snapshot that must later be removable on its own.",
+     "inputSchema": {"type": "object", "properties": {
+         "project_id": {"type": "string"},
+         "project_name": {"type": "string", "description": "Project name — an alternative to project_id; resolved to the id internally. project_id wins if both are given."},
+         "name": {"type": "string", "maxLength": 200, "description": "Short label. Defaults to a UTC timestamp. Duplicates are allowed; the id is the handle."},
+         "question": {"type": "string", "maxLength": 500, "description": "The research question in your own words. Strongly recommended: a cold session cannot resume without it."},
+         "session_id": {"type": "string", "description": "Optional session taking the snapshot. Must belong to the project."},
+         "experiment_id": {"type": "string", "description": "Optional experiment in this project. Adds its name, status and hypothesis."},
+         "open_threads": {"type": "array", "items": {"type": "string"}, "maxItems": 50, "description": "Open threads the next session should see, as plain text."},
+         "next_steps": {"type": "array", "items": {"type": "string"}, "maxItems": 50, "description": "Next steps, as plain text. Open sprint items are added automatically."},
+         "findings_limit": {"type": "integer", "minimum": 1, "maximum": 200, "description": "How many of the newest findings to consider (default 50). The oldest are dropped first if the state would exceed 32 KB."}},
+         "required": []}},
+    {"name": "list_guidestones", "description":
+        "List a project's guidestones, newest first: guidestone_id, name, question, created_at "
+        "and counts. Omits the saved state. Read-only.",
+     "inputSchema": {"type": "object", "properties": {
+         "project_id": {"type": "string"},
+         "project_name": {"type": "string", "description": "Project name — an alternative to project_id; resolved to the id internally. project_id wins if both are given."},
+         "limit": {"type": "integer", "minimum": 1, "maximum": 100}},
+         "required": []}},
+    {"name": "load_guidestone", "description":
+        "Load one guidestone as frozen data: the saved state plus a bounded resume_markdown block. "
+        "Omit guidestone_id to load the newest. Read-only. Everything returned is a snapshot from "
+        "when it was saved, never live state, and is marked untrusted.",
+     "inputSchema": {"type": "object", "properties": {
+         "project_id": {"type": "string"},
+         "project_name": {"type": "string", "description": "Project name — an alternative to project_id; resolved to the id internally. project_id wins if both are given."},
+         "guidestone_id": {"type": "string"}},
          "required": []}},
     {"name": "promote_research_run", "description":
         "a5343387 — explicitly promote a completed, disposition='promote' research "
@@ -4774,12 +4891,162 @@ _MCP_TOOLS_LIST: list[dict[str, Any]] = [
          "blocking": {"type": "boolean", "description": "true = real exit-code-blocking semantics. false = advisory/non-blocking."},
          "enabled": {"type": "boolean", "description": "Enable/disable this hook. Disabling immediately removes any already-written artifact files for it (best-effort)."}},
          "required": ["hook_id"]}},
+    {"name": "runpod_check_key", "description":
+        "RunPod key check. Resolves a RunPod API key on this machine and confirms it works with two "
+        "read-only calls to the RunPod API: one billing call and one pod listing. Returns ok, "
+        "credential_source (the source kind only: env, keyring or runpodctl), pod_count (pods on the "
+        "first page, up to 1000), billing_available and error. The key itself is never returned, logged "
+        "or echoed. Omit credential_ref to try env:RUNPOD_API_KEY, then keyring:meridian-desktop/"
+        "runpod-api-key, then runpodctl:default. Pass credential_ref to use one reference only; store a "
+        "reference, never the key. Local only: refused on hosted Meridian.",
+     "inputSchema": {"type": "object", "properties": {
+         "credential_ref": {"type": "string", "description": "Optional credential reference: env:NAME, keyring:SERVICE/ACCOUNT or runpodctl:default. Give a reference, never the key itself; a raw key is rejected without being echoed."}},
+         "required": []}},
+    {"name": "runpod_list_pods", "description":
+        "RunPod pod list. Resolves a RunPod API key on this machine (the same sources as runpod_check_key) "
+        "and lists one page (up to 1000) of the account's pods as summaries. Each summary has these keys, "
+        "all always present, with null for a value RunPod does not supply: id (Pod.id); name (Pod.name); "
+        "status (Pod.status: PROVISIONING, STARTING, RUNNING, EXITED, ERROR or TERMINATED); gpu (Pod.gpu as "
+        "{id, count}, or null for a CPU pod); costPerHour (Pod.cost, the current cost in USD per hour, 0 "
+        "when EXITED or TERMINATED); uptimeSeconds (Pod.runtime.uptime, seconds since the container started, "
+        "null unless the pod is RUNNING). Cluster member pods are not listed: RunPod's includeClusterPods "
+        "parameter defaults to false and this client never sends it. has_more_pods is true when more pods "
+        "exist. Raw pod payloads are never returned, so pod environment variables are not exposed. Reads "
+        "only: it does not create, stop or terminate a pod. Local only: refused on hosted Meridian.",
+     "inputSchema": {"type": "object", "properties": {
+         "credential_ref": {"type": "string", "description": "Optional credential reference: env:NAME, keyring:SERVICE/ACCOUNT or runpodctl:default. Give a reference, never the key itself; a raw key is rejected without being echoed."}},
+         "required": []}},
+    # Zotero bridge write tools: local only. They write to the caller's own Zotero library through the Zotero Bridge
+    # plugin on 127.0.0.1 (meridian/zotero_bridge_transport.py). Hosted Meridian refuses them in the handlers.
+    {"name": "zotero_create_collection", "description":
+        "Creates a collection named `name` in the local Zotero library, under `parent_key` when it is given and at the "
+        "top level when it is not. Returns the new collection key. Writes to the Zotero library on this machine only, "
+        "through the Zotero Bridge plugin. Writes need only the bridge token: no Zotero prompt appears. Local only: "
+        "refused on hosted Meridian.",
+     "inputSchema": {"type": "object", "properties": {
+         "name": {"type": "string", "description": "Name of the new collection. Must not be blank."},
+         "parent_key": {"type": "string", "description": "Optional. The 8-character key of the collection to create this one under. Omit it to create the collection at the top level."}},
+         "required": ["name"]}},
+    {"name": "zotero_move_collection", "description":
+        "Moves the collection `key` under `parent_key`. Omit `parent_key` or pass null to move it to the top level. "
+        "Writes to the Zotero library on this machine only, through the Zotero Bridge plugin. Writes need only the bridge "
+        "token: no Zotero prompt appears. Local only: refused on hosted Meridian.",
+     "inputSchema": {"type": "object", "properties": {
+         "key": {"type": "string", "description": "The 8-character key of the collection to move."},
+         "parent_key": {"type": ["string", "null"], "description": "Optional. The 8-character key of the new parent collection. Omit it or pass null to move the collection to the top level."}},
+         "required": ["key"]}},
+    {"name": "zotero_move_item", "description":
+        "Adds a Zotero item to the collections in `add_collections` and removes it from the collections in "
+        "`remove_collections`. Give at least one collection in either list. A collection cannot be in both lists. "
+        "Writes to the Zotero library on this machine only, through the Zotero Bridge plugin. Writes need only the bridge "
+        "token: no Zotero prompt appears. Local only: refused on hosted Meridian.",
+     "inputSchema": {"type": "object", "properties": {
+         "item_key": {"type": "string", "description": "The 8-character key of the item to move."},
+         "add_collections": {"type": "array", "items": {"type": "string"}, "description": "Optional. Keys of the collections to add the item to."},
+         "remove_collections": {"type": "array", "items": {"type": "string"}, "description": "Optional. Keys of the collections to remove the item from."}},
+         "required": ["item_key"]}},
+    {"name": "zotero_create_webpage", "description":
+        "Creates a webpage item in the local Zotero library with the given title and absolute http or https URL. With "
+        "`collection_keys`, the item is added to those collections. Returns the new item key. Writes to the Zotero "
+        "library on this machine only, through the Zotero Bridge plugin. Writes need only the bridge token: no Zotero "
+        "prompt appears. Local only: refused on hosted Meridian.",
+     "inputSchema": {"type": "object", "properties": {
+         "title": {"type": "string", "description": "Title of the webpage item. Must not be blank."},
+         "url": {"type": "string", "description": "Absolute http or https URL of the page. It must not contain spaces."},
+         "collection_keys": {"type": "array", "items": {"type": "string"}, "description": "Optional. Keys of the collections to add the item to."}},
+         "required": ["title", "url"]}},
+    {"name": "zotero_attach_pdf", "description":
+        "Attaches the PDF at `path` to the Zotero item `item_key` as a child attachment. `path` must be an absolute path "
+        "to a file that starts with %PDF-. Files of 24 MiB or less are imported into Zotero. Larger files are linked by "
+        "path, and the bridge decides whether it may link them. Returns status already_attached, with nothing written, "
+        "when the item already has a PDF attachment. Writes to the Zotero library on this machine only, through the "
+        "Zotero Bridge plugin. Writes need only the bridge token: no Zotero prompt appears. Local only: refused on hosted "
+        "Meridian.",
+     "inputSchema": {"type": "object", "properties": {
+         "item_key": {"type": "string", "description": "The 8-character key of the parent item."},
+         "path": {"type": "string", "description": "Absolute path to the PDF file on this machine."},
+         "title": {"type": "string", "description": "Optional title for the attachment."}},
+         "required": ["item_key", "path"]}},
+    {"name": "zotero_add_child_note", "description":
+        "Adds a child note holding `html` to the Zotero item `parent_key`. The note carries `dedup_marker`, which must be "
+        "8 to 128 letters, digits, dots, underscores or hyphens. If a child note of that item already carries the marker, "
+        "nothing is written and the result is status already_present. Writes to the Zotero library on this machine only, "
+        "through the Zotero Bridge plugin. Writes need only the bridge token: no Zotero prompt appears. Local only: refused "
+        "on hosted Meridian.",
+     "inputSchema": {"type": "object", "properties": {
+         "parent_key": {"type": "string", "description": "The 8-character key of the parent item."},
+         "html": {"type": "string", "description": "HTML content of the note."},
+         "dedup_marker": {"type": "string", "description": "Marker stored in the note, used to detect an existing copy. 8 to 128 letters, digits, dots, underscores or hyphens."}},
+         "required": ["parent_key", "html", "dedup_marker"]}},
+    {"name": "zotero_batch", "description":
+        "Runs 1 to 200 Zotero bridge write operations in one bridge transaction. Each operation is an object with `method`, "
+        "`path` and an optional object `body`. Only these routes can be batched: POST /v1/items; PATCH /v1/items/<key>; "
+        "POST /v1/items/<key>/trash and /restore; POST /v1/items/<key>/notes; PATCH /v1/notes/<key>; POST and DELETE "
+        "/v1/items/<key>/relations; POST /v1/collections; PATCH /v1/collections/<key>; POST /v1/collections/<key>/trash "
+        "and /restore; POST and DELETE /v1/collections/<key>/items. Every other route or method is refused before anything "
+        "is sent, including grant routes, the status route, attachments, tag renames and BibTeX imports (attach a PDF with "
+        "zotero_attach_pdf). All operations apply or none do. Writes to the Zotero library on this machine only, through "
+        "the Zotero Bridge plugin. Writes need only the bridge token: no Zotero prompt appears. Local only: refused on "
+        "hosted Meridian.",
+     "inputSchema": {"type": "object", "properties": {
+         "operations": {"type": "array", "minItems": 1, "maxItems": 200, "description": "The operations to run, in order.",
+             "items": {"type": "object", "properties": {
+                 "method": {"type": "string", "description": "HTTP method of the bridge route, for example PATCH or POST."},
+                 "path": {"type": "string", "description": "A route from the list in this tool's description, for example /v1/items/<key>."},
+                 "body": {"type": "object", "description": "Optional JSON body for the route."}},
+                 "required": ["method", "path"]}}},
+         "required": ["operations"]}},
+    {"name": "prose_check", "description":
+        "Flags and questions for a piece of writing, with a preset applied. Works on any "
+        "plain prose, Markdown included. Returns one list, `flags`, sorted by location: "
+        "built-in rule matches (stock phrases, dash marks, three-item lists), owner rules "
+        "from prose_rules.toml, repeated word spans, duplicate sentences, restatement "
+        "candidates, and questions to the author (unsourced figures, quantity claims with "
+        "no number, generic sentences, repeats that may be intended). Also returns plain "
+        "counts (word_count, sentence_count) and two reported values (specificity, "
+        "lexical_diversity), each with its validation status. It never returns a score, a "
+        "grade or a verdict, and it never changes the text. Presets: general (default), "
+        "academic, overleaf (LaTeX source), docx (text from Word). Pure local computation.",
+     "inputSchema": {"type": "object", "properties": {
+         "text": {"type": "string", "description": "The writing to check. Up to 200,000 characters."},
+         "preset": {"type": "string", "enum": ["general", "academic", "overleaf", "docx"],
+                    "description": "general (default) for any plain prose; academic turns off dash and three-item-list flags; overleaf strips LaTeX markup first; docx normalises Word's curly quotes and non-breaking spaces."},
+         "include_custom_rules": {"type": "boolean",
+                    "description": "Apply the owner's rules from prose_rules.toml in the server's data directory (default true)."}},
+         "required": ["text"]}},
 ]
+
+# Publish the distinctive canonical names first so clients that rank the
+# registry see them before the deprecated, collision-prone aliases. The
+# dispatcher still uses the original internal names via
+# normalize_public_tool_name().
+for _legacy_name, _canonical_name in NATIVE_CANONICAL_TOOL_NAMES.items():
+    _legacy_tool = next(
+        tool for tool in _MCP_TOOLS_LIST if tool["name"] == _legacy_name
+    )
+    _canonical_tool = deepcopy(_legacy_tool)
+    _canonical_tool["name"] = _canonical_name
+    _legacy_description = _legacy_tool["description"]
+    _canonical_tool["description"] = (
+        _legacy_description.rstrip()
+        + f" Use `{_canonical_name}` as the canonical Meridian tool name."
+    )
+    _legacy_tool["description"] = (
+        f"DEPRECATED: use `{_canonical_name}`. This legacy alias remains "
+        f"supported during the migration window. {_legacy_description}"
+    )
+    _MCP_TOOLS_LIST.insert(_MCP_TOOLS_LIST.index(_legacy_tool), _canonical_tool)
+    _example = _TOOL_EXAMPLES.pop(_legacy_name, None)
+    if _example:
+        _TOOL_EXAMPLES[_canonical_name] = _example.replace(
+            _legacy_name, _canonical_name, 1
+        )
 
 _READ_ONLY_TOOLS = {
     "list_projects", "get_project_by_name", "get_goal", "get_notes", "read_note",
     "get_pinned_decisions", "get_proposal_gates", "get_tasks", "search_tasks", "search_all", "search_synthesis",
     "paper_search", "social_search", "github_search", "zotero_search",
+    "prose_check",
     "list_watchlist_queries",
     "get_session_brief", "get_context_block", "get_hitl_request",
     "get_external_job", "list_external_jobs",
@@ -4787,9 +5054,10 @@ _READ_ONLY_TOOLS = {
     "list_resumable_sessions", "get_session_recovery",
     "get_project_state_milestones",
     "get_research_run", "list_research_runs",
+    "list_guidestones", "load_guidestone",
     "get_experiment", "list_experiments", "get_experiment_run", "list_experiment_runs",
     "get_experiment_events",
-    "list_hitl_requests", "list_sessions", "get_sprint_notes",
+    "list_hitl_requests", "list_decisions", "list_sessions", "get_sprint_notes",
     "get_session_log", "get_session_activity", "get_connection_log", "get_server_logs",
     "search_server_logs", "get_server_log_checkpoint",
     "idle_until_session_done", "generate_handoff", "load_handoff",
@@ -4828,6 +5096,11 @@ _READ_ONLY_TOOLS = {
     # 7c96d41b — paper_contract read-only queries.
     "get_paper_contract", "list_paper_contract_revisions",
     "get_current_paper_contract_content",
+    # Image-storage rights preview: pure decision, reads the stored use mode, grants nothing.
+    "check_image_rights",
+    # RunPod key check and pod list: local only, read-only calls to RunPod with a local key.
+    # Read level: absent from MCP_MEMBER_POLICY_OPERATIONS, which has no read operation.
+    "runpod_check_key", "runpod_list_pods",
 }
 
 # Member-policy intent for MCP dispatch.  Values describe the operation shape,
@@ -4901,6 +5174,8 @@ _OPEN_WORLD_TOOLS = {
     # R2-G — the only step of this tool that isn't a local DB read/write is
     # the actual OTLP HTTP POST to an operator-configured external endpoint.
     "export_ai_log_otel",
+    # RunPod key check and pod list: each makes read-only calls to the RunPod API.
+    "runpod_check_key", "runpod_list_pods",
 }
 
 # ---------------------------------------------------------------------------
@@ -4963,6 +5238,16 @@ _TOOL_CATEGORY: dict[str, str] = {
     "start_remote_task":        "session",
     "get_remote_task_status":   "session",
     "list_remote_tasks":        "session",
+    "runpod_check_key":         "session",
+    "runpod_list_pods":         "session",
+    # Zotero bridge write tools (local only), grouped with the research tools that read Zotero.
+    "zotero_create_collection": "research",
+    "zotero_move_collection":   "research",
+    "zotero_move_item":         "research",
+    "zotero_create_webpage":    "research",
+    "zotero_attach_pdf":        "research",
+    "zotero_add_child_note":    "research",
+    "zotero_batch":             "research",
     "register_session_recovery": "session",
     "list_resumable_sessions":   "session",
     "get_session_recovery":      "session",
@@ -4971,6 +5256,9 @@ _TOOL_CATEGORY: dict[str, str] = {
     "complete_research_run":    "research",
     "get_research_run":         "research",
     "list_research_runs":       "research",
+    "create_guidestone":        "research",
+    "list_guidestones":         "research",
+    "load_guidestone":          "research",
     "promote_research_run":     "research",
     # 3f6b8715 — W1-M Experiment Registry: categorized alongside the research
     # run family above (same "adjacent research primitive" territory).
@@ -5036,6 +5324,7 @@ _TOOL_CATEGORY: dict[str, str] = {
     "rename_project":      "project",
     "set_project_execution_mode": "project",
     "set_project_use_mode": "project",
+    "check_image_rights": "project",
     "merge_project":       "project",
     "list_projects":       "project",
     "get_project_by_name": "project",
@@ -5075,6 +5364,7 @@ _TOOL_CATEGORY: dict[str, str] = {
     "request_hitl":     "hitl",
     "get_hitl_request": "hitl",
     "list_hitl_requests": "hitl",
+    "list_decisions": "hitl",
     "answer_hitl":      "hitl",
     "dismiss_hitl":     "hitl",
     # workspace-level
@@ -5202,6 +5492,7 @@ _TOOL_CATEGORY: dict[str, str] = {
     "paper_search": "research",
     "social_search": "research",
     "github_search": "research",
+    "prose_check": "research",
     "zotero_search": "research",
     "save_watchlist_query": "research",
     "list_watchlist_queries": "research",
@@ -5289,6 +5580,15 @@ _TOOL_ROLE_RELEVANCE: dict[str, str] = {
     "start_remote_task":          "executor",
     "get_remote_task_status":     "both",
     "list_remote_tasks":          "both",
+    "runpod_check_key":           "both",
+    "runpod_list_pods":           "both",
+    "zotero_create_collection":   "both",
+    "zotero_move_collection":     "both",
+    "zotero_move_item":           "both",
+    "zotero_create_webpage":      "both",
+    "zotero_attach_pdf":          "both",
+    "zotero_add_child_note":      "both",
+    "zotero_batch":               "both",
     "register_session_recovery":  "both",
     "list_resumable_sessions":    "both",
     "get_session_recovery":       "both",
@@ -5297,6 +5597,9 @@ _TOOL_ROLE_RELEVANCE: dict[str, str] = {
     "complete_research_run":      "both",
     "get_research_run":           "both",
     "list_research_runs":         "both",
+    "create_guidestone":          "both",
+    "list_guidestones":           "both",
+    "load_guidestone":            "both",
     "promote_research_run":       "both",
     # 3f6b8715 — W1-M Experiment Registry: "both", mirroring research_run's
     # own role_relevance immediately above (an executor runs the experiment;
@@ -5350,6 +5653,7 @@ _TOOL_ROLE_RELEVANCE: dict[str, str] = {
     "paper_search":              "planner",
     "social_search":             "planner",
     "github_search":             "planner",
+    "prose_check":               "planner",
     "zotero_search":             "planner",
     "save_watchlist_query":      "planner",
     "list_watchlist_queries":    "planner",
@@ -5396,6 +5700,7 @@ _TOOL_ROLE_RELEVANCE: dict[str, str] = {
     "rename_project":            "both",
     "set_project_execution_mode": "both",
     "set_project_use_mode": "both",
+    "check_image_rights": "both",
     "merge_project":             "both",
     "list_projects":             "both",
     "get_project_by_name":       "both",
@@ -5444,6 +5749,7 @@ _TOOL_ROLE_RELEVANCE: dict[str, str] = {
     "request_hitl":              "both",
     "get_hitl_request":          "both",
     "list_hitl_requests":        "both",
+    "list_decisions":            "both",
     "answer_hitl":               "both",
     "dismiss_hitl":              "both",
     "search_code_semantic":      "both",
@@ -5548,10 +5854,22 @@ _TOOL_WORKFLOW_TIER: dict[str, str] = {
     "start_remote_task":           "common-support",
     "get_remote_task_status":      "common-support",
     "list_remote_tasks":           "common-support",
+    "runpod_check_key":            "common-support",
+    "runpod_list_pods":            "common-support",
+    "zotero_create_collection":    "maintenance-only",
+    "zotero_move_collection":      "maintenance-only",
+    "zotero_move_item":            "maintenance-only",
+    "zotero_create_webpage":       "maintenance-only",
+    "zotero_attach_pdf":           "maintenance-only",
+    "zotero_add_child_note":       "maintenance-only",
+    "zotero_batch":                "maintenance-only",
     "start_research_run":          "common-support",
     "complete_research_run":       "common-support",
     "get_research_run":            "common-support",
     "list_research_runs":          "common-support",
+    "create_guidestone":           "main-workflow",
+    "list_guidestones":            "common-support",
+    "load_guidestone":             "common-support",
     "promote_research_run":        "common-support",
     # 3f6b8715 — W1-M Experiment Registry: common-support, same tier as the
     # research_run family immediately above.
@@ -5607,6 +5925,7 @@ _TOOL_WORKFLOW_TIER: dict[str, str] = {
     # hitl management
     "get_hitl_request":           "common-support",
     "list_hitl_requests":         "common-support",
+    "list_decisions":             "common-support",
     "answer_hitl":                "common-support",
     "dismiss_hitl":               "common-support",
     # file-locking (claim sequence per AGENTS.md)
@@ -5633,6 +5952,7 @@ _TOOL_WORKFLOW_TIER: dict[str, str] = {
     "paper_search":               "common-support",
     "social_search":              "common-support",
     "github_search":              "common-support",
+    "prose_check":                "common-support",
     "zotero_search":              "common-support",
     "save_watchlist_query":       "common-support",
     "list_watchlist_queries":     "common-support",
@@ -5689,6 +6009,7 @@ _TOOL_WORKFLOW_TIER: dict[str, str] = {
     "rename_project":             "maintenance-only",
     "set_project_execution_mode": "maintenance-only",
     "set_project_use_mode": "maintenance-only",
+    "check_image_rights": "common-support",
     "merge_project":              "maintenance-only",
     "set_parent_project":         "maintenance-only",
     "list_projects":              "maintenance-only",
@@ -5783,6 +6104,7 @@ _TITLE_OVERRIDES: dict[str, str] = {
     "request_hitl": "Request HITL",
     "get_hitl_request": "Get HITL Request",
     "list_hitl_requests": "List HITL Requests",
+    "list_decisions": "List Decisions",
     "answer_hitl": "Answer HITL",
     "dismiss_hitl": "Dismiss HITL",
     "update_md_section": "Update Markdown Section",
@@ -5885,6 +6207,29 @@ _TITLE_OVERRIDES: dict[str, str] = {
     "search_server_logs": "Search Server Logs",
     "get_server_log_checkpoint": "Get Server Log Checkpoint",
 }
+
+for _legacy_name, _canonical_name in NATIVE_CANONICAL_TOOL_NAMES.items():
+    if _legacy_name in _READ_ONLY_TOOLS:
+        _READ_ONLY_TOOLS.add(_canonical_name)
+    if _legacy_name in _DESTRUCTIVE_TOOLS:
+        _DESTRUCTIVE_TOOLS.add(_canonical_name)
+    if _legacy_name in _TOOL_CATEGORY:
+        _TOOL_CATEGORY[_canonical_name] = _TOOL_CATEGORY[_legacy_name]
+    if _legacy_name in _TOOL_ROLE_RELEVANCE:
+        _TOOL_ROLE_RELEVANCE[_canonical_name] = _TOOL_ROLE_RELEVANCE[
+            _legacy_name
+        ]
+    if _legacy_name in _TOOL_WORKFLOW_TIER:
+        _TOOL_WORKFLOW_TIER[_canonical_name] = _TOOL_WORKFLOW_TIER[
+            _legacy_name
+        ]
+
+_TITLE_OVERRIDES.update({
+    "meridian_project_create": "Meridian Project Create",
+    "meridian_project_list": "Meridian Project List",
+    "create_project": "DEPRECATED: use meridian_project_create",
+    "list_projects": "DEPRECATED: use meridian_project_list",
+})
 
 for _tool in _MCP_TOOLS_LIST:
     _is_read_only = _tool["name"] in _READ_ONLY_TOOLS

@@ -63,7 +63,7 @@ def build_mcp_server():
     # as the HTTP /mcp surface (meridian/mcp/handler.py) so both transports
     # advertise identical prompts and bodies.
     from . import handler as _handler
-    from ..mcp_tools import _MCP_TOOLS_LIST
+    from ..mcp_tools import _MCP_TOOLS_LIST, normalize_public_tool_name
 
     server: Server = Server("meridian")
 
@@ -168,42 +168,8 @@ def build_mcp_server():
     async def list_tools() -> list[Tool]:
         """Advertise every Meridian tool to the MCP client."""
         return [
-            Tool(
-                name="create_project",
-                description=(
-                    "Create a new Meridian project to coordinate sessions "
-                    "around. Returns the project id and name. Project names "
-                    "must be unique."
-                ),
-                inputSchema={
-                    "type": "object",
-                    "properties": {
-                        "name": {"type": "string"},
-                        "execution_mode": {
-                            "type": "string",
-                            "enum": ["autonomous", "interactive"],
-                            "description": (
-                                "Executor posture for sessions on this project. "
-                                "'autonomous' (default) claims and runs sprint "
-                                "items immediately without asking; 'interactive' "
-                                "asks for direction first. Editable later in "
-                                "dashboard Settings."
-                            ),
-                        },
-                        "parent_project_id": {
-                            "type": "string",
-                            "description": (
-                                "Optional parent project id — makes this a "
-                                "subproject that inherits the parent's north_star "
-                                "when it has none of its own. Subprojects are one "
-                                "level deep: the parent must exist and must not "
-                                "itself be a subproject."
-                            ),
-                        },
-                    },
-                    "required": ["name"],
-                },
-            ),
+            _shared_tool("meridian_project_create"),
+            _shared_tool("create_project"),
             Tool(
                 name="register_session",
                 description=(
@@ -373,6 +339,10 @@ def build_mcp_server():
             # above).
             _shared_tool("list_active_worktrees"),
             _shared_tool("list_worktrees_pending_cleanup"),
+            # Guidestones: the same canonical schemas HTTP MCP advertises.
+            _shared_tool("create_guidestone"),
+            _shared_tool("list_guidestones"),
+            _shared_tool("load_guidestone"),
             Tool(
                 name="idle_until_session_done",
                 description=(
@@ -783,6 +753,27 @@ def build_mcp_server():
                     "type": "object",
                     "properties": {"request_id": {"type": "string"}},
                     "required": ["request_id"],
+                },
+            ),
+            Tool(
+                name="list_decisions",
+                description=(
+                    "List open human decisions for a project: pending HITL questions "
+                    "that carry answer options. Each entry has its numbered options, "
+                    "the recommended option, the urgency, and whether a human must "
+                    "answer (require_human). Answer one with answer_hitl."
+                ),
+                inputSchema={
+                    "type": "object",
+                    "properties": {
+                        "project_id": {"type": "string"},
+                        "project_name": {"type": "string", "description": "Project name — an alternative to project_id; resolved to the id internally. project_id wins if both are given."},
+                        "limit": {
+                            "type": "integer",
+                            "description": "Max decisions, default 200.",
+                        },
+                    },
+                    "required": [],
                 },
             ),
             Tool(
@@ -2121,6 +2112,15 @@ def build_mcp_server():
             # in the shared elif tuple below (mirrors reconcile_stale_claims).
             _shared_tool("release_sprint_item_claim"),
             _shared_tool("transfer_sprint_item_claim"),
+            # Local-only Zotero bridge writes. _shared_tool() pulls the schema HTTP MCP advertises from _MCP_TOOLS_LIST,
+            # and call_tool routes them through _dispatch_mcp_tool, so the transports cannot drift apart.
+            _shared_tool("zotero_create_collection"),
+            _shared_tool("zotero_move_collection"),
+            _shared_tool("zotero_move_item"),
+            _shared_tool("zotero_create_webpage"),
+            _shared_tool("zotero_attach_pdf"),
+            _shared_tool("zotero_add_child_note"),
+            _shared_tool("zotero_batch"),
             # 325276f8 — was a hand-duplicated inputSchema that had drifted from
             # the canonical one in meridian/mcp_tools.py: it was missing "compact"
             # and "mode" entirely, and its "role" enum only allowed "executor"
@@ -2129,38 +2129,11 @@ def build_mcp_server():
             # schema/description the HTTP/streamable-HTTP transport advertises so
             # the three transports can no longer drift apart on this tool.
             _shared_tool("start_session"),
-            Tool(
-                name="list_projects",
-                description=(
-                    "Call first when project_id is unknown. Returns the "
-                    "current tenant's projects as [{id, name, sprint, "
-                    "created_at}] newest first."
-                ),
-                inputSchema={"type": "object", "properties": {}},
-            ),
-            Tool(
-                name="get_project_by_name",
-                description=(
-                    "Look up a project by name (exact match, then "
-                    "case-insensitive exact match; not a substring search). "
-                    "Returns the match with id, name, and sprint. "
-                    "Use this when you know the project name but not the UUID."
-                ),
-                inputSchema={
-                    "type": "object",
-                    "properties": {
-                        "name": {
-                            "type": "string",
-                            "description": (
-                                "Full project name — exact match, then "
-                                "case-insensitive exact match (no partial "
-                                "or substring matching)."
-                            ),
-                        }
-                    },
-                    "required": ["name"],
-                },
-            ),
+            _shared_tool("meridian_project_list"),
+            # #3 — the stdio server advertised pre-fix descriptions for these two tools because it hand-declared them.
+            # _shared_tool() pulls the same schema the HTTP transport serves, so the transports cannot drift apart.
+            _shared_tool("list_projects"),
+            _shared_tool("get_project_by_name"),
             Tool(
                 name="get_session_brief",
                 description=(
@@ -2190,6 +2163,7 @@ def build_mcp_server():
         name: str, arguments: dict[str, Any]
     ) -> list[TextContent]:
         """Dispatch an MCP tool call to the matching db/handoff function."""
+        name = normalize_public_tool_name(name)
         db = await _ensure_db()
         result: Any
         try:
@@ -2712,7 +2686,7 @@ def build_mcp_server():
                 "pin_decision", "update_decision", "get_pinned_decisions",
                 "archive_decision",
                 "request_hitl", "get_hitl_request",
-                "list_hitl_requests", "answer_hitl", "dismiss_hitl",
+                "list_hitl_requests", "list_decisions", "answer_hitl", "dismiss_hitl",
                 "update_md_section",
                 "list_sessions",
                 "add_note", "ingest_document", "get_document_structure", "get_latex_structure", "get_notes", "read_note", "delete_note",
@@ -2741,6 +2715,9 @@ def build_mcp_server():
                 "start_research_run", "complete_research_run",
                 "get_research_run", "list_research_runs",
                 "promote_research_run",
+                # Guidestones -- impromptu research waypoints; same shared dispatch
+                # and schema as HTTP MCP (meridian/mcp/handlers/guidestone_tools.py).
+                "create_guidestone", "list_guidestones", "load_guidestone",
                 "execute_batch",
                 "batch_read", "batch_mutate",
                 "add_workspace_note", "get_workspace_notes",
@@ -2760,6 +2737,14 @@ def build_mcp_server():
                 "release_sprint_item_claim", "transfer_sprint_item_claim",
             ):
                 # v2.4/v0.9 — share dispatch with HTTP MCP so both surfaces stay in sync.
+                result = await _dispatch_mcp_tool(
+                    name, arguments, db, state["data_dir"]
+                )
+            elif name in (
+                "zotero_create_collection", "zotero_move_collection", "zotero_move_item",
+                "zotero_create_webpage", "zotero_attach_pdf", "zotero_add_child_note", "zotero_batch",
+            ):
+                # Local-only Zotero bridge writes: share dispatch with HTTP MCP (the _handle_zotero_bridge_tools group).
                 result = await _dispatch_mcp_tool(
                     name, arguments, db, state["data_dir"]
                 )

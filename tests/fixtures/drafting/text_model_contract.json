@@ -1,0 +1,201 @@
+{
+  "schema_version": 1,
+  "contract": "docs/drafting/text-model.md",
+  "kinds": [
+    "heading",
+    "paragraph",
+    "figure",
+    "table",
+    "equation",
+    "citation",
+    "table_of_contents",
+    "section_break",
+    "unsupported"
+  ],
+  "section_types": ["front_matter", "body", "unknown"],
+  "sources": ["docx", "latex", "gdocs"],
+  "cases": [
+    {
+      "name": "docx_heading_and_paragraphs",
+      "source": "docx",
+      "expected_blocks": [
+        {
+          "id": "docx:0001",
+          "kind": "paragraph",
+          "text": "Draft for review",
+          "runs": [{"text": "Draft for review", "bold": false, "italic": true}],
+          "section_type": "front_matter",
+          "skip": false,
+          "source": "docx",
+          "order": 0
+        },
+        {
+          "id": "docx:0002",
+          "kind": "heading",
+          "text": "Introduction",
+          "runs": [{"text": "Introduction", "bold": false, "italic": false}],
+          "section_type": "body",
+          "skip": false,
+          "source": "docx",
+          "order": 1
+        },
+        {
+          "id": "docx:0003",
+          "kind": "paragraph",
+          "text": "We study the text model.",
+          "runs": [
+            {"text": "We study the ", "bold": false, "italic": false},
+            {"text": "text model", "bold": true, "italic": false},
+            {"text": ".", "bold": false, "italic": false}
+          ],
+          "section_type": "body",
+          "skip": false,
+          "source": "docx",
+          "order": 2
+        },
+        {
+          "id": "docx:0004",
+          "kind": "heading",
+          "text": "Method",
+          "runs": [{"text": "Method", "bold": false, "italic": false}],
+          "section_type": "body",
+          "skip": false,
+          "source": "docx",
+          "order": 3
+        },
+        {
+          "id": "docx:0005",
+          "kind": "paragraph",
+          "text": "Results appear in the table below.",
+          "runs": [{"text": "Results appear in the table below.", "bold": false, "italic": false}],
+          "section_type": "body",
+          "skip": false,
+          "source": "docx",
+          "order": 4
+        }
+      ]
+    },
+    {
+      "name": "latex_outline_and_objects",
+      "source": "latex",
+      "expected_blocks": [
+        {
+          "id": "latex:0001",
+          "kind": "heading",
+          "text": "Introduction",
+          "runs": [{"text": "Introduction", "bold": false, "italic": false}],
+          "section_type": "body",
+          "skip": false,
+          "source": "latex",
+          "order": 0
+        },
+        {
+          "id": "latex:0002",
+          "kind": "figure",
+          "text": "Mean accuracy by epoch.",
+          "runs": [{"text": "Mean accuracy by epoch.", "bold": false, "italic": false}],
+          "section_type": "body",
+          "skip": false,
+          "source": "latex",
+          "order": 1
+        },
+        {
+          "id": "latex:0003",
+          "kind": "equation",
+          "text": "E = m c^2",
+          "runs": [{"text": "E = m c^2", "bold": false, "italic": false}],
+          "section_type": "body",
+          "skip": false,
+          "source": "latex",
+          "order": 2
+        },
+        {
+          "id": "latex:0004",
+          "kind": "citation",
+          "text": "smith2020",
+          "runs": [{"text": "smith2020", "bold": false, "italic": false}],
+          "section_type": "body",
+          "skip": false,
+          "source": "latex",
+          "order": 3
+        },
+        {
+          "id": "latex:0005",
+          "kind": "table",
+          "text": "Model Accuracy Baseline 0.87",
+          "runs": [{"text": "Model Accuracy Baseline 0.87", "bold": false, "italic": false}],
+          "section_type": "body",
+          "skip": false,
+          "source": "latex",
+          "order": 4
+        }
+      ]
+    },
+    {
+      "name": "gdocs_structure_and_skips",
+      "source": "gdocs",
+      "expected_blocks": [
+        {
+          "id": "gdocs:0001",
+          "kind": "table_of_contents",
+          "text": "",
+          "runs": [],
+          "section_type": "front_matter",
+          "skip": true,
+          "source": "gdocs",
+          "order": 0
+        },
+        {
+          "id": "gdocs:0002",
+          "kind": "section_break",
+          "text": "",
+          "runs": [],
+          "section_type": "front_matter",
+          "skip": true,
+          "source": "gdocs",
+          "order": 1
+        },
+        {
+          "id": "gdocs:0003",
+          "kind": "heading",
+          "text": "Abstract",
+          "runs": [{"text": "Abstract", "bold": false, "italic": false}],
+          "section_type": "body",
+          "skip": false,
+          "source": "gdocs",
+          "order": 2
+        },
+        {
+          "id": "gdocs:0004",
+          "kind": "paragraph",
+          "text": "Short text.",
+          "runs": [{"text": "Short text.", "bold": false, "italic": false}],
+          "section_type": "body",
+          "skip": false,
+          "source": "gdocs",
+          "order": 3
+        },
+        {
+          "id": "gdocs:0005",
+          "kind": "table",
+          "text": "Metric Value Accuracy 0.91",
+          "runs": [{"text": "Metric Value Accuracy 0.91", "bold": false, "italic": false}],
+          "section_type": "body",
+          "skip": false,
+          "source": "gdocs",
+          "order": 4
+        },
+        {
+          "id": "gdocs:0006",
+          "kind": "unsupported",
+          "text": "",
+          "runs": [],
+          "section_type": "body",
+          "skip": true,
+          "source": "gdocs",
+          "order": 5
+        }
+      ]
+    }
+  ]
+}

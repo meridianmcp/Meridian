@@ -210,7 +210,14 @@ async def test_dispatch_timeout_records_committed_phase_when_actually_landed(db,
 
     mh._completion_attempts.clear()
     p, item = await _project_with_item(db)
-    monkeypatch.setattr(mh, "_COMPLETE_SPRINT_ITEM_DISPATCH_TIMEOUT_S", 0.05)
+    # The real handler has to reach its commit before the dispatch-level timeout
+    # fires, and the 5s sleep below has to outlast it so the timeout still fires
+    # after the commit. 0.05s was too tight: the first complete_sprint_item call in
+    # a fresh process is slower than that on this host (the commit was cancelled
+    # before it landed and the test failed with timed_out_before_commit when run
+    # alone). 2.0s keeps the cold path inside the budget while still timing out
+    # before the 5s sleep.
+    monkeypatch.setattr(mh, "_COMPLETE_SPRINT_ITEM_DISPATCH_TIMEOUT_S", 2.0)
 
     from meridian.mcp.handlers import sprint_tools as st_mod
     real_handle = st_mod.handle_complete_sprint_item

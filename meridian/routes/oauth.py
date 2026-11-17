@@ -974,7 +974,9 @@ async def _oauth_token(request: Request):
                 (_api_tid, tenant_id, tok_hash, "oauth", "readwrite"),
             )
             await auth_db.commit()
-            await db_module.delete_orphaned_oauth_tokens(auth_db, tenant_id)
+            # Keep a row for as long as its token can still be used (90 days). A 24-hour sweep here removed other
+            # live clients' keys on every new sign-in.
+            await db_module.delete_orphaned_oauth_tokens(auth_db, tenant_id, older_than_hours=90 * 24)
         except Exception:
             pass
     else:

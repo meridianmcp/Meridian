@@ -82,6 +82,12 @@ def _nbytes(s: str) -> int:
     return len(s.encode("utf-8"))
 
 
+def _code_line(ctx: str) -> str:
+    """The code-intel line: it sits right after the static/volatile boundary."""
+    lines = ctx.splitlines()
+    return lines[lines.index(sb.VOLATILE_BOUNDARY) + 1]
+
+
 def _fetch_returning(text):
     calls = []
 
@@ -133,8 +139,10 @@ def test_session_brief_fits_4096_with_huge_shadow_list():
     assert _nbytes(ctx) <= sb.BRIEF_MAX_BYTES
     lines = ctx.splitlines()
     assert lines[0].startswith("[Meridian guard brief]")
-    assert lines[1].startswith("Code intel:") and lines[1].endswith("...")
-    assert _nbytes(lines[1]) <= sb.CODE_INTEL_MAX_BYTES
+    # The code-intel line is clock-derived (index age), so it sits after the boundary.
+    code = lines[lines.index(sb.VOLATILE_BOUNDARY) + 1]
+    assert code.startswith("Code intel:") and code.endswith("...")
+    assert _nbytes(code) <= sb.CODE_INTEL_MAX_BYTES
     assert sb._TRUST in lines and sb._HARD_RULES in lines
 
 
@@ -269,7 +277,7 @@ def test_is_directive(line, expected):
 ])
 def test_code_intel_line_names_the_winning_index(cwd, winner, extra):
     ctx = _brief(cwd)["context"]
-    code = ctx.splitlines()[1]
+    code = _code_line(ctx)
     assert f"project '{winner}'" in code
     if extra:
         assert extra in code
@@ -353,7 +361,7 @@ def test_real_fs_refresh_writes_snapshot_and_resolves(machine):
     r = sb.build_brief(payload, env=machine["env"], budget_s=5)
     assert r["status"]["snapshot"] == "refreshed"
     assert (machine["gdir"] / "snapshot.json").is_file()
-    code = r["context"].splitlines()[1]
+    code = _code_line(r["context"])
     assert f"project '{machine['name']}'" in code
     assert "repo-old-duplicate" in code  # shadowed duplicate named
     assert r["status"]["project_id_source"] == "unresolved"

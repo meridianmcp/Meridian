@@ -28,9 +28,9 @@ Every session that connects to Meridian can:
 - **Read the current goal** — what the project is trying to accomplish right now
 - **Log tasks** — what it's doing, what it finished, what failed
 - **See every other session's work** — no duplicate effort
-- **Generate instant handoffs** — compressed context files that resume a new session in seconds
+- **Generate instant handoffs** — compressed context files a new session can load to pick up where the last one stopped
 
-When the context window fills up, you can generate a handoff and start fresh. The new session will then read the file and pick up exactly where you left off -- no re-explaining required.
+When the context window fills up, you can generate a handoff and start fresh. The new session will then read the file and pick up where you left off -- no re-explaining required.
 
 <img src="screenshots/05b_charts_tab.png" alt="Meridian features" style="max-width:100%;border-radius:8px;margin:12px 0">
 
@@ -64,7 +64,7 @@ Both modes are configurable per-project in **Settings → Parallel Safety**.
 | `claim_sprint_item` | Claim a sprint item; returns git worktree setup commands by default |
 | `get_sprint_items` | See the sprint board — pending, in-progress, done |
 | `pin_workspace_decision` | Cross-project decisions surfaced in every session's context as capped one-line summaries (full text via `get_workspace_decisions`) |
-| `get_commits` / `list_branches` | GitHub hub: read commits, branches, PRs, issues from connected repo |
+| `get_commits` / `meridian_github_list_branches` | GitHub hub: read commits, branches, PRs, issues from connected repo |
 | `generate_handoff` | Compress full context into a resumable file (also returned by `checkpoint`) |
 
 ## Architecture

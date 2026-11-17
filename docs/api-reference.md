@@ -791,6 +791,15 @@ No auth required.
 | `POST` | `/code/mcp/{tenant_id}/{rest:path}` | Same as code_mcp_proxy but for sub-paths |
 
 
+### `/compute`
+
+| Method | Path | Description |
+|--------|------|-------------|
+| `GET` | `/compute/offers` | GPU offers from the live RunPod catalog, filtered and sorted server-side |
+| `GET` | `/compute/runpod/check` | Check that the default RunPod credential works (one billing call, one pod-listing call) |
+| `GET` | `/compute/runpod/pods` | List one page (up to 1000) of the account's RunPod pods as summaries |
+
+
 ### `/config`
 
 | Method | Path | Description |
@@ -853,6 +862,16 @@ No auth required.
 | Method | Path | Description |
 |--------|------|-------------|
 | `POST` | `/demo-auth` | Validate demo password and set a signed access cookie |
+
+
+### `/desktop`
+
+| Method | Path | Description |
+|--------|------|-------------|
+| `GET` | `/desktop/code/search` | Search the local code index of the configured repository. Loopback only |
+| `GET` | `/desktop/outputs/search` | Search the local outputs index of the configured outputs directory. Loopback only |
+| `GET` | `/desktop/research/runs` | Read research runs from the local store, newest first. Loopback only |
+| `GET` | `/desktop/research/search` | Desktop Search tab: read-only research search across the named sources (loopback only) |
 
 
 ### `/docs`
@@ -1362,6 +1381,7 @@ No auth required.
 
 | Method | Path | Description |
 |--------|------|-------------|
+| `POST` | `/zotero/connect` | Run one Zotero approval attempt for a self-hosted loopback caller who explicitly confirmed it |
 | `GET` | `/zotero/mcp/{tenant_id}` | Proxy requests to the tenant's zotero-mcp server over the zotero tunnel |
 | `OPTIONS` | `/zotero/mcp/{tenant_id}` | Proxy requests to the tenant's zotero-mcp server over the zotero tunnel |
 | `POST` | `/zotero/mcp/{tenant_id}` | Proxy requests to the tenant's zotero-mcp server over the zotero tunnel |

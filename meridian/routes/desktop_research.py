@@ -82,7 +82,7 @@ async def _require_loopback(request: Request) -> None:
     ):
         raise HTTPException(
             status_code=403,
-            detail="The desktop research search is only available from this machine.",
+            detail="This desktop route is only available from this machine.",
         )
 
 

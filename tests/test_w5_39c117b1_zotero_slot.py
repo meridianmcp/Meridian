@@ -23,7 +23,7 @@ def test_zotero_builtin_plugin_entry_shape():
     z = by_name["zotero-mcp"]
     assert z["slot"] == "zotero"
     assert z["port"] == tp.DEFAULT_ZOTERO_PORT
-    assert z["command"] == ["uvx", "zotero-mcp"]
+    assert z["command"] == ["uvx", "zotero-mcp==0.3.1"]
     assert z["env"] == {"ZOTERO_LOCAL": "true"}
     assert z["builtin"] is True
     # Opt-in like the other Office slots (not auto-on).

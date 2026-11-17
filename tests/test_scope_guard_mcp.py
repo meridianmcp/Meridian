@@ -559,6 +559,7 @@ async def test_any_star_project_id_argument_must_be_in_scope(db):
 
 _LISTING_EXTRA = {
     "list_hitl_requests": {},
+    "list_decisions": {},
     "get_file_claims": {"file_path": "scope/a.py"},
     "list_worktrees_pending_cleanup": {},
     "get_workspace_proposals": {},

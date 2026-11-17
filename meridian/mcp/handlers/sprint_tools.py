@@ -1371,7 +1371,14 @@ async def handle_claim_sprint_item(
             # persisted for later merge-time validation.
             "worktree_base_branch": "dev",
             "worktree_setup_cmd": f"git worktree add {wt_path} -b {wt_branch}",
-            "worktree_cleanup_cmd": f"git worktree remove {wt_path} --force",
+            # No --force: `git worktree remove --force` discards modified and
+            # untracked files. Step 1 gates removal on a clean status (the
+            # `test -z` exits non-zero when status prints anything, so the
+            # remove never runs on a dirty tree); step 2 removes the clean tree.
+            "worktree_cleanup_cmd": (
+                f'test -z "$(git -C {wt_path} status --porcelain)" '
+                f"&& git worktree remove {wt_path}"
+            ),
             "worktree_merge_cmd": (
                 f"git checkout dev && git merge {wt_branch} --no-edit "
                 f"&& git branch -d {wt_branch}"

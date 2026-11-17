@@ -1344,7 +1344,10 @@ def test_tunnel_device_code_expires(monkeypatch, tmp_path):
 def test_tunnel_connect_page_redirects_unauthenticated(monkeypatch, tmp_path):
     """GET /auth/tunnel-connect without session redirects to login."""
     hclient, _ = _make_tunnel_hosted_client(monkeypatch, tmp_path)
-    r = hclient.get("/auth/tunnel-connect?device_code=abc", follow_redirects=False)
+    r = hclient.get(
+        "/auth/tunnel-connect?device_code=11111111-1111-4111-8111-111111111111",
+        follow_redirects=False,
+    )
     assert r.status_code == 302
     assert "/auth/login" in r.headers["location"]
     assert "device_code" in r.headers["location"]
@@ -8446,6 +8449,8 @@ def test_pg_migration_registry_matches_historical_order():
         "_migrate_pg_feedback",
         "_migrate_pg_registered_hostnames",
         "_migrate_pg_redis_overage_fields",
+        # tunnel_tool_filter (1984adc0) is unshipped, so it is appended at the tail, not mid-list.
+        "_migrate_pg_tunnel_tool_filter",
     ]
     assert late == [
         "_migrate_pg_workspace_tenant_isolation",
@@ -8587,10 +8592,17 @@ def test_pg_migration_registry_matches_historical_order():
         "_migrate_pg_sprint_item_coarse_lock_files",
         "_migrate_pg_backfill_finding_note_kind",
         "_migrate_pg_project_state_milestones",
+        # use_mode (4bfc9293) was added after this order was pinned and is not on main,
+        # so no production database has run it. It is appended at the tail, not mid-list.
+        # Its ADD COLUMN IF NOT EXISTS is idempotent and nothing later depends on it.
+        "_migrate_pg_project_use_mode",
+        # Guidestones (impromptu research waypoints) were added after this order was pinned.
+        # Appended at the tail; its CREATE TABLE IF NOT EXISTS is idempotent.
+        "_migrate_pg_guidestones",
     ]
     # No duplicates across the three groups.
     allnames = core + hosted + late
-    assert len(allnames) == len(set(allnames)) == 175
+    assert len(allnames) == len(set(allnames)) == 178
 
 
 def test_core_schema_literals_have_no_inline_tenant_id_indexes():
@@ -9439,7 +9451,10 @@ def test_roadmap_auto_update_replaces_existing_entry(client, tmp_path, monkeypat
 
 @pytest.mark.asyncio
 async def test_expire_regenerates_claude_md(db, tmp_path, monkeypatch):
-    """_expire_and_generate_handoffs regenerates CLAUDE.md for each project."""
+    """_expire_and_generate_handoffs writes the state block to CLAUDE.local.md.
+
+    The tracked CLAUDE.md must not be created or rewritten (gh-claude-md-state-untracked).
+    """
     from meridian import server as srv
     monkeypatch.setattr(srv, "_REPO_ROOT", tmp_path)
 
@@ -9452,10 +9467,59 @@ async def test_expire_regenerates_claude_md(db, tmp_path, monkeypatch):
     await db.commit()
 
     await srv._expire_and_generate_handoffs(db, str(tmp_path))
-    claude_md = tmp_path / "CLAUDE.md"
-    assert claude_md.exists(), "CLAUDE.md should have been written after session expiry"
-    content = claude_md.read_text(encoding="utf-8")
-    assert "MERIDIAN STATE" in content
+    assert not (tmp_path / "CLAUDE.md").exists(), "tracked CLAUDE.md must not be written on session expiry"
+    local = tmp_path / "CLAUDE.local.md"
+    assert local.exists(), "CLAUDE.local.md should have been written after session expiry"
+    assert "MERIDIAN STATE" in local.read_text(encoding="utf-8")
+
+
+@pytest.mark.asyncio
+async def test_regenerate_claude_md_leaves_tracked_claude_md_bytes_unchanged(db, tmp_path):
+    """Regeneration never rewrites the tracked CLAUDE.md bytes.
+
+    The generated block goes to the gitignored CLAUDE.local.md. The tracked file,
+    with its legacy MERIDIAN STATE marker and human content above it, must come
+    back byte-for-byte identical. The key-files block must name meridian/db/__init__.py.
+    """
+    from meridian import server as srv
+
+    p = await db_module.create_project(db, "untracked-state")
+    tracked = tmp_path / "CLAUDE.md"
+    original = (
+        "# Project notes\n\nHuman-written guidance.\n"
+        + srv._CLAUDE_MD_STATE_MARKER
+        + "## stale legacy state\n"
+    ).encode("utf-8")
+    tracked.write_bytes(original)
+
+    await srv._regenerate_claude_md(db, p["id"], tmp_path)
+
+    assert tracked.read_bytes() == original
+    local = (tmp_path / "CLAUDE.local.md").read_text(encoding="utf-8")
+    assert "MERIDIAN STATE" in local
+    assert "`meridian/db/__init__.py`" in local
+    assert "`meridian/db.py`" not in local
+
+
+@pytest.mark.asyncio
+async def test_regenerate_claude_md_preserves_human_content_in_claude_local(db, tmp_path):
+    """Human content above the marker in CLAUDE.local.md survives regeneration."""
+    from meridian import server as srv
+
+    p = await db_module.create_project(db, "local-human-content")
+    local = tmp_path / "CLAUDE.local.md"
+    local.write_text(
+        "Project ID: 1234\n" + srv._CLAUDE_MD_STATE_MARKER + "## old generated\n",
+        encoding="utf-8",
+    )
+
+    await srv._regenerate_claude_md(db, p["id"], tmp_path)
+    await srv._regenerate_claude_md(db, p["id"], tmp_path)
+
+    content = local.read_text(encoding="utf-8")
+    assert content.startswith("Project ID: 1234\n")
+    assert "## old generated" not in content
+    assert content.count("MERIDIAN STATE") == 1
 
 
 # ---------------------------------------------------------------------------
@@ -16360,6 +16424,16 @@ async def test_claim_sprint_item_returns_worktree_fields_when_isolation_set(db):
     assert "git worktree add" in result["worktree_setup_cmd"]
     assert "git worktree remove" in result["worktree_cleanup_cmd"]
     assert "git merge" in result["worktree_merge_cmd"]
+    # The cleanup command must never force-remove: it gates removal on a clean
+    # `git -C <path> status --porcelain` before `git worktree remove`, and
+    # neither handed-out command may carry --force (it discards uncommitted work).
+    assert "git -C" in result["worktree_cleanup_cmd"]
+    assert "status --porcelain" in result["worktree_cleanup_cmd"]
+    assert "--force" not in result["worktree_cleanup_cmd"]
+    assert "--force" not in result["worktree_merge_cmd"]
+    # Merge cleanup keeps the safe branch delete (-d), never the forced -D.
+    assert "git branch -d " in result["worktree_merge_cmd"]
+    assert "git branch -D" not in result["worktree_merge_cmd"]
     # eb2e44f8 — the claim response also names the base branch the worktree
     # is expected to be created from, matching worktree_merge_cmd's target,
     # so an executor can pass it straight to POST /worktrees' base_branch
@@ -18692,8 +18766,8 @@ def test_build_quick_start_goal_version_with_no_matches():
 
 
 def test_build_quick_start_goal_autonomous_directive():
-    """ecf69de8 — autonomous (default) prepends the non-deferential executor
-    directive so the session runs immediately."""
+    """ecf69de8 — autonomous (default) prepends the executor directive, which
+    asks the human to confirm before claiming unless no_confirmation is set."""
     from meridian.handoff import (
         _build_quick_start_goal,
         _EXECUTOR_GOAL_DIRECTIVE,
@@ -18706,7 +18780,7 @@ def test_build_quick_start_goal_autonomous_directive():
         _build_quick_start_goal(items),
     ):
         assert _EXECUTOR_GOAL_DIRECTIVE.strip() in goal
-        assert "without asking for direction" in goal
+        assert "Confirm with the human before claiming" in goal
         assert "aaa" in goal and "bbb" in goal
 
 
@@ -18890,7 +18964,7 @@ def test_mcp_start_session_includes_execution_policy(client):
     assert policy is not None
     assert policy["execution_mode"] == "immediate"
     assert policy["required_first_action"] == "claim_sprint_item"
-    assert policy["no_confirmation"] is True
+    assert policy["no_confirmation"] is False
     assert policy["permitted_parallel_wave"] is True
     assert policy["claim_before_edit"] is True
     assert isinstance(policy["max_planning_turns"], int) and policy["max_planning_turns"] >= 1
@@ -18964,7 +19038,7 @@ def test_mcp_generate_handoff_embeds_execution_policy_tag_all_modes(client, mode
     body = result.get("content") or ""
     assert 'execution_mode="immediate"' in body
     assert 'required_first_action="claim_sprint_item"' in body
-    assert 'no_confirmation="true"' in body
+    assert 'no_confirmation="false"' in body
     assert 'claim_before_edit="true"' in body
 
 

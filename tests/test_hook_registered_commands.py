@@ -358,6 +358,12 @@ CASES: dict[str, list[tuple[str, dict[str, Any], dict[str, str], int, Any, str |
         ("unsupported_tool_is_noop", {"session_id": "registered-cmd-test", "hook_event_name": "PostToolUse",
                                        "tool_name": "Other"}, {}, 0, _empty, None),
     ],
+    "intake_capture": [
+        # Writes to the per-test LOCALAPPDATA from _base_env, never the owner's queue.
+        ("prompt_is_captured_silently",
+         {"session_id": "registered-cmd-test", "hook_event_name": "UserPromptSubmit",
+          "prompt": "registered-cmd probe"}, {}, 0, _empty, None),
+    ],
 }
 
 

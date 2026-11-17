@@ -17,7 +17,7 @@ Meridian is an open-source MCP server that gives every AI session shared persist
 - The same task log (what was done, by which session, when)
 - The same pinned decisions ("use psycopg3 not asyncpg")  
 - The same sprint board (what's claimed, what's pending, what's done)
-- A compressed handoff so a fresh session resumes in seconds
+- A compressed handoff so a fresh session can resume without re-explaining
 
 When context fills up, `checkpoint()` snapshots progress and writes a delta handoff. The next session reads it and continues — no re-explaining.
 
@@ -65,7 +65,7 @@ The MCP protocol is the interface; Meridian is the coordination layer underneath
 
 ## What's in the box
 
-**21 MCP tools:** `start_session` · `log_task` · `checkpoint` · `pin_decision` · `request_hitl` · `generate_handoff` · `claim_task` · and more
+**MCP tools include:** `start_session` · `log_task` · `checkpoint` · `pin_decision` · `request_hitl` · `generate_handoff` · `claim_task` · and more
 
 **Dashboard** at `localhost:7878` — sessions, sprint board, swimlane timeline, HITL queue, pinned decisions, activity log
 

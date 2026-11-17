@@ -14,6 +14,12 @@ from __future__ import annotations
 
 from typing import FrozenSet
 
+from .tool_catalog import (
+    LEAN_PROFILE,
+    LEAN_PROFILE_TOOL_NAMES,
+    ROLE_PROFILE_TOOL_NAMES,
+)
+
 
 OPENAI_PUBLIC_PROFILE = "openai"
 
@@ -26,6 +32,7 @@ OPENAI_PUBLIC_PROFILE = "openai"
 OPENAI_PUBLIC_TOOL_NAMES: FrozenSet[str] = frozenset(
     {
         "create_project",
+        "meridian_project_create",
         "get_project_by_name",
         "start_session",
         "get_goal",
@@ -95,6 +102,8 @@ OPENAI_PUBLIC_TOOL_NAMES: FrozenSet[str] = frozenset(
 
 _PROFILES: dict[str, FrozenSet[str]] = {
     OPENAI_PUBLIC_PROFILE: OPENAI_PUBLIC_TOOL_NAMES,
+    LEAN_PROFILE: LEAN_PROFILE_TOOL_NAMES,
+    **ROLE_PROFILE_TOOL_NAMES,
 }
 
 

@@ -104,7 +104,15 @@ def test_env_override_wins(monkeypatch, tmp_path):
     assert tc._tunnel_log_path() == target
 
 
+# The nested pytest run does real work (it imports and drives run_tunnel), so it
+# gets its own budget. The OUTER test's pytest-timeout budget must be larger than
+# that, or the runner's --timeout=60 kills this test before subprocess.run's own
+# timeout can ever fire.
+_NESTED_PYTEST_TIMEOUT_SECONDS = 240.0
+
+
 @pytest.mark.subprocess_isolated
+@pytest.mark.timeout(_NESTED_PYTEST_TIMEOUT_SECONDS + 60)
 def test_running_tunnel_tests_leaves_the_real_log_path_untouched(tmp_path):
     """End-to-end: run real run_tunnel tests in a child pytest whose HOME is an
     empty temp dir and whose own environment carries NO override -- the child's
@@ -117,17 +125,25 @@ def test_running_tunnel_tests_leaves_the_real_log_path_untouched(tmp_path):
     for k in ("HOMEDRIVE", "HOMEPATH", "MERIDIAN_TUNNEL_LOG", "PYTEST_ADDOPTS"):
         env.pop(k, None)
 
-    proc = subprocess.run(
-        [
-            sys.executable, "-m", "pytest",
-            "tests/test_cov_tunnel_client.py",
-            "-k", "test_run_tunnel_returns_2_when_no_token or test_run_tunnel_me_failure_returns_1",
-            "-p", "no:xdist", "-p", "no:cacheprovider", "-q", "--timeout=60",
-        ],
-        cwd=str(_REPO_ROOT), env=env, capture_output=True, text=True, timeout=240,
-    )
-    assert proc.returncode == 0, proc.stdout[-2000:] + proc.stderr[-2000:]
-    assert "2 passed" in proc.stdout, proc.stdout[-2000:]
+    # stdin is DEVNULL and stdout/stderr go to a file, not a pipe: any process the
+    # child leaves holding an inherited pipe stops communicate() from ever seeing
+    # EOF, which turns even a bounded timeout into an indefinite wait.
+    child_log = tmp_path / "nested-pytest.log"
+    with child_log.open("wb") as log:
+        proc = subprocess.run(
+            [
+                sys.executable, "-m", "pytest",
+                "tests/test_cov_tunnel_client.py",
+                "-k", "test_run_tunnel_returns_2_when_no_token or test_run_tunnel_me_failure_returns_1",
+                "-p", "no:xdist", "-p", "no:cacheprovider", "-q", "--timeout=60",
+            ],
+            cwd=str(_REPO_ROOT), env=env, stdin=subprocess.DEVNULL,
+            stdout=log, stderr=subprocess.STDOUT,
+            timeout=_NESTED_PYTEST_TIMEOUT_SECONDS, check=False,
+        )
+    output = child_log.read_text(encoding="utf-8", errors="replace")
+    assert proc.returncode == 0, output[-4000:]
+    assert "2 passed" in output, output[-2000:]
     assert not (fake_home / ".meridian" / "tunnel.log").exists(), (
         "a run_tunnel test wrote tunnel.log under the user's home (4d6e87dd)"
     )

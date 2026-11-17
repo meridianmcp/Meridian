@@ -13,6 +13,7 @@ import urllib.request
 import webbrowser
 from typing import Any
 
+from . import zotero_connect
 from .tunnel_config import (
     ZoteroCredentialStoreUnavailable,
     delete_zotero_api_key,
@@ -27,6 +28,17 @@ _DEFAULT_LOCAL_API_BASE = "http://127.0.0.1:23119/api"
 _LOCAL_API_TIMEOUT_SECONDS = 3.0
 
 
+def _build_opener(*handlers):
+    """The local API read's opener: no proxy, and no redirect off loopback, to the authorize endpoint,
+    or through an ambiguous authority."""
+    return urllib.request.build_opener(
+        urllib.request.ProxyHandler({}), zotero_connect._NoAuthorizeRedirect(), *handlers,
+    )
+
+
+_OPENER = _build_opener()
+
+
 class ZoteroSetupError(RuntimeError):
     """A user-actionable local Zotero setup or connection error."""
 
@@ -37,10 +49,13 @@ def list_local_zotero_collections(
     """Read collection keys/names from the running local Zotero API.
 
     No account key is sent: Zotero's local read API serves the signed-in local
-    user's library and is intentionally kept on loopback.
+    user's library and stays on loopback. The base URL must be a loopback address
+    before any request is made, and no redirect off loopback is followed.
     """
     base = (base_url or os.environ.get("MERIDIAN_ZOTERO_API_URL") or _DEFAULT_LOCAL_API_BASE)
     url = f"{base.strip().rstrip('/')}/users/0/collections?format=json"
+    if not zotero_connect._require_loopback(url) or zotero_connect._targets_authorize(url):
+        raise ZoteroSetupError("The Zotero local API address is not allowed. Check MERIDIAN_ZOTERO_API_URL.")
     request = urllib.request.Request(
         url,
         headers={
@@ -51,7 +66,7 @@ def list_local_zotero_collections(
         method="GET",
     )
     try:
-        with urllib.request.urlopen(request, timeout=timeout) as response:
+        with _OPENER.open(request, timeout=timeout) as response:
             if not 200 <= response.status < 300:
                 raise ZoteroSetupError(f"Zotero local API returned HTTP {response.status}.")
             payload = json.loads(response.read().decode("utf-8"))

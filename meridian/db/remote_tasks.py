@@ -124,6 +124,13 @@ async def start_remote_task(
         # actually started, so there is nothing to poll for later.
         status = "terminated-unexpectedly"
         log_path = None
+    elif result.error == remote_ssh.SSH_TIMEOUT_ERROR:
+        # The local wait expired before ssh returned. The launch script hands
+        # its PID back as soon as pid.txt is written, but this call gave up
+        # first, so the job may already be running. Keep the job_id and its
+        # deterministic log path, leave pid NULL, and let
+        # get_remote_task_status confirm it from the remote pid.txt.
+        status = "launch_unconfirmed"
     else:
         # Could not even establish the launching connection -- we genuinely
         # don't know whether anything ran.
@@ -176,6 +183,22 @@ async def get_remote_task_status(
     lost" just because it can't be reached afterward) -- otherwise it writes
     ``connection-lost-but-possibly-still-running``, explicitly distinct from
     any failure status, per the sprint item.
+
+    When the check does connect, an ``unknown`` result (NODIR, NOPID, or a
+    check that cannot tell) never replaces an already-terminal stored status
+    either. The rule is the same on both branches.
+
+    When the check does connect and the remote ``pid.txt`` exists, the PID and
+    the stdout log path are persisted. That is how a ``launch_unconfirmed``
+    job gets its PID once it is confirmed. ``log_tail`` stores the stdout tail
+    when that tail has non-whitespace content, and otherwise the stderr tail,
+    so a job that fails with its error only on stderr keeps that text across
+    restarts. The stderr tail is the launcher's ``launch.err`` when the job
+    never created its own ``stderr.log``, so a launch that failed before the
+    job started still reports why. An empty or whitespace-only read never
+    clears a tail stored earlier. The response also carries ``stdout_tail``
+    and ``stderr_tail``, each read from its own file and bounded separately,
+    plus the remote ``exit_code``.
     """
     job = await _find(db, project_id, job_id)
     if job is None:
@@ -191,6 +214,9 @@ async def get_remote_task_status(
     now = model.utcnow_iso()
 
     updates: dict[str, Any] = {"updated_at": now}
+    exit_code: "int | None" = None
+    stdout_tail = ""
+    stderr_tail = ""
     if not result.connected:
         if job["status"] in model.REMOTE_TASK_TERMINAL_STATUSES:
             new_status = job["status"]
@@ -204,10 +230,24 @@ async def get_remote_task_status(
         new_status = model.map_check_marker_to_status(
             parsed["marker"], parsed["exit_code"]
         )
+        # NODIR, NOPID and an unparseable check all map to "unknown". That must
+        # not overwrite a terminal status the job already reached.
+        if new_status == "unknown" and job["status"] in model.REMOTE_TASK_TERMINAL_STATUSES:
+            new_status = job["status"]
+        exit_code = parsed["exit_code"]
+        stdout_tail = parsed["stdout_tail"]
+        stderr_tail = parsed["stderr_tail"]
         updates["status"] = new_status
         updates["last_heartbeat_at"] = now
-        if parsed["log_tail"]:
-            updates["log_tail"] = parsed["log_tail"]
+        if parsed["pid"] is not None:
+            updates["pid"] = parsed["pid"]
+            updates["log_path"] = f"{model.build_job_dir(job_id)}/stdout.log"
+        # Prefer stdout. Fall back to stderr when stdout is blank, so a
+        # stderr-only failure still stores its error text. A blank read writes
+        # nothing, so a tail stored by an earlier check is kept.
+        log_tail = stdout_tail if stdout_tail.strip() else stderr_tail
+        if log_tail.strip():
+            updates["log_tail"] = log_tail
         if new_status in model.REMOTE_TASK_TERMINAL_STATUSES:
             updates["completed_at"] = job.get("completed_at") or now
 
@@ -224,6 +264,9 @@ async def get_remote_task_status(
         "elapsed_seconds": _elapsed_seconds(updated),
         "connected": result.connected,
         "ssh_error": result.error,
+        "exit_code": exit_code,
+        "stdout_tail": stdout_tail,
+        "stderr_tail": stderr_tail,
     }
 
 

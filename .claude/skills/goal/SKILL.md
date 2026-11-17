@@ -84,12 +84,20 @@ the instructions there before proceeding.
 
 For each pending sprint item in the board:
 
-1. `claim_sprint_item(item_id=..., project_id=..., session_id=...)`
-2. Do the work described in the item title/description.
-3. Run tests (`pixi run test` or the project-appropriate command).
-4. `complete_sprint_item(item_id=..., project_id=..., session_id=..., notes="<evidence>")`
-5. `log_task(session_id=..., project_id=..., description="<summary>", kind="shipped")`
-6. After each item call `get_sprint_progress(project_id, session_id)` to pick
+1. Start each item in its own git worktree, never in the shared checkout.
+2. `claim_sprint_item(item_id=..., project_id=..., session_id=...)`
+3. Before editing a shared file, call `get_file_claims(file_path)` and then
+   `claim_file(session_id, file_path, mode="write")`. Release it with
+   `release_file` when you are done.
+4. Do the work described in the item title/description. Stage by path only
+   (`git add <path>`), never `git add -A`, `git add .` or `git commit -a`.
+   Never force push, and never push main.
+5. Run the targeted tests before any merge (`pixi run test` or the
+   project-appropriate command).
+6. `complete_sprint_item(item_id=..., project_id=..., session_id=..., notes="<evidence>")`
+   for each finished item.
+7. `log_task(session_id=..., project_id=..., description="<summary>", kind="shipped")`
+8. After each item call `get_sprint_progress(project_id, session_id)` to pick
    up any new items injected mid-run.
 
 Do NOT ask "what should I work on?" — claim the first unclaimed pending item

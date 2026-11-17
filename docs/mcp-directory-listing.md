@@ -130,12 +130,12 @@ remain specialist local extensions and are not part of this first listing.
 
 ### Curated tool profile
 
-The first listing intentionally exposes this 64-tool native profile. It is
+The first listing intentionally exposes this 66-tool native profile. It is
 large enough to support real project, research, sprint, wave, and handoff
 work while remaining below the 70-tool review target:
 
 ```text
-create_project
+meridian_project_create
 get_project_by_name
 start_session
 get_goal

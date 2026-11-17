@@ -372,17 +372,21 @@ def test_tunnel_argv_skips_selector_event_loop_policy_at_import(tmp_path):
 
 
 @pytest.mark.skipif(sys.platform != "win32", reason="event-loop override is Windows-only")
-def test_mcp_argv_still_gets_selector_event_loop_policy_at_import():
-    """--mcp (and the default server mode) must keep the psycopg3-required SelectorEventLoop."""
+def test_mcp_argv_gets_selector_event_loop_policy_from_main_not_import():
+    """--mcp (and the default server mode) keep the psycopg3-required SelectorEventLoop,
+    but the policy is installed by main(), never by importing the module."""
     script = textwrap.dedent(
         """
         import sys
         sys.argv = ["meridian", "--mcp"]
-        import meridian.__main__  # noqa: F401
+        import meridian.__main__ as entry
         import asyncio
-        policy = type(asyncio.get_event_loop_policy()).__name__
-        assert policy == "WindowsSelectorEventLoopPolicy", policy
-        print("OK:" + policy)
+        before = type(asyncio.get_event_loop_policy()).__name__
+        assert before == "WindowsProactorEventLoopPolicy", before
+        entry._install_windows_loop_policy(["--mcp"])
+        after = type(asyncio.get_event_loop_policy()).__name__
+        assert after == "WindowsSelectorEventLoopPolicy", after
+        print("OK:" + after)
         """
     )
     result = subprocess.run(
