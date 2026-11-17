@@ -436,7 +436,7 @@ def _cells(table: QTableWidget, row: int) -> list[str]:
 def test_the_slot_table_has_one_row_per_slot_port_and_is_not_checked_until_a_check():
     rows = model.slot_rows()
     assert [(row.slot, row.port) for row in rows] == list(slot_ports.SLOT_PORTS)
-    assert len(rows) == 15
+    assert len(rows) == 16  # 15 slots plus the read-only InvenTree slot (225861b8)
     assert all(row.state == model.SLOT_STATE_NOT_CHECKED for row in rows)
 
 
@@ -536,7 +536,7 @@ def test_the_slot_table_fills_in_the_port_check_on_a_check(qtbot, settings_path,
     monkeypatch.setattr(tunnel_panel, "probe_slot_ports", lambda: results)
     panel, _spawn, _confirm = _panel(qtbot, settings_path, tmp_path, status_call=runner_reply("running"))
     table = panel.findChild(QTableWidget, "tunnelpanel-slots")
-    assert table.rowCount() == len(slot_ports.SLOT_PORTS) == 15
+    assert table.rowCount() == len(slot_ports.SLOT_PORTS) == 16
     assert [_cells(table, row) for row in range(table.rowCount())] == _expected_slot_cells(
         lambda slot: model.SLOT_STATE_NOT_CHECKED
     )

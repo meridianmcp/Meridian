@@ -176,8 +176,9 @@ def test_probe_results_are_labelled_listening_never_healthy():
 
 def test_slot_port_timeout_is_per_port_and_total_is_bounded():
     assert PER_PORT_TIMEOUT == 0.25
-    assert worst_case_seconds() == pytest.approx(3.75)
-    assert worst_case_seconds() <= 3.75
+    # 16 slots at 0.25 s each: the 15 existing slots plus the read-only InvenTree slot (225861b8).
+    assert worst_case_seconds() == pytest.approx(4.0)
+    assert worst_case_seconds() <= 4.0
     assert worst_case_seconds(EXPECTED_SLOT_PORTS[:2]) == pytest.approx(0.5)
 
 
