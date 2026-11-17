@@ -22,6 +22,7 @@ Connector groups, keyed by the tunnel slot label (``routes/tunnel.py``)::
     office      ppt, word          -> powerpoint__*, word__*
     desktop     dc                 -> desktop-commander__*
     zotero      zotero             -> zotero-mcp__*
+    inventory   inventree          -> meridian-inventree__* (read-only InvenTree, 225861b8)
     custom      p0..p3             -> custom-p0__* .. custom-p3__*
     custom      owner's connectors -> custom-<name>__*     (custom_connectors.py, opt-in)
 
@@ -58,6 +59,7 @@ _SLOT_GROUPS: dict[str, str] = {
     "word": "office",
     "dc": "desktop",
     "zotero": "zotero",
+    "inventree": "inventory",
     "p0": "custom",
     "p1": "custom",
     "p2": "custom",

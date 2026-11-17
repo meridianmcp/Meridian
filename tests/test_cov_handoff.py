@@ -843,7 +843,12 @@ async def test_handoff_modes_render_same_effective_test_cmd_parallelism_branch_v
         {"test_cmd": "pixi run test -n auto", "branch": "dev", "test_min": 42},
     )
     s = await db_module.register_session(db, p["id"], "sess-parity")
-    await db_module.add_sprint_item(db, p["id"], "v1", "FEAT: parity check", force=True)
+    # prospect_bypass: this test checks handoff rendering, not prospecting. Title words
+    # are matched against repo file names, so "check" matched meridian/prose/check.py
+    # after the tunnel-branch merge, which excluded the item as unprospected.
+    await db_module.add_sprint_item(
+        db, p["id"], "v1", "FEAT: parity check", force=True, prospect_bypass=True,
+    )
 
     expected_snippets = [
         'test_cmd="pixi run test -n auto"',

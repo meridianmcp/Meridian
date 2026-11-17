@@ -24,7 +24,7 @@ from meridian.routes import tunnel as tn
 
 EXPECTED_GROUPS = {
     "chat-files", "code", "outputs", "docs", "latex", "debug",
-    "office", "desktop", "zotero", "custom",
+    "office", "desktop", "zotero", "inventory", "custom",
 }
 
 

@@ -972,6 +972,18 @@ No auth required.
 | `POST` | `/hooks/stop` | Claude Code / Codex Stop hook |
 
 
+### `/inventree`
+
+| Method | Path | Description |
+|--------|------|-------------|
+| `GET` | `/inventree/mcp/{tenant_id}` | 225861b8 — Proxy requests to the tenant's read-only meridian-inventree server |
+| `OPTIONS` | `/inventree/mcp/{tenant_id}` | 225861b8 — Proxy requests to the tenant's read-only meridian-inventree server |
+| `POST` | `/inventree/mcp/{tenant_id}` | 225861b8 — Proxy requests to the tenant's read-only meridian-inventree server |
+| `GET` | `/inventree/mcp/{tenant_id}/{rest:path}` | Proxy sub-path requests to the tenant's read-only meridian-inventree server |
+| `OPTIONS` | `/inventree/mcp/{tenant_id}/{rest:path}` | Proxy sub-path requests to the tenant's read-only meridian-inventree server |
+| `POST` | `/inventree/mcp/{tenant_id}/{rest:path}` | Proxy sub-path requests to the tenant's read-only meridian-inventree server |
+
+
 ### `/journal-style-presets`
 
 | Method | Path | Description |
