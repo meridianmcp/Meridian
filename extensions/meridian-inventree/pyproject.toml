@@ -1,0 +1,30 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "meridian-inventree"
+version = "0.1.0"
+description = "MCP server for one InvenTree instance: read tools, and write plans that only an owner approves in a terminal."
+readme = "README.md"
+requires-python = ">=3.12"
+authors = [{ name = "Adam Camerer" }]
+keywords = ["mcp", "inventree", "inventory", "plans"]
+dependencies = [
+    # Pinned below the v2 major for the same reason as meridian-outputs: the
+    # FastMCP import used by server.py must resolve under uvx and pixi alike.
+    # The floor is 1.30 because server.py uses ToolAnnotations and the tool(annotations=)
+    # argument, and 1.30.0 is the version those calls were checked against.
+    "mcp>=1.30,<2",
+]
+
+[project.optional-dependencies]
+test = ["pytest>=8"]
+
+[project.scripts]
+# Named meridian-inventree-mcp, not meridian-inventree, to avoid the uvx command
+# name colliding with the package name (same convention as meridian-outputs).
+meridian-inventree-mcp = "meridian_inventree.server:main"
+
+[tool.hatch.build.targets.wheel]
+packages = ["meridian_inventree"]
